@@ -1,0 +1,28 @@
+name: spatio-temporal-dl
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  # Deep learning
+  - pytorch
+  - torchvision
+  - torchaudio
+  - tensorflow
+  - keras
+  # Data science
+  - numpy
+  - pandas
+  - scipy
+  - scikit-learn
+  # Visualization
+  - matplotlib
+  - seaborn
+  # Geospatial
+  - geopandas
+  - rasterio
+  - shapely
+  - folium
+  # Jupyter
+  - jupyter
+  # Utilities
+  - tqdm

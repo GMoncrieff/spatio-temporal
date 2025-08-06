@@ -1,0 +1,40 @@
+# Configuration file for spatio-temporal deep learning project
+
+# Data configuration
+data:
+  raw_data_path: "data/raw"
+  processed_data_path: "data/processed"
+  external_data_path: "data/external"
+  batch_size: 32
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+
+# Model configuration
+model:
+  architecture: "lstm"  # Options: lstm, gru, transformer, cnn_lstm
+  hidden_size: 128
+  num_layers: 2
+  dropout: 0.2
+  learning_rate: 0.001
+
+# Training configuration
+training:
+  epochs: 100
+  patience: 10
+  checkpoint_dir: "models/checkpoints"
+  save_best_only: true
+  monitor: "val_loss"
+  mode: "min"
+
+# Logging configuration
+logging:
+  log_dir: "logs"
+  experiment_name: "spatio_temporal_experiment"
+  log_level: "INFO"
+
+# Hardware configuration
+device:
+  use_gpu: true
+  gpu_id: 0
+  num_workers: 4
