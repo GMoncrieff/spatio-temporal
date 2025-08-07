@@ -19,7 +19,7 @@ if __name__ == "__main__":
 
     # Callbacks
     checkpoint_cb = ModelCheckpoint(monitor='val_loss', save_top_k=1, mode='min')
-    early_stop_cb = EarlyStopping(monitor='val_loss', patience=5, mode='min')
+    # No early stopping
 
     # Wandb logger
     wandb_logger = WandbLogger(project='spatio-temporal-convlstm', log_model=True)
@@ -27,7 +27,7 @@ if __name__ == "__main__":
     # Trainer
     trainer = pl.Trainer(
         max_epochs=100,
-        callbacks=[checkpoint_cb, early_stop_cb],
+        callbacks=[checkpoint_cb],
         accelerator='auto',
         default_root_dir=os.path.join(os.getcwd(), 'models', 'checkpoints'),
         logger=wandb_logger
@@ -60,26 +60,51 @@ if __name__ == "__main__":
         # Log images to wandb
         images = []
         B = input_dynamic.shape[0]
+        # Retrieve means/stds for inverse transform
+        ds = val_loader.dataset
+        if hasattr(ds, 'dataset'):
+            ds = ds.dataset  # Unwrap DataLoader if needed
+        hm_mean, hm_std = ds.hm_mean, ds.hm_std
+        elev_mean, elev_std = ds.elev_mean, ds.elev_std
         for b in range(B):
-            fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-            im0 = axes[0].imshow(target[b].cpu(), cmap='magma', vmin=0, vmax=1)
-            axes[0].set_title('Target')
-            axes[0].axis('off')
-            plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
-            im1 = axes[1].imshow(preds[b].cpu(), cmap='viridis', vmin=0, vmax=1)
-            axes[1].set_title('Prediction')
-            axes[1].axis('off')
-            plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
-            error = (preds[b] - target[b]).abs()
-            im2 = axes[2].imshow(error.cpu(), cmap='hot', vmin=0, vmax=1)
-            axes[2].set_title('Absolute Error')
-            axes[2].axis('off')
-            plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+            fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+            # Input human footprint chips (T=3), unnormalize
+            for t in range(3):
+                hm_in = input_dynamic[b, t, 0].cpu().numpy() * hm_std + hm_mean
+                im = axes[0, t].imshow(hm_in, cmap='plasma', vmin=0, vmax=10000)
+                axes[0, t].set_title(f'Input HM t-{2-t} (0-10k)')
+                axes[0, t].axis('off')
+                plt.colorbar(im, ax=axes[0, t], fraction=0.046, pad=0.04)
+            # Elevation raster, unnormalize
+            elev_in = input_static[b, 0].cpu().numpy() * elev_std + elev_mean
+            im = axes[0, 3].imshow(elev_in, cmap='terrain')
+            axes[0, 3].set_title('Elevation (meters)')
+            axes[0, 3].axis('off')
+            plt.colorbar(im, ax=axes[0, 3], fraction=0.046, pad=0.04)
+            # Target, unnormalize
+            target_denorm = target[b].cpu().numpy() * hm_std + hm_mean
+            im0 = axes[1, 0].imshow(target_denorm, cmap='magma', vmin=0, vmax=10000)
+            axes[1, 0].set_title('Target (0-10k)')
+            axes[1, 0].axis('off')
+            plt.colorbar(im0, ax=axes[1, 0], fraction=0.046, pad=0.04)
+            # Prediction, unnormalize
+            pred_denorm = preds[b].cpu().numpy() * hm_std + hm_mean
+            im1 = axes[1, 1].imshow(pred_denorm, cmap='viridis', vmin=0, vmax=10000)
+            axes[1, 1].set_title('Prediction (0-10k)')
+            axes[1, 1].axis('off')
+            plt.colorbar(im1, ax=axes[1, 1], fraction=0.046, pad=0.04)
+            # Error (in original units)
+            error = np.abs(pred_denorm - target_denorm)
+            im2 = axes[1, 2].imshow(error, cmap='hot', vmin=0, vmax=10000)
+            axes[1, 2].set_title('Absolute Error (0-10k)')
+            axes[1, 2].axis('off')
+            plt.colorbar(im2, ax=axes[1, 2], fraction=0.046, pad=0.04)
+            # Hide unused subplot
+            axes[1, 3].axis('off')
             plt.tight_layout()
             # Convert to numpy array and log (robust for macOS backend)
             fig.canvas.draw()
             img_rgba = np.array(fig.canvas.buffer_rgba())
-            # Convert RGBA to RGB
             img_rgb = img_rgba[..., :3]
             images.append(wandb.Image(img_rgb, caption=f"Sample {b}"))
             plt.close(fig)

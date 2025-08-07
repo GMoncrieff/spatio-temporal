@@ -35,8 +35,15 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
         self.hm_stack = []
         for f in hm_files:
             with rasterio.open(f) as src:
-                self.hm_stack.append(src.read(1))
+                arr = src.read(1)
+                arr = arr * 10000  # Scale HM from [0,1] to [0,10000] for regression
+                self.hm_stack.append(arr)
         self.hm_stack = np.stack(self.hm_stack, axis=0)  # [T, H, W]
+        # Compute mean/std for normalization (ignore NaNs)
+        self.hm_mean = np.nanmean(self.hm_stack)
+        self.hm_std = np.nanstd(self.hm_stack)
+        self.hm_stack = (self.hm_stack - self.hm_mean) / self.hm_std
+
         self.T, self.H, self.W = self.hm_stack.shape
         # Load static variable(s) [C, H, W]
         static_layers = []
@@ -44,6 +51,10 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
             with rasterio.open(f) as src:
                 static_layers.append(src.read(1))
         self.static = np.stack(static_layers, axis=0)
+        # Compute mean/std for elevation normalization (ignore NaNs)
+        self.elev_mean = np.nanmean(self.static)
+        self.elev_std = np.nanstd(self.static)
+        self.static = (self.static - self.elev_mean) / self.elev_std
         # Compute valid time indices
         self.valid_time_idxs = list(range(self.timesteps, self.T))
         # Precompute all chip positions if not random
