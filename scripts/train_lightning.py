@@ -16,6 +16,12 @@ if __name__ == "__main__":
 
     # Model
     model = SpatioTemporalLightningModule(hidden_dim=16, lr=1e-3)
+    # Set normalization stats for physical-scale MAE logging
+    if hasattr(train_loader, 'dataset'):
+        ds = train_loader.dataset
+        if hasattr(ds, 'hm_mean') and hasattr(ds, 'hm_std'):
+            model.hm_mean = ds.hm_mean
+            model.hm_std = ds.hm_std
 
     # Callbacks
     checkpoint_cb = ModelCheckpoint(monitor='val_loss', save_top_k=1, mode='min')
@@ -48,15 +54,25 @@ if __name__ == "__main__":
         best_model.eval()
         # Move model and data to same device
         device = next(best_model.parameters()).device
-        best_model = best_model.to(device)
-        batch = next(iter(val_loader))
-        input_dynamic = batch['input_dynamic'].to(device)
-        input_static = batch['input_static'].to(device)
-        target = batch['target'].to(device)
-        with torch.no_grad():
-            if input_dynamic.dim() == 4:
-                input_dynamic = input_dynamic.unsqueeze(2)
-            preds = best_model(input_dynamic, input_static).squeeze(1)
+        # Inference on a batch of validation data with at least one valid target pixel
+        valid_batch_found = False
+        for batch in val_loader:
+            target = batch['target']
+            # Check for at least one valid (non-NaN) pixel in any sample
+            if torch.any(~torch.isnan(target)).item():
+                input_dynamic = batch['input_dynamic'].to(device)
+                input_static = batch['input_static'].to(device)
+                target = target.to(device)
+                best_model.eval()
+                with torch.no_grad():
+                    if input_dynamic.dim() == 4:
+                        input_dynamic = input_dynamic.unsqueeze(2)
+                    preds = best_model(input_dynamic, input_static).squeeze(1)
+                valid_batch_found = True
+                break
+        if not valid_batch_found:
+            print("WARNING: No valid (non-NaN) target pixels found in any validation batch for image logging and MAE.")
+            sys.exit(0)
         # Log images to wandb
         images = []
         B = input_dynamic.shape[0]
@@ -66,13 +82,20 @@ if __name__ == "__main__":
             ds = ds.dataset  # Unwrap DataLoader if needed
         hm_mean, hm_std = ds.hm_mean, ds.hm_std
         elev_mean, elev_std = ds.elev_mean, ds.elev_std
+        # Get years from dataset
+        ds_years = getattr(ds, 'years', None)
         for b in range(B):
-            fig, axes = plt.subplots(2, 4, figsize=(16, 8))
-            # Input human footprint chips (T=3), unnormalize
+            fig, axes = plt.subplots(2, 5, figsize=(20, 8))
+            # Use a single color ramp for all HM images
+            hm_vmin, hm_vmax = 0, 10000
+            # Input human footprint chips (T=3), unnormalize and label with years
+            years_list = ds_years if ds_years is not None else list(range(3))
+            t_idx = batch['timestep'][b].item() if isinstance(batch['timestep'][b], torch.Tensor) else batch['timestep'][b]
+            input_years = [years_list[t_idx - 3 + t] for t in range(3)]
             for t in range(3):
                 hm_in = input_dynamic[b, t, 0].cpu().numpy() * hm_std + hm_mean
-                im = axes[0, t].imshow(hm_in, cmap='plasma', vmin=0, vmax=10000)
-                axes[0, t].set_title(f'Input HM t-{2-t} (0-10k)')
+                im = axes[0, t].imshow(hm_in, cmap='turbo', vmin=hm_vmin, vmax=hm_vmax)
+                axes[0, t].set_title(f'HM {input_years[t]}')
                 axes[0, t].axis('off')
                 plt.colorbar(im, ax=axes[0, t], fraction=0.046, pad=0.04)
             # Elevation raster, unnormalize
@@ -81,26 +104,37 @@ if __name__ == "__main__":
             axes[0, 3].set_title('Elevation (meters)')
             axes[0, 3].axis('off')
             plt.colorbar(im, ax=axes[0, 3], fraction=0.046, pad=0.04)
-            # Target, unnormalize
+            # Hide unused subplot in first row
+            axes[0, 4].axis('off')
+            # Target, unnormalize and label with year
             target_denorm = target[b].cpu().numpy() * hm_std + hm_mean
-            im0 = axes[1, 0].imshow(target_denorm, cmap='magma', vmin=0, vmax=10000)
-            axes[1, 0].set_title('Target (0-10k)')
+            target_year = years_list[t_idx] if ds_years is not None else 'Target'
+            im0 = axes[1, 0].imshow(target_denorm, cmap='turbo', vmin=hm_vmin, vmax=hm_vmax)
+            axes[1, 0].set_title(f'Target HM {target_year}')
             axes[1, 0].axis('off')
             plt.colorbar(im0, ax=axes[1, 0], fraction=0.046, pad=0.04)
-            # Prediction, unnormalize
+            # Prediction, unnormalize and label
             pred_denorm = preds[b].cpu().numpy() * hm_std + hm_mean
-            im1 = axes[1, 1].imshow(pred_denorm, cmap='viridis', vmin=0, vmax=10000)
-            axes[1, 1].set_title('Prediction (0-10k)')
+            im1 = axes[1, 1].imshow(pred_denorm, cmap='turbo', vmin=hm_vmin, vmax=hm_vmax)
+            axes[1, 1].set_title(f'Predicted HM {target_year}')
             axes[1, 1].axis('off')
             plt.colorbar(im1, ax=axes[1, 1], fraction=0.046, pad=0.04)
             # Error (in original units)
             error = np.abs(pred_denorm - target_denorm)
-            im2 = axes[1, 2].imshow(error, cmap='hot', vmin=0, vmax=10000)
+            im2 = axes[1, 2].imshow(error, cmap='hot', vmin=0, vmax=hm_vmax)
             axes[1, 2].set_title('Absolute Error (0-10k)')
             axes[1, 2].axis('off')
             plt.colorbar(im2, ax=axes[1, 2], fraction=0.046, pad=0.04)
-            # Hide unused subplot
+            # Delta image: target - most recent input HM
+            most_recent_in = input_dynamic[b, -1, 0].cpu().numpy() * hm_std + hm_mean
+            delta = target_denorm - most_recent_in
+            vmax_delta = np.nanmax(np.abs(delta))
+            im3 = axes[1, 3].imshow(delta, cmap='bwr', vmin=-vmax_delta, vmax=vmax_delta)
+            axes[1, 3].set_title(f'Delta HM {target_year}-{input_years[-1]}')
             axes[1, 3].axis('off')
+            plt.colorbar(im3, ax=axes[1, 3], fraction=0.046, pad=0.04)
+            # Hide unused subplot in second row
+            axes[1, 4].axis('off')
             plt.tight_layout()
             # Convert to numpy array and log (robust for macOS backend)
             fig.canvas.draw()
@@ -109,5 +143,6 @@ if __name__ == "__main__":
             images.append(wandb.Image(img_rgb, caption=f"Sample {b}"))
             plt.close(fig)
         wandb.log({"Predictions_vs_Targets": images})
+
     else:
         print("No best checkpoint found for image logging.")

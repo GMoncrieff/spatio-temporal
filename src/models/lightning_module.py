@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 import pytorch_lightning as pl
 from torchmetrics.functional import structural_similarity_index_measure as ssim
 from .spatiotemporal_predictor import SpatioTemporalPredictor
@@ -48,7 +49,6 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             ssim_loss = 1.0 - ssim_val
         total_loss = loss + self.ssim_weight * ssim_loss
         self.log('train_loss', loss)
-        self.log('train_mae', mae)
         self.log('train_ssim_loss', ssim_loss)
         self.log('train_total_loss', total_loss)
         return total_loss
@@ -82,7 +82,16 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             ssim_loss = torch.tensor(0.0, device=preds.device)
         else:
             loss = self.loss_fn(valid_preds, valid_target)
-            mae = self.mae_fn(valid_preds, valid_target)
+            # Masked MAE (normalized)
+            valid_mask = ~torch.isnan(target)
+            mae = F.l1_loss(preds[valid_mask], target[valid_mask])
+            self.log('val_mae', mae, on_step=False, on_epoch=True, prog_bar=True)
+            # Physical-scale MAE (original scale, 0-10000)
+            if hasattr(self, 'hm_mean') and hasattr(self, 'hm_std'):
+                preds_orig = preds[valid_mask] * self.hm_std + self.hm_mean
+                target_orig = target[valid_mask] * self.hm_std + self.hm_mean
+                mae_orig = F.l1_loss(preds_orig, target_orig)
+                self.log('val_mae_original', mae_orig, on_step=False, on_epoch=True, prog_bar=True)
             # SSIM expects [B, C, H, W] and values in [0,1]
             preds_masked = preds.clone()
             target_masked = target.clone()
@@ -93,7 +102,6 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             print(f"[VAL] Loss: {loss.item():.6f}, MAE: {mae.item():.6f}, SSIM: {ssim_val.item():.6f}")
         total_loss = loss + self.ssim_weight * ssim_loss
         self.log('val_loss', loss)
-        self.log('val_mae', mae)
         self.log('val_ssim_loss', ssim_loss)
         self.log('val_total_loss', total_loss)
         return total_loss
