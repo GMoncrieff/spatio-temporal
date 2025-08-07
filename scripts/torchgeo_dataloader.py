@@ -63,25 +63,32 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
             return self.chips_per_epoch
 
     def __getitem__(self, idx):
-        # Random or grid sampling
-        if self.mode == "grid":
-            t, i, j = self.chip_positions[idx]
-        else:
-            t = np.random.choice(self.valid_time_idxs)
-            i = np.random.randint(0, self.H - self.chip_size + 1)
-            j = np.random.randint(0, self.W - self.chip_size + 1)
-        # Dynamic input: [timesteps, chip_size, chip_size]
-        input_dynamic = self.hm_stack[t - self.timesteps:t, i:i+self.chip_size, j:j+self.chip_size]
-        # Static input: [C, chip_size, chip_size]
-        input_static = self.static[:, i:i+self.chip_size, j:j+self.chip_size]
-        # Target: [chip_size, chip_size] (next timestep)
-        target = self.hm_stack[t, i:i+self.chip_size, j:j+self.chip_size]
+        # Try up to 10 times to get a non-all-NaN chip
+        for _ in range(10):
+            if self.mode == "grid":
+                t, i, j = self.chip_positions[idx]
+            else:
+                t = np.random.choice(self.valid_time_idxs)
+                i = np.random.randint(0, self.H - self.chip_size + 1)
+                j = np.random.randint(0, self.W - self.chip_size + 1)
+            input_dynamic = self.hm_stack[t - self.timesteps:t, i:i+self.chip_size, j:j+self.chip_size]
+            input_static = self.static[:, i:i+self.chip_size, j:j+self.chip_size]
+            target = self.hm_stack[t, i:i+self.chip_size, j:j+self.chip_size]
+            if not np.isnan(target).all():
+                return {
+                    "input_dynamic": torch.from_numpy(input_dynamic).float(),
+                    "input_static": torch.from_numpy(input_static).float(),
+                    "target": torch.from_numpy(target).float(),
+                    "timestep": t
+                }
+        # If all attempts fail, return anyway (will be masked out in loss)
         return {
             "input_dynamic": torch.from_numpy(input_dynamic).float(),
             "input_static": torch.from_numpy(input_static).float(),
             "target": torch.from_numpy(target).float(),
             "timestep": t
         }
+
 
 def get_dataloader(batch_size=1, chip_size=128, timesteps=3, stride=64, mode="random", chips_per_epoch=100):
     ds = HumanFootprintChipDataset(hm_files, static_files, chip_size=chip_size, timesteps=timesteps, stride=stride, mode=mode, chips_per_epoch=chips_per_epoch)
