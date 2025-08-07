@@ -12,56 +12,93 @@ years = [1990, 1995, 2000, 2005, 2010, 2015, 2020]
 hm_files = [os.path.join(HM_DIR, f"HM_{year}_1km.tif") for year in years]
 static_files = [os.path.join(STATIC_DIR, "SRTM_Elevation_1km.tif")]
 
-class HumanFootprintDataset(RasterDataset):
+import numpy as np
+import rasterio
+
+class HumanFootprintChipDataset(torch.utils.data.Dataset):
     """
-    Loads human footprint (dynamic) and static variable rasters for a given year.
-    Returns a dict with 'image' (static vars), 'target' (human footprint), and 'year'.
+    Yields chips for ConvLSTM training:
+      - input_dynamic: [timesteps=3, 512, 512]
+      - input_static: [1, 512, 512]
+      - target: [512, 512] (next timestep)
     """
-    def __init__(self, hm_file, static_files):
-        super().__init__()
-        self.hm_file = hm_file
+    def __init__(self, hm_files, static_files, chip_size=512, timesteps=3, stride=256, mode="random", chips_per_epoch=100):
+        self.hm_files = hm_files
         self.static_files = static_files
+        self.chip_size = chip_size
+        self.timesteps = timesteps
+        self.stride = stride
+        self.mode = mode
+        self.chips_per_epoch = chips_per_epoch
 
-        # No need to register self.files for this custom dataset
-
-    def __getitem__(self, index):
-        # Ignore index, always return the full raster (single sample)
-        import rasterio
-        import numpy as np
-        # Human footprint (target)
-        with rasterio.open(self.hm_file) as src:
-            target = src.read(1)
-            profile = src.profile
-        # Static variable(s)
+        # Load all human footprint rasters into [T, H, W]
+        self.hm_stack = []
+        for f in hm_files:
+            with rasterio.open(f) as src:
+                self.hm_stack.append(src.read(1))
+        self.hm_stack = np.stack(self.hm_stack, axis=0)  # [T, H, W]
+        self.T, self.H, self.W = self.hm_stack.shape
+        # Load static variable(s) [C, H, W]
         static_layers = []
-        for f in self.static_files:
-            with rasterio.open(f) as s:
-                static_layers.append(s.read(1))
-        static = np.stack(static_layers, axis=0)  # shape: [C, H, W]
-        # Add batch dimension (simulate sample)
-        return {
-            'image': torch.from_numpy(static).float(),
-            'target': torch.from_numpy(target).float().unsqueeze(0),
-            'year': int(os.path.basename(self.hm_file).split('_')[1])
-        }
+        for f in static_files:
+            with rasterio.open(f) as src:
+                static_layers.append(src.read(1))
+        self.static = np.stack(static_layers, axis=0)
+        # Compute valid time indices
+        self.valid_time_idxs = list(range(self.timesteps, self.T))
+        # Precompute all chip positions if not random
+        if self.mode == "grid":
+            self.chip_positions = []
+            for t in self.valid_time_idxs:
+                for i in range(0, self.H - chip_size + 1, stride):
+                    for j in range(0, self.W - chip_size + 1, stride):
+                        self.chip_positions.append((t, i, j))
+        else:
+            self.chip_positions = None
 
     def __len__(self):
-        return 1  # Each dataset is a single raster
+        if self.mode == "grid":
+            return len(self.chip_positions)
+        else:
+            return self.chips_per_epoch
 
-def get_datasets():
-    datasets = []
-    for hm_file in hm_files:
-        datasets.append(HumanFootprintDataset(hm_file, static_files))
-    return datasets
+    def __getitem__(self, idx):
+        # Random or grid sampling
+        if self.mode == "grid":
+            t, i, j = self.chip_positions[idx]
+        else:
+            t = np.random.choice(self.valid_time_idxs)
+            i = np.random.randint(0, self.H - self.chip_size + 1)
+            j = np.random.randint(0, self.W - self.chip_size + 1)
+        # Dynamic input: [timesteps, chip_size, chip_size]
+        input_dynamic = self.hm_stack[t - self.timesteps:t, i:i+self.chip_size, j:j+self.chip_size]
+        # Static input: [C, chip_size, chip_size]
+        input_static = self.static[:, i:i+self.chip_size, j:j+self.chip_size]
+        # Target: [chip_size, chip_size] (next timestep)
+        target = self.hm_stack[t, i:i+self.chip_size, j:j+self.chip_size]
+        return {
+            "input_dynamic": torch.from_numpy(input_dynamic).float(),
+            "input_static": torch.from_numpy(input_static).float(),
+            "target": torch.from_numpy(target).float(),
+            "timestep": t
+        }
 
-def get_dataloader(year_idx=0, batch_size=1):
-    ds = get_datasets()[year_idx]
+def get_dataloader(batch_size=1, chip_size=128, timesteps=3, stride=64, mode="random", chips_per_epoch=100):
+    ds = HumanFootprintChipDataset(hm_files, static_files, chip_size=chip_size, timesteps=timesteps, stride=stride, mode=mode, chips_per_epoch=chips_per_epoch)
     return DataLoader(ds, batch_size=batch_size)
 
 if __name__ == "__main__":
-    # Example: load 2010 data
-    year_idx = 4  # 2010
-    loader = get_dataloader(year_idx)
+    loader = get_dataloader(batch_size=2, chip_size=128, timesteps=3, chips_per_epoch=2)
+    batch = next(iter(loader))
+    print(f"input_dynamic shape: {batch['input_dynamic'].shape}")  # [B, 3, 128, 128]
+    print(f"input_static shape: {batch['input_static'].shape}")    # [B, 1, 128, 128]
+    print(f"target shape: {batch['target'].shape}")               # [B, 128, 128]
+    print(f"timesteps: {batch['timestep']}")
+
+    years = [1990, 1995, 2000, 2005, 2010, 2015, 2020]
+    t = batch['timestep']
+    print("Target year(s):", [years[ti] for ti in t])
+    print("Input years:", [[years[ti-3], years[ti-2], years[ti-1]] for ti in t])
     for batch in loader:
         print(f"Year: {batch['year']}")
         print(f"Image shape (static): {batch['image'].shape}")
