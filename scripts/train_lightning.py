@@ -12,10 +12,11 @@ import os
 if __name__ == "__main__":
     # Data
     train_loader = get_dataloader(batch_size=8, chip_size=128, timesteps=3, chips_per_epoch=200)
-    val_loader = get_dataloader(batch_size=8, chip_size=128, timesteps=3, chips_per_epoch=40, mode="grid")
+    # Validation uses grid sampling and requests future targets for autoregressive evaluation
+    val_loader = get_dataloader(batch_size=8, chip_size=128, timesteps=3, chips_per_epoch=40, mode="grid", future_horizons=4)
 
     # Model
-    model = SpatioTemporalLightningModule(hidden_dim=16, lr=1e-3)
+    model = SpatioTemporalLightningModule(hidden_dim=16, lr=1e-3, forecast_horizon=4)
     # Set normalization stats for physical-scale MAE logging
     if hasattr(train_loader, 'dataset'):
         ds = train_loader.dataset
@@ -32,11 +33,12 @@ if __name__ == "__main__":
 
     # Trainer
     trainer = pl.Trainer(
-        max_epochs=100,
+        max_epochs=20,
         callbacks=[checkpoint_cb],
         accelerator='auto',
         default_root_dir=os.path.join(os.getcwd(), 'models', 'checkpoints'),
-        logger=wandb_logger
+        logger=wandb_logger,
+        log_every_n_steps=10
     )
 
     # Train

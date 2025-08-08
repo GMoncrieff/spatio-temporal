@@ -22,7 +22,7 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
       - input_static: [1, 512, 512]
       - target: [512, 512] (next timestep)
     """
-    def __init__(self, hm_files, static_files, chip_size=512, timesteps=3, stride=256, mode="random", chips_per_epoch=100):
+    def __init__(self, hm_files, static_files, chip_size=512, timesteps=3, stride=256, mode="random", chips_per_epoch=100, future_horizons=0):
         self.hm_files = hm_files
         self.static_files = static_files
         self.chip_size = chip_size
@@ -30,6 +30,7 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
         self.stride = stride
         self.mode = mode
         self.chips_per_epoch = chips_per_epoch
+        self.future_horizons = future_horizons
 
         # Load all human footprint rasters into [T, H, W]
         self.hm_stack = []
@@ -86,24 +87,59 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
             input_static = self.static[:, i:i+self.chip_size, j:j+self.chip_size]
             target = self.hm_stack[t, i:i+self.chip_size, j:j+self.chip_size]
             if not np.isnan(target).all():
-                return {
+                sample = {
                     "input_dynamic": torch.from_numpy(input_dynamic).float(),
                     "input_static": torch.from_numpy(input_static).float(),
                     "target": torch.from_numpy(target).float(),
                     "timestep": t
                 }
+                # Optionally include future targets up to future_horizons
+                if self.future_horizons > 0:
+                    # Compute how many future steps are actually available from t
+                    available = max(0, self.T - 1 - t)
+                    max_future = min(self.future_horizons, available)
+                    # Prepare fixed-size container [future_horizons, Hc, Wc] padded with NaNs
+                    fut_arr = np.full((self.future_horizons, self.chip_size, self.chip_size), np.nan, dtype=self.hm_stack[0].dtype)
+                    for h in range(max_future):
+                        fut_arr[h] = self.hm_stack[t + (h + 1), i:i+self.chip_size, j:j+self.chip_size]
+                    sample["future_targets"] = torch.from_numpy(fut_arr).float()
+                    sample["future_horizons"] = max_future  # how many valid horizons are filled
+                    sample["future_horizons_fixed"] = self.future_horizons  # requested K
+                return sample
         # If all attempts fail, return anyway (will be masked out in loss)
-        return {
+        sample = {
             "input_dynamic": torch.from_numpy(input_dynamic).float(),
             "input_static": torch.from_numpy(input_static).float(),
             "target": torch.from_numpy(target).float(),
             "timestep": t
         }
+        if self.future_horizons > 0:
+            # Return fixed-size padded tensor of NaNs when we failed to find a non-NaN target
+            fut_arr = np.full((self.future_horizons, self.chip_size, self.chip_size), np.nan, dtype=self.hm_stack[0].dtype)
+            sample["future_targets"] = torch.from_numpy(fut_arr).float()
+            sample["future_horizons"] = 0
+            sample["future_horizons_fixed"] = self.future_horizons
+        return sample
 
 
-def get_dataloader(batch_size=1, chip_size=128, timesteps=3, stride=64, mode="random", chips_per_epoch=100):
-    ds = HumanFootprintChipDataset(hm_files, static_files, chip_size=chip_size, timesteps=timesteps, stride=stride, mode=mode, chips_per_epoch=chips_per_epoch)
-    return DataLoader(ds, batch_size=batch_size)
+def get_dataloader(batch_size=1, chip_size=128, timesteps=3, stride=64, mode="random", chips_per_epoch=100, future_horizons=0):
+    ds = HumanFootprintChipDataset(
+        hm_files,
+        static_files,
+        chip_size=chip_size,
+        timesteps=timesteps,
+        stride=stride,
+        mode=mode,
+        chips_per_epoch=chips_per_epoch,
+        future_horizons=future_horizons,
+    )
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        num_workers=8,
+        pin_memory=True,
+        persistent_workers=True,
+    )
 
 if __name__ == "__main__":
     loader = get_dataloader(batch_size=2, chip_size=128, timesteps=3, chips_per_epoch=2)
