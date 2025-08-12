@@ -17,20 +17,35 @@ import rasterio
 
 class HumanFootprintChipDataset(torch.utils.data.Dataset):
     """
-    Yields chips for ConvLSTM training:
-      - input_dynamic: [timesteps=3, 512, 512]
-      - input_static: [1, 512, 512]
-      - target: [512, 512] (next timestep)
+    Yields chips for ConvLSTM training (single-step, fixed-year forecasting):
+      - input_dynamic: [3, H, W] from years (1990, 1995, 2000)
+      - input_static: [1, H, W]
+      - target: [H, W] for year 2020
     """
-    def __init__(self, hm_files, static_files, chip_size=512, timesteps=3, stride=256, mode="random", chips_per_epoch=100, future_horizons=0):
+    def __init__(
+        self,
+        hm_files,
+        static_files,
+        chip_size=512,
+        timesteps=3,
+        stride=256,
+        mode="random",
+        chips_per_epoch=100,
+        fixed_input_years=(1990, 1995, 2000),
+        fixed_target_year=2020,
+    ):
         self.hm_files = hm_files
         self.static_files = static_files
         self.chip_size = chip_size
-        self.timesteps = timesteps
+        self.timesteps = timesteps  # kept for compatibility; must be 3
+        if self.timesteps != 3:
+            raise ValueError("Single-step setup expects exactly 3 input timesteps (1990, 1995, 2000)")
         self.stride = stride
         self.mode = mode
         self.chips_per_epoch = chips_per_epoch
-        self.future_horizons = future_horizons
+        # Fixed-year setup
+        self.fixed_input_years = tuple(fixed_input_years)
+        self.fixed_target_year = int(fixed_target_year)
 
         # Load all human footprint rasters into [T, H, W]
         self.hm_stack = []
@@ -56,8 +71,20 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
         self.elev_mean = np.nanmean(self.static)
         self.elev_std = np.nanstd(self.static)
         self.static = (self.static - self.elev_mean) / self.elev_std
-        # Compute valid time indices
-        self.valid_time_idxs = list(range(self.timesteps, self.T))
+        # Map fixed years to indices in the stacked timeline
+        year_to_idx = {y: i for i, y in enumerate(years)}
+        # Expose available years for downstream labeling
+        self.years = years
+        try:
+            self.input_t_idxs = [year_to_idx[y] for y in self.fixed_input_years]
+            self.target_t_idx = year_to_idx[self.fixed_target_year]
+        except KeyError as e:
+            raise ValueError(f"Requested year {e} not found in available years {years}")
+        # Validate ordering and availability
+        if len(self.input_t_idxs) != 3:
+            raise ValueError("fixed_input_years must have exactly 3 entries: e.g., (1990, 1995, 2000)")
+        # Precompute valid positions (target year only)
+        self.valid_time_idxs = [self.target_t_idx]
         # Precompute all chip positions if not random
         if self.mode == "grid":
             self.chip_positions = []
@@ -80,12 +107,14 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
             if self.mode == "grid":
                 t, i, j = self.chip_positions[idx]
             else:
-                t = np.random.choice(self.valid_time_idxs)
+                # Target year is fixed; randomly sample spatial chips
+                t = self.target_t_idx
                 i = np.random.randint(0, self.H - self.chip_size + 1)
                 j = np.random.randint(0, self.W - self.chip_size + 1)
-            input_dynamic = self.hm_stack[t - self.timesteps:t, i:i+self.chip_size, j:j+self.chip_size]
+            # Build input from fixed earlier years
+            input_dynamic = self.hm_stack[self.input_t_idxs, i:i+self.chip_size, j:j+self.chip_size]
             input_static = self.static[:, i:i+self.chip_size, j:j+self.chip_size]
-            target = self.hm_stack[t, i:i+self.chip_size, j:j+self.chip_size]
+            target = self.hm_stack[self.target_t_idx, i:i+self.chip_size, j:j+self.chip_size]
             if not np.isnan(target).all():
                 sample = {
                     "input_dynamic": torch.from_numpy(input_dynamic).float(),
@@ -93,18 +122,6 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
                     "target": torch.from_numpy(target).float(),
                     "timestep": t
                 }
-                # Optionally include future targets up to future_horizons
-                if self.future_horizons > 0:
-                    # Compute how many future steps are actually available from t
-                    available = max(0, self.T - 1 - t)
-                    max_future = min(self.future_horizons, available)
-                    # Prepare fixed-size container [future_horizons, Hc, Wc] padded with NaNs
-                    fut_arr = np.full((self.future_horizons, self.chip_size, self.chip_size), np.nan, dtype=self.hm_stack[0].dtype)
-                    for h in range(max_future):
-                        fut_arr[h] = self.hm_stack[t + (h + 1), i:i+self.chip_size, j:j+self.chip_size]
-                    sample["future_targets"] = torch.from_numpy(fut_arr).float()
-                    sample["future_horizons"] = max_future  # how many valid horizons are filled
-                    sample["future_horizons_fixed"] = self.future_horizons  # requested K
                 return sample
         # If all attempts fail, return anyway (will be masked out in loss)
         sample = {
@@ -113,16 +130,22 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
             "target": torch.from_numpy(target).float(),
             "timestep": t
         }
-        if self.future_horizons > 0:
-            # Return fixed-size padded tensor of NaNs when we failed to find a non-NaN target
-            fut_arr = np.full((self.future_horizons, self.chip_size, self.chip_size), np.nan, dtype=self.hm_stack[0].dtype)
-            sample["future_targets"] = torch.from_numpy(fut_arr).float()
-            sample["future_horizons"] = 0
-            sample["future_horizons_fixed"] = self.future_horizons
         return sample
 
 
-def get_dataloader(batch_size=1, chip_size=128, timesteps=3, stride=64, mode="random", chips_per_epoch=100, future_horizons=0):
+def get_dataloader(
+    batch_size=1,
+    chip_size=128,
+    timesteps=3,
+    stride=64,
+    mode="random",
+    chips_per_epoch=100,
+    fixed_input_years=(1990, 1995, 2000),
+    fixed_target_year=2020,
+    num_workers=0,
+    pin_memory=False,
+    persistent_workers=False,
+):
     ds = HumanFootprintChipDataset(
         hm_files,
         static_files,
@@ -131,14 +154,15 @@ def get_dataloader(batch_size=1, chip_size=128, timesteps=3, stride=64, mode="ra
         stride=stride,
         mode=mode,
         chips_per_epoch=chips_per_epoch,
-        future_horizons=future_horizons,
+        fixed_input_years=fixed_input_years,
+        fixed_target_year=fixed_target_year,
     )
     return DataLoader(
         ds,
         batch_size=batch_size,
-        num_workers=8,
-        pin_memory=True,
-        persistent_workers=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
     )
 
 if __name__ == "__main__":
@@ -147,14 +171,7 @@ if __name__ == "__main__":
     print(f"input_dynamic shape: {batch['input_dynamic'].shape}")  # [B, 3, 128, 128]
     print(f"input_static shape: {batch['input_static'].shape}")    # [B, 1, 128, 128]
     print(f"target shape: {batch['target'].shape}")               # [B, 128, 128]
-    print(f"timesteps: {batch['timestep']}")
-
-    years = [1990, 1995, 2000, 2005, 2010, 2015, 2020]
-    t = batch['timestep']
-    print("Target year(s):", [years[ti] for ti in t])
-    print("Input years:", [[years[ti-3], years[ti-2], years[ti-1]] for ti in t])
-    for batch in loader:
-        print(f"Year: {batch['year']}")
-        print(f"Image shape (static): {batch['image'].shape}")
-        print(f"Target shape (human footprint): {batch['target'].shape}")
-        print(f"Target min/max: {batch['target'].min().item()} / {batch['target'].max().item()}")
+    print(f"target timestep index: {batch['timestep']}")
+    ds = loader.dataset
+    print("Fixed input years:", getattr(ds, 'fixed_input_years', None))
+    print("Fixed target year:", getattr(ds, 'fixed_target_year', None))
