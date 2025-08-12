@@ -41,16 +41,24 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             input_dynamic = input_dynamic.unsqueeze(2)
         preds = self(input_dynamic, input_static)
         target = batch['target'].unsqueeze(1)
-        mask = torch.isfinite(target)
-        valid_preds = preds[mask]
-        valid_target = target[mask]
-        if valid_preds.numel() == 0:
+        # Use last dynamic input as baseline to form deltas
+        last_input = input_dynamic[:, -1, :, :, :]  # [B, 1, H, W]
+        # Valid where both target and last_input are finite
+        mask = torch.isfinite(target) & torch.isfinite(last_input)
+        # Deltas in normalized/native scale
+        delta_pred = preds - last_input
+        delta_true = target - last_input
+        valid_delta_pred = delta_pred[mask]
+        valid_delta_true = delta_true[mask]
+        if valid_delta_pred.numel() == 0:
             loss = torch.tensor(0.0, device=preds.device)
             mae = torch.tensor(0.0, device=preds.device)
             ssim_loss = torch.tensor(0.0, device=preds.device)
         else:
-            loss = self.loss_fn(valid_preds, valid_target)
-            mae = self.mae_fn(valid_preds, valid_target)
+            # MSE on delta (prediction - last input) vs (target - last input)
+            loss = self.loss_fn(valid_delta_pred, valid_delta_true)
+            # MAE reported on absolute prediction vs target for reference
+            mae = self.mae_fn(preds[mask], target[mask])
             # SSIM expects [B, C, H, W] and values in [0,1]
             preds_masked = preds.clone()
             target_masked = target.clone()
@@ -76,9 +84,12 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             input_dynamic = input_dynamic.unsqueeze(2)
         preds = self(input_dynamic, input_static)
         target = batch['target'].unsqueeze(1)
-        mask = torch.isfinite(target)
-        valid_preds = preds[mask]
-        valid_target = target[mask]
+        last_input = input_dynamic[:, -1, :, :, :]  # [B, 1, H, W]
+        mask = torch.isfinite(target) & torch.isfinite(last_input)
+        delta_pred = preds - last_input
+        delta_true = target - last_input
+        valid_delta_pred = delta_pred[mask]
+        valid_delta_true = delta_true[mask]
         # Diagnostics
         num_total = target.numel()
         num_valid = mask.sum().item()
@@ -88,15 +99,16 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         min_target = float(target[mask].min()) if num_valid > 0 else float('nan')
         max_target = float(target[mask].max()) if num_valid > 0 else float('nan')
         print(f"[VAL] Batch: total={num_total}, valid={num_valid}, nan={num_nan}, pred=[{min_pred:.4f},{max_pred:.4f}], target=[{min_target:.4f},{max_target:.4f}]")
-        if valid_preds.numel() == 0:
+        if valid_delta_pred.numel() == 0:
             print("[VAL] All targets are NaN in this batch!")
             loss = torch.tensor(0.0, device=preds.device)
             mae = torch.tensor(0.0, device=preds.device)
             ssim_loss = torch.tensor(0.0, device=preds.device)
         else:
-            loss = self.loss_fn(valid_preds, valid_target)
-            # Masked MAE (normalized)
-            valid_mask = ~torch.isnan(target)
+            # Delta MSE loss
+            loss = self.loss_fn(valid_delta_pred, valid_delta_true)
+            # Masked MAE (normalized) on absolute prediction
+            valid_mask = mask
             mae = F.l1_loss(preds[valid_mask], target[valid_mask])
             self.log('val_mae', mae, on_step=False, on_epoch=True, prog_bar=True)
             # Physical-scale MAE (original scale, 0-10000)
