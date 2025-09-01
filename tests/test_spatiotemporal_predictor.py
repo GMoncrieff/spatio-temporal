@@ -9,8 +9,10 @@ def test_spatiotemporal_predictor_forward():
     batch_size = 2
     timesteps = 3
     H = W = 128
-    input_dynamic = torch.randn(batch_size, timesteps, 1, H, W)
-    input_static = torch.randn(batch_size, 1, H, W)
+    C_dyn = 9   # 1 HM + 8 components
+    C_static = 5  # elevation, slope, BIO05/06/12
+    input_dynamic = torch.randn(batch_size, timesteps, C_dyn, H, W)
+    input_static = torch.randn(batch_size, C_static, H, W)
     model = SpatioTemporalPredictor(hidden_dim=8, kernel_size=3, num_layers=1)
     pred = model(input_dynamic, input_static)
     # Output should be [B, 1, H, W]

@@ -11,10 +11,10 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 
 class SpatioTemporalLightningModule(pl.LightningModule):
-    def __init__(self, hidden_dim: int = 16, lr: float = 1e-3, ssim_weight: float = 0.2):
+    def __init__(self, hidden_dim: int = 16, num_layers: int = 1, kernel_size: int = 3, lr: float = 1e-3, ssim_weight: float = 0.2):
         super().__init__()
         self.save_hyperparameters()
-        self.model = SpatioTemporalPredictor(hidden_dim=hidden_dim)
+        self.model = SpatioTemporalPredictor(hidden_dim=hidden_dim, kernel_size=kernel_size, num_layers=num_layers)
         self.loss_fn = nn.MSELoss(reduction='mean')
         self.mae_fn = nn.L1Loss(reduction='mean')
         self.lr = lr
@@ -34,6 +34,8 @@ class SpatioTemporalLightningModule(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         input_dynamic = batch['input_dynamic']
         input_static = batch['input_static']
+        dynamic_valid_mask = batch.get('dynamic_valid_mask', None)
+        target_valid_mask = batch.get('target_valid_mask', None)
         # Replace NaNs in inputs with 0
         input_dynamic = torch.nan_to_num(input_dynamic, nan=0.0)
         input_static = torch.nan_to_num(input_static, nan=0.0)
@@ -41,10 +43,15 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             input_dynamic = input_dynamic.unsqueeze(2)
         preds = self(input_dynamic, input_static)
         target = batch['target'].unsqueeze(1)
-        # Use last dynamic input as baseline to form deltas
-        last_input = input_dynamic[:, -1, :, :, :]  # [B, 1, H, W]
-        # Valid where both target and last_input are finite
+        # Use last timestep HM channel (channel 0) as baseline to form deltas
+        # input_dynamic: [B, T, C_dyn, H, W]; select C=0 and keep channel dim
+        last_input = input_dynamic[:, -1, 0:1, :, :]  # [B, 1, H, W]
+        # Build mask: require valid target and valid dynamic inputs at last timestep
         mask = torch.isfinite(target) & torch.isfinite(last_input)
+        if target_valid_mask is not None:
+            mask = mask & target_valid_mask.to(mask.device)
+        if dynamic_valid_mask is not None:
+            mask = mask & dynamic_valid_mask[:, -1].to(mask.device)
         # Deltas in normalized/native scale
         delta_pred = preds - last_input
         delta_true = target - last_input
@@ -77,6 +84,8 @@ class SpatioTemporalLightningModule(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         input_dynamic = batch['input_dynamic']
         input_static = batch['input_static']
+        dynamic_valid_mask = batch.get('dynamic_valid_mask', None)
+        target_valid_mask = batch.get('target_valid_mask', None)
         # Replace NaNs in inputs with 0
         input_dynamic = torch.nan_to_num(input_dynamic, nan=0.0)
         input_static = torch.nan_to_num(input_static, nan=0.0)
@@ -84,8 +93,13 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             input_dynamic = input_dynamic.unsqueeze(2)
         preds = self(input_dynamic, input_static)
         target = batch['target'].unsqueeze(1)
-        last_input = input_dynamic[:, -1, :, :, :]  # [B, 1, H, W]
+        # Baseline is last timestep HM channel (channel 0)
+        last_input = input_dynamic[:, -1, 0:1, :, :]  # [B, 1, H, W]
         mask = torch.isfinite(target) & torch.isfinite(last_input)
+        if target_valid_mask is not None:
+            mask = mask & target_valid_mask.to(mask.device)
+        if dynamic_valid_mask is not None:
+            mask = mask & dynamic_valid_mask[:, -1].to(mask.device)
         delta_pred = preds - last_input
         delta_true = target - last_input
         valid_delta_pred = delta_pred[mask]
@@ -111,7 +125,7 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             valid_mask = mask
             mae = F.l1_loss(preds[valid_mask], target[valid_mask])
             self.log('val_mae', mae, on_step=False, on_epoch=True, prog_bar=True)
-            # Physical-scale MAE (original scale, 0-10000)
+            # Physical-scale MAE (original scale, 0-1)
             if hasattr(self, 'hm_mean') and hasattr(self, 'hm_std'):
                 preds_orig = preds[valid_mask] * self.hm_std + self.hm_mean
                 target_orig = target[valid_mask] * self.hm_std + self.hm_mean
@@ -133,4 +147,22 @@ class SpatioTemporalLightningModule(pl.LightningModule):
     # Removed AR panel rendering and end-of-fit logging
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.lr)
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
+        # Reduce LR when validation total loss plateaus
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=0.5,
+            patience=2,
+            threshold=1e-3,
+        )
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'monitor': 'val_total_loss',  # logged in validation_step
+                'interval': 'epoch',
+                'frequency': 1,
+                'strict': False,
+            }
+        }

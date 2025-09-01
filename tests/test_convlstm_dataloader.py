@@ -19,6 +19,7 @@ def test_convlstm_accepts_dataloader_batch():
         return_all_layers=False
     )
     # Only use dynamic input for ConvLSTM
-    x = batch['input_dynamic'].unsqueeze(2)  # [B, T, 1, H, W]
+    # Select HM channel (channel 0) -> [B, T, 1, H, W]
+    x = batch['input_dynamic'][:, :, 0:1, ...]
     output, _ = model(x)
     assert output[0].shape == (2, 3, 8, 128, 128)
