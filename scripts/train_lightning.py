@@ -21,6 +21,24 @@ if __name__ == "__main__":
     parser.add_argument("--train_mode", type=str, default="random", choices=["random", "grid"], help="Sampling mode for training")
     parser.add_argument("--val_mode", type=str, default="grid", choices=["random", "grid"], help="Sampling mode for validation")
     parser.add_argument("--stride", type=int, default=128, help="Stride for grid sampling (pixels)")
+    parser.add_argument(
+        "--include_components",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?',
+        const=True,
+        default=True,
+        help="Whether to include component covariates (AG, BU, etc.) in dynamic inputs",
+    )
+    parser.add_argument(
+        "--static_channels",
+        type=int,
+        default=None,
+        help="Limit number of static channels (e.g., 1 to use only elevation)",
+    )
+    # Model complexity
+    parser.add_argument("--hidden_dim", type=int, default=64, help="ConvLSTM hidden dimension")
+    parser.add_argument("--num_layers", type=int, default=2, help="Number of ConvLSTM layers")
+    parser.add_argument("--kernel_size", type=int, default=3, help="Conv kernel size for ConvLSTM")
     args = parser.parse_args()
     # Data
     train_loader = get_dataloader(
@@ -30,6 +48,8 @@ if __name__ == "__main__":
         chips_per_epoch=args.train_chips,
         mode=args.train_mode,
         stride=args.stride,
+        include_components=args.include_components,
+        static_channels=args.static_channels,
         num_workers=0,
         pin_memory=False,
         persistent_workers=False,
@@ -42,13 +62,24 @@ if __name__ == "__main__":
         chips_per_epoch=args.val_chips,
         mode=args.val_mode,
         stride=args.stride,
-        num_workers=0,
+        include_components=args.include_components,
+        static_channels=args.static_channels,
+        num_workers=9,
         pin_memory=False,
         persistent_workers=False,
     )
 
     # Model
-    model = SpatioTemporalLightningModule(hidden_dim=16, lr=1e-3)
+    num_static_channels = getattr(train_loader.dataset, 'C_static', 1)
+    num_dynamic_channels = getattr(train_loader.dataset, 'C_dyn', 1)
+    model = SpatioTemporalLightningModule(
+        hidden_dim=args.hidden_dim,
+        lr=1e-3,
+        num_static_channels=num_static_channels,
+        num_dynamic_channels=num_dynamic_channels,
+        num_layers=args.num_layers,
+        kernel_size=args.kernel_size,
+    )
     # Set normalization stats for physical-scale MAE logging
     if hasattr(train_loader, 'dataset'):
         ds = train_loader.dataset
@@ -115,7 +146,7 @@ if __name__ == "__main__":
         if not valid_batch_found:
             print("WARNING: No valid (non-NaN) target pixels found in any validation batch for image logging and MAE.")
             sys.exit(0)
-        # Log images to wandb
+        # Log images to wandb (backtransformed to original data scale)
         images = []
         B = input_dynamic.shape[0]
         # Retrieve means/stds for inverse transform
@@ -129,17 +160,19 @@ if __name__ == "__main__":
         fixed_target_year = getattr(ds, 'fixed_target_year', None)
         for b in range(B):
             fig, axes = plt.subplots(2, 5, figsize=(20, 8))
-            # Use a single color ramp for all HM images
-            hm_vmin, hm_vmax = 0, 10000
+            # Use a single color ramp for all HM images in original 0-1 scale
+            hm_vmin, hm_vmax = 0.0, 1.0
             # Input human footprint chips (T=3), unnormalize and label with fixed years
             input_years = list(fixed_input_years)
             for t in range(3):
                 hm_in = input_dynamic[b, t, 0].cpu().numpy() * hm_std + hm_mean
-                im = axes[0, t].imshow(hm_in, cmap='turbo', vmin=hm_vmin, vmax=hm_vmax)
+                # Mask input HM by its own validity
+                hm_in_plot = np.where(np.isfinite(hm_in), hm_in, np.nan)
+                im = axes[0, t].imshow(hm_in_plot, cmap='turbo', vmin=hm_vmin, vmax=hm_vmax)
                 axes[0, t].set_title(f'HM {input_years[t]}')
                 axes[0, t].axis('off')
                 plt.colorbar(im, ax=axes[0, t], fraction=0.046, pad=0.04)
-            # Elevation raster, unnormalize
+            # Elevation raster backtransformed
             elev_in = input_static[b, 0].cpu().numpy() * elev_std + elev_mean
             im = axes[0, 3].imshow(elev_in, cmap='terrain')
             axes[0, 3].set_title('Elevation (meters)')
@@ -148,35 +181,42 @@ if __name__ == "__main__":
             # Hide unused subplot in first row
             axes[0, 4].axis('off')
             # Target, unnormalize and label with year
-            target_denorm = target[b].cpu().numpy() * hm_std + hm_mean
+            target_orig = target[b].cpu().numpy() * hm_std + hm_mean
             target_year = fixed_target_year if fixed_target_year is not None else 'Target'
-            im0 = axes[1, 0].imshow(target_denorm, cmap='turbo', vmin=hm_vmin, vmax=hm_vmax)
+            # Baseline for validity: target and last input HM must be finite
+            most_recent_in = (input_dynamic[b, -1, 0].cpu().numpy() * hm_std + hm_mean)
+            valid_pred_mask = np.isfinite(target_orig) & np.isfinite(most_recent_in)
+            target_plot = np.where(valid_pred_mask, target_orig, np.nan)
+            im0 = axes[1, 0].imshow(target_plot, cmap='turbo', vmin=hm_vmin, vmax=hm_vmax)
             axes[1, 0].set_title(f'Target HM {target_year}')
             axes[1, 0].axis('off')
             plt.colorbar(im0, ax=axes[1, 0], fraction=0.046, pad=0.04)
             # Prediction, unnormalize and label
-            pred_denorm = preds[b].cpu().numpy() * hm_std + hm_mean
-            im1 = axes[1, 1].imshow(pred_denorm, cmap='turbo', vmin=hm_vmin, vmax=hm_vmax)
+            pred_orig = preds[b].cpu().numpy() * hm_std + hm_mean
+            pred_plot = np.where(valid_pred_mask, pred_orig, np.nan)
+            im1 = axes[1, 1].imshow(pred_plot, cmap='turbo', vmin=hm_vmin, vmax=hm_vmax)
             axes[1, 1].set_title(f'Predicted HM {target_year}')
             axes[1, 1].axis('off')
             plt.colorbar(im1, ax=axes[1, 1], fraction=0.046, pad=0.04)
-            # Error (in original units)
-            error = np.abs(pred_denorm - target_denorm)
-            im2 = axes[1, 2].imshow(error, cmap='hot', vmin=0, vmax=hm_vmax)
-            axes[1, 2].set_title('Absolute Error (0-10k)')
+            # Error (in original 0-1 scale)
+            error = np.abs(pred_orig - target_orig)
+            error_plot = np.where(valid_pred_mask, error, np.nan)
+            im2 = axes[1, 2].imshow(error_plot, cmap='hot', vmin=0.0, vmax=hm_vmax)
+            axes[1, 2].set_title('Absolute Error (0-1)')
             axes[1, 2].axis('off')
             plt.colorbar(im2, ax=axes[1, 2], fraction=0.046, pad=0.04)
             # Delta image (observed): target - most recent input HM
-            most_recent_in = input_dynamic[b, -1, 0].cpu().numpy() * hm_std + hm_mean
-            delta = target_denorm - most_recent_in
-            vmax_delta = np.nanmax(np.abs(delta))
-            im3 = axes[1, 3].imshow(delta, cmap='bwr', vmin=-vmax_delta, vmax=vmax_delta)
+            delta = target_orig - most_recent_in
+            delta_plot = np.where(valid_pred_mask, delta, np.nan)
+            vmax_delta = np.nanmax(np.abs(delta_plot)) if np.any(np.isfinite(delta_plot)) else 1.0
+            im3 = axes[1, 3].imshow(delta_plot, cmap='bwr', vmin=-vmax_delta, vmax=vmax_delta)
             axes[1, 3].set_title(f'Delta HM {target_year}-{input_years[-1]}')
             axes[1, 3].axis('off')
             plt.colorbar(im3, ax=axes[1, 3], fraction=0.046, pad=0.04)
             # Delta image (predicted): prediction - most recent input HM, using the same color scaling as observed delta
-            pred_delta = pred_denorm - most_recent_in
-            im4 = axes[1, 4].imshow(pred_delta, cmap='bwr', vmin=-vmax_delta, vmax=vmax_delta)
+            pred_delta = pred_orig - most_recent_in
+            pred_delta_plot = np.where(valid_pred_mask, pred_delta, np.nan)
+            im4 = axes[1, 4].imshow(pred_delta_plot, cmap='bwr', vmin=-vmax_delta, vmax=vmax_delta)
             axes[1, 4].set_title(f'Pred Delta HM {target_year}-{input_years[-1]}')
             axes[1, 4].axis('off')
             plt.colorbar(im4, ax=axes[1, 4], fraction=0.046, pad=0.04)

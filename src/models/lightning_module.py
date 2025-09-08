@@ -11,10 +11,25 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 
 class SpatioTemporalLightningModule(pl.LightningModule):
-    def __init__(self, hidden_dim: int = 16, lr: float = 1e-3, ssim_weight: float = 0.2):
+    def __init__(
+        self,
+        hidden_dim: int = 16,
+        lr: float = 1e-3,
+        ssim_weight: float = 0.2,
+        num_static_channels: int = 1,
+        num_dynamic_channels: int = 1,
+        num_layers: int = 1,
+        kernel_size: int = 3,
+    ):
         super().__init__()
         self.save_hyperparameters()
-        self.model = SpatioTemporalPredictor(hidden_dim=hidden_dim)
+        self.model = SpatioTemporalPredictor(
+            hidden_dim=hidden_dim,
+            num_static_channels=num_static_channels,
+            num_dynamic_channels=num_dynamic_channels,
+            num_layers=num_layers,
+            kernel_size=kernel_size,
+        )
         self.loss_fn = nn.MSELoss(reduction='mean')
         self.mae_fn = nn.L1Loss(reduction='mean')
         self.lr = lr
@@ -41,8 +56,9 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             input_dynamic = input_dynamic.unsqueeze(2)
         preds = self(input_dynamic, input_static)
         target = batch['target'].unsqueeze(1)
-        # Use last dynamic input as baseline to form deltas
-        last_input = input_dynamic[:, -1, :, :, :]  # [B, 1, H, W]
+        # Use last timestep HM channel (0) as baseline to form deltas
+        # input_dynamic shape: [B, T, C_d, H, W], HM is channel 0
+        last_input = input_dynamic[:, -1, 0:1, :, :]  # [B, 1, H, W]
         # Valid where both target and last_input are finite
         mask = torch.isfinite(target) & torch.isfinite(last_input)
         # Deltas in normalized/native scale
@@ -84,7 +100,7 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             input_dynamic = input_dynamic.unsqueeze(2)
         preds = self(input_dynamic, input_static)
         target = batch['target'].unsqueeze(1)
-        last_input = input_dynamic[:, -1, :, :, :]  # [B, 1, H, W]
+        last_input = input_dynamic[:, -1, 0:1, :, :]  # [B, 1, H, W]
         mask = torch.isfinite(target) & torch.isfinite(last_input)
         delta_pred = preds - last_input
         delta_true = target - last_input
@@ -111,11 +127,11 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             valid_mask = mask
             mae = F.l1_loss(preds[valid_mask], target[valid_mask])
             self.log('val_mae', mae, on_step=False, on_epoch=True, prog_bar=True)
-            # Physical-scale MAE (original scale, 0-10000)
-            if hasattr(self, 'hm_mean') and hasattr(self, 'hm_std'):
-                preds_orig = preds[valid_mask] * self.hm_std + self.hm_mean
-                target_orig = target[valid_mask] * self.hm_std + self.hm_mean
-                mae_orig = F.l1_loss(preds_orig, target_orig)
+            # Physical-scale MAE (0-10000): backtransform to original 0-1 scale, then *10000
+            if (self.hm_mean is not None) and (self.hm_std is not None):
+                preds_bt = preds[valid_mask] * self.hm_std + self.hm_mean
+                target_bt = target[valid_mask] * self.hm_std + self.hm_mean
+                mae_orig = F.l1_loss(preds_bt * 10000.0, target_bt * 10000.0)
                 self.log('val_mae_original', mae_orig, on_step=False, on_epoch=True, prog_bar=True)
             # SSIM expects [B, C, H, W] and values in [0,1]
             preds_masked = preds.clone()
