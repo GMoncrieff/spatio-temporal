@@ -140,7 +140,27 @@ if __name__ == "__main__":
                 with torch.no_grad():
                     if input_dynamic.dim() == 4:
                         input_dynamic = input_dynamic.unsqueeze(2)
-                    preds = best_model(input_dynamic, input_static).squeeze(1)
+                
+                    # Apply same NaN handling as training/validation
+                    # Compute validity mask from RAW inputs
+                    target_unsqueezed = target.unsqueeze(1)  # Add channel dimension for consistency
+                    target_valid = torch.isfinite(target_unsqueezed)
+                    dynamic_valid = torch.isfinite(input_dynamic).all(dim=(1, 2), keepdim=True)
+                    static_valid = torch.isfinite(input_static).all(dim=1, keepdim=True).unsqueeze(1)
+                    input_mask = target_valid & dynamic_valid.squeeze(2) & static_valid.squeeze(2)
+                
+                    # Replace NaNs in inputs with 0 for model forward
+                    input_dynamic_clean = torch.nan_to_num(input_dynamic, nan=0.0)
+                    input_static_clean = torch.nan_to_num(input_static, nan=0.0)
+                
+                    # Get predictions from model
+                    preds = best_model(input_dynamic_clean, input_static_clean)  # Keep [B, 1, H, W]
+                
+                    # Set predictions to NaN where any input was NaN
+                    preds[~input_mask] = float('nan')
+                    
+                    # Now squeeze for plotting
+                    preds = preds.squeeze(1)  # [B, H, W]
                 valid_batch_found = True
                 break
         if not valid_batch_found:
@@ -183,9 +203,17 @@ if __name__ == "__main__":
             # Target, unnormalize and label with year
             target_orig = target[b].cpu().numpy() * hm_std + hm_mean
             target_year = fixed_target_year if fixed_target_year is not None else 'Target'
-            # Baseline for validity: target and last input HM must be finite
-            most_recent_in = (input_dynamic[b, -1, 0].cpu().numpy() * hm_std + hm_mean)
-            valid_pred_mask = np.isfinite(target_orig) & np.isfinite(most_recent_in)
+            
+            # Compute validity mask from RAW inputs to match Lightning module logic
+            target_valid = np.isfinite(target_orig)
+            # Check all dynamic channels across all timesteps - BEFORE backtransformation
+            input_dynamic_raw = input_dynamic[b].cpu().numpy()  # Raw normalized values
+            dynamic_valid = np.isfinite(input_dynamic_raw).all(axis=(0, 1))  # [H, W]
+            # Check all static channels - BEFORE backtransformation  
+            input_static_raw = input_static[b].cpu().numpy()  # Raw normalized values
+            static_valid = np.isfinite(input_static_raw).all(axis=0)  # [H, W]
+            valid_pred_mask = target_valid & dynamic_valid & static_valid
+            
             target_plot = np.where(valid_pred_mask, target_orig, np.nan)
             im0 = axes[1, 0].imshow(target_plot, cmap='turbo', vmin=hm_vmin, vmax=hm_vmax)
             axes[1, 0].set_title(f'Target HM {target_year}')
@@ -206,6 +234,7 @@ if __name__ == "__main__":
             axes[1, 2].axis('off')
             plt.colorbar(im2, ax=axes[1, 2], fraction=0.046, pad=0.04)
             # Delta image (observed): target - most recent input HM
+            most_recent_in = (input_dynamic[b, -1, 0].cpu().numpy() * hm_std + hm_mean)
             delta = target_orig - most_recent_in
             delta_plot = np.where(valid_pred_mask, delta, np.nan)
             vmax_delta = np.nanmax(np.abs(delta_plot)) if np.any(np.isfinite(delta_plot)) else 1.0
