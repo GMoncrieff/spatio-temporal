@@ -175,6 +175,9 @@ if __name__ == "__main__":
             sys.exit(0)
         # Log images to wandb (backtransformed to original data scale)
         images = []
+        # For hexbin plot of observed vs predicted change
+        diffs_obs = []
+        diffs_mod = []
         B = input_dynamic.shape[0]
         # Retrieve means/stds for inverse transform
         ds = val_loader.dataset
@@ -263,7 +266,57 @@ if __name__ == "__main__":
             img_rgb = img_rgba[..., :3]
             images.append(wandb.Image(img_rgb, caption=f"Sample {b}"))
             plt.close(fig)
+
+            # Accumulate diffs for hexbin (mask to valid pixels)
+            valid_mask_np = valid_pred_mask
+            diffs_obs.append(delta[valid_mask_np])
+            diffs_mod.append(pred_delta[valid_mask_np])
+
         experiment.log({"Predictions_vs_Targets": images})
+
+        # ---- Hexbin plot: Observed vs Predicted HM change ----
+        import matplotlib.colors as mcolors
+        pmin, pmax = -0.01, 0.2
+        if len(diffs_obs) > 0:
+            diff_obs_all = np.concatenate(diffs_obs)
+            diff_mod_all = np.concatenate(diffs_mod)
+            # Filter to range
+            in_range = (
+                (diff_obs_all >= pmin) & (diff_obs_all <= pmax) &
+                (diff_mod_all >= pmin) & (diff_mod_all <= pmax)
+            )
+            diff_obs_small = diff_obs_all[in_range]
+            diff_mod_small = diff_mod_all[in_range]
+
+            fig2 = plt.figure(figsize=(6, 5))
+            hb = plt.hexbin(
+                diff_obs_small,
+                diff_mod_small,
+                gridsize=80,
+                cmap="cubehelix",
+                mincnt=1,
+                norm=mcolors.LogNorm(),
+            )
+            cbar = plt.colorbar(hb)
+            cbar.set_label("Count (log scale)")
+            # 1:1 line
+            plt.plot([pmin, pmax], [pmin, pmax], linestyle="--", color="grey", label="1:1 line")
+            # Axes, labels, legend
+            plt.axhline(0, color="black", lw=0.5)
+            plt.axvline(0, color="black", lw=0.5)
+            plt.xlim(pmin, pmax)
+            plt.ylim(pmin, pmax)
+            plt.xlabel("Observed difference")
+            plt.ylabel("Modelled difference")
+            plt.legend(frameon=False, loc="upper left")
+            plt.grid(True, linestyle="--", linewidth=0.3, alpha=0.4)
+            plt.tight_layout()
+            fig2.canvas.draw()
+            img_rgba2 = np.array(fig2.canvas.buffer_rgba())
+            img_rgb2 = img_rgba2[..., :3]
+            experiment.log({"Obs_vs_Pred_HM_Change": [wandb.Image(img_rgb2, caption="Obs vs Pred HM change (hexbin)")]})
+            plt.close(fig2)
+
         # Ensure wandb shuts down cleanly
         experiment.finish()
     else:
