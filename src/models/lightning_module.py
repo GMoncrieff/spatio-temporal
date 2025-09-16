@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from torchmetrics.functional import structural_similarity_index_measure as ssim
 from .spatiotemporal_predictor import SpatioTemporalPredictor
+from .losses import LaplacianPyramidLoss
 import wandb
 import numpy as np
 from matplotlib import cm
@@ -15,7 +16,8 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         self,
         hidden_dim: int = 16,
         lr: float = 1e-3,
-        ssim_weight: float = 0.2,
+        ssim_weight: float = 0.1,
+        laplacian_weight: float = 0.2,
         num_static_channels: int = 1,
         num_dynamic_channels: int = 1,
         num_layers: int = 1,
@@ -34,6 +36,9 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         self.mae_fn = nn.L1Loss(reduction='mean')
         self.lr = lr
         self.ssim_weight = ssim_weight
+        self.laplacian_weight = laplacian_weight
+        # 3-level Laplacian pyramid by default
+        self.lap_loss = LaplacianPyramidLoss(levels=3, kernel_size=5, sigma=1.0, include_lowpass=True)
         # Normalization stats to be set externally
         self.hm_mean = None
         self.hm_std = None
@@ -82,19 +87,23 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             loss = torch.tensor(0.0, device=preds.device)
             mae = torch.tensor(0.0, device=preds.device)
             ssim_loss = torch.tensor(0.0, device=preds.device)
+            lap_loss = torch.tensor(0.0, device=preds.device)
         else:
             loss = self.loss_fn(valid_delta_pred, valid_delta_true)
             mae = self.mae_fn(preds[mask], target[mask])
             # SSIM expects [B, C, H, W] and values in [0,1]
-            preds_ssim = preds.clone()
-            target_ssim = target.clone()
-            preds_ssim[~mask] = 0.0
-            target_ssim[~mask] = 0.0
-            ssim_val = ssim(preds_ssim, target_ssim, data_range=1.0)
+            preds_sanitized = preds.clone()
+            target_sanitized = target.clone()
+            preds_sanitized[~mask] = 0.0
+            target_sanitized[~mask] = 0.0
+            ssim_val = ssim(preds_sanitized, target_sanitized, data_range=1.0)
             ssim_loss = 1.0 - ssim_val
-        total_loss = loss + self.ssim_weight * ssim_loss
+            # Laplacian Pyramid multi-scale L1 on absolute images with masking
+            lap_loss = self.lap_loss(preds_sanitized, target_sanitized, mask=mask)
+        total_loss = loss + self.ssim_weight * ssim_loss + self.laplacian_weight * lap_loss
         self.log('train_loss', loss)
         self.log('train_ssim_loss', ssim_loss)
+        self.log('train_lap_loss', lap_loss)
         self.log('train_total_loss', total_loss)
         return total_loss
 
@@ -143,6 +152,7 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             loss = torch.tensor(0.0, device=preds.device)
             mae = torch.tensor(0.0, device=preds.device)
             ssim_loss = torch.tensor(0.0, device=preds.device)
+            lap_loss = torch.tensor(0.0, device=preds.device)
         else:
             loss = self.loss_fn(valid_delta_pred, valid_delta_true)
             mae = F.l1_loss(preds[mask], target[mask])
@@ -154,16 +164,19 @@ class SpatioTemporalLightningModule(pl.LightningModule):
                 mae_orig = F.l1_loss(preds_bt * 10000.0, target_bt * 10000.0)
                 self.log('val_mae_original', mae_orig, on_step=False, on_epoch=True, prog_bar=True)
             # SSIM expects [B, C, H, W] and values in [0,1]
-            preds_ssim = preds.clone()
-            target_ssim = target.clone()
-            preds_ssim[~mask] = 0.0
-            target_ssim[~mask] = 0.0
-            ssim_val = ssim(preds_ssim, target_ssim, data_range=1.0)
+            preds_sanitized = preds.clone()
+            target_sanitized = target.clone()
+            preds_sanitized[~mask] = 0.0
+            target_sanitized[~mask] = 0.0
+            ssim_val = ssim(preds_sanitized, target_sanitized, data_range=1.0)
             ssim_loss = 1.0 - ssim_val
+            # Laplacian Pyramid multi-scale L1
+            lap_loss = self.lap_loss(preds_sanitized, target_sanitized, mask=mask)
             print(f"[VAL] Loss: {loss.item():.6f}, MAE: {mae.item():.6f}, SSIM: {ssim_val.item():.6f}")
-        total_loss = loss + self.ssim_weight * ssim_loss
+        total_loss = loss + self.ssim_weight * ssim_loss + self.laplacian_weight * lap_loss
         self.log('val_loss', loss)
         self.log('val_ssim_loss', ssim_loss)
+        self.log('val_lap_loss', lap_loss)
         self.log('val_total_loss', total_loss)
         return total_loss
 
