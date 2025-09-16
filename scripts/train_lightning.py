@@ -109,14 +109,21 @@ if __name__ == "__main__":
     # Train
     trainer.fit(model, train_loader, val_loader)
 
-    # --- Log predictions from best checkpoint to wandb ---
+    # --- Log predictions from best checkpoint to wandb (rank 0 only) ---
     import torch
     import matplotlib.pyplot as plt
     import numpy as np
-    import wandb
-    # Find best checkpoint
+    # Only the global zero process should log to W&B
     best_ckpt = checkpoint_cb.best_model_path
-    if best_ckpt and use_wandb:
+    should_log_wandb = (
+        best_ckpt
+        and use_wandb
+        and isinstance(trainer.logger, WandbLogger)
+        and getattr(trainer, "is_global_zero", True)
+    )
+    if should_log_wandb:
+        import wandb  # import here to avoid touching wandb on non-logging ranks
+        experiment = trainer.logger.experiment  # a wandb.Run
         best_model = SpatioTemporalLightningModule.load_from_checkpoint(best_ckpt)
         best_model.eval()
         # Move model and data to same device
@@ -256,15 +263,16 @@ if __name__ == "__main__":
             img_rgb = img_rgba[..., :3]
             images.append(wandb.Image(img_rgb, caption=f"Sample {b}"))
             plt.close(fig)
-        wandb.log({"Predictions_vs_Targets": images})
+        experiment.log({"Predictions_vs_Targets": images})
         # Ensure wandb shuts down cleanly
-        wandb.finish()
-
+        experiment.finish()
     else:
-        print("No best checkpoint found for image logging.")
+        if best_ckpt and use_wandb:
+            # Only non-zero ranks should skip W&B logging to avoid crashes on multi-GPU
+            print("Skipping W&B image logging: not global rank 0 or WandbLogger not active.")
 
     # Finalize W&B session if used to ensure clean exit
-    if use_wandb:
+    if use_wandb and getattr(trainer, "is_global_zero", True):
         try:
             import wandb as _wandb
             _wandb.finish()
