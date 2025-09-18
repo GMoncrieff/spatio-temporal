@@ -24,6 +24,13 @@ training:
   patience: 10
   checkpoint_dir: "models/checkpoints"
   save_best_only: true
+
+# Inference configuration
+inference:
+  # Path to a GeoJSON file describing the prediction region (Polygon or MultiPolygon in the same CRS as inputs)
+  region_geojson: "config/region_to_predict.geojson"
+  # Whether to run large-area prediction after training completes
+  do_prediction: true
   monitor: "val_loss"
   mode: "min"
 

@@ -1,14 +1,28 @@
 import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent))
+import os
+import argparse
+import json
+
+import numpy as np
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import WandbLogger
 from torch.utils.data import DataLoader
 from src.models.lightning_module import SpatioTemporalLightningModule
-from torchgeo_dataloader import get_dataloader
-import os
-import argparse
+from torchgeo_dataloader import get_dataloader, hm_files, component_files, static_files, years
+
+# Geospatial imports for inference
+import rasterio
+from rasterio import windows as rio_windows
+from rasterio import features as rio_features
+from rasterio.transform import rowcol, Affine
+from shapely.geometry import shape, mapping
+from shapely.ops import transform as shp_transform
+from pyproj import Transformer
+from scipy.ndimage import distance_transform_edt
+import yaml
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -39,6 +53,27 @@ if __name__ == "__main__":
     parser.add_argument("--hidden_dim", type=int, default=64, help="ConvLSTM hidden dimension")
     parser.add_argument("--num_layers", type=int, default=2, help="Number of ConvLSTM layers")
     parser.add_argument("--kernel_size", type=int, default=3, help="Conv kernel size for ConvLSTM")
+    # Inference flags
+    parser.add_argument(
+        "--predict_after_training",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?',
+        const=True,
+        default=True,
+        help="Run large-area prediction and write GeoTIFF after training (default: True)",
+    )
+    parser.add_argument(
+        "--predict_region",
+        type=str,
+        default=None,
+        help="Path to GeoJSON file for prediction region. If not provided, loaded from config/config.yaml",
+    )
+    parser.add_argument(
+        "--predict_stride",
+        type=int,
+        default=64,
+        help="Stride (pixels) between prediction tiles for overlap blending",
+    )
     args = parser.parse_args()
     # Data
     train_loader = get_dataloader(
@@ -331,3 +366,193 @@ if __name__ == "__main__":
             _wandb.finish()
         except Exception:
             pass
+
+    # -------------------- Large-area prediction to GeoTIFF --------------------
+    def _predict_region_and_write(best_ckpt_path: str):
+        # Only rank 0 performs writing
+        if not getattr(trainer, "is_global_zero", True):
+            return
+        # Resolve region path: CLI > config
+        region_path = args.predict_region
+        if region_path is None:
+            cfg_path = Path(__file__).parent.parent / "config" / "config.yaml"
+            if cfg_path.exists():
+                try:
+                    with open(cfg_path, 'r') as f:
+                        cfg = yaml.safe_load(f)
+                    region_path = (
+                        cfg.get("inference", {}).get("region_geojson", None)
+                    )
+                except Exception:
+                    region_path = None
+        if region_path is None or not os.path.exists(region_path):
+            print("No valid prediction region specified; skipping large-area prediction.")
+            return
+
+        # Load region polygon (assume EPSG:4326 if no CRS field)
+        with open(region_path, 'r') as f:
+            gj = json.load(f)
+        # Merge all features into a single geometry collection/polygon list
+        geoms = [shape(feat["geometry"]) for feat in gj.get("features", [])]
+        if not geoms:
+            print("Empty geometry in region GeoJSON; skipping.")
+            return
+        # Use target HM raster (2020) as spatial reference
+        target_year = getattr(train_loader.dataset, 'fixed_target_year', 2020)
+        year_to_idx = {y: i for i, y in enumerate(years)}
+        target_src_path = hm_files[year_to_idx[target_year]]
+        with rasterio.open(target_src_path) as ref:
+            ref_crs = ref.crs
+            ref_transform = ref.transform
+            ref_height, ref_width = ref.height, ref.width
+            # Reproject geoms to ref CRS
+            # Assume GeoJSON in EPSG:4326 unless a crs member exists (rare in modern GeoJSON)
+            transformer = Transformer.from_crs("EPSG:4326", ref_crs, always_xy=True)
+            geoms_ref = [shp_transform(lambda x, y: transformer.transform(x, y), g) for g in geoms]
+            # Build a unioned geometry
+            try:
+                from shapely.ops import unary_union
+                region_geom = unary_union(geoms_ref)
+            except Exception:
+                region_geom = geoms_ref[0]
+            # Compute bounding rows/cols
+            minx, miny, maxx, maxy = region_geom.bounds
+            top_left = rowcol(ref_transform, minx, maxy, op=float)
+            bottom_right = rowcol(ref_transform, maxx, miny, op=float)
+            r0 = int(max(0, np.floor(min(top_left[0], bottom_right[0]))))
+            c0 = int(max(0, np.floor(min(top_left[1], bottom_right[1]))))
+            r1 = int(min(ref_height, np.ceil(max(top_left[0], bottom_right[0]))))
+            c1 = int(min(ref_width, np.ceil(max(top_left[1], bottom_right[1]))))
+            if r1 <= r0 or c1 <= c0:
+                print("Region is outside raster extent; skipping.")
+                return
+
+            # Prepare accumulators over the bbox window
+            Hwin, Wwin = r1 - r0, c1 - c0
+            accum = np.zeros((Hwin, Wwin), dtype=np.float64)
+            wsum = np.zeros((Hwin, Wwin), dtype=np.float64)
+            nodata_mask_total = np.zeros((Hwin, Wwin), dtype=bool)
+
+            # Stats and config from training dataset
+            ds_train = train_loader.dataset
+            hm_mean, hm_std = ds_train.hm_mean, ds_train.hm_std
+            elev_mean, elev_std = ds_train.elev_mean, ds_train.elev_std
+            include_components = bool(getattr(ds_train, 'include_components', True))
+            static_list_paths = list(static_files if args.static_channels is None else static_files[:int(args.static_channels)])
+            input_years = list(getattr(ds_train, 'fixed_input_years', (1990, 1995, 2000)))
+            t_idxs = [year_to_idx[y] for y in input_years]
+
+            # Open all sources
+            hm_srcs = [rasterio.open(p) for p in hm_files]
+            comp_srcs = {y: [rasterio.open(p) for p in component_files[y]] for y in years} if include_components else {y: [] for y in years}
+            stat_srcs = [rasterio.open(p) for p in static_list_paths]
+
+            tile = 128
+            stride = int(args.predict_stride)
+            from rasterio.windows import Window
+            # Precompute a region mask over the bbox for faster per-tile tests
+            bbox_transform = ref_transform * Affine.translation(c0, r0)
+            bbox_mask = rio_features.geometry_mask([mapping(region_geom)], out_shape=(Hwin, Wwin), transform=bbox_transform, invert=True)
+
+            # Load model for inference
+            device = next(model.parameters()).device
+            infer_model = SpatioTemporalLightningModule.load_from_checkpoint(best_ckpt_path, map_location=device)
+            infer_model.eval()
+
+            for i in range(r0, r1, stride):
+                for j in range(c0, c1, stride):
+                    hi = min(tile, r1 - i)
+                    wj = min(tile, c1 - j)
+                    if hi <= 0 or wj <= 0:
+                        continue
+                    # Local indices in accum arrays
+                    li0, lj0 = i - r0, j - c0
+                    li1, lj1 = li0 + hi, lj0 + wj
+                    submask = bbox_mask[li0:li1, lj0:lj1]
+                    if not np.any(submask):
+                        continue
+                    win = Window(j, i, wj, hi)
+                    # Build inputs
+                    dyn_ts = []
+                    for t_idx, y in zip(t_idxs, input_years):
+                        channels = []
+                        arr_hm = hm_srcs[t_idx].read(1, window=win, masked=True).filled(np.nan)
+                        channels.append((arr_hm - hm_mean) / hm_std)
+                        if include_components and comp_srcs.get(y, []):
+                            for src in comp_srcs[y]:
+                                carr = src.read(1, window=win, masked=True).filled(np.nan)
+                                channels.append((carr - hm_mean) / hm_std)
+                        dyn_ts.append(np.stack(channels, axis=0))  # [C_dyn, hi, wj]
+                    input_dynamic_np = np.stack(dyn_ts, axis=0)  # [T, C_dyn, hi, wj]
+                    static_chs = []
+                    for src in stat_srcs:
+                        sarr = src.read(1, window=win, masked=True).filled(np.nan)
+                        static_chs.append((sarr - elev_mean) / elev_std)
+                    input_static_np = np.stack(static_chs, axis=0) if static_chs else np.zeros((0, hi, wj), dtype=np.float32)
+
+                    # Valid mask consistent with training logic
+                    target_valid = np.isfinite(input_dynamic_np[0, 0])  # any single HM layer as spatial support
+                    dyn_valid = np.isfinite(input_dynamic_np).all(axis=(0, 1))
+                    stat_valid = np.isfinite(input_static_np).all(axis=0) if static_chs else np.ones((hi, wj), dtype=bool)
+                    valid_mask = submask & target_valid & dyn_valid & stat_valid
+                    if not np.any(valid_mask):
+                        continue
+
+                    # Forward pass
+                    import torch
+                    in_dyn = torch.from_numpy(np.nan_to_num(input_dynamic_np, nan=0.0)).float().unsqueeze(0).to(device)
+                    in_stat = torch.from_numpy(np.nan_to_num(input_static_np, nan=0.0)).float().unsqueeze(0).to(device)
+                    with torch.no_grad():
+                        preds = infer_model(in_dyn, in_stat)  # [1, 1, hi, wj]
+                    pred_np = preds.squeeze().detach().cpu().numpy()  # normalized
+                    pred_np = pred_np * hm_std + hm_mean  # back to 0-1 HM scale
+
+                    # Distance-to-edge weights within tile
+                    # Start with interior mask = valid pixels within region
+                    interior = valid_mask.astype(np.uint8)
+                    # Zero-out 1-pixel border to define edges
+                    interior[[0, -1], :] = 0
+                    interior[:, [0, -1]] = 0
+                    weights = distance_transform_edt(interior)  # 0 at edges, grows inward
+                    # Ensure no contribution from invalid pixels
+                    weights = np.where(valid_mask, weights, 0.0)
+                    if weights.max() > 0:
+                        # Accumulate
+                        accum[li0:li1, lj0:lj1] += pred_np * weights
+                        wsum[li0:li1, lj0:lj1] += weights
+                    # Track nodata for areas never covered
+                    nodata_mask_total[li0:li1, lj0:lj1] |= ~valid_mask
+
+            # Final blend
+            out = np.full((Hwin, Wwin), np.nan, dtype=np.float32)
+            m = wsum > 0
+            out[m] = (accum[m] / wsum[m]).astype(np.float32)
+
+            # Write GeoTIFF clipped window
+            out_profile = ref.profile.copy()
+            out_profile.update({
+                'height': Hwin,
+                'width': Wwin,
+                'transform': ref_transform * Affine.translation(c0, r0),
+                'count': 1,
+                'dtype': 'float32',
+                'compress': 'deflate'
+            })
+            out_dir = Path(os.getcwd()) / 'data' / 'predictions'
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / f"prediction_{target_year}_blended.tif"
+            with rasterio.open(out_path, 'w', **out_profile) as dst:
+                dst.write(out, 1)
+            print(f"Wrote blended prediction GeoTIFF to {out_path}")
+
+            # Close sources
+            for src in hm_srcs:
+                src.close()
+            for y in comp_srcs:
+                for src in comp_srcs[y]:
+                    src.close()
+            for src in stat_srcs:
+                src.close()
+
+    if args.predict_after_training and checkpoint_cb.best_model_path:
+        _predict_region_and_write(checkpoint_cb.best_model_path)
