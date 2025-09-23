@@ -22,6 +22,10 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         num_dynamic_channels: int = 1,
         num_layers: int = 1,
         kernel_size: int = 3,
+        use_location_encoder: bool = True,
+        locenc_backbone=("sphericalharmonics", "siren"),
+        locenc_hparams=None,
+        locenc_out_channels: int = 8,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -31,6 +35,10 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             num_dynamic_channels=num_dynamic_channels,
             num_layers=num_layers,
             kernel_size=kernel_size,
+            use_location_encoder=use_location_encoder,
+            locenc_backbone=locenc_backbone,
+            locenc_hparams=locenc_hparams,
+            locenc_out_channels=locenc_out_channels,
         )
         self.loss_fn = nn.MSELoss(reduction='mean')
         self.mae_fn = nn.L1Loss(reduction='mean')
@@ -45,16 +53,19 @@ class SpatioTemporalLightningModule(pl.LightningModule):
 
     # Removed AR-specific helpers and panels for single-step setup
 
-    def forward(self, input_dynamic, input_static):
+    def forward(self, input_dynamic, input_static, lonlat=None):
         # Ensure input_dynamic is [B, T, 1, H, W]
         if input_dynamic.dim() == 4:
             input_dynamic = input_dynamic.unsqueeze(2)
-        return self.model(input_dynamic, input_static)
+        return self.model(input_dynamic, input_static, lonlat=lonlat)
 
     def training_step(self, batch, batch_idx):
         input_dynamic = batch['input_dynamic']
         input_static = batch['input_static']
         target = batch['target'].unsqueeze(1)
+        lonlat = batch.get('lonlat', None)
+        if lonlat is not None:
+            lonlat = lonlat.to(input_dynamic.device)
         if input_dynamic.dim() == 4:
             input_dynamic = input_dynamic.unsqueeze(2)
         
@@ -68,7 +79,7 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         input_dynamic = torch.nan_to_num(input_dynamic, nan=0.0)
         input_static = torch.nan_to_num(input_static, nan=0.0)
         
-        preds = self(input_dynamic, input_static)
+        preds = self(input_dynamic, input_static, lonlat=lonlat)
         
         # Set predictions to NaN where any input was NaN
         preds[~input_mask] = float('nan')
@@ -111,6 +122,9 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         input_dynamic = batch['input_dynamic']
         input_static = batch['input_static']
         target = batch['target'].unsqueeze(1)
+        lonlat = batch.get('lonlat', None)
+        if lonlat is not None:
+            lonlat = lonlat.to(input_dynamic.device)
         if input_dynamic.dim() == 4:
             input_dynamic = input_dynamic.unsqueeze(2)
         
@@ -124,7 +138,7 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         input_dynamic = torch.nan_to_num(input_dynamic, nan=0.0)
         input_static = torch.nan_to_num(input_static, nan=0.0)
         
-        preds = self(input_dynamic, input_static)
+        preds = self(input_dynamic, input_static, lonlat=lonlat)
         
         # Set predictions to NaN where any input was NaN
         preds[~input_mask] = float('nan')

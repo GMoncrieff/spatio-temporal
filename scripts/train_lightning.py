@@ -74,6 +74,14 @@ if __name__ == "__main__":
         default=64,
         help="Stride (pixels) between prediction tiles for overlap blending",
     )
+    parser.add_argument(
+        "--use_location_encoder",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?',
+        const=True,
+        default=True,
+        help="Whether to append per-pixel LocationEncoder features to static inputs (default: True)",
+    )
     args = parser.parse_args()
     # Data
     train_loader = get_dataloader(
@@ -114,6 +122,7 @@ if __name__ == "__main__":
         num_dynamic_channels=num_dynamic_channels,
         num_layers=args.num_layers,
         kernel_size=args.kernel_size,
+        use_location_encoder=args.use_location_encoder,
     )
     # Set normalization stats for physical-scale MAE logging
     if hasattr(train_loader, 'dataset'):
@@ -194,9 +203,12 @@ if __name__ == "__main__":
                     # Replace NaNs in inputs with 0 for model forward
                     input_dynamic_clean = torch.nan_to_num(input_dynamic, nan=0.0)
                     input_static_clean = torch.nan_to_num(input_static, nan=0.0)
-                
-                    # Get predictions from model
-                    preds = best_model(input_dynamic_clean, input_static_clean)  # Keep [B, 1, H, W]
+                    # Lon/lat from dataset if present
+                    lonlat = batch.get('lonlat', None)
+                    if lonlat is not None:
+                        lonlat = lonlat.to(device)
+                    # Get predictions from model (learnable location encoder)
+                    preds = best_model(input_dynamic_clean, input_static_clean, lonlat=lonlat)  # Keep [B, 1, H, W]
                 
                     # Set predictions to NaN where any input was NaN
                     preds[~input_mask] = float('nan')
@@ -458,6 +470,18 @@ if __name__ == "__main__":
             device = next(model.parameters()).device
             infer_model = SpatioTemporalLightningModule.load_from_checkpoint(best_ckpt_path, map_location=device)
             infer_model.eval()
+            def lonlat_grid_for_window(i0: int, j0: int, hi: int, wj: int):
+                rows = np.arange(i0, i0 + hi)
+                cols = np.arange(j0, j0 + wj)
+                rr, cc = np.meshgrid(rows, cols, indexing='ij')
+                xs, ys = rasterio.transform.xy(ref_transform, rr, cc)
+                xs = np.array(xs); ys = np.array(ys)
+                if ref_crs and ref_crs.to_string() not in ("EPSG:4326", "OGC:CRS84"):
+                    transformer = Transformer.from_crs(ref_crs, "EPSG:4326", always_xy=True)
+                    lon, lat = transformer.transform(xs, ys)
+                else:
+                    lon, lat = xs, ys
+                return np.stack([lon, lat], axis=-1).astype(np.float32)  # [H, W, 2]
 
             for i in range(r0, r1, stride):
                 for j in range(c0, c1, stride):
@@ -503,7 +527,10 @@ if __name__ == "__main__":
                     in_dyn = torch.from_numpy(np.nan_to_num(input_dynamic_np, nan=0.0)).float().unsqueeze(0).to(device)
                     in_stat = torch.from_numpy(np.nan_to_num(input_static_np, nan=0.0)).float().unsqueeze(0).to(device)
                     with torch.no_grad():
-                        preds = infer_model(in_dyn, in_stat)  # [1, 1, hi, wj]
+                        # Build lon/lat grid tensor for the tile if using location encoder
+                        lonlat_hw2 = lonlat_grid_for_window(i, j, hi, wj)
+                        lonlat_t = torch.from_numpy(lonlat_hw2).to(device).unsqueeze(0)  # [1, H, W, 2]
+                        preds = infer_model(in_dyn, in_stat, lonlat=lonlat_t)  # [1, 1, hi, wj]
                     pred_np = preds.squeeze().detach().cpu().numpy()  # normalized
                     pred_np = pred_np * hm_std + hm_mean  # back to 0-1 HM scale
 

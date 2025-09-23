@@ -2,6 +2,7 @@ import os
 from torch.utils.data import DataLoader
 from torchgeo.datasets import RasterDataset
 import torch
+from pyproj import Transformer
 
 # Paths (updated to hm_medium dataset)
 HM_DIR = os.path.join("data", "raw", "hm_medium")
@@ -201,6 +202,19 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
                 sarr = (sarr - self.elev_mean) / self.elev_std
                 static_list.append(sarr)
             input_static = np.stack(static_list, axis=0) if static_list else np.zeros((0, self.chip_size, self.chip_size), dtype=np.float32)
+            # Build lon/lat grid [H, W, 2] from target raster transform, reproject to EPSG:4326 if needed
+            ref = self._hm_srcs[self.target_t_idx]
+            rows = np.arange(i, i + self.chip_size)
+            cols = np.arange(j, j + self.chip_size)
+            rr, cc = np.meshgrid(rows, cols, indexing='ij')
+            xs, ys = rasterio.transform.xy(ref.transform, rr, cc)
+            xs = np.array(xs); ys = np.array(ys)
+            if ref.crs and ref.crs.to_string() not in ("EPSG:4326", "OGC:CRS84"):
+                transformer = Transformer.from_crs(ref.crs, "EPSG:4326", always_xy=True)
+                lon, lat = transformer.transform(xs, ys)
+            else:
+                lon, lat = xs, ys
+            lonlat = np.stack([lon, lat], axis=-1).astype(np.float32)  # [H, W, 2]
             # Target (next time)
             target = self._hm_srcs[self.target_t_idx].read(1, window=rasterio.windows.Window(j, i, self.chip_size, self.chip_size), masked=True).filled(np.nan)
             target = (target - self.hm_mean) / self.hm_std
@@ -208,6 +222,7 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
                 sample = {
                     "input_dynamic": torch.from_numpy(input_dynamic).float(),
                     "input_static": torch.from_numpy(input_static).float(),
+                    "lonlat": torch.from_numpy(lonlat).float(),
                     "target": torch.from_numpy(target).float(),
                     "timestep": t
                 }
@@ -216,6 +231,7 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
         sample = {
             "input_dynamic": torch.from_numpy(input_dynamic).float(),
             "input_static": torch.from_numpy(input_static).float(),
+            "lonlat": torch.from_numpy(lonlat).float(),
             "target": torch.from_numpy(target).float(),
             "timestep": t
         }
