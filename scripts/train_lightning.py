@@ -519,10 +519,14 @@ if __name__ == "__main__":
                     for t_idx, y in zip(t_idxs, input_years):
                         channels = []
                         arr_hm = hm_srcs[t_idx].read(1, window=win, masked=True).filled(np.nan)
+                        # Scale from [0, 10000] to [0, 1] before normalization
+                        arr_hm = arr_hm / 10000.0
                         channels.append((arr_hm - hm_mean) / hm_std)
                         if include_components and comp_srcs.get(y, []):
                             for src in comp_srcs[y]:
                                 carr = src.read(1, window=win, masked=True).filled(np.nan)
+                                # Scale HM component variables from [0, 10000] to [0, 1]
+                                carr = carr / 10000.0
                                 channels.append((carr - hm_mean) / hm_std)
                         dyn_ts.append(np.stack(channels, axis=0))  # [C_dyn, hi, wj]
                     input_dynamic_np = np.stack(dyn_ts, axis=0)  # [T, C_dyn, hi, wj]
@@ -549,8 +553,8 @@ if __name__ == "__main__":
                         lonlat_hw2 = lonlat_grid_for_window(i, j, hi, wj)
                         lonlat_t = torch.from_numpy(lonlat_hw2).to(device).unsqueeze(0)  # [1, H, W, 2]
                         preds = infer_model(in_dyn, in_stat, lonlat=lonlat_t)  # [1, 1, hi, wj]
-                    pred_np = preds.squeeze().detach().cpu().numpy()  # normalized
-                    pred_np = pred_np * hm_std + hm_mean  # back to 0-1 HM scale
+                    pred_np = preds.squeeze().detach().cpu().numpy()  # normalized (z-score)
+                    pred_np = pred_np * hm_std + hm_mean  # denormalize to [0, 1] scale (already scaled by /10000)
 
                     # Distance-to-edge weights within tile
                     # Start with interior mask = valid pixels within region

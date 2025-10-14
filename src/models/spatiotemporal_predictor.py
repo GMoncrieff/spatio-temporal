@@ -56,15 +56,10 @@ class SpatioTemporalPredictor(nn.Module):
         B, T, C, H, W = input_dynamic.shape
         # Optionally compute learnable location features
         if self.use_location_encoder and (self.location_encoder is not None) and (lonlat is not None):
-            # Build per-batch encoded features
-            loc_feats_list = []
-            for b in range(B):
-                ll = lonlat[b]  # [H, W, 2]
-                ll_flat = ll.reshape(-1, 2)  # [H*W, 2]
-                feats = self.location_encoder(ll_flat)  # [H*W, C_loc]
-                feats = feats.view(H, W, -1).permute(2, 0, 1).contiguous()  # [C_loc, H, W]
-                loc_feats_list.append(feats)
-            loc_feats = torch.stack(loc_feats_list, dim=0)  # [B, C_loc, H, W]
+            # Vectorized: process entire batch at once
+            ll_flat = lonlat.reshape(B * H * W, 2)  # [B*H*W, 2]
+            feats = self.location_encoder(ll_flat)  # [B*H*W, C_loc]
+            loc_feats = feats.view(B, H, W, self.locenc_out_channels).permute(0, 3, 1, 2).contiguous()  # [B, C_loc, H, W]
             input_static = torch.cat([input_static, loc_feats], dim=1)
         # Repeat all static channels for each timestep and concat
         static_rep = input_static.unsqueeze(1).repeat(1, T, 1, 1, 1)  # [B, T, C_s, H, W]
