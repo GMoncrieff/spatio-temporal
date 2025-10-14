@@ -89,6 +89,14 @@ if __name__ == "__main__":
         help="Number of data loading workers (default: 0 for single-threaded)",
     )
     args = parser.parse_args()
+    
+    # Split mask file
+    split_mask_file = "data/raw/hm_global/split_mask_1000.tif"
+    if not os.path.exists(split_mask_file):
+        print(f"WARNING: Split mask not found: {split_mask_file}")
+        print("Training without train/val/test separation. Run scripts/create_validity_mask.py to create splits.")
+        split_mask_file = None
+    
     # Data
     train_loader = get_dataloader(
         batch_size=args.batch_size,
@@ -102,6 +110,8 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         pin_memory=True if args.num_workers > 0 else False,
         persistent_workers=True if args.num_workers > 0 else False,
+        split_mask_file=split_mask_file,
+        split_value=1,  # Train split
     )
     # Validation uses grid sampling; no future horizons in single-step mode
     val_loader = get_dataloader(
@@ -116,6 +126,8 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         pin_memory=True if args.num_workers > 0 else False,
         persistent_workers=True if args.num_workers > 0 else False,
+        split_mask_file=split_mask_file,
+        split_value=2,  # Validation split
     )
 
     # Model

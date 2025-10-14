@@ -55,6 +55,8 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
         enforce_input_hm_valid=True,
         include_components=True,
         static_channels=None,
+        split_mask_file=None,
+        split_value=None,
     ):
         self.hm_files = hm_files
         self.component_files = component_files
@@ -75,6 +77,11 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
         self._hm_files = list(hm_files)
         self._static_files = list(static_files if static_channels is None else static_files[:int(static_channels)])
         self._comp_files = {y: list(component_files.get(y, [])) for y in years} if self.include_components else {y: [] for y in years}
+        
+        # Split mask for train/val/test separation
+        self.split_mask_file = split_mask_file
+        self.split_value = split_value  # 1=train, 2=val, 3=test, 4=calib
+        
         # Lazily opened rasterio datasets (per worker)
         self._hm_srcs = None
         self._static_srcs = None
@@ -139,6 +146,26 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
             raise ValueError("fixed_input_years must have exactly 3 entries: e.g., (1990, 1995, 2000)")
         # Precompute valid positions (target year only)
         self.valid_time_idxs = [self.target_t_idx]
+        
+        # Precompute valid positions for split if using split mask
+        self.valid_split_positions = None
+        if self.split_mask_file is not None and self.split_value is not None:
+            print(f"Pre-computing valid positions for split_value={self.split_value}...")
+            with rasterio.open(self.split_mask_file) as split_src:
+                split_data = split_src.read(1)
+                valid_positions = []
+                # Use chip_size for sampling (matches split generation)
+                for i in range(0, self.H - chip_size + 1, chip_size):
+                    for j in range(0, self.W - chip_size + 1, chip_size):
+                        chip = split_data[i:i+chip_size, j:j+chip_size]
+                        # Check if this chip belongs to the correct split
+                        if (chip == self.split_value).any():  # Any pixel in split
+                            valid_positions.append((i, j))
+                self.valid_split_positions = valid_positions
+                print(f"  Found {len(valid_positions)} valid chip positions for split {self.split_value}")
+                if len(valid_positions) == 0:
+                    raise ValueError(f"No valid positions found for split_value={self.split_value}. Check split mask.")
+        
         # Precompute all chip positions if not random
         if self.mode == "grid":
             self.chip_positions = []
@@ -176,8 +203,19 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
             else:
                 # Target year is fixed; randomly sample spatial chips
                 t = self.target_t_idx
-                i = np.random.randint(0, self.H - self.chip_size + 1)
-                j = np.random.randint(0, self.W - self.chip_size + 1)
+                
+                # If using splits, sample from pre-computed valid positions
+                if self.valid_split_positions is not None:
+                    # Randomly select a valid chip position
+                    pos_idx = np.random.randint(0, len(self.valid_split_positions))
+                    i, j = self.valid_split_positions[pos_idx]
+                    # Add small random offset within chip for diversity
+                    offset = min(32, self.chip_size // 4)
+                    i = max(0, min(self.H - self.chip_size, i + np.random.randint(-offset, offset)))
+                    j = max(0, min(self.W - self.chip_size, j + np.random.randint(-offset, offset)))
+                else:
+                    i = np.random.randint(0, self.H - self.chip_size + 1)
+                    j = np.random.randint(0, self.W - self.chip_size + 1)
             # Build input from fixed earlier years using windowed reads
             self._ensure_open()
             # Dynamic inputs per timestep: base HM plus HM covariates (if enabled)
@@ -262,7 +300,16 @@ def get_dataloader(
     enforce_input_hm_valid=True,
     include_components=True,
     static_channels=None,
+    split_mask_file=None,
+    split_value=None,
 ):
+    """
+    Create a DataLoader for the Human Footprint dataset.
+    
+    Args:
+        split_mask_file: Path to split mask GeoTIFF (e.g., 'data/raw/hm_global/split_mask_1000.tif')
+        split_value: Which split to use (1=train, 2=val, 3=test, 4=calib, None=all data)
+    """
     ds = HumanFootprintChipDataset(
         hm_files,
         component_files,
@@ -279,6 +326,8 @@ def get_dataloader(
         enforce_input_hm_valid=enforce_input_hm_valid,
         include_components=include_components,
         static_channels=static_channels,
+        split_mask_file=split_mask_file,
+        split_value=split_value,
     )
     return DataLoader(
         ds,
