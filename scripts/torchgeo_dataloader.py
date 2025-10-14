@@ -5,24 +5,24 @@ import torch
 from pyproj import Transformer
 
 # Paths (updated to hm_medium dataset)
-HM_DIR = os.path.join("data", "raw", "hm_medium")
+HM_DIR = os.path.join("data", "raw", "hm_global")
 STATIC_DIR = HM_DIR
 
 # List of years for which we have human footprint data
 years = [1990, 1995, 2000, 2005, 2010, 2015, 2020]
-hm_files = [os.path.join(HM_DIR, f"HM_{year}_300.tif") for year in years]
+hm_files = [os.path.join(HM_DIR, f"HM_{year}_AA_1000.tiff") for year in years]
 # Time-varying HM covariates
 HM_VARS = ["AG", "BU", "EX", "FR", "HI", "NS", "PO", "TI"]
 component_files = {
-    y: [os.path.join(HM_DIR, f"HM_{y}_{v}_300.tif") for v in HM_VARS]
+    y: [os.path.join(HM_DIR, f"HM_{y}_{v}_1000.tiff") for v in HM_VARS]
     for y in years
 }
 static_files = [
-    os.path.join(STATIC_DIR, "SRTM_Elevation_300.tif"),
-    os.path.join(STATIC_DIR, "SRTM_Slope_300.tif"),
-    os.path.join(STATIC_DIR, "WCv1_BIO05_TmaxWarmest_C_300.tif"),
-    os.path.join(STATIC_DIR, "WCv1_BIO06_TminColdest_C_300.tif"),
-    os.path.join(STATIC_DIR, "WCv1_BIO12_AnnualPrecip_mm_300.tif"),
+    os.path.join(STATIC_DIR, "hm_static_ele_1000.tiff"),
+    os.path.join(STATIC_DIR, "hm_static_ele_slope_1000.tiff"),
+    os.path.join(STATIC_DIR, "hm_static_tas_1000.tiff"),
+    os.path.join(STATIC_DIR, "hm_static_tasmin_1000.tiff"),
+    os.path.join(STATIC_DIR, "hm_static_pr_1000.tiff"),
 ]
 
 import numpy as np
@@ -99,6 +99,8 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
                         j = int(rng.integers(0, Ws - self.chip_size + 1))
                     window = rasterio.windows.Window(j, i, self.chip_size, self.chip_size)
                     arr = src.read(1, window=window, masked=True).filled(np.nan)
+                    # Scale from [0, 10000] to [0, 1]
+                    arr = arr / 10000.0
                     hm_samples.append(arr)
         if len(hm_samples) == 0:
             raise RuntimeError("Failed to sample windows for HM stats; check input rasters")
@@ -184,13 +186,16 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
                 channels = []
                 # Base HM for this timestep
                 arr_hm = self._hm_srcs[t_idx].read(1, window=rasterio.windows.Window(j, i, self.chip_size, self.chip_size), masked=True).filled(np.nan)
+                # Scale from [0, 10000] to [0, 1]
+                arr_hm = arr_hm / 10000.0
                 arr_hm = (arr_hm - self.hm_mean) / self.hm_std
                 channels.append(arr_hm)
                 # HM covariates for the same year
                 if self.include_components and self._comp_srcs.get(year, []):
                     for src in self._comp_srcs[year]:
                         carr = src.read(1, window=rasterio.windows.Window(j, i, self.chip_size, self.chip_size), masked=True).filled(np.nan)
-                        # Normalize with HM stats (covariates are also 0-1 originally)
+                        # Scale from [0, 10000] to [0, 1]
+                        carr = carr / 10000.0
                         carr = (carr - self.hm_mean) / self.hm_std
                         channels.append(carr)
                 dyn_list.append(np.stack(channels, axis=0))  # [C_dyn, H, W]
@@ -217,6 +222,8 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
             lonlat = np.stack([lon, lat], axis=-1).astype(np.float32)  # [H, W, 2]
             # Target (next time)
             target = self._hm_srcs[self.target_t_idx].read(1, window=rasterio.windows.Window(j, i, self.chip_size, self.chip_size), masked=True).filled(np.nan)
+            # Scale from [0, 10000] to [0, 1]
+            target = target / 10000.0
             target = (target - self.hm_mean) / self.hm_std
             if not np.isnan(target).all():
                 sample = {
