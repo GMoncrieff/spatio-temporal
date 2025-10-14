@@ -82,6 +82,12 @@ if __name__ == "__main__":
         default=True,
         help="Whether to append per-pixel LocationEncoder features to static inputs (default: True)",
     )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=0,
+        help="Number of data loading workers (default: 0 for single-threaded)",
+    )
     args = parser.parse_args()
     # Data
     train_loader = get_dataloader(
@@ -93,9 +99,9 @@ if __name__ == "__main__":
         stride=args.stride,
         include_components=args.include_components,
         static_channels=args.static_channels,
-        num_workers=0,
-        pin_memory=False,
-        persistent_workers=False,
+        num_workers=args.num_workers,
+        pin_memory=True if args.num_workers > 0 else False,
+        persistent_workers=True if args.num_workers > 0 else False,
     )
     # Validation uses grid sampling; no future horizons in single-step mode
     val_loader = get_dataloader(
@@ -107,9 +113,9 @@ if __name__ == "__main__":
         stride=args.stride,
         include_components=args.include_components,
         static_channels=args.static_channels,
-        num_workers=9,
-        pin_memory=False,
-        persistent_workers=False,
+        num_workers=args.num_workers,
+        pin_memory=True if args.num_workers > 0 else False,
+        persistent_workers=True if args.num_workers > 0 else False,
     )
 
     # Model
