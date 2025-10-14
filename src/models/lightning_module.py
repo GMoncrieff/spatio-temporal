@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from torchmetrics.functional import structural_similarity_index_measure as ssim
 from .spatiotemporal_predictor import SpatioTemporalPredictor
+from .swin_unet_predictor import SwinUNetPredictor
 from .losses import LaplacianPyramidLoss
 import wandb
 import numpy as np
@@ -26,20 +27,38 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         locenc_backbone=("sphericalharmonics", "siren"),
         locenc_hparams=None,
         locenc_out_channels: int = 8,
+        model_type: str = "convlstm",
     ):
         super().__init__()
         self.save_hyperparameters()
-        self.model = SpatioTemporalPredictor(
-            hidden_dim=hidden_dim,
-            num_static_channels=num_static_channels,
-            num_dynamic_channels=num_dynamic_channels,
-            num_layers=num_layers,
-            kernel_size=kernel_size,
-            use_location_encoder=use_location_encoder,
-            locenc_backbone=locenc_backbone,
-            locenc_hparams=locenc_hparams,
-            locenc_out_channels=locenc_out_channels,
-        )
+        
+        # Create model based on type
+        if model_type == "swin_unet":
+            self.model = SwinUNetPredictor(
+                hidden_dim=hidden_dim,
+                num_static_channels=num_static_channels,
+                num_dynamic_channels=num_dynamic_channels,
+                num_layers=num_layers,
+                kernel_size=kernel_size,
+                use_location_encoder=use_location_encoder,
+                locenc_backbone=locenc_backbone,
+                locenc_hparams=locenc_hparams,
+                locenc_out_channels=locenc_out_channels,
+            )
+        elif model_type == "convlstm":
+            self.model = SpatioTemporalPredictor(
+                hidden_dim=hidden_dim,
+                num_static_channels=num_static_channels,
+                num_dynamic_channels=num_dynamic_channels,
+                num_layers=num_layers,
+                kernel_size=kernel_size,
+                use_location_encoder=use_location_encoder,
+                locenc_backbone=locenc_backbone,
+                locenc_hparams=locenc_hparams,
+                locenc_out_channels=locenc_out_channels,
+            )
+        else:
+            raise ValueError(f"Unknown model_type: {model_type}. Choose 'convlstm' or 'swin_unet'")
         self.loss_fn = nn.MSELoss(reduction='mean')
         self.mae_fn = nn.L1Loss(reduction='mean')
         self.lr = lr

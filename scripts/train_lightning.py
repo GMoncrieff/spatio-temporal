@@ -49,10 +49,12 @@ if __name__ == "__main__":
         default=None,
         help="Limit number of static channels (e.g., 1 to use only elevation)",
     )
-    # Model complexity
-    parser.add_argument("--hidden_dim", type=int, default=64, help="ConvLSTM hidden dimension")
-    parser.add_argument("--num_layers", type=int, default=2, help="Number of ConvLSTM layers")
-    parser.add_argument("--kernel_size", type=int, default=3, help="Conv kernel size for ConvLSTM")
+    # Model selection and complexity
+    parser.add_argument("--model_type", type=str, default="convlstm", choices=["convlstm", "swin_unet"], 
+                        help="Model architecture: 'convlstm' or 'swin_unet'")
+    parser.add_argument("--hidden_dim", type=int, default=64, help="Hidden dimension (ConvLSTM) or embed_dim (Swin-UNet)")
+    parser.add_argument("--num_layers", type=int, default=2, help="Number of layers (ConvLSTM) or encoder depth (Swin-UNet)")
+    parser.add_argument("--kernel_size", type=int, default=3, help="Kernel size (ConvLSTM) or window_size (Swin-UNet)")
     # Inference flags
     parser.add_argument(
         "--predict_after_training",
@@ -133,6 +135,17 @@ if __name__ == "__main__":
     # Model
     num_static_channels = getattr(train_loader.dataset, 'C_static', 1)
     num_dynamic_channels = getattr(train_loader.dataset, 'C_dyn', 1)
+    
+    print(f"\n{'='*60}")
+    print(f"Creating {args.model_type.upper()} model:")
+    print(f"  Hidden dim: {args.hidden_dim}")
+    print(f"  Num layers: {args.num_layers}")
+    print(f"  Kernel/window size: {args.kernel_size}")
+    print(f"  Static channels: {num_static_channels}")
+    print(f"  Dynamic channels: {num_dynamic_channels}")
+    print(f"  Location encoder: {args.use_location_encoder}")
+    print(f"{'='*60}\n")
+    
     model = SpatioTemporalLightningModule(
         hidden_dim=args.hidden_dim,
         lr=1e-3,
@@ -141,6 +154,7 @@ if __name__ == "__main__":
         num_layers=args.num_layers,
         kernel_size=args.kernel_size,
         use_location_encoder=args.use_location_encoder,
+        model_type=args.model_type,
     )
     # Set normalization stats for physical-scale MAE logging
     if hasattr(train_loader, 'dataset'):
@@ -399,6 +413,13 @@ if __name__ == "__main__":
 
     # -------------------- Large-area prediction to GeoTIFF --------------------
     def _predict_region_and_write(best_ckpt_path: str):
+        import time
+        start_time = time.time()
+        
+        print("\n" + "="*70)
+        print("LARGE-AREA PREDICTION")
+        print("="*70)
+        
         # Only rank 0 performs writing
         if not getattr(trainer, "is_global_zero", True):
             return
@@ -416,8 +437,10 @@ if __name__ == "__main__":
                 except Exception:
                     region_path = None
         if region_path is None or not os.path.exists(region_path):
-            print("No valid prediction region specified; skipping large-area prediction.")
+            print("⚠ No valid prediction region specified; skipping large-area prediction.")
             return
+        
+        print(f"Region file: {region_path}")
 
         # Load region polygon (assume EPSG:4326 if no CRS field)
         with open(region_path, 'r') as f:
@@ -454,11 +477,15 @@ if __name__ == "__main__":
             r1 = int(min(ref_height, np.ceil(max(top_left[0], bottom_right[0]))))
             c1 = int(min(ref_width, np.ceil(max(top_left[1], bottom_right[1]))))
             if r1 <= r0 or c1 <= c0:
-                print("Region is outside raster extent; skipping.")
+                print("⚠ Region is outside raster extent; skipping.")
                 return
 
             # Prepare accumulators over the bbox window
             Hwin, Wwin = r1 - r0, c1 - c0
+            print(f"Region bounding box: {Hwin} × {Wwin} pixels")
+            print(f"  Row range: [{r0}, {r1})")
+            print(f"  Col range: [{c0}, {c1})")
+            
             accum = np.zeros((Hwin, Wwin), dtype=np.float64)
             wsum = np.zeros((Hwin, Wwin), dtype=np.float64)
             nodata_mask_total = np.zeros((Hwin, Wwin), dtype=bool)
@@ -485,9 +512,12 @@ if __name__ == "__main__":
             bbox_mask = rio_features.geometry_mask([mapping(region_geom)], out_shape=(Hwin, Wwin), transform=bbox_transform, invert=True)
 
             # Load model for inference
+            print(f"\nLoading model from checkpoint: {best_ckpt_path}")
             device = next(model.parameters()).device
             infer_model = SpatioTemporalLightningModule.load_from_checkpoint(best_ckpt_path, map_location=device)
             infer_model.eval()
+            print(f"✓ Model loaded on device: {device}")
+            
             def lonlat_grid_for_window(i0: int, j0: int, hi: int, wj: int):
                 rows = np.arange(i0, i0 + hi)
                 cols = np.arange(j0, j0 + wj)
@@ -501,8 +531,37 @@ if __name__ == "__main__":
                     lon, lat = xs, ys
                 return np.stack([lon, lat], axis=-1).astype(np.float32)  # [H, W, 2]
 
+            # Calculate total tiles for progress tracking
+            num_tiles_i = len(range(r0, r1, stride))
+            num_tiles_j = len(range(c0, c1, stride))
+            total_tiles = num_tiles_i * num_tiles_j
+            print(f"\nProcessing {total_tiles:,} tiles ({num_tiles_i} × {num_tiles_j})")
+            print(f"  Tile size: {tile} × {tile} pixels")
+            print(f"  Stride: {stride} pixels")
+            print(f"  Target year: {target_year}")
+            print(f"  Input years: {input_years}")
+            print()
+            
+            tiles_processed = 0
+            tiles_skipped = 0
+            tiles_with_valid = 0
+            last_percent = -1
+            tile_start_time = time.time()
+            
             for i in range(r0, r1, stride):
                 for j in range(c0, c1, stride):
+                    tiles_processed += 1
+                    
+                    # Progress indicator
+                    percent = int(100 * tiles_processed / total_tiles)
+                    if percent != last_percent and percent % 5 == 0:
+                        elapsed = time.time() - tile_start_time
+                        tiles_per_sec = tiles_processed / elapsed if elapsed > 0 else 0
+                        eta_sec = (total_tiles - tiles_processed) / tiles_per_sec if tiles_per_sec > 0 else 0
+                        print(f"  Progress: {percent:3d}% ({tiles_processed:,}/{total_tiles:,} tiles) | "
+                              f"Speed: {tiles_per_sec:.1f} tiles/s | "
+                              f"ETA: {int(eta_sec//60):02d}:{int(eta_sec%60):02d}")
+                        last_percent = percent
                     hi = min(tile, r1 - i)
                     wj = min(tile, c1 - j)
                     if hi <= 0 or wj <= 0:
@@ -512,6 +571,7 @@ if __name__ == "__main__":
                     li1, lj1 = li0 + hi, lj0 + wj
                     submask = bbox_mask[li0:li1, lj0:lj1]
                     if not np.any(submask):
+                        tiles_skipped += 1
                         continue
                     win = Window(j, i, wj, hi)
                     # Build inputs
@@ -542,7 +602,10 @@ if __name__ == "__main__":
                     stat_valid = np.isfinite(input_static_np).all(axis=0) if static_chs else np.ones((hi, wj), dtype=bool)
                     valid_mask = submask & target_valid & dyn_valid & stat_valid
                     if not np.any(valid_mask):
+                        tiles_skipped += 1
                         continue
+                    
+                    tiles_with_valid += 1
 
                     # Forward pass
                     import torch
@@ -573,11 +636,22 @@ if __name__ == "__main__":
                     nodata_mask_total[li0:li1, lj0:lj1] |= ~valid_mask
 
             # Final blend
+            print("\n" + "-"*70)
+            print("Blending overlapping tiles...")
             out = np.full((Hwin, Wwin), np.nan, dtype=np.float32)
             m = wsum > 0
             out[m] = (accum[m] / wsum[m]).astype(np.float32)
+            
+            # Calculate statistics
+            num_valid_pixels = m.sum()
+            num_total_pixels = Hwin * Wwin
+            valid_percent = 100 * num_valid_pixels / num_total_pixels
+            
+            print(f"✓ Blending complete")
+            print(f"  Valid pixels: {num_valid_pixels:,} / {num_total_pixels:,} ({valid_percent:.1f}%)")
 
             # Write GeoTIFF clipped window
+            print("\nWriting output GeoTIFF...")
             out_profile = ref.profile.copy()
             out_profile.update({
                 'height': Hwin,
@@ -592,7 +666,20 @@ if __name__ == "__main__":
             out_path = out_dir / f"prediction_{target_year}_blended.tif"
             with rasterio.open(out_path, 'w', **out_profile) as dst:
                 dst.write(out, 1)
-            print(f"Wrote blended prediction GeoTIFF to {out_path}")
+            
+            # Final summary
+            elapsed_total = time.time() - start_time
+            print(f"✓ Output written to: {out_path}")
+            print("\n" + "="*70)
+            print("PREDICTION SUMMARY")
+            print("="*70)
+            print(f"Total tiles processed: {tiles_processed:,}")
+            print(f"  Tiles with valid data: {tiles_with_valid:,}")
+            print(f"  Tiles skipped (no data/outside region): {tiles_skipped:,}")
+            print(f"Output dimensions: {Hwin} × {Wwin} pixels")
+            print(f"Valid output pixels: {num_valid_pixels:,} ({valid_percent:.1f}%)")
+            print(f"Total time: {int(elapsed_total//60):02d}:{int(elapsed_total%60):02d}")
+            print("="*70 + "\n")
 
             # Close sources
             for src in hm_srcs:
