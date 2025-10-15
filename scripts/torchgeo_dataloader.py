@@ -12,22 +12,22 @@ STATIC_DIR = HM_DIR
 years = [1990, 1995, 2000, 2005, 2010, 2015, 2020]
 hm_files = [os.path.join(HM_DIR, f"HM_{year}_AA_1000.tiff") for year in years]
 # Time-varying HM covariates
-HM_VARS = ["AG", "BU", "EX", "FR", "HI", "NS", "PO", "TI", "gdp", "population"]
+HM_VARS = ["AG", "BU", "EX", "FR", "HI", "NS", "PO", "TI"]
 component_files = {
     y: [os.path.join(HM_DIR, f"HM_{y}_{v}_1000.tiff") for v in HM_VARS]
     for y in years
 }
 static_files = [
     os.path.join(STATIC_DIR, "hm_static_ele_1000.tiff"),
-    os.path.join(STATIC_DIR, "hm_static_ele_asp_cosin_1000.tiff"),
-    os.path.join(STATIC_DIR, "hm_static_ele_asp_sin_1000.tiff"),
-    os.path.join(STATIC_DIR, "hm_static_ele_slope_1000.tiff"),
+   # os.path.join(STATIC_DIR, "hm_static_ele_asp_cosin_1000.tiff"),
+   # os.path.join(STATIC_DIR, "hm_static_ele_asp_sin_1000.tiff"),
+   # os.path.join(STATIC_DIR, "hm_static_ele_slope_1000.tiff"),
     os.path.join(STATIC_DIR, "hm_static_tas_1000.tiff"),
     os.path.join(STATIC_DIR, "hm_static_tasmin_1000.tiff"),
     os.path.join(STATIC_DIR, "hm_static_pr_1000.tiff"),
-    os.path.join(STATIC_DIR, "hm_static_dpi_dsi_1000.tiff"),
-    os.path.join(STATIC_DIR, "hm_static_iucn_nostrict_1000.tiff"),
-    os.path.join(STATIC_DIR, "hm_static_iucn_strict_1000.tiff"),
+   # os.path.join(STATIC_DIR, "hm_static_dpi_dsi_1000.tiff"),
+   # os.path.join(STATIC_DIR, "hm_static_iucn_nostrict_1000.tiff"),
+   # os.path.join(STATIC_DIR, "hm_static_iucn_strict_1000.tiff"),
 ]
 
 import numpy as np
