@@ -10,12 +10,17 @@ class SpatioTemporalPredictor(nn.Module):
     - input_static: [B, C_s, H, W] (C_s static channels, e.g., elevation, slope, climate)
     - lonlat: [B, H, W, 2] (per-pixel longitude, latitude in degrees), optional
     - output: [B, 1, H, W] (predicted next human footprint)
+    
+    With histogram head enabled:
+    - Also outputs tile-level histogram predictions over change magnitude bins
     """
     def __init__(self, hidden_dim=16, kernel_size=3, num_layers=1, num_static_channels=1, num_dynamic_channels=1,
                  use_location_encoder: bool = True,
                  locenc_backbone=("sphericalharmonics", "siren"),
                  locenc_hparams=None,
-                 locenc_out_channels: int = 8):
+                 locenc_out_channels: int = 8,
+                 use_histogram_head: bool = False,
+                 histogram_bins=None):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_static_channels = int(num_static_channels)
@@ -42,12 +47,40 @@ class SpatioTemporalPredictor(nn.Module):
             bias=True,
             return_all_layers=False
         )
-        # Deeper prediction head for increased capacity
+        # Deeper prediction head for increased capacity (pixel-level predictions)
         self.head = nn.Sequential(
             nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, bias=True),
             nn.ReLU(inplace=True),
             nn.Conv2d(hidden_dim, 1, kernel_size=1, bias=True),
         )
+        
+        # Histogram prediction head (tile-level distribution)
+        self.use_histogram_head = use_histogram_head
+        if self.use_histogram_head:
+            # Define histogram bins (edges)
+            if histogram_bins is None:
+                # Default bins: [-1, -0.05, -ε, +ε, 0.02, 0.05, 0.1, 0.2, 0.5, 1]
+                histogram_bins = [-1.0, -0.05, -0.005, 0.005, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0]
+            self.register_buffer('histogram_bins', torch.tensor(histogram_bins, dtype=torch.float32))
+            self.num_bins = len(histogram_bins) - 1
+            
+            # Compute bin midpoints for Wasserstein distance
+            bin_edges = self.histogram_bins
+            bin_midpoints = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+            self.register_buffer('bin_midpoints', bin_midpoints)
+            
+            # Histogram head: MLP on tile embedding
+            # Input: tile embedding (mean-pooled features)
+            # Output: logits over bins (will apply softmax)
+            self.histogram_head = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim * 2),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.1),
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.1),
+                nn.Linear(hidden_dim, self.num_bins),
+            )
 
     def forward(self, input_dynamic, input_static, lonlat=None):
         # input_dynamic: [B, T, C_d, H, W]
@@ -68,5 +101,19 @@ class SpatioTemporalPredictor(nn.Module):
         output, _ = self.convlstm(x)
         # output[0]: [B, T, hidden_dim, H, W] (last layer)
         last_hidden = output[0][:, -1]  # [B, hidden_dim, H, W] (last timestep)
+        
+        # Pixel-level prediction
         pred = self.head(last_hidden)   # [B, 1, H, W]
-        return pred
+        
+        # Histogram prediction (if enabled)
+        if self.use_histogram_head:
+            # Create tile embedding via mean pooling over spatial dimensions
+            tile_embedding = torch.mean(last_hidden, dim=(2, 3))  # [B, hidden_dim]
+            
+            # Predict histogram logits
+            hist_logits = self.histogram_head(tile_embedding)  # [B, num_bins]
+            hist_probs = torch.softmax(hist_logits, dim=1)  # [B, num_bins]
+            
+            return pred, hist_probs
+        else:
+            return pred

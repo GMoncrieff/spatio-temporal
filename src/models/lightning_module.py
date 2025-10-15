@@ -5,6 +5,7 @@ import pytorch_lightning as pl
 from torchmetrics.functional import structural_similarity_index_measure as ssim
 from .spatiotemporal_predictor import SpatioTemporalPredictor
 from .losses import LaplacianPyramidLoss
+from .histogram_loss import HistogramLoss, compute_observed_histogram
 import wandb
 import numpy as np
 from matplotlib import cm
@@ -26,6 +27,10 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         locenc_backbone=("sphericalharmonics", "siren"),
         locenc_hparams=None,
         locenc_out_channels: int = 8,
+        use_histogram_head: bool = False,
+        histogram_bins=None,
+        histogram_weight: float = 0.5,
+        histogram_lambda_w2: float = 0.1,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -39,6 +44,8 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             locenc_backbone=locenc_backbone,
             locenc_hparams=locenc_hparams,
             locenc_out_channels=locenc_out_channels,
+            use_histogram_head=use_histogram_head,
+            histogram_bins=histogram_bins,
         )
         self.loss_fn = nn.MSELoss(reduction='mean')
         self.mae_fn = nn.L1Loss(reduction='mean')
@@ -50,6 +57,14 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         # Normalization stats to be set externally
         self.hm_mean = None
         self.hm_std = None
+        # Histogram head
+        self.use_histogram_head = use_histogram_head
+        self.histogram_weight = histogram_weight
+        if self.use_histogram_head:
+            # Get bin midpoints from model
+            bin_midpoints = self.model.bin_midpoints
+            self.histogram_loss_fn = HistogramLoss(bin_midpoints, lambda_w2=histogram_lambda_w2)
+            self.histogram_bins = self.model.histogram_bins
 
     # Removed AR-specific helpers and panels for single-step setup
 
@@ -79,7 +94,12 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         input_dynamic = torch.nan_to_num(input_dynamic, nan=0.0)
         input_static = torch.nan_to_num(input_static, nan=0.0)
         
-        preds = self(input_dynamic, input_static, lonlat=lonlat)
+        # Forward pass (may return histogram probs if enabled)
+        model_output = self(input_dynamic, input_static, lonlat=lonlat)
+        if self.use_histogram_head:
+            preds, hist_probs = model_output
+        else:
+            preds = model_output
         
         # Set predictions to NaN where any input was NaN
         preds[~input_mask] = float('nan')
@@ -99,6 +119,7 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             mae = torch.tensor(0.0, device=preds.device)
             ssim_loss = torch.tensor(0.0, device=preds.device)
             lap_loss = torch.tensor(0.0, device=preds.device)
+            hist_loss = torch.tensor(0.0, device=preds.device)
         else:
             loss = self.loss_fn(valid_delta_pred, valid_delta_true)
             mae = self.mae_fn(preds[mask], target[mask])
@@ -111,10 +132,28 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             ssim_loss = 1.0 - ssim_val
             # Laplacian Pyramid multi-scale L1 on absolute images with masking
             lap_loss = self.lap_loss(preds_sanitized, target_sanitized, mask=mask)
+            
+            # Histogram loss (if enabled)
+            hist_loss = torch.tensor(0.0, device=preds.device)
+            if self.use_histogram_head:
+                # Compute observed histogram from ground truth changes
+                delta_true_denorm = delta_true.squeeze(1)  # [B, H, W]
+                p_obs = compute_observed_histogram(delta_true_denorm, self.histogram_bins, mask=mask.squeeze(1))
+                
+                # Compute histogram loss
+                hist_total, hist_ce, hist_w2 = self.histogram_loss_fn(p_obs, hist_probs)
+                hist_loss = hist_total
+                self.log('train_hist_ce', hist_ce)
+                self.log('train_hist_w2', hist_w2)
+        
         total_loss = loss + self.ssim_weight * ssim_loss + self.laplacian_weight * lap_loss
+        if self.use_histogram_head:
+            total_loss = total_loss + self.histogram_weight * hist_loss
+        
         self.log('train_loss', loss)
         self.log('train_ssim_loss', ssim_loss)
         self.log('train_lap_loss', lap_loss)
+        self.log('train_hist_loss', hist_loss)
         self.log('train_total_loss', total_loss)
         return total_loss
 
@@ -138,7 +177,12 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         input_dynamic = torch.nan_to_num(input_dynamic, nan=0.0)
         input_static = torch.nan_to_num(input_static, nan=0.0)
         
-        preds = self(input_dynamic, input_static, lonlat=lonlat)
+        # Forward pass (may return histogram probs if enabled)
+        model_output = self(input_dynamic, input_static, lonlat=lonlat)
+        if self.use_histogram_head:
+            preds, hist_probs = model_output
+        else:
+            preds = model_output
         
         # Set predictions to NaN where any input was NaN
         preds[~input_mask] = float('nan')
@@ -167,6 +211,7 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             mae = torch.tensor(0.0, device=preds.device)
             ssim_loss = torch.tensor(0.0, device=preds.device)
             lap_loss = torch.tensor(0.0, device=preds.device)
+            hist_loss = torch.tensor(0.0, device=preds.device)
         else:
             loss = self.loss_fn(valid_delta_pred, valid_delta_true)
             mae = F.l1_loss(preds[mask], target[mask])
@@ -186,11 +231,30 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             ssim_loss = 1.0 - ssim_val
             # Laplacian Pyramid multi-scale L1
             lap_loss = self.lap_loss(preds_sanitized, target_sanitized, mask=mask)
+            
+            # Histogram loss (if enabled)
+            hist_loss = torch.tensor(0.0, device=preds.device)
+            if self.use_histogram_head:
+                # Compute observed histogram from ground truth changes
+                delta_true_denorm = delta_true.squeeze(1)  # [B, H, W]
+                p_obs = compute_observed_histogram(delta_true_denorm, self.histogram_bins, mask=mask.squeeze(1))
+                
+                # Compute histogram loss
+                hist_total, hist_ce, hist_w2 = self.histogram_loss_fn(p_obs, hist_probs)
+                hist_loss = hist_total
+                self.log('val_hist_ce', hist_ce)
+                self.log('val_hist_w2', hist_w2)
+            
             print(f"[VAL] Loss: {loss.item():.6f}, MAE: {mae.item():.6f}, SSIM: {ssim_val.item():.6f}")
+        
         total_loss = loss + self.ssim_weight * ssim_loss + self.laplacian_weight * lap_loss
+        if self.use_histogram_head:
+            total_loss = total_loss + self.histogram_weight * hist_loss
+        
         self.log('val_loss', loss)
         self.log('val_ssim_loss', ssim_loss)
         self.log('val_lap_loss', lap_loss)
+        self.log('val_hist_loss', hist_loss)
         self.log('val_total_loss', total_loss)
         return total_loss
 
