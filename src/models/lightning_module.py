@@ -190,7 +190,7 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             loss = self.loss_fn(valid_delta_pred, valid_delta_true)
             mae = F.l1_loss(preds[mask], target[mask])
             self.log('val_mae', mae, on_step=False, on_epoch=True, prog_bar=True)
-            # Physical-scale MAE (0-10000): backtransform to original 0-1 scale, then *10000
+            # Physical-scale MAE (0-10000): backtransform to 0-1 scale, then scale to 0-10000 for interpretability
             if (self.hm_mean is not None) and (self.hm_std is not None):
                 preds_bt = preds[mask] * self.hm_std + self.hm_mean
                 target_bt = target[mask] * self.hm_std + self.hm_mean

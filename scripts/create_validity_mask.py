@@ -73,6 +73,7 @@ def create_validity_mask():
             tiled=True,
             blockxsize=512,
             blockysize=512,
+            nodata=None,  # Remove float nodata value for uint8 mask
         )
         
         # Write validity mask
