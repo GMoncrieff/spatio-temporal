@@ -259,8 +259,15 @@ if __name__ == "__main__":
                     lonlat = batch.get('lonlat', None)
                     if lonlat is not None:
                         lonlat = lonlat.to(device)
-                    # Get predictions from model (learnable location encoder)
-                    preds = best_model(input_dynamic_clean, input_static_clean, lonlat=lonlat)  # Keep [B, 1, H, W]
+                    # Get predictions from model (may return histogram probs if enabled)
+                    model_output = best_model(input_dynamic_clean, input_static_clean, lonlat=lonlat)
+                    if isinstance(model_output, tuple):
+                        # Histogram head enabled: (preds, hist_probs)
+                        preds, hist_probs = model_output
+                    else:
+                        # No histogram head: just preds
+                        preds = model_output
+                        hist_probs = None
                 
                     # Set predictions to NaN where any input was NaN
                     preds[~input_mask] = float('nan')
