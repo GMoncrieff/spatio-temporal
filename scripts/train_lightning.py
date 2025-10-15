@@ -49,12 +49,10 @@ if __name__ == "__main__":
         default=None,
         help="Limit number of static channels (e.g., 1 to use only elevation)",
     )
-    # Model selection and complexity
-    parser.add_argument("--model_type", type=str, default="convlstm", choices=["convlstm", "swin_unet"], 
-                        help="Model architecture: 'convlstm' or 'swin_unet'")
-    parser.add_argument("--hidden_dim", type=int, default=64, help="Hidden dimension (ConvLSTM) or embed_dim (Swin-UNet)")
-    parser.add_argument("--num_layers", type=int, default=2, help="Number of layers (ConvLSTM) or encoder depth (Swin-UNet)")
-    parser.add_argument("--kernel_size", type=int, default=3, help="Kernel size (ConvLSTM) or window_size (Swin-UNet)")
+    # Model complexity
+    parser.add_argument("--hidden_dim", type=int, default=64, help="ConvLSTM hidden dimension")
+    parser.add_argument("--num_layers", type=int, default=2, help="Number of ConvLSTM layers")
+    parser.add_argument("--kernel_size", type=int, default=3, help="Conv kernel size for ConvLSTM")
     # Inference flags
     parser.add_argument(
         "--predict_after_training",
@@ -141,17 +139,6 @@ if __name__ == "__main__":
     # Model
     num_static_channels = getattr(train_loader.dataset, 'C_static', 1)
     num_dynamic_channels = getattr(train_loader.dataset, 'C_dyn', 1)
-    
-    print(f"\n{'='*60}")
-    print(f"Creating {args.model_type.upper()} model:")
-    print(f"  Hidden dim: {args.hidden_dim}")
-    print(f"  Num layers: {args.num_layers}")
-    print(f"  Kernel/window size: {args.kernel_size}")
-    print(f"  Static channels: {num_static_channels}")
-    print(f"  Dynamic channels: {num_dynamic_channels}")
-    print(f"  Location encoder: {args.use_location_encoder}")
-    print(f"{'='*60}\n")
-    
     model = SpatioTemporalLightningModule(
         hidden_dim=args.hidden_dim,
         lr=1e-3,
@@ -160,7 +147,6 @@ if __name__ == "__main__":
         num_layers=args.num_layers,
         kernel_size=args.kernel_size,
         use_location_encoder=args.use_location_encoder,
-        model_type=args.model_type,
     )
     # Set normalization stats for physical-scale MAE logging
     if hasattr(train_loader, 'dataset'):
@@ -217,9 +203,12 @@ if __name__ == "__main__":
             if hasattr(ds_train, 'hm_mean') and hasattr(ds_train, 'hm_std'):
                 best_model.hm_mean = ds_train.hm_mean
                 best_model.hm_std = ds_train.hm_std
-        # Inference on a batch of validation data with at least one valid target pixel
-        valid_batch_found = False
-        for batch in val_loader:
+        # Inference on entire validation set
+        print("\nRunning inference on entire validation set for plotting...")
+        all_batches_data = []
+        num_batches_processed = 0
+        
+        for batch_idx, batch in enumerate(val_loader):
             target = batch['target']
             # Check for at least one valid (non-NaN) pixel in any sample
             if torch.any(~torch.isnan(target)).item():
@@ -254,17 +243,27 @@ if __name__ == "__main__":
                     
                     # Now squeeze for plotting
                     preds = preds.squeeze(1)  # [B, H, W]
-                valid_batch_found = True
-                break
-        if not valid_batch_found:
-            print("WARNING: No valid (non-NaN) target pixels found in any validation batch for image logging and MAE.")
+                
+                # Store batch data for later processing
+                all_batches_data.append({
+                    'input_dynamic': input_dynamic.cpu(),
+                    'input_static': input_static.cpu(),
+                    'target': target.cpu(),
+                    'preds': preds.cpu(),
+                    'input_mask': input_mask.cpu(),
+                    'lonlat': batch.get('lonlat', None)
+                })
+                num_batches_processed += 1
+                
+                if batch_idx % 10 == 0:
+                    print(f"  Processed {batch_idx + 1} batches...")
+        
+        if num_batches_processed == 0:
+            print("WARNING: No valid (non-NaN) target pixels found in any validation batch for image logging.")
             sys.exit(0)
-        # Log images to wandb (backtransformed to original data scale)
-        images = []
-        # For hexbin plot of observed vs predicted change
-        diffs_obs = []
-        diffs_mod = []
-        B = input_dynamic.shape[0]
+        
+        print(f"✓ Processed {num_batches_processed} validation batches")
+        
         # Retrieve means/stds for inverse transform
         ds = val_loader.dataset
         if hasattr(ds, 'dataset'):
@@ -274,6 +273,18 @@ if __name__ == "__main__":
         # Years for labeling come from fixed configuration in dataset
         fixed_input_years = getattr(ds, 'fixed_input_years', (None, None, None))
         fixed_target_year = getattr(ds, 'fixed_target_year', None)
+        
+        # Log images from first batch only (for visualization)
+        print("\nCreating sample visualizations from first batch...")
+        images = []
+        first_batch = all_batches_data[0]
+        input_dynamic = first_batch['input_dynamic']
+        input_static = first_batch['input_static']
+        target = first_batch['target']
+        preds = first_batch['preds']
+        input_mask = first_batch['input_mask']
+        
+        B = input_dynamic.shape[0]
         for b in range(B):
             fig, axes = plt.subplots(2, 5, figsize=(20, 8))
             # Use a single color ramp for all HM images in original 0-1 scale
@@ -353,12 +364,43 @@ if __name__ == "__main__":
             images.append(wandb.Image(img_rgb, caption=f"Sample {b}"))
             plt.close(fig)
 
-            # Accumulate diffs for hexbin (mask to valid pixels)
-            valid_mask_np = valid_pred_mask
-            diffs_obs.append(delta[valid_mask_np])
-            diffs_mod.append(pred_delta[valid_mask_np])
-
         experiment.log({"Predictions_vs_Targets": images})
+        
+        # ---- Accumulate diffs from ALL batches for hexbin and histogram ----
+        print("\nAccumulating changes from all validation batches...")
+        diffs_obs = []
+        diffs_mod = []
+        
+        for batch_data in all_batches_data:
+            input_dynamic_batch = batch_data['input_dynamic']
+            target_batch = batch_data['target']
+            preds_batch = batch_data['preds']
+            input_mask_batch = batch_data['input_mask']
+            
+            B_batch = input_dynamic_batch.shape[0]
+            for b in range(B_batch):
+                # Denormalize
+                target_orig = target_batch[b].numpy() * hm_std + hm_mean
+                pred_orig = preds_batch[b].numpy() * hm_std + hm_mean
+                most_recent_in = (input_dynamic_batch[b, -1, 0].numpy() * hm_std + hm_mean)
+                
+                # Compute validity mask
+                target_valid = np.isfinite(target_orig)
+                input_dynamic_raw = input_dynamic_batch[b].numpy()
+                dynamic_valid = np.isfinite(input_dynamic_raw).all(axis=(0, 1))
+                input_static_raw = batch_data['input_static'][b].numpy()
+                static_valid = np.isfinite(input_static_raw).all(axis=0)
+                valid_pred_mask = target_valid & dynamic_valid & static_valid
+                
+                # Calculate changes
+                delta = target_orig - most_recent_in
+                pred_delta = pred_orig - most_recent_in
+                
+                # Accumulate valid pixels only
+                diffs_obs.append(delta[valid_pred_mask])
+                diffs_mod.append(pred_delta[valid_pred_mask])
+        
+        print(f"✓ Accumulated changes from {len(all_batches_data)} batches")
 
         # ---- Hexbin plot: Observed vs Predicted HM change ----
         import matplotlib.colors as mcolors
@@ -402,6 +444,41 @@ if __name__ == "__main__":
             img_rgb2 = img_rgba2[..., :3]
             experiment.log({"Obs_vs_Pred_HM_Change": [wandb.Image(img_rgb2, caption="Obs vs Pred HM change (hexbin)")]})
             plt.close(fig2)
+            
+            # ---- Histogram: Observed vs Predicted HM change distribution ----
+            bins = [-1, -0.05, 0, 0.005, 0.02, 0.05, 0.1, 0.2, 0.5, 1]
+            bin_labels = ['-1 to -0.05', '-0.05 to 0', '0 to 0.005', '0.005 to 0.02', 
+                          '0.02 to 0.05', '0.05 to 0.1', '0.1 to 0.2', '0.2 to 0.5', '0.5 to 1']
+            
+            # Compute histograms on full data (not just filtered range)
+            obs_hist, _ = np.histogram(diff_obs_all, bins=bins)
+            pred_hist, _ = np.histogram(diff_mod_all, bins=bins)
+            
+            # Create histogram figure
+            fig3, ax = plt.subplots(figsize=(12, 6))
+            x = np.arange(len(bin_labels))
+            width = 0.35
+            
+            # Plot bars
+            ax.bar(x - width/2, obs_hist, width, label='Observed', alpha=0.8, color='#2ecc71')
+            ax.bar(x + width/2, pred_hist, width, label='Predicted', alpha=0.8, color='#3498db')
+            
+            # Formatting
+            ax.set_xlabel('Change Bins', fontsize=12, fontweight='bold')
+            ax.set_ylabel('Count (log scale)', fontsize=12, fontweight='bold')
+            ax.set_title('Observed vs Predicted HM Change Distribution', fontsize=14, fontweight='bold')
+            ax.set_xticks(x)
+            ax.set_xticklabels(bin_labels, rotation=45, ha='right')
+            ax.legend(fontsize=11)
+            ax.set_yscale('log')
+            ax.grid(True, alpha=0.3, axis='y')
+            
+            plt.tight_layout()
+            fig3.canvas.draw()
+            img_rgba3 = np.array(fig3.canvas.buffer_rgba())
+            img_rgb3 = img_rgba3[..., :3]
+            experiment.log({"HM_Change_Histogram": [wandb.Image(img_rgb3, caption="Obs vs Pred HM change histogram")]})
+            plt.close(fig3)
 
         # Ensure wandb shuts down cleanly
         experiment.finish()
