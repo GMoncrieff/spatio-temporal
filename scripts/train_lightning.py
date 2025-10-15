@@ -94,6 +94,27 @@ if __name__ == "__main__":
         default=1,
         help="Number of batches to accumulate gradients over (default: 1, no accumulation)",
     )
+    # Histogram head arguments
+    parser.add_argument(
+        "--use_histogram_head",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?',
+        const=True,
+        default=False,
+        help="Enable histogram prediction head for tile-level distribution (default: False)",
+    )
+    parser.add_argument(
+        "--histogram_weight",
+        type=float,
+        default=0.5,
+        help="Weight for histogram loss in total loss (default: 0.5)",
+    )
+    parser.add_argument(
+        "--histogram_lambda_w2",
+        type=float,
+        default=0.1,
+        help="Weight for Wasserstein-2 term within histogram loss (default: 0.1)",
+    )
     args = parser.parse_args()
     
     # Split mask file
@@ -147,6 +168,9 @@ if __name__ == "__main__":
         num_layers=args.num_layers,
         kernel_size=args.kernel_size,
         use_location_encoder=args.use_location_encoder,
+        use_histogram_head=args.use_histogram_head,
+        histogram_weight=args.histogram_weight,
+        histogram_lambda_w2=args.histogram_lambda_w2,
     )
     # Set normalization stats for physical-scale MAE logging
     if hasattr(train_loader, 'dataset'):
