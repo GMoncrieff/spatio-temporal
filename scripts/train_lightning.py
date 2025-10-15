@@ -309,8 +309,21 @@ if __name__ == "__main__":
         input_mask = first_batch['input_mask']
         
         B = input_dynamic.shape[0]
+        
+        # Check if histogram head is enabled
+        has_histogram_head = hasattr(best_model, 'use_histogram_head') and best_model.use_histogram_head
+        if has_histogram_head:
+            histogram_bins = best_model.histogram_bins.cpu().numpy()
+            bin_midpoints = best_model.model.bin_midpoints.cpu().numpy()
+            num_bins = len(histogram_bins) - 1
+        
         for b in range(B):
-            fig, axes = plt.subplots(2, 5, figsize=(20, 8))
+            # Create figure with extra row for histogram if enabled
+            if has_histogram_head:
+                fig, axes = plt.subplots(3, 5, figsize=(20, 12))
+            else:
+                fig, axes = plt.subplots(2, 5, figsize=(20, 8))
+            
             # Use a single color ramp for all HM images in original 0-1 scale
             hm_vmin, hm_vmax = 0.0, 1.0
             # Input human footprint chips (T=3), unnormalize and label with fixed years
@@ -380,6 +393,84 @@ if __name__ == "__main__":
             axes[1, 4].set_title(f'Pred Delta HM {target_year}-{input_years[-1]}')
             axes[1, 4].axis('off')
             plt.colorbar(im4, ax=axes[1, 4], fraction=0.046, pad=0.04)
+            
+            # Add histogram comparison panel if histogram head is enabled
+            if has_histogram_head:
+                # Get histogram predictions for this sample
+                # Need to re-run forward pass to get histogram probs
+                import torch
+                with torch.no_grad():
+                    input_dynamic_single = first_batch['input_dynamic'][b:b+1].to(device)
+                    input_static_single = first_batch['input_static'][b:b+1].to(device)
+                    lonlat_single = first_batch['lonlat'][b:b+1].to(device) if first_batch['lonlat'] is not None else None
+                    
+                    # Clean inputs
+                    input_dynamic_clean = torch.nan_to_num(input_dynamic_single, nan=0.0)
+                    input_static_clean = torch.nan_to_num(input_static_single, nan=0.0)
+                    
+                    # Forward pass
+                    _, hist_probs_sample = best_model(input_dynamic_clean, input_static_clean, lonlat=lonlat_single)
+                    hist_probs_sample = hist_probs_sample[0].cpu().numpy()  # [num_bins]
+                
+                # Compute observed histogram from ground truth changes
+                from src.models.histogram_loss import compute_observed_histogram
+                delta_tensor = torch.from_numpy(delta).unsqueeze(0)  # [1, H, W]
+                mask_tensor = torch.from_numpy(valid_pred_mask).unsqueeze(0)  # [1, H, W]
+                p_obs = compute_observed_histogram(delta_tensor, torch.from_numpy(histogram_bins), mask=mask_tensor)
+                p_obs = p_obs[0].numpy()  # [num_bins]
+                
+                # Compute histogram from pixel predictions (differentiable binning)
+                pred_delta_tensor = torch.from_numpy(pred_delta).unsqueeze(0)  # [1, H, W]
+                p_pred_pixels = compute_observed_histogram(pred_delta_tensor, torch.from_numpy(histogram_bins), mask=mask_tensor)
+                p_pred_pixels = p_pred_pixels[0].numpy()  # [num_bins]
+                
+                # Plot histograms in third row (log scale)
+                # Histogram 1: Observed changes
+                axes[2, 0].bar(range(num_bins), p_obs, alpha=0.7, color='blue', edgecolor='black')
+                axes[2, 0].set_title('Observed Change Histogram')
+                axes[2, 0].set_xlabel('Bin')
+                axes[2, 0].set_ylabel('Proportion (log scale)')
+                axes[2, 0].set_yscale('log')
+                axes[2, 0].set_ylim([1e-4, 1.0])
+                axes[2, 0].grid(alpha=0.3, which='both')
+                
+                # Histogram 2: Predicted from histogram head
+                axes[2, 1].bar(range(num_bins), hist_probs_sample, alpha=0.7, color='red', edgecolor='black')
+                axes[2, 1].set_title('Histogram Head Prediction')
+                axes[2, 1].set_xlabel('Bin')
+                axes[2, 1].set_ylabel('Proportion (log scale)')
+                axes[2, 1].set_yscale('log')
+                axes[2, 1].set_ylim([1e-4, 1.0])
+                axes[2, 1].grid(alpha=0.3, which='both')
+                
+                # Histogram 3: Binned pixel predictions
+                axes[2, 2].bar(range(num_bins), p_pred_pixels, alpha=0.7, color='green', edgecolor='black')
+                axes[2, 2].set_title('Pixel Predictions (Binned)')
+                axes[2, 2].set_xlabel('Bin')
+                axes[2, 2].set_ylabel('Proportion (log scale)')
+                axes[2, 2].set_yscale('log')
+                axes[2, 2].set_ylim([1e-4, 1.0])
+                axes[2, 2].grid(alpha=0.3, which='both')
+                
+                # Overlay comparison
+                x = np.arange(num_bins)
+                width = 0.25
+                axes[2, 3].bar(x - width, p_obs, width, label='Observed', alpha=0.7, color='blue', edgecolor='black')
+                axes[2, 3].bar(x, hist_probs_sample, width, label='Hist Head', alpha=0.7, color='red', edgecolor='black')
+                axes[2, 3].bar(x + width, p_pred_pixels, width, label='Pixel (Binned)', alpha=0.7, color='green', edgecolor='black')
+                axes[2, 3].set_title('Histogram Comparison')
+                axes[2, 3].set_xlabel('Bin')
+                axes[2, 3].set_ylabel('Proportion (log scale)')
+                axes[2, 3].set_yscale('log')
+                axes[2, 3].set_ylim([1e-4, 1.0])
+                axes[2, 3].legend()
+                axes[2, 3].grid(alpha=0.3, which='both')
+                
+                # Show bin edges as text
+                bin_text = "Bin edges:\n" + ", ".join([f"{edge:.3f}" for edge in histogram_bins])
+                axes[2, 4].text(0.1, 0.5, bin_text, fontsize=10, verticalalignment='center', family='monospace')
+                axes[2, 4].axis('off')
+            
             plt.tight_layout()
             # Convert to numpy array and log (robust for macOS backend)
             fig.canvas.draw()
