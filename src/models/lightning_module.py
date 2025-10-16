@@ -232,6 +232,11 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             # Histogram loss on pixel-level change distributions
             hist_loss = torch.tensor(0.0, device=preds.device)
             hist_active = self.histogram_weight > 0 and self.current_epoch >= self.histogram_warmup_epochs
+            
+            # Debug: print histogram settings on first validation batch
+            if batch_idx == 0:
+                print(f"[DEBUG] hist_weight={self.histogram_weight}, epoch={self.current_epoch}, warmup={self.histogram_warmup_epochs}, active={hist_active}")
+            
             if hist_active:
                 # Squeeze deltas to [B, H, W]
                 delta_true_2d = delta_true.squeeze(1)
