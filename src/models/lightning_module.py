@@ -246,7 +246,9 @@ class SpatioTemporalLightningModule(pl.LightningModule):
                 self.log('val_hist_w2', hist_w2, on_step=False, on_epoch=True)
                 self.log('val_hist_loss_weighted', self.histogram_weight * hist_loss, on_step=False, on_epoch=True)  # Log weighted contribution
             
-            print(f"[VAL] Loss: {loss.item():.6f}, MAE: {mae.item():.6f}, SSIM: {ssim_val.item():.6f}")
+            # Print validation metrics with 5 decimals
+            hist_str = f", Hist: {hist_loss.item():.5f}" if self.histogram_weight > 0 and self.current_epoch >= self.histogram_warmup_epochs else ""
+            print(f"[VAL] MSE: {loss.item():.5f}, MAE: {mae.item():.5f}, SSIM: {ssim_val.item():.5f}, Lap: {lap_loss.item():.5f}{hist_str}")
         
         total_loss = loss + self.ssim_weight * ssim_loss + self.laplacian_weight * lap_loss
         if self.histogram_weight > 0 and self.current_epoch >= self.histogram_warmup_epochs:
