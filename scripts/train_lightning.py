@@ -123,15 +123,12 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     
-    # Set seeds for reproducibility
+    # Set seeds for reproducibility (without strict determinism)
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
-    # Make PyTorch deterministic (may reduce performance)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
     pl.seed_everything(args.seed, workers=True)
     
     # Split mask file
@@ -214,7 +211,6 @@ if __name__ == "__main__":
         log_every_n_steps=10,
         fast_dev_run=args.fast_dev_run,
         accumulate_grad_batches=args.accumulate_grad_batches,
-        deterministic=True,  # Ensure reproducibility
     )
 
     # Train
