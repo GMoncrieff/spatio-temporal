@@ -57,11 +57,13 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         # Histogram loss for pixel-level change distributions
         self.histogram_weight = histogram_weight
         self.histogram_warmup_epochs = histogram_warmup_epochs
+        self.histogram_lambda_w2 = histogram_lambda_w2  # Store for reference (not used in new implementation)
         if self.histogram_weight > 0:
             # Define histogram bins: [-1, -0.05, -ε, +ε, 0.02, 0.05, 0.1, 0.2, 0.5, 1]
             histogram_bins = torch.tensor([-1.0, -0.05, -0.005, 0.005, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0])
-            self.histogram_loss_fn = HistogramLoss(histogram_bins, lambda_w2=histogram_lambda_w2)
+            self.histogram_loss_fn = HistogramLoss(histogram_bins)  # Bin weights will be set later
             self.register_buffer('histogram_bins', histogram_bins)
+            self.histogram_bins_initialized = False
 
     # Removed AR-specific helpers and panels for single-step setup
 
@@ -133,20 +135,16 @@ class SpatioTemporalLightningModule(pl.LightningModule):
                 delta_pred_2d = delta_pred.squeeze(1)
                 mask_2d = mask.squeeze(1)
                 
-                hist_total, hist_ce, hist_w2, p_obs, p_pred = self.histogram_loss_fn(
+                hist_loss, p_obs, p_pred = self.histogram_loss_fn(
                     delta_true_2d, delta_pred_2d, mask=mask_2d
                 )
-                hist_loss = hist_total
                 
-                # Log histogram metrics with better precision
-                self.log('train_hist_loss_raw', hist_total)  # Log raw histogram loss
-                self.log('train_hist_ce', hist_ce)
-                self.log('train_hist_w2', hist_w2)
-                self.log('train_hist_loss_weighted', self.histogram_weight * hist_loss)  # Log weighted contribution
+                # Log histogram metrics
+                self.log('train_hist_loss', hist_loss)
                 
                 # Debug print on first batch of warmup epoch
                 if batch_idx == 0 and self.current_epoch == self.histogram_warmup_epochs:
-                    print(f"\n[HISTOGRAM ACTIVATED] Epoch {self.current_epoch}: hist_loss={hist_total.item():.6f}, weighted={self.histogram_weight * hist_loss.item():.6f}\n")
+                    print(f"\n[HISTOGRAM ACTIVATED] Epoch {self.current_epoch}: hist_loss={hist_loss.item():.6f}, weighted={self.histogram_weight * hist_loss.item():.6f}\n")
         
         total_loss = loss + self.ssim_weight * ssim_loss + self.laplacian_weight * lap_loss
         if self.histogram_weight > 0 and self.current_epoch >= self.histogram_warmup_epochs:
@@ -243,14 +241,10 @@ class SpatioTemporalLightningModule(pl.LightningModule):
                 delta_pred_2d = delta_pred.squeeze(1)
                 mask_2d = mask.squeeze(1)
                 
-                hist_total, hist_ce, hist_w2, p_obs, p_pred = self.histogram_loss_fn(
+                hist_loss, p_obs, p_pred = self.histogram_loss_fn(
                     delta_true_2d, delta_pred_2d, mask=mask_2d
                 )
-                hist_loss = hist_total
-                self.log('val_hist_loss_raw', hist_total, on_step=False, on_epoch=True)  # Log raw histogram loss
-                self.log('val_hist_ce', hist_ce, on_step=False, on_epoch=True)
-                self.log('val_hist_w2', hist_w2, on_step=False, on_epoch=True)
-                self.log('val_hist_loss_weighted', self.histogram_weight * hist_loss, on_step=False, on_epoch=True)  # Log weighted contribution
+                self.log('val_hist_loss', hist_loss, on_step=False, on_epoch=True)
             
             # Print validation metrics with 5 decimals (raw and weighted)
             ssim_weighted = self.ssim_weight * ssim_loss.item()

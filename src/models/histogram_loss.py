@@ -69,65 +69,44 @@ def compute_histogram(changes, bin_edges, mask=None):
 
 class HistogramLoss(nn.Module):
     """
-    Loss for comparing histograms of pixel-level changes.
+    Rarity-weighted Wasserstein-2 loss for comparing histograms of pixel-level changes.
     
-    Combines:
-    1. Class-balanced Cross-Entropy: Weights bins by inverse frequency
-    2. Wasserstein-2 Distance: Metric on probability distributions
+    Uses only W2 distance with rarity weights to ensure all bins contribute equally.
     """
     
-    def __init__(self, bin_edges, lambda_w2=0.1, smoothing=1e-3, label_smoothing=0.05):
+    def __init__(self, bin_edges, bin_weights=None):
         """
         Args:
             bin_edges: Tensor [num_bins+1] with bin edge values
-            lambda_w2: Weight for Wasserstein-2 term (default: 0.1)
-            smoothing: Smoothing factor for class weights (default: 1e-3)
-            label_smoothing: Label smoothing factor to prevent extreme log probs (default: 0.05)
+            bin_weights: Optional tensor [num_bins] with rarity weights (default: uniform)
         """
         super().__init__()
         self.register_buffer('bin_edges', bin_edges)
-        self.lambda_w2 = lambda_w2
-        self.smoothing = smoothing
-        self.label_smoothing = label_smoothing
         self.num_bins = len(bin_edges) - 1
         
         # Compute bin midpoints for Wasserstein distance
         bin_midpoints = 0.5 * (bin_edges[:-1] + bin_edges[1:])
         self.register_buffer('bin_midpoints', bin_midpoints)
+        
+        # Set bin weights (default: uniform)
+        if bin_weights is None:
+            bin_weights = torch.ones(self.num_bins)
+        self.register_buffer('bin_weights', bin_weights)
     
-    def compute_class_weights(self, p_obs):
-        """
-        Compute inverse frequency weights for class-balanced CE.
-        
-        Args:
-            p_obs: [B, num_bins] - observed proportions
-            
-        Returns:
-            weights: [num_bins] - class weights (inverse frequency)
-        """
-        # Average proportion across batch
-        avg_proportions = p_obs.mean(dim=0)  # [num_bins]
-        
-        # Inverse frequency with smoothing
-        weights = 1.0 / (avg_proportions + self.smoothing)
-        
-        # Normalize weights to sum to num_bins (so average weight is 1.0)
-        weights = weights * self.num_bins / weights.sum()
-        
-        return weights
+    def set_bin_weights(self, bin_weights):
+        """Update bin weights (used after computing from training data)."""
+        self.bin_weights = bin_weights.to(self.bin_edges.device)
     
-    def wasserstein2_loss(self, p_obs, p_pred):
+    def wasserstein2_loss_weighted(self, p_obs, p_pred):
         """
-        Compute Wasserstein-2 distance between two discrete distributions.
-        
-        For 1D distributions with ordered bins, uses cumulative distribution difference.
+        Compute rarity-weighted Wasserstein-2 distance.
         
         Args:
             p_obs: [B, num_bins] - observed distribution
             p_pred: [B, num_bins] - predicted distribution
             
         Returns:
-            Scalar Wasserstein-2 distance (squared)
+            Scalar rarity-weighted W2 distance
         """
         # Compute cumulative distributions
         cdf_obs = torch.cumsum(p_obs, dim=1)  # [B, num_bins]
@@ -138,14 +117,16 @@ class HistogramLoss(nn.Module):
         # Pad to match num_bins
         bin_widths = torch.cat([bin_widths, bin_widths[-1:]])  # [num_bins]
         
-        # W2^2 distance (squared for differentiability)
-        w2_sq = torch.sum(((cdf_obs - cdf_pred) ** 2) * bin_widths.unsqueeze(0), dim=1)  # [B]
+        # Apply rarity weights to emphasize rare bins
+        # W2^2 distance with bin weights
+        weighted_diff = ((cdf_obs - cdf_pred) ** 2) * bin_widths.unsqueeze(0) * self.bin_weights.unsqueeze(0)
+        w2_weighted = weighted_diff.sum(dim=1).mean()  # [B] -> scalar
         
-        return w2_sq.mean()
+        return w2_weighted
     
     def forward(self, changes_obs, changes_pred, mask=None):
         """
-        Compute histogram loss between observed and predicted changes.
+        Compute rarity-weighted W2 histogram loss.
         
         Args:
             changes_obs: [B, H, W] - observed changes (target - last_input)
@@ -153,9 +134,7 @@ class HistogramLoss(nn.Module):
             mask: [B, H, W] - validity mask
             
         Returns:
-            total_loss: Combined loss
-            ce_loss: Class-balanced CE component
-            w2_loss: Wasserstein-2 component
+            w2_loss: Rarity-weighted Wasserstein-2 loss
             p_obs: Observed histogram proportions (for logging)
             p_pred: Predicted histogram proportions (for logging)
         """
@@ -163,24 +142,10 @@ class HistogramLoss(nn.Module):
         counts_obs, p_obs = compute_histogram(changes_obs, self.bin_edges, mask=mask)
         counts_pred, p_pred = compute_histogram(changes_pred, self.bin_edges, mask=mask)
         
-        # Apply label smoothing to predicted probabilities to prevent extreme log values
-        if self.label_smoothing > 0:
-            p_pred = (1 - self.label_smoothing) * p_pred + self.label_smoothing / self.num_bins
+        # Rarity-weighted Wasserstein-2 loss
+        w2_loss = self.wasserstein2_loss_weighted(p_obs, p_pred)
         
-        # Compute class weights from observed distribution
-        class_weights = self.compute_class_weights(p_obs)  # [num_bins]
+        # Normalize by num_bins for scale compatibility
+        w2_loss = w2_loss / self.num_bins
         
-        # Class-balanced Cross-Entropy
-        # Treat as classification: p_obs is target, p_pred is prediction
-        # Weight each bin by inverse frequency
-        log_p_pred = torch.log(p_pred + 1e-8)  # [B, num_bins]
-        weighted_ce = -p_obs * log_p_pred * class_weights.unsqueeze(0)  # [B, num_bins]
-        ce_loss = weighted_ce.sum(dim=1).mean()  # Average over batch
-        
-        # Wasserstein-2 loss
-        w2_loss = self.wasserstein2_loss(p_obs, p_pred)
-        
-        # Combined loss (normalized by num_bins for scale compatibility with other losses)
-        total_loss = (ce_loss + self.lambda_w2 * w2_loss) / self.num_bins
-        
-        return total_loss, ce_loss, w2_loss, p_obs, p_pred
+        return w2_loss, p_obs, p_pred

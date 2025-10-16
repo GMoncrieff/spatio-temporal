@@ -201,8 +201,71 @@ if __name__ == "__main__":
         histogram_warmup_epochs=args.histogram_warmup_epochs,
     )
     
+    # Compute histogram bin weights from training data
+    if args.histogram_weight > 0 and hasattr(model, 'histogram_loss_fn'):
+        print("\nComputing histogram bin weights from 10 training batches...")
+        from src.models.histogram_loss import compute_histogram
+        
+        all_counts = []
+        device = next(model.parameters()).device
+        num_batches_to_sample = min(10, len(train_loader))
+        
+        for batch_idx, batch in enumerate(train_loader):
+            if batch_idx >= num_batches_to_sample:
+                break
+            
+            input_dynamic = batch['input_dynamic'].to(device)
+            target = batch['target'].to(device)
+            
+            # Get last input for delta calculation
+            last_input = input_dynamic[:, -1, 0]  # [B, H, W]
+            
+            # Compute mask for valid pixels
+            target_valid = torch.isfinite(target)  # [B, H, W]
+            last_input_valid = torch.isfinite(last_input)  # [B, H, W]
+            mask = target_valid & last_input_valid  # [B, H, W]
+            
+            # Compute deltas
+            delta_true = target - last_input  # [B, H, W]
+            
+            # Compute histogram
+            counts, _ = compute_histogram(delta_true, model.histogram_bins, mask=mask)
+            all_counts.append(counts.cpu())
+        
+        # Aggregate counts across all batches
+        all_counts = torch.cat(all_counts, dim=0)  # [N_batches*B, num_bins]
+        total_counts = all_counts.sum(dim=0)  # [num_bins]
+        
+        # Compute inverse frequency weights
+        smoothing = 1e-3
+        bin_weights = 1.0 / (total_counts + smoothing)
+        # Normalize so average weight is 1.0
+        num_bins = len(model.histogram_bins) - 1
+        bin_weights = bin_weights * num_bins / bin_weights.sum()
+        
+        # Set weights in model
+        model.histogram_loss_fn.set_bin_weights(bin_weights.to(device))
+        model.histogram_bins_initialized = True
+        
+        # Print bin information
+        print("\n" + "="*60)
+        print("HISTOGRAM BIN WEIGHTS (Rarity-Weighted)")
+        print("="*60)
+        print(f"Bin edges: {model.histogram_bins.tolist()}")
+        print(f"\nBin | Count  | Proportion | Weight")
+        print("-" * 45)
+        total_pixels = total_counts.sum().item()
+        for i in range(num_bins):
+            count = total_counts[i].item()
+            proportion = count / total_pixels
+            weight = bin_weights[i].item()
+            left_edge = model.histogram_bins[i].item()
+            right_edge = model.histogram_bins[i+1].item()
+            print(f" {i}  | {count:6.0f} | {proportion:9.4f}  | {weight:6.3f}  [{left_edge:+.3f}, {right_edge:+.3f})")
+        print("="*60 + "\n")
+    
     # Print loss weights at start of training
-    print("\n" + "="*60)
+    print("="*60)
     print("LOSS WEIGHTS")
     print("="*60)
     print(f"MSE weight:        1.0 (fixed)")
@@ -341,8 +404,6 @@ if __name__ == "__main__":
         total_ssim = 0.0
         total_lap = 0.0
         total_hist = 0.0
-        total_hist_ce = 0.0
-        total_hist_w2 = 0.0
         total_pixels = 0
         
         for batch_data in all_batches_data:
@@ -395,12 +456,10 @@ if __name__ == "__main__":
                 delta_pred_2d = delta_pred  # [B, H, W]
                 mask_2d = mask  # [B, H, W]
                 
-                hist_total, hist_ce, hist_w2, _, _ = best_model.histogram_loss_fn(
+                hist_loss, _, _ = best_model.histogram_loss_fn(
                     delta_true_2d, delta_pred_2d, mask=mask_2d
                 )
-                total_hist += hist_total.item() * mask.sum().item()
-                total_hist_ce += hist_ce.item() * mask.sum().item()
-                total_hist_w2 += hist_w2.item() * mask.sum().item()
+                total_hist += hist_loss.item() * mask.sum().item()
             
             total_pixels += mask.sum().item()
         
@@ -411,8 +470,6 @@ if __name__ == "__main__":
             avg_ssim = total_ssim / total_pixels
             avg_lap = total_lap / total_pixels
             avg_hist = total_hist / total_pixels if best_model.histogram_weight > 0 else 0.0
-            avg_hist_ce = total_hist_ce / total_pixels if best_model.histogram_weight > 0 else 0.0
-            avg_hist_w2 = total_hist_w2 / total_pixels if best_model.histogram_weight > 0 else 0.0
             
             # Compute total loss
             avg_total_loss = (avg_mse + 
@@ -431,9 +488,7 @@ if __name__ == "__main__":
             print(f"  SSIM loss:          {avg_ssim:.6f}")
             print(f"  Laplacian loss:     {avg_lap:.6f}")
             if best_model.histogram_weight > 0:
-                print(f"  Histogram loss:     {avg_hist:.6f}")
-                print(f"    - CE component:   {avg_hist_ce:.6f}")
-                print(f"    - W2 component:   {avg_hist_w2:.6f}")
+                print(f"  Histogram loss (W2):{avg_hist:.6f}")
             print(f"\nWeighted Total Loss: {avg_total_loss:.6f}")
             print("="*60 + "\n")
             
@@ -448,8 +503,6 @@ if __name__ == "__main__":
             if best_model.histogram_weight > 0:
                 experiment.log({
                     "val_full/histogram_loss": avg_hist,
-                    "val_full/histogram_ce": avg_hist_ce,
-                    "val_full/histogram_w2": avg_hist_w2,
                 })
         else:
             print("WARNING: No valid pixels found for metric calculation")
