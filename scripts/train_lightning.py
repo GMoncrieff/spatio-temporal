@@ -4,8 +4,10 @@ sys.path.append(str(Path(__file__).parent.parent))
 import os
 import argparse
 import json
+import random
 
 import numpy as np
+import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import WandbLogger
@@ -113,7 +115,24 @@ if __name__ == "__main__":
         default=20,
         help="Number of epochs before histogram loss is applied (default: 20)",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducibility (default: 42)",
+    )
     args = parser.parse_args()
+    
+    # Set seeds for reproducibility
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    # Make PyTorch deterministic (may reduce performance)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    pl.seed_everything(args.seed, workers=True)
     
     # Split mask file
     split_mask_file = "data/raw/hm_global/split_mask_1000.tif"
@@ -195,6 +214,7 @@ if __name__ == "__main__":
         log_every_n_steps=10,
         fast_dev_run=args.fast_dev_run,
         accumulate_grad_batches=args.accumulate_grad_batches,
+        deterministic=True,  # Ensure reproducibility
     )
 
     # Train
@@ -285,6 +305,134 @@ if __name__ == "__main__":
             sys.exit(0)
         
         print(f"✓ Processed {num_batches_processed} validation batches")
+        
+        # ===== Calculate validation metrics over full validation set =====
+        print("\nCalculating validation metrics over full validation set...")
+        from src.models.losses import LaplacianPyramidLoss
+        from torchmetrics.functional import structural_similarity_index_measure as ssim
+        import torch.nn.functional as F
+        
+        # Initialize loss functions
+        lap_loss_fn = LaplacianPyramidLoss(levels=3, kernel_size=5, sigma=1.0, include_lowpass=True)
+        
+        # Accumulators for metrics
+        total_mse = 0.0
+        total_mae = 0.0
+        total_ssim = 0.0
+        total_lap = 0.0
+        total_hist = 0.0
+        total_hist_ce = 0.0
+        total_hist_w2 = 0.0
+        total_pixels = 0
+        
+        for batch_data in all_batches_data:
+            input_dynamic = batch_data['input_dynamic'].to(device)
+            target = batch_data['target'].to(device)
+            preds = batch_data['preds'].to(device)
+            input_mask = batch_data['input_mask'].to(device)
+            
+            # Get last input for delta calculation
+            last_input = input_dynamic[:, -1, 0]  # [B, H, W]
+            
+            # Compute mask for valid pixels
+            mask = input_mask.squeeze(1) & torch.isfinite(last_input)
+            
+            if mask.sum() == 0:
+                continue
+            
+            # Delta predictions and targets
+            delta_pred = preds - last_input
+            delta_true = target - last_input
+            
+            valid_delta_pred = delta_pred[mask]
+            valid_delta_true = delta_true[mask]
+            
+            # MSE on deltas
+            mse = F.mse_loss(valid_delta_pred, valid_delta_true, reduction='sum')
+            total_mse += mse.item()
+            
+            # MAE on absolute predictions
+            mae = F.l1_loss(preds[mask], target[mask], reduction='sum')
+            total_mae += mae.item()
+            
+            # SSIM (requires [B, C, H, W])
+            preds_sanitized = preds.unsqueeze(1).clone()
+            target_sanitized = target.unsqueeze(1).clone()
+            mask_4d = mask.unsqueeze(1)
+            preds_sanitized[~mask_4d] = 0.0
+            target_sanitized[~mask_4d] = 0.0
+            ssim_val = ssim(preds_sanitized, target_sanitized, data_range=1.0)
+            ssim_loss = 1.0 - ssim_val
+            total_ssim += ssim_loss.item() * mask.sum().item()
+            
+            # Laplacian loss
+            lap_loss = lap_loss_fn(preds_sanitized, target_sanitized, mask=mask_4d)
+            total_lap += lap_loss.item() * mask.sum().item()
+            
+            # Histogram loss (if enabled)
+            if best_model.histogram_weight > 0 and hasattr(best_model, 'histogram_loss_fn'):
+                delta_true_2d = delta_true  # [B, H, W]
+                delta_pred_2d = delta_pred  # [B, H, W]
+                mask_2d = mask  # [B, H, W]
+                
+                hist_total, hist_ce, hist_w2, _, _ = best_model.histogram_loss_fn(
+                    delta_true_2d, delta_pred_2d, mask=mask_2d
+                )
+                total_hist += hist_total.item() * mask.sum().item()
+                total_hist_ce += hist_ce.item() * mask.sum().item()
+                total_hist_w2 += hist_w2.item() * mask.sum().item()
+            
+            total_pixels += mask.sum().item()
+        
+        # Compute average metrics
+        if total_pixels > 0:
+            avg_mse = total_mse / total_pixels
+            avg_mae = total_mae / total_pixels
+            avg_ssim = total_ssim / total_pixels
+            avg_lap = total_lap / total_pixels
+            avg_hist = total_hist / total_pixels if best_model.histogram_weight > 0 else 0.0
+            avg_hist_ce = total_hist_ce / total_pixels if best_model.histogram_weight > 0 else 0.0
+            avg_hist_w2 = total_hist_w2 / total_pixels if best_model.histogram_weight > 0 else 0.0
+            
+            # Compute total loss
+            avg_total_loss = (avg_mse + 
+                            best_model.ssim_weight * avg_ssim + 
+                            best_model.laplacian_weight * avg_lap)
+            if best_model.histogram_weight > 0:
+                avg_total_loss += best_model.histogram_weight * avg_hist
+            
+            print("\n" + "="*60)
+            print("FULL VALIDATION SET METRICS (Best Model)")
+            print("="*60)
+            print(f"Total valid pixels: {total_pixels:,}")
+            print(f"\nLoss Components:")
+            print(f"  MSE (delta):        {avg_mse:.6f}")
+            print(f"  MAE (absolute):     {avg_mae:.6f}")
+            print(f"  SSIM loss:          {avg_ssim:.6f}")
+            print(f"  Laplacian loss:     {avg_lap:.6f}")
+            if best_model.histogram_weight > 0:
+                print(f"  Histogram loss:     {avg_hist:.6f}")
+                print(f"    - CE component:   {avg_hist_ce:.6f}")
+                print(f"    - W2 component:   {avg_hist_w2:.6f}")
+            print(f"\nWeighted Total Loss: {avg_total_loss:.6f}")
+            print("="*60 + "\n")
+            
+            # Log to W&B
+            experiment.log({
+                "val_full/mse": avg_mse,
+                "val_full/mae": avg_mae,
+                "val_full/ssim_loss": avg_ssim,
+                "val_full/laplacian_loss": avg_lap,
+                "val_full/total_loss": avg_total_loss,
+            })
+            if best_model.histogram_weight > 0:
+                experiment.log({
+                    "val_full/histogram_loss": avg_hist,
+                    "val_full/histogram_ce": avg_hist_ce,
+                    "val_full/histogram_w2": avg_hist_w2,
+                })
+        else:
+            print("WARNING: No valid pixels found for metric calculation")
         
         # Retrieve means/stds for inverse transform
         ds = val_loader.dataset
