@@ -76,17 +76,19 @@ class HistogramLoss(nn.Module):
     2. Wasserstein-2 Distance: Metric on probability distributions
     """
     
-    def __init__(self, bin_edges, lambda_w2=0.1, smoothing=1e-3):
+    def __init__(self, bin_edges, lambda_w2=0.1, smoothing=1e-3, label_smoothing=0.05):
         """
         Args:
             bin_edges: Tensor [num_bins+1] with bin edge values
             lambda_w2: Weight for Wasserstein-2 term (default: 0.1)
             smoothing: Smoothing factor for class weights (default: 1e-3)
+            label_smoothing: Label smoothing factor to prevent extreme log probs (default: 0.05)
         """
         super().__init__()
         self.register_buffer('bin_edges', bin_edges)
         self.lambda_w2 = lambda_w2
         self.smoothing = smoothing
+        self.label_smoothing = label_smoothing
         self.num_bins = len(bin_edges) - 1
         
         # Compute bin midpoints for Wasserstein distance
@@ -161,6 +163,10 @@ class HistogramLoss(nn.Module):
         counts_obs, p_obs = compute_histogram(changes_obs, self.bin_edges, mask=mask)
         counts_pred, p_pred = compute_histogram(changes_pred, self.bin_edges, mask=mask)
         
+        # Apply label smoothing to predicted probabilities to prevent extreme log values
+        if self.label_smoothing > 0:
+            p_pred = (1 - self.label_smoothing) * p_pred + self.label_smoothing / self.num_bins
+        
         # Compute class weights from observed distribution
         class_weights = self.compute_class_weights(p_obs)  # [num_bins]
         
@@ -174,7 +180,7 @@ class HistogramLoss(nn.Module):
         # Wasserstein-2 loss
         w2_loss = self.wasserstein2_loss(p_obs, p_pred)
         
-        # Combined loss
-        total_loss = ce_loss + self.lambda_w2 * w2_loss
+        # Combined loss (normalized by num_bins for scale compatibility with other losses)
+        total_loss = (ce_loss + self.lambda_w2 * w2_loss) / self.num_bins
         
         return total_loss, ce_loss, w2_loss, p_obs, p_pred

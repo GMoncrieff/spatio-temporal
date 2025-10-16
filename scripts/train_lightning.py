@@ -178,7 +178,7 @@ if __name__ == "__main__":
             model.hm_std = ds.hm_std
 
     # Callbacks
-    checkpoint_cb = ModelCheckpoint(monitor='val_loss', save_top_k=1, mode='min')
+    checkpoint_cb = ModelCheckpoint(monitor='val_total_loss', save_top_k=1, mode='min')
     # No early stopping
 
     # Wandb logger (optional)
