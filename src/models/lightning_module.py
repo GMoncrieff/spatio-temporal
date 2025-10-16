@@ -252,9 +252,17 @@ class SpatioTemporalLightningModule(pl.LightningModule):
                 self.log('val_hist_w2', hist_w2, on_step=False, on_epoch=True)
                 self.log('val_hist_loss_weighted', self.histogram_weight * hist_loss, on_step=False, on_epoch=True)  # Log weighted contribution
             
-            # Print validation metrics with 5 decimals
-            hist_str = f", Hist: {hist_loss.item():.5f}" if hist_active else f" [hist off: epoch={self.current_epoch}, warmup={self.histogram_warmup_epochs}]"
-            print(f"[VAL] MSE: {loss.item():.5f}, MAE: {mae.item():.5f}, SSIM: {ssim_val.item():.5f}, Lap: {lap_loss.item():.5f}{hist_str}")
+            # Print validation metrics with 5 decimals (raw and weighted)
+            ssim_weighted = self.ssim_weight * ssim_loss.item()
+            lap_weighted = self.laplacian_weight * lap_loss.item()
+            hist_str = ""
+            if hist_active:
+                hist_weighted = self.histogram_weight * hist_loss.item()
+                hist_str = f", Hist: {hist_loss.item():.5f} (w:{hist_weighted:.5f})"
+            else:
+                hist_str = f" [hist off: epoch={self.current_epoch}, warmup={self.histogram_warmup_epochs}]"
+            
+            print(f"[VAL] MSE: {loss.item():.5f} (w:{loss.item():.5f}), MAE: {mae.item():.5f}, SSIM: {ssim_val.item():.5f} (w:{ssim_weighted:.5f}), Lap: {lap_loss.item():.5f} (w:{lap_weighted:.5f}){hist_str}")
         
         total_loss = loss + self.ssim_weight * ssim_loss + self.laplacian_weight * lap_loss
         if self.histogram_weight > 0 and self.current_epoch >= self.histogram_warmup_epochs:
