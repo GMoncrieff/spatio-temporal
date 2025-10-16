@@ -94,6 +94,19 @@ if __name__ == "__main__":
         default=1,
         help="Number of batches to accumulate gradients over (default: 1, no accumulation)",
     )
+    # Histogram loss arguments
+    parser.add_argument(
+        "--histogram_weight",
+        type=float,
+        default=0.0,
+        help="Weight for histogram loss on pixel-level change distributions (default: 0.0, disabled)",
+    )
+    parser.add_argument(
+        "--histogram_lambda_w2",
+        type=float,
+        default=0.1,
+        help="Weight for Wasserstein-2 term within histogram loss (default: 0.1)",
+    )
     args = parser.parse_args()
     
     # Split mask file
@@ -147,6 +160,8 @@ if __name__ == "__main__":
         num_layers=args.num_layers,
         kernel_size=args.kernel_size,
         use_location_encoder=args.use_location_encoder,
+        histogram_weight=args.histogram_weight,
+        histogram_lambda_w2=args.histogram_lambda_w2,
     )
     # Set normalization stats for physical-scale MAE logging
     if hasattr(train_loader, 'dataset'):
@@ -305,8 +320,7 @@ if __name__ == "__main__":
             axes[0, 3].set_title('Elevation (meters)')
             axes[0, 3].axis('off')
             plt.colorbar(im, ax=axes[0, 3], fraction=0.046, pad=0.04)
-            # Hide unused subplot in first row
-            axes[0, 4].axis('off')
+            
             # Target, unnormalize and label with year
             target_orig = target[b].cpu().numpy() * hm_std + hm_mean
             target_year = fixed_target_year if fixed_target_year is not None else 'Target'
@@ -321,13 +335,48 @@ if __name__ == "__main__":
             static_valid = np.isfinite(input_static_raw).all(axis=0)  # [H, W]
             valid_pred_mask = target_valid & dynamic_valid & static_valid
             
+            # Compute deltas for histogram (before plotting other panels)
+            most_recent_in = (input_dynamic[b, -1, 0].cpu().numpy() * hm_std + hm_mean)
+            delta = target_orig - most_recent_in
+            pred_orig = preds[b].cpu().numpy() * hm_std + hm_mean
+            pred_delta = pred_orig - most_recent_in
+            
+            # Histogram comparison in upper right (axes[0, 4])
+            # Define bins
+            histogram_bins = np.array([-1.0, -0.05, -0.005, 0.005, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0])
+            num_bins = len(histogram_bins) - 1
+            
+            # Compute histograms for valid pixels only
+            delta_valid = delta[valid_pred_mask]
+            pred_delta_valid = pred_delta[valid_pred_mask]
+            
+            if len(delta_valid) > 0:
+                # Compute observed histogram
+                counts_obs, _ = np.histogram(delta_valid, bins=histogram_bins)
+                counts_pred, _ = np.histogram(pred_delta_valid, bins=histogram_bins)
+                
+                # Plot as bar chart (log scale)
+                x = np.arange(num_bins)
+                width = 0.35
+                axes[0, 4].bar(x - width/2, counts_obs, width, label='Observed', alpha=0.7, color='blue', edgecolor='black')
+                axes[0, 4].bar(x + width/2, counts_pred, width, label='Predicted', alpha=0.7, color='red', edgecolor='black')
+                axes[0, 4].set_yscale('log')
+                axes[0, 4].set_ylim([0.5, max(counts_obs.max(), counts_pred.max()) * 2])
+                axes[0, 4].set_xlabel('Bin')
+                axes[0, 4].set_ylabel('Pixel Count (log)')
+                axes[0, 4].set_title('Change Distribution')
+                axes[0, 4].legend(fontsize=8)
+                axes[0, 4].grid(alpha=0.3, which='both')
+            else:
+                axes[0, 4].text(0.5, 0.5, 'No valid pixels', ha='center', va='center', transform=axes[0, 4].transAxes)
+                axes[0, 4].axis('off')
+            
             target_plot = np.where(valid_pred_mask, target_orig, np.nan)
             im0 = axes[1, 0].imshow(target_plot, cmap='turbo', vmin=hm_vmin, vmax=hm_vmax)
             axes[1, 0].set_title(f'Target HM {target_year}')
             axes[1, 0].axis('off')
             plt.colorbar(im0, ax=axes[1, 0], fraction=0.046, pad=0.04)
-            # Prediction, unnormalize and label
-            pred_orig = preds[b].cpu().numpy() * hm_std + hm_mean
+            # Prediction, unnormalize and label (already computed above)
             pred_plot = np.where(valid_pred_mask, pred_orig, np.nan)
             im1 = axes[1, 1].imshow(pred_plot, cmap='turbo', vmin=hm_vmin, vmax=hm_vmax)
             axes[1, 1].set_title(f'Predicted HM {target_year}')
@@ -340,17 +389,14 @@ if __name__ == "__main__":
             axes[1, 2].set_title('Absolute Error (0-1)')
             axes[1, 2].axis('off')
             plt.colorbar(im2, ax=axes[1, 2], fraction=0.046, pad=0.04)
-            # Delta image (observed): target - most recent input HM
-            most_recent_in = (input_dynamic[b, -1, 0].cpu().numpy() * hm_std + hm_mean)
-            delta = target_orig - most_recent_in
+            # Delta image (observed): already computed above
             delta_plot = np.where(valid_pred_mask, delta, np.nan)
             vmax_delta = np.nanmax(np.abs(delta_plot)) if np.any(np.isfinite(delta_plot)) else 1.0
             im3 = axes[1, 3].imshow(delta_plot, cmap='bwr', vmin=-vmax_delta, vmax=vmax_delta)
             axes[1, 3].set_title(f'Delta HM {target_year}-{input_years[-1]}')
             axes[1, 3].axis('off')
             plt.colorbar(im3, ax=axes[1, 3], fraction=0.046, pad=0.04)
-            # Delta image (predicted): prediction - most recent input HM, using the same color scaling as observed delta
-            pred_delta = pred_orig - most_recent_in
+            # Delta image (predicted): already computed above
             pred_delta_plot = np.where(valid_pred_mask, pred_delta, np.nan)
             im4 = axes[1, 4].imshow(pred_delta_plot, cmap='bwr', vmin=-vmax_delta, vmax=vmax_delta)
             axes[1, 4].set_title(f'Pred Delta HM {target_year}-{input_years[-1]}')

@@ -5,6 +5,7 @@ import pytorch_lightning as pl
 from torchmetrics.functional import structural_similarity_index_measure as ssim
 from .spatiotemporal_predictor import SpatioTemporalPredictor
 from .losses import LaplacianPyramidLoss
+from .histogram_loss import HistogramLoss
 import wandb
 import numpy as np
 from matplotlib import cm
@@ -26,6 +27,8 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         locenc_backbone=("sphericalharmonics", "siren"),
         locenc_hparams=None,
         locenc_out_channels: int = 8,
+        histogram_weight: float = 0.0,
+        histogram_lambda_w2: float = 0.1,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -50,6 +53,13 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         # Normalization stats to be set externally
         self.hm_mean = None
         self.hm_std = None
+        # Histogram loss for pixel-level change distributions
+        self.histogram_weight = histogram_weight
+        if self.histogram_weight > 0:
+            # Define histogram bins: [-1, -0.05, -ε, +ε, 0.02, 0.05, 0.1, 0.2, 0.5, 1]
+            histogram_bins = torch.tensor([-1.0, -0.05, -0.005, 0.005, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0])
+            self.histogram_loss_fn = HistogramLoss(histogram_bins, lambda_w2=histogram_lambda_w2)
+            self.register_buffer('histogram_bins', histogram_bins)
 
     # Removed AR-specific helpers and panels for single-step setup
 
@@ -99,6 +109,7 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             mae = torch.tensor(0.0, device=preds.device)
             ssim_loss = torch.tensor(0.0, device=preds.device)
             lap_loss = torch.tensor(0.0, device=preds.device)
+            hist_loss = torch.tensor(0.0, device=preds.device)
         else:
             loss = self.loss_fn(valid_delta_pred, valid_delta_true)
             mae = self.mae_fn(preds[mask], target[mask])
@@ -111,10 +122,30 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             ssim_loss = 1.0 - ssim_val
             # Laplacian Pyramid multi-scale L1 on absolute images with masking
             lap_loss = self.lap_loss(preds_sanitized, target_sanitized, mask=mask)
+            
+            # Histogram loss on pixel-level change distributions
+            hist_loss = torch.tensor(0.0, device=preds.device)
+            if self.histogram_weight > 0:
+                # Squeeze deltas to [B, H, W]
+                delta_true_2d = delta_true.squeeze(1)
+                delta_pred_2d = delta_pred.squeeze(1)
+                mask_2d = mask.squeeze(1)
+                
+                hist_total, hist_ce, hist_w2, p_obs, p_pred = self.histogram_loss_fn(
+                    delta_true_2d, delta_pred_2d, mask=mask_2d
+                )
+                hist_loss = hist_total
+                self.log('train_hist_ce', hist_ce)
+                self.log('train_hist_w2', hist_w2)
+        
         total_loss = loss + self.ssim_weight * ssim_loss + self.laplacian_weight * lap_loss
+        if self.histogram_weight > 0:
+            total_loss = total_loss + self.histogram_weight * hist_loss
+        
         self.log('train_loss', loss)
         self.log('train_ssim_loss', ssim_loss)
         self.log('train_lap_loss', lap_loss)
+        self.log('train_hist_loss', hist_loss)
         self.log('train_total_loss', total_loss)
         return total_loss
 
