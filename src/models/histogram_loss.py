@@ -145,7 +145,4 @@ class HistogramLoss(nn.Module):
         # Rarity-weighted Wasserstein-2 loss
         w2_loss = self.wasserstein2_loss_weighted(p_obs, p_pred)
         
-        # Normalize by num_bins for scale compatibility
-        w2_loss = w2_loss / self.num_bins
-        
         return w2_loss, p_obs, p_pred
