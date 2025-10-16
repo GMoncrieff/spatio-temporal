@@ -100,8 +100,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--histogram_weight",
         type=float,
-        default=0.0,
-        help="Weight for histogram loss on pixel-level change distributions (default: 0.0, disabled)",
+        default=0.1,
+        help="Weight for histogram loss on pixel-level change distributions (default: 0.1)",
     )
     parser.add_argument(
         "--histogram_lambda_w2",
