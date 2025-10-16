@@ -231,7 +231,8 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             
             # Histogram loss on pixel-level change distributions
             hist_loss = torch.tensor(0.0, device=preds.device)
-            if self.histogram_weight > 0 and self.current_epoch >= self.histogram_warmup_epochs:
+            hist_active = self.histogram_weight > 0 and self.current_epoch >= self.histogram_warmup_epochs
+            if hist_active:
                 # Squeeze deltas to [B, H, W]
                 delta_true_2d = delta_true.squeeze(1)
                 delta_pred_2d = delta_pred.squeeze(1)
@@ -247,7 +248,7 @@ class SpatioTemporalLightningModule(pl.LightningModule):
                 self.log('val_hist_loss_weighted', self.histogram_weight * hist_loss, on_step=False, on_epoch=True)  # Log weighted contribution
             
             # Print validation metrics with 5 decimals
-            hist_str = f", Hist: {hist_loss.item():.5f}" if self.histogram_weight > 0 and self.current_epoch >= self.histogram_warmup_epochs else ""
+            hist_str = f", Hist: {hist_loss.item():.5f}" if hist_active else f" [hist off: epoch={self.current_epoch}, warmup={self.histogram_warmup_epochs}]"
             print(f"[VAL] MSE: {loss.item():.5f}, MAE: {mae.item():.5f}, SSIM: {ssim_val.item():.5f}, Lap: {lap_loss.item():.5f}{hist_str}")
         
         total_loss = loss + self.ssim_weight * ssim_loss + self.laplacian_weight * lap_loss
