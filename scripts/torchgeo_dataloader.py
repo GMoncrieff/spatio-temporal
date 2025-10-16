@@ -118,24 +118,72 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
         hm_stack_samp = np.stack(hm_samples, axis=0)
         self.hm_mean = np.nanmean(hm_stack_samp)
         self.hm_std = np.nanstd(hm_stack_samp) + 1e-8
-        # Static stats (sample from each static layer)
-        static_samples = []
-        total_static_samps = max(32, int(stat_samples))
-        for f in self._static_files:
-            with rasterio.open(f) as src:
-                Hs, Ws = src.height, src.width
-                per_static = max(1, int(np.ceil(total_static_samps / max(1, len(self._static_files)))))
-                for _ in range(per_static):
-                    if Hs < self.chip_size or Ws < self.chip_size:
-                        i = 0; j = 0
-                    else:
-                        i = int(rng.integers(0, Hs - self.chip_size + 1))
-                        j = int(rng.integers(0, Ws - self.chip_size + 1))
-                    window = rasterio.windows.Window(j, i, self.chip_size, self.chip_size)
-                    static_samples.append(src.read(1, window=window, masked=True).filled(np.nan))
-        static_stack_samp = np.stack(static_samples, axis=0) if static_samples else np.zeros((1,1,1))
-        self.elev_mean = np.nanmean(static_stack_samp)
-        self.elev_std = np.nanstd(static_stack_samp) + 1e-8
+        # Static stats (per variable) - different variables have different scales
+        self.static_means = []
+        self.static_stds = []
+        if len(self._static_files) > 0:
+            print("Computing per-variable normalization statistics for static layers...")
+            total_static_samps = max(32, int(stat_samples))
+            for static_idx, f in enumerate(self._static_files):
+                static_samples = []
+                with rasterio.open(f) as src:
+                    Hs, Ws = src.height, src.width
+                    per_static = max(1, int(np.ceil(total_static_samps / max(1, len(self._static_files)))))
+                    for _ in range(per_static):
+                        if Hs < self.chip_size or Ws < self.chip_size:
+                            i = 0; j = 0
+                        else:
+                            i = int(rng.integers(0, Hs - self.chip_size + 1))
+                            j = int(rng.integers(0, Ws - self.chip_size + 1))
+                        window = rasterio.windows.Window(j, i, self.chip_size, self.chip_size)
+                        static_samples.append(src.read(1, window=window, masked=True).filled(np.nan))
+                if len(static_samples) > 0:
+                    static_stack = np.stack(static_samples, axis=0)
+                    self.static_means.append(np.nanmean(static_stack))
+                    self.static_stds.append(np.nanstd(static_stack) + 1e-8)
+                else:
+                    self.static_means.append(0.0)
+                    self.static_stds.append(1.0)
+            print("Static normalization stats:")
+            for idx, f in enumerate(self._static_files):
+                var_name = f.split('/')[-1].replace('hm_static_', '').replace('_1000.tiff', '')
+                print(f"  {var_name}: mean={self.static_means[idx]:.6e}, std={self.static_stds[idx]:.6e}")
+        # Keep elev_mean/std for backward compatibility (use first static variable)
+        self.elev_mean = self.static_means[0] if self.static_means else 0.0
+        self.elev_std = self.static_stds[0] if self.static_stds else 1.0
+        
+        # Component stats (per variable) - critical for GDP/population which have different scales
+        self.comp_means = {}
+        self.comp_stds = {}
+        if self.include_components:
+            print("Computing per-variable normalization statistics for components...")
+            for var_idx, var_name in enumerate(HM_VARS):
+                var_samples = []
+                for year in years:
+                    comp_file = self._comp_files[year][var_idx]
+                    with rasterio.open(comp_file) as src:
+                        Hs, Ws = src.height, src.width
+                        per_var = max(1, int(np.ceil(stat_samples / len(years))))
+                        for _ in range(per_var):
+                            if Hs < self.chip_size or Ws < self.chip_size:
+                                i = 0; j = 0
+                            else:
+                                i = int(rng.integers(0, Hs - self.chip_size + 1))
+                                j = int(rng.integers(0, Ws - self.chip_size + 1))
+                            window = rasterio.windows.Window(j, i, self.chip_size, self.chip_size)
+                            arr = src.read(1, window=window, masked=True).filled(np.nan)
+                            var_samples.append(arr)
+                if len(var_samples) > 0:
+                    var_stack = np.stack(var_samples, axis=0)
+                    self.comp_means[var_name] = np.nanmean(var_stack)
+                    self.comp_stds[var_name] = np.nanstd(var_stack) + 1e-8
+                else:
+                    self.comp_means[var_name] = 0.0
+                    self.comp_stds[var_name] = 1.0
+            print("Component normalization stats:")
+            for var_name in HM_VARS:
+                print(f"  {var_name}: mean={self.comp_means[var_name]:.6e}, std={self.comp_stds[var_name]:.6e}")
+        
         # Map fixed years to indices in the stacked timeline
         year_to_idx = {y: i for i, y in enumerate(years)}
         # Expose available years for downstream labeling
@@ -233,18 +281,20 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
                 channels.append(arr_hm)
                 # HM covariates for the same year
                 if self.include_components and self._comp_srcs.get(year, []):
-                    for src in self._comp_srcs[year]:
+                    for var_idx, src in enumerate(self._comp_srcs[year]):
                         carr = src.read(1, window=rasterio.windows.Window(j, i, self.chip_size, self.chip_size), masked=True).filled(np.nan)
-                        # Data is already in [0, 1] range
-                        carr = (carr - self.hm_mean) / self.hm_std
+                        # Use per-variable normalization (critical for GDP/population)
+                        var_name = HM_VARS[var_idx]
+                        carr = (carr - self.comp_means[var_name]) / self.comp_stds[var_name]
                         channels.append(carr)
                 dyn_list.append(np.stack(channels, axis=0))  # [C_dyn, H, W]
             input_dynamic = np.stack(dyn_list, axis=0)  # [T, C_dyn, H, W]
             # Static layers
             static_list = []
-            for src in self._static_srcs:
+            for static_idx, src in enumerate(self._static_srcs):
                 sarr = src.read(1, window=rasterio.windows.Window(j, i, self.chip_size, self.chip_size), masked=True).filled(np.nan)
-                sarr = (sarr - self.elev_mean) / self.elev_std
+                # Use per-variable normalization
+                sarr = (sarr - self.static_means[static_idx]) / self.static_stds[static_idx]
                 static_list.append(sarr)
             input_static = np.stack(static_list, axis=0) if static_list else np.zeros((0, self.chip_size, self.chip_size), dtype=np.float32)
             # Build lon/lat grid [H, W, 2] from target raster transform, reproject to EPSG:4326 if needed
