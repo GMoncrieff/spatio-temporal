@@ -96,12 +96,24 @@ if __name__ == "__main__":
         default=1,
         help="Number of batches to accumulate gradients over (default: 1, no accumulation)",
     )
-    # Histogram loss arguments
+    # Loss weight arguments
+    parser.add_argument(
+        "--ssim_weight",
+        type=float,
+        default=2.0,
+        help="Weight for SSIM loss (default: 2.0)",
+    )
+    parser.add_argument(
+        "--laplacian_weight",
+        type=float,
+        default=1.0,
+        help="Weight for Laplacian pyramid loss (default: 1.0)",
+    )
     parser.add_argument(
         "--histogram_weight",
         type=float,
-        default=0.1,
-        help="Weight for histogram loss on pixel-level change distributions (default: 0.1)",
+        default=0.67,
+        help="Weight for histogram loss on pixel-level change distributions (default: 0.67)",
     )
     parser.add_argument(
         "--histogram_lambda_w2",
@@ -182,10 +194,22 @@ if __name__ == "__main__":
         num_layers=args.num_layers,
         kernel_size=args.kernel_size,
         use_location_encoder=args.use_location_encoder,
+        ssim_weight=args.ssim_weight,
+        laplacian_weight=args.laplacian_weight,
         histogram_weight=args.histogram_weight,
         histogram_lambda_w2=args.histogram_lambda_w2,
         histogram_warmup_epochs=args.histogram_warmup_epochs,
     )
+    
+    # Print loss weights at start of training
+    print("\n" + "="*60)
+    print("LOSS WEIGHTS")
+    print("="*60)
+    print(f"MSE weight:        1.0 (fixed)")
+    print(f"SSIM weight:       {args.ssim_weight}")
+    print(f"Laplacian weight:  {args.laplacian_weight}")
+    print(f"Histogram weight:  {args.histogram_weight} (warmup: {args.histogram_warmup_epochs} epochs)")
+    print("="*60 + "\n")
     # Set normalization stats for physical-scale MAE logging
     if hasattr(train_loader, 'dataset'):
         ds = train_loader.dataset
