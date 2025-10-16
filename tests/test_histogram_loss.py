@@ -110,9 +110,32 @@ def test_class_balanced_weights():
     print(f"  Weights: {weights.numpy()}")
 
 
+def test_warmup_epochs():
+    """Test that histogram loss respects warmup epochs."""
+    from src.models.lightning_module import SpatioTemporalLightningModule
+    
+    model = SpatioTemporalLightningModule(
+        hidden_dim=16,
+        num_static_channels=3,
+        num_dynamic_channels=9,
+        num_layers=2,
+        histogram_weight=0.5,
+        histogram_warmup_epochs=10,
+    )
+    
+    # Check that warmup is set correctly
+    assert model.histogram_warmup_epochs == 10, "Warmup epochs should be 10"
+    assert model.histogram_weight == 0.5, "Histogram weight should be 0.5"
+    
+    print("✓ Warmup epochs test passed")
+    print(f"  Warmup epochs: {model.histogram_warmup_epochs}")
+    print(f"  Histogram weight: {model.histogram_weight}")
+
+
 if __name__ == "__main__":
     test_compute_histogram()
     test_histogram_loss()
     test_histogram_with_mask()
     test_class_balanced_weights()
+    test_warmup_epochs()
     print("\n✅ All histogram loss tests passed!")

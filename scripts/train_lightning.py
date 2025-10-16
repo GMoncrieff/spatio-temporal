@@ -107,6 +107,12 @@ if __name__ == "__main__":
         default=0.1,
         help="Weight for Wasserstein-2 term within histogram loss (default: 0.1)",
     )
+    parser.add_argument(
+        "--histogram_warmup_epochs",
+        type=int,
+        default=20,
+        help="Number of epochs before histogram loss is applied (default: 20)",
+    )
     args = parser.parse_args()
     
     # Split mask file
@@ -162,6 +168,7 @@ if __name__ == "__main__":
         use_location_encoder=args.use_location_encoder,
         histogram_weight=args.histogram_weight,
         histogram_lambda_w2=args.histogram_lambda_w2,
+        histogram_warmup_epochs=args.histogram_warmup_epochs,
     )
     # Set normalization stats for physical-scale MAE logging
     if hasattr(train_loader, 'dataset'):

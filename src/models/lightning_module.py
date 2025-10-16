@@ -29,6 +29,7 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         locenc_out_channels: int = 8,
         histogram_weight: float = 0.0,
         histogram_lambda_w2: float = 0.1,
+        histogram_warmup_epochs: int = 20,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -55,6 +56,7 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         self.hm_std = None
         # Histogram loss for pixel-level change distributions
         self.histogram_weight = histogram_weight
+        self.histogram_warmup_epochs = histogram_warmup_epochs
         if self.histogram_weight > 0:
             # Define histogram bins: [-1, -0.05, -ε, +ε, 0.02, 0.05, 0.1, 0.2, 0.5, 1]
             histogram_bins = torch.tensor([-1.0, -0.05, -0.005, 0.005, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0])
@@ -125,7 +127,7 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             
             # Histogram loss on pixel-level change distributions
             hist_loss = torch.tensor(0.0, device=preds.device)
-            if self.histogram_weight > 0:
+            if self.histogram_weight > 0 and self.current_epoch >= self.histogram_warmup_epochs:
                 # Squeeze deltas to [B, H, W]
                 delta_true_2d = delta_true.squeeze(1)
                 delta_pred_2d = delta_pred.squeeze(1)
@@ -139,7 +141,7 @@ class SpatioTemporalLightningModule(pl.LightningModule):
                 self.log('train_hist_w2', hist_w2)
         
         total_loss = loss + self.ssim_weight * ssim_loss + self.laplacian_weight * lap_loss
-        if self.histogram_weight > 0:
+        if self.histogram_weight > 0 and self.current_epoch >= self.histogram_warmup_epochs:
             total_loss = total_loss + self.histogram_weight * hist_loss
         
         self.log('train_loss', loss)
@@ -198,6 +200,7 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             mae = torch.tensor(0.0, device=preds.device)
             ssim_loss = torch.tensor(0.0, device=preds.device)
             lap_loss = torch.tensor(0.0, device=preds.device)
+            hist_loss = torch.tensor(0.0, device=preds.device)
         else:
             loss = self.loss_fn(valid_delta_pred, valid_delta_true)
             mae = F.l1_loss(preds[mask], target[mask])
@@ -217,11 +220,32 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             ssim_loss = 1.0 - ssim_val
             # Laplacian Pyramid multi-scale L1
             lap_loss = self.lap_loss(preds_sanitized, target_sanitized, mask=mask)
+            
+            # Histogram loss on pixel-level change distributions
+            hist_loss = torch.tensor(0.0, device=preds.device)
+            if self.histogram_weight > 0 and self.current_epoch >= self.histogram_warmup_epochs:
+                # Squeeze deltas to [B, H, W]
+                delta_true_2d = delta_true.squeeze(1)
+                delta_pred_2d = delta_pred.squeeze(1)
+                mask_2d = mask.squeeze(1)
+                
+                hist_total, hist_ce, hist_w2, p_obs, p_pred = self.histogram_loss_fn(
+                    delta_true_2d, delta_pred_2d, mask=mask_2d
+                )
+                hist_loss = hist_total
+                self.log('val_hist_ce', hist_ce, on_step=False, on_epoch=True)
+                self.log('val_hist_w2', hist_w2, on_step=False, on_epoch=True)
+            
             print(f"[VAL] Loss: {loss.item():.6f}, MAE: {mae.item():.6f}, SSIM: {ssim_val.item():.6f}")
+        
         total_loss = loss + self.ssim_weight * ssim_loss + self.laplacian_weight * lap_loss
+        if self.histogram_weight > 0 and self.current_epoch >= self.histogram_warmup_epochs:
+            total_loss = total_loss + self.histogram_weight * hist_loss
+        
         self.log('val_loss', loss)
         self.log('val_ssim_loss', ssim_loss)
         self.log('val_lap_loss', lap_loss)
+        self.log('val_hist_loss', hist_loss, on_step=False, on_epoch=True)
         self.log('val_total_loss', total_loss)
         return total_loss
 
