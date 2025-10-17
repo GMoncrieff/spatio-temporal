@@ -727,120 +727,146 @@ if __name__ == "__main__":
 
         experiment.log({"Predictions_vs_Targets": images})
         
-        # ---- Accumulate diffs from ALL batches for hexbin and histogram ----
-        print("\nAccumulating changes from all validation batches...")
-        diffs_obs = []
-        diffs_mod = []
+        # ---- Accumulate diffs from ALL batches for hexbin and histogram (per horizon) ----
+        print("\nAccumulating changes from all validation batches (per horizon)...")
+        horizon_names = ['5yr', '10yr', '15yr', '20yr']
+        horizon_years = [2005, 2010, 2015, 2020]
+        
+        # Per-horizon accumulators
+        diffs_obs_horizons = {h: [] for h in horizon_names}
+        diffs_mod_horizons = {h: [] for h in horizon_names}
         
         for batch_data in all_batches_data:
             input_dynamic_batch = batch_data['input_dynamic']
-            # Use 20yr horizon for hexbin plots
-            target_batch = batch_data['target_20yr']
-            preds_batch = batch_data['preds_20yr']
             input_mask_batch = batch_data['input_mask']
             
             B_batch = input_dynamic_batch.shape[0]
             for b in range(B_batch):
-                # Denormalize
-                target_orig = target_batch[b].numpy() * hm_std + hm_mean
-                pred_orig = preds_batch[b].numpy() * hm_std + hm_mean
                 most_recent_in = (input_dynamic_batch[b, -1, 0].numpy() * hm_std + hm_mean)
                 
-                # Compute validity mask
-                target_valid = np.isfinite(target_orig)
+                # Compute validity mask (same for all horizons)
                 input_dynamic_raw = input_dynamic_batch[b].numpy()
                 dynamic_valid = np.isfinite(input_dynamic_raw).all(axis=(0, 1))
                 input_static_raw = batch_data['input_static'][b].numpy()
                 static_valid = np.isfinite(input_static_raw).all(axis=0)
-                valid_pred_mask = target_valid & dynamic_valid & static_valid
                 
-                # Calculate changes
-                delta = target_orig - most_recent_in
-                pred_delta = pred_orig - most_recent_in
-                
-                # Accumulate valid pixels only
-                diffs_obs.append(delta[valid_pred_mask])
-                diffs_mod.append(pred_delta[valid_pred_mask])
+                # Process each horizon
+                for h_name in horizon_names:
+                    target_batch = batch_data[f'target_{h_name}']
+                    preds_batch = batch_data[f'preds_{h_name}']
+                    
+                    # Denormalize
+                    target_orig = target_batch[b].numpy() * hm_std + hm_mean
+                    pred_orig = preds_batch[b].numpy() * hm_std + hm_mean
+                    
+                    # Compute validity mask for this horizon
+                    target_valid = np.isfinite(target_orig)
+                    valid_pred_mask = target_valid & dynamic_valid & static_valid
+                    
+                    # Calculate changes
+                    delta = target_orig - most_recent_in
+                    pred_delta = pred_orig - most_recent_in
+                    
+                    # Accumulate valid pixels only
+                    diffs_obs_horizons[h_name].append(delta[valid_pred_mask])
+                    diffs_mod_horizons[h_name].append(pred_delta[valid_pred_mask])
         
-        print(f"✓ Accumulated changes from {len(all_batches_data)} batches")
+        print(f"✓ Accumulated changes from {len(all_batches_data)} batches for all horizons")
 
-        # ---- Hexbin plot: Observed vs Predicted HM change ----
+        # ---- Hexbin plots: Observed vs Predicted HM change (per horizon) ----
         import matplotlib.colors as mcolors
         pmin, pmax = -0.01, 0.2
-        if len(diffs_obs) > 0:
-            diff_obs_all = np.concatenate(diffs_obs)
-            diff_mod_all = np.concatenate(diffs_mod)
-            # Filter to range
-            in_range = (
-                (diff_obs_all >= pmin) & (diff_obs_all <= pmax) &
-                (diff_mod_all >= pmin) & (diff_mod_all <= pmax)
-            )
-            diff_obs_small = diff_obs_all[in_range]
-            diff_mod_small = diff_mod_all[in_range]
+        
+        hexbin_images = []
+        for h_name, h_year in zip(horizon_names, horizon_years):
+            if len(diffs_obs_horizons[h_name]) > 0:
+                diff_obs_all = np.concatenate(diffs_obs_horizons[h_name])
+                diff_mod_all = np.concatenate(diffs_mod_horizons[h_name])
+                
+                # Filter to range
+                in_range = (
+                    (diff_obs_all >= pmin) & (diff_obs_all <= pmax) &
+                    (diff_mod_all >= pmin) & (diff_mod_all <= pmax)
+                )
+                diff_obs_small = diff_obs_all[in_range]
+                diff_mod_small = diff_mod_all[in_range]
 
-            fig2 = plt.figure(figsize=(6, 5))
-            hb = plt.hexbin(
-                diff_obs_small,
-                diff_mod_small,
-                gridsize=80,
-                cmap="cubehelix",
-                mincnt=1,
-                norm=mcolors.LogNorm(),
-            )
-            cbar = plt.colorbar(hb)
-            cbar.set_label("Count (log scale)")
-            # 1:1 line
-            plt.plot([pmin, pmax], [pmin, pmax], linestyle="--", color="grey", label="1:1 line")
-            # Axes, labels, legend
-            plt.axhline(0, color="black", lw=0.5)
-            plt.axvline(0, color="black", lw=0.5)
-            plt.xlim(pmin, pmax)
-            plt.ylim(pmin, pmax)
-            plt.xlabel("Observed difference")
-            plt.ylabel("Modelled difference")
-            plt.legend(frameon=False, loc="upper left")
-            plt.grid(True, linestyle="--", linewidth=0.3, alpha=0.4)
-            plt.tight_layout()
-            fig2.canvas.draw()
-            img_rgba2 = np.array(fig2.canvas.buffer_rgba())
-            img_rgb2 = img_rgba2[..., :3]
-            experiment.log({"Obs_vs_Pred_HM_Change": [wandb.Image(img_rgb2, caption="Obs vs Pred HM change (hexbin)")]})
-            plt.close(fig2)
+                fig2 = plt.figure(figsize=(6, 5))
+                hb = plt.hexbin(
+                    diff_obs_small,
+                    diff_mod_small,
+                    gridsize=80,
+                    cmap="cubehelix",
+                    mincnt=1,
+                    norm=mcolors.LogNorm(),
+                )
+                cbar = plt.colorbar(hb)
+                cbar.set_label("Count (log scale)")
+                # 1:1 line
+                plt.plot([pmin, pmax], [pmin, pmax], linestyle="--", color="grey", label="1:1 line")
+                # Axes, labels, legend
+                plt.axhline(0, color="black", lw=0.5)
+                plt.axvline(0, color="black", lw=0.5)
+                plt.xlim(pmin, pmax)
+                plt.ylim(pmin, pmax)
+                plt.xlabel("Observed difference")
+                plt.ylabel("Modelled difference")
+                plt.title(f"Obs vs Pred HM Change - {h_year}")
+                plt.legend(frameon=False, loc="upper left")
+                plt.grid(True, linestyle="--", linewidth=0.3, alpha=0.4)
+                plt.tight_layout()
+                fig2.canvas.draw()
+                img_rgba2 = np.array(fig2.canvas.buffer_rgba())
+                img_rgb2 = img_rgba2[..., :3]
+                hexbin_images.append(wandb.Image(img_rgb2, caption=f"{h_year} ({h_name})"))
+                plt.close(fig2)
+        
+        if hexbin_images:
+            experiment.log({"Obs_vs_Pred_HM_Change": hexbin_images})
             
-            # ---- Histogram: Observed vs Predicted HM change distribution ----
-            bins = [-1, -0.05, 0, 0.005, 0.02, 0.05, 0.1, 0.2, 0.5, 1]
-            bin_labels = ['-1 to -0.05', '-0.05 to 0', '0 to 0.005', '0.005 to 0.02', 
-                          '0.02 to 0.05', '0.05 to 0.1', '0.1 to 0.2', '0.2 to 0.5', '0.5 to 1']
-            
-            # Compute histograms on full data (not just filtered range)
-            obs_hist, _ = np.histogram(diff_obs_all, bins=bins)
-            pred_hist, _ = np.histogram(diff_mod_all, bins=bins)
-            
-            # Create histogram figure
-            fig3, ax = plt.subplots(figsize=(12, 6))
-            x = np.arange(len(bin_labels))
-            width = 0.35
-            
-            # Plot bars
-            ax.bar(x - width/2, obs_hist, width, label='Observed', alpha=0.8, color='#2ecc71')
-            ax.bar(x + width/2, pred_hist, width, label='Predicted', alpha=0.8, color='#3498db')
-            
-            # Formatting
-            ax.set_xlabel('Change Bins', fontsize=12, fontweight='bold')
-            ax.set_ylabel('Count (log scale)', fontsize=12, fontweight='bold')
-            ax.set_title('Observed vs Predicted HM Change Distribution', fontsize=14, fontweight='bold')
-            ax.set_xticks(x)
-            ax.set_xticklabels(bin_labels, rotation=45, ha='right')
-            ax.legend(fontsize=11)
-            ax.set_yscale('log')
-            ax.grid(True, alpha=0.3, axis='y')
-            
-            plt.tight_layout()
-            fig3.canvas.draw()
-            img_rgba3 = np.array(fig3.canvas.buffer_rgba())
-            img_rgb3 = img_rgba3[..., :3]
-            experiment.log({"HM_Change_Histogram": [wandb.Image(img_rgb3, caption="Obs vs Pred HM change histogram")]})
-            plt.close(fig3)
+        # ---- Histograms: Observed vs Predicted HM change distribution (per horizon) ----
+        bins = [-1, -0.05, 0, 0.005, 0.02, 0.05, 0.1, 0.2, 0.5, 1]
+        bin_labels = ['-1 to -0.05', '-0.05 to 0', '0 to 0.005', '0.005 to 0.02', 
+                      '0.02 to 0.05', '0.05 to 0.1', '0.1 to 0.2', '0.2 to 0.5', '0.5 to 1']
+        
+        histogram_images = []
+        for h_name, h_year in zip(horizon_names, horizon_years):
+            if len(diffs_obs_horizons[h_name]) > 0:
+                diff_obs_all = np.concatenate(diffs_obs_horizons[h_name])
+                diff_mod_all = np.concatenate(diffs_mod_horizons[h_name])
+                
+                # Compute histograms on full data (not just filtered range)
+                obs_hist, _ = np.histogram(diff_obs_all, bins=bins)
+                pred_hist, _ = np.histogram(diff_mod_all, bins=bins)
+                
+                # Create histogram figure
+                fig3, ax = plt.subplots(figsize=(12, 6))
+                x = np.arange(len(bin_labels))
+                width = 0.35
+                
+                # Plot bars
+                ax.bar(x - width/2, obs_hist, width, label='Observed', alpha=0.8, color='#2ecc71')
+                ax.bar(x + width/2, pred_hist, width, label='Predicted', alpha=0.8, color='#3498db')
+                
+                # Formatting
+                ax.set_xlabel('Change Bins', fontsize=12, fontweight='bold')
+                ax.set_ylabel('Count (log scale)', fontsize=12, fontweight='bold')
+                ax.set_title(f'Observed vs Predicted HM Change Distribution - {h_year}', fontsize=14, fontweight='bold')
+                ax.set_xticks(x)
+                ax.set_xticklabels(bin_labels, rotation=45, ha='right')
+                ax.legend(fontsize=11)
+                ax.set_yscale('log')
+                ax.grid(True, alpha=0.3, axis='y')
+                
+                plt.tight_layout()
+                fig3.canvas.draw()
+                img_rgba3 = np.array(fig3.canvas.buffer_rgba())
+                img_rgb3 = img_rgba3[..., :3]
+                histogram_images.append(wandb.Image(img_rgb3, caption=f"{h_year} ({h_name})"))
+                plt.close(fig3)
+        
+        if histogram_images:
+            experiment.log({"HM_Change_Histogram": histogram_images})
 
         # Ensure wandb shuts down cleanly
         experiment.finish()
