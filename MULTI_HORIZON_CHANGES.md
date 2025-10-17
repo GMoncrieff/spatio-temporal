@@ -160,13 +160,21 @@ python scripts/train_lightning.py \
      - `prediction_2020_blended.tif` (20yr)
    - Tile-based prediction with distance-weighted blending
 
+3. **Metrics**: ✅ Per-horizon logging to W&B
+   - **Per-horizon metrics** (logged for each forecast horizon):
+     - `train/val_mae_5yr`, `train/val_mae_10yr`, `train/val_mae_15yr`, `train/val_mae_20yr`
+     - `train/val_ssim_loss_5yr`, `train/val_ssim_loss_10yr`, `train/val_ssim_loss_15yr`, `train/val_ssim_loss_20yr`
+     - `train/val_lap_loss_5yr`, `train/val_lap_loss_10yr`, `train/val_lap_loss_15yr`, `train/val_lap_loss_20yr`
+     - `train/val_hist_loss_5yr`, `train/val_hist_loss_10yr`, `train/val_hist_loss_15yr`, `train/val_hist_loss_20yr`
+   - **Averaged metrics** (mean across all horizons):
+     - `train/val_mae_total`, `train/val_ssim_loss_total`, `train/val_lap_loss_total`, `train/val_hist_loss_total`
+   - Enables direct comparison of model performance across forecast horizons
+
 ## What's Still TODO
 
-1. **Metrics**: Log per-horizon metrics to W&B (currently only averaged)
+1. **Analysis**: Compare performance across different forecast horizons
 
-2. **Analysis**: Compare performance across different forecast horizons
-
-3. **Hexbin plots**: Update scatter plots to show per-horizon comparisons
+2. **Hexbin plots**: Update scatter plots to show per-horizon comparisons
 
 ## Backward Compatibility
 

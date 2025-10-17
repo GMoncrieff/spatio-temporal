@@ -439,8 +439,9 @@ if __name__ == "__main__":
         
         for batch_data in all_batches_data:
             input_dynamic = batch_data['input_dynamic'].to(device)
-            target = batch_data['target'].to(device)
-            preds = batch_data['preds'].to(device)
+            # Use 20yr horizon for aggregate metrics
+            target = batch_data['target_20yr'].to(device)
+            preds = batch_data['preds_20yr'].to(device)
             input_mask = batch_data['input_mask'].to(device)
             
             # Get last input for delta calculation
@@ -481,14 +482,14 @@ if __name__ == "__main__":
             lap_loss = lap_loss_fn(preds_sanitized, target_sanitized, mask=mask_4d)
             total_lap += lap_loss.item() * mask.sum().item()
             
-            # Histogram loss (if enabled)
+            # Histogram loss (if enabled) - use 20yr horizon (index 3)
             if best_model.histogram_weight > 0 and hasattr(best_model, 'histogram_loss_fn'):
                 delta_true_2d = delta_true  # [B, H, W]
                 delta_pred_2d = delta_pred  # [B, H, W]
                 mask_2d = mask  # [B, H, W]
                 
                 hist_loss, _, _ = best_model.histogram_loss_fn(
-                    delta_true_2d, delta_pred_2d, mask=mask_2d
+                    delta_true_2d, delta_pred_2d, mask=mask_2d, horizon_idx=3
                 )
                 total_hist += hist_loss.item() * mask.sum().item()
             
@@ -700,8 +701,9 @@ if __name__ == "__main__":
         
         for batch_data in all_batches_data:
             input_dynamic_batch = batch_data['input_dynamic']
-            target_batch = batch_data['target']
-            preds_batch = batch_data['preds']
+            # Use 20yr horizon for hexbin plots
+            target_batch = batch_data['target_20yr']
+            preds_batch = batch_data['preds_20yr']
             input_mask_batch = batch_data['input_mask']
             
             B_batch = input_dynamic_batch.shape[0]
