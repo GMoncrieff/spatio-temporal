@@ -1110,6 +1110,25 @@ if __name__ == "__main__":
                     in_stat = np.nan_to_num(input_static_np, nan=0.0).astype(np.float32)
                     lonlat_hw2 = lonlat_grid_for_window(i, j, hi, wj)
                     
+                    # Pad to tile size if needed (for edge tiles)
+                    if hi < tile or wj < tile:
+                        # Pad dynamic: [T, C, hi, wj] -> [T, C, tile, tile]
+                        T, C = in_dyn.shape[:2]
+                        in_dyn_padded = np.zeros((T, C, tile, tile), dtype=np.float32)
+                        in_dyn_padded[:, :, :hi, :wj] = in_dyn
+                        in_dyn = in_dyn_padded
+                        
+                        # Pad static: [C, hi, wj] -> [C, tile, tile]
+                        C_stat = in_stat.shape[0]
+                        in_stat_padded = np.zeros((C_stat, tile, tile), dtype=np.float32)
+                        in_stat_padded[:, :hi, :wj] = in_stat
+                        in_stat = in_stat_padded
+                        
+                        # Pad lonlat: [hi, wj, 2] -> [tile, tile, 2]
+                        lonlat_padded = np.zeros((tile, tile, 2), dtype=np.float32)
+                        lonlat_padded[:hi, :wj, :] = lonlat_hw2
+                        lonlat_hw2 = lonlat_padded
+                    
                     batch_inputs_dyn.append(in_dyn)
                     batch_inputs_stat.append(in_stat)
                     batch_lonlats.append(lonlat_hw2)
@@ -1127,10 +1146,10 @@ if __name__ == "__main__":
                     
                     # Process each tile in the batch
                     for tile_idx, (i, j, hi, wj, li0, lj0, li1, lj1, valid_mask) in enumerate(batch_metadata):
-                        # Extract predictions for this tile
+                        # Extract predictions for this tile (crop to actual size if padded)
                         preds_horizons = {}
                         for h_idx, h_name in enumerate(horizon_names):
-                            pred_h = batch_preds[tile_idx, h_idx].detach().cpu().numpy()  # [hi, wj] normalized
+                            pred_h = batch_preds[tile_idx, h_idx, :hi, :wj].detach().cpu().numpy()  # [hi, wj] normalized (crop padding)
                             pred_h = pred_h * hm_std + hm_mean  # denormalize to [0, 1] scale
                             preds_horizons[h_name] = pred_h
                         
