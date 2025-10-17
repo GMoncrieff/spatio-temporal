@@ -1000,12 +1000,20 @@ if __name__ == "__main__":
                 rr, cc = np.meshgrid(rows, cols, indexing='ij')
                 xs, ys = rasterio.transform.xy(ref_transform, rr, cc)
                 xs = np.array(xs); ys = np.array(ys)
+                # Ensure xs and ys have shape [hi, wj]
+                if xs.ndim == 1:
+                    xs = xs.reshape(hi, wj)
+                    ys = ys.reshape(hi, wj)
                 if ref_crs and ref_crs.to_string() not in ("EPSG:4326", "OGC:CRS84"):
                     transformer = Transformer.from_crs(ref_crs, "EPSG:4326", always_xy=True)
                     lon, lat = transformer.transform(xs, ys)
+                    lon = np.array(lon); lat = np.array(lat)
+                    if lon.ndim == 1:
+                        lon = lon.reshape(hi, wj)
+                        lat = lat.reshape(hi, wj)
                 else:
                     lon, lat = xs, ys
-                return np.stack([lon, lat], axis=-1).astype(np.float32)  # [H, W, 2]
+                return np.stack([lon, lat], axis=-1).astype(np.float32)  # [hi, wj, 2]
 
             # Calculate total tiles for progress tracking
             num_tiles_i = len(range(r0, r1, stride))
