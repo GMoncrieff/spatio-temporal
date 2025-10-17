@@ -166,13 +166,15 @@ if __name__ == "__main__":
         stride=args.stride,
         include_components=args.include_components,
         static_channels=args.static_channels,
+        use_temporal_sampling=True,  # Enable temporal sampling for training
+        end_year_options=(2000, 2005, 2010, 2015),
         num_workers=args.num_workers,
         pin_memory=True if args.num_workers > 0 else False,
         persistent_workers=True if args.num_workers > 0 else False,
         split_mask_file=split_mask_file,
         split_value=1,  # Train split
     )
-    # Validation uses grid sampling; no future horizons in single-step mode
+    # Validation uses fixed years (1990, 1995, 2000 -> 2005-2020) for consistent metrics
     val_loader = get_dataloader(
         batch_size=args.batch_size,
         chip_size=128,
@@ -182,6 +184,7 @@ if __name__ == "__main__":
         stride=args.stride,
         include_components=args.include_components,
         static_channels=args.static_channels,
+        use_temporal_sampling=False,  # Fixed years for validation (Option A)
         num_workers=args.num_workers,
         pin_memory=True if args.num_workers > 0 else False,
         persistent_workers=True if args.num_workers > 0 else False,
@@ -561,9 +564,6 @@ if __name__ == "__main__":
             ds = ds.dataset  # Unwrap DataLoader if needed
         hm_mean, hm_std = ds.hm_mean, ds.hm_std
         elev_mean, elev_std = ds.elev_mean, ds.elev_std
-        # Years for labeling come from fixed configuration in dataset
-        fixed_input_years = getattr(ds, 'fixed_input_years', (None, None, None))
-        fixed_target_years = getattr(ds, 'fixed_target_years', (2005, 2010, 2015, 2020))
         
         # Log images from first batch only (for visualization)
         print("\nCreating multi-horizon visualizations from first batch...")
@@ -575,7 +575,6 @@ if __name__ == "__main__":
         
         # All horizon targets and predictions
         horizon_names = ['5yr', '10yr', '15yr', '20yr']
-        horizon_years = [2005, 2010, 2015, 2020]
         targets_all = {
             '5yr': first_batch['target_5yr'],
             '10yr': first_batch['target_10yr'],
@@ -591,15 +590,22 @@ if __name__ == "__main__":
         
         B = input_dynamic.shape[0]
         for b in range(B):
+            # Extract year metadata from this sample (NEW: supports temporal sampling)
+            input_years = first_batch.get('input_years', [1990, 1995, 2000])
+            target_years = first_batch.get('target_years', [2005, 2010, 2015, 2020])
+            # Handle batch dimension if present
+            if isinstance(input_years, list) and len(input_years) > 0 and isinstance(input_years[0], list):
+                input_years = input_years[b]  # Extract for this sample
+                target_years = target_years[b]
+            
             # Create multi-horizon figure: 6 rows x 5 columns
-            # Row 0: Input HM (1990, 1995, 2000) + Elevation + empty
+            # Row 0: Input HM (dynamic years) + Elevation + empty
             # Rows 1-4: Each horizon (Target, Pred, Error, Delta Obs, Delta Pred)
             # Row 5: Change histograms for all horizons
             fig, axes = plt.subplots(6, 5, figsize=(20, 24))
             # Use a single color ramp for all HM images in original 0-1 scale
             hm_vmin, hm_vmax = 0.0, 1.0
-            # Input human footprint chips (T=3), unnormalize and label with fixed years
-            input_years = list(fixed_input_years)
+            # Input human footprint chips (T=3), unnormalize and label with actual years
             for t in range(3):
                 hm_in = input_dynamic[b, t, 0].cpu().numpy() * hm_std + hm_mean
                 # Mask input HM by its own validity
@@ -633,8 +639,9 @@ if __name__ == "__main__":
             num_bins = len(histogram_bins) - 1
             
             # Plot each horizon in rows 1-4
-            for h_idx, (h_name, h_year) in enumerate(zip(horizon_names, horizon_years)):
+            for h_idx, h_name in enumerate(horizon_names):
                 row = h_idx + 1
+                h_year = target_years[h_idx]  # Get actual year for this sample
                 
                 # Get target and prediction for this horizon
                 target_h = targets_all[h_name][b].cpu().numpy() * hm_std + hm_mean
@@ -648,17 +655,17 @@ if __name__ == "__main__":
                 delta_obs = target_h - most_recent_in
                 delta_pred = pred_h - most_recent_in
                 
-                # Column 0: Target
+                # Column 0: Target (show year + horizon offset)
                 target_plot = np.where(valid_mask, target_h, np.nan)
                 im = axes[row, 0].imshow(target_plot, cmap='turbo', vmin=hm_vmin, vmax=hm_vmax)
-                axes[row, 0].set_title(f'Target {h_year}')
+                axes[row, 0].set_title(f'Target {h_year} (+{(h_idx+1)*5}yr)')
                 axes[row, 0].axis('off')
                 plt.colorbar(im, ax=axes[row, 0], fraction=0.046, pad=0.04)
                 
-                # Column 1: Prediction
+                # Column 1: Prediction (show year + horizon offset)
                 pred_plot = np.where(valid_mask, pred_h, np.nan)
                 im = axes[row, 1].imshow(pred_plot, cmap='turbo', vmin=hm_vmin, vmax=hm_vmax)
-                axes[row, 1].set_title(f'Pred {h_year}')
+                axes[row, 1].set_title(f'Pred {h_year} (+{(h_idx+1)*5}yr)')
                 axes[row, 1].axis('off')
                 plt.colorbar(im, ax=axes[row, 1], fraction=0.046, pad=0.04)
                 
@@ -687,6 +694,7 @@ if __name__ == "__main__":
             
             # Row 5: Histograms for all horizons
             for h_idx, h_name in enumerate(horizon_names):
+                h_year = target_years[h_idx]  # Get actual year for this sample
                 target_h = targets_all[h_name][b].cpu().numpy() * hm_std + hm_mean
                 pred_h = preds_all[h_name][b].cpu().numpy() * hm_std + hm_mean
                 target_valid = np.isfinite(target_h)
@@ -707,7 +715,7 @@ if __name__ == "__main__":
                     axes[5, h_idx].bar(x - width/2, counts_obs, width, label='Obs', alpha=0.7, color='blue')
                     axes[5, h_idx].bar(x + width/2, counts_pred, width, label='Pred', alpha=0.7, color='red')
                     axes[5, h_idx].set_yscale('log')
-                    axes[5, h_idx].set_title(f'Δ Histogram {horizon_years[h_idx]}')
+                    axes[5, h_idx].set_title(f'Δ Histogram {h_year}')
                     axes[5, h_idx].legend(fontsize=6)
                     axes[5, h_idx].grid(alpha=0.3)
                 else:
