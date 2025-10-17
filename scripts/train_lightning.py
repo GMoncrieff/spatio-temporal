@@ -429,113 +429,123 @@ if __name__ == "__main__":
         # Initialize loss functions
         lap_loss_fn = LaplacianPyramidLoss(levels=3, kernel_size=5, sigma=1.0, include_lowpass=True)
         
-        # Accumulators for metrics
-        total_mse = 0.0
-        total_mae = 0.0
-        total_ssim = 0.0
-        total_lap = 0.0
-        total_hist = 0.0
-        total_pixels = 0
+        # Accumulators for metrics per horizon
+        horizon_names = ['5yr', '10yr', '15yr', '20yr']
+        horizon_keys = ['target_5yr', 'target_10yr', 'target_15yr', 'target_20yr']
+        pred_keys = ['preds_5yr', 'preds_10yr', 'preds_15yr', 'preds_20yr']
+        
+        horizon_metrics = {h: {
+            'mse': 0.0, 'mae': 0.0, 'ssim': 0.0, 'lap': 0.0, 'hist': 0.0, 'pixels': 0
+        } for h in horizon_names}
         
         for batch_data in all_batches_data:
             input_dynamic = batch_data['input_dynamic'].to(device)
-            # Use 20yr horizon for aggregate metrics
-            target = batch_data['target_20yr'].to(device)
-            preds = batch_data['preds_20yr'].to(device)
             input_mask = batch_data['input_mask'].to(device)
-            
-            # Get last input for delta calculation
             last_input = input_dynamic[:, -1, 0]  # [B, H, W]
             
-            # Compute mask for valid pixels
-            mask = input_mask.squeeze(1) & torch.isfinite(last_input)
-            
-            if mask.sum() == 0:
-                continue
-            
-            # Delta predictions and targets
-            delta_pred = preds - last_input
-            delta_true = target - last_input
-            
-            valid_delta_pred = delta_pred[mask]
-            valid_delta_true = delta_true[mask]
-            
-            # MSE on deltas
-            mse = F.mse_loss(valid_delta_pred, valid_delta_true, reduction='sum')
-            total_mse += mse.item()
-            
-            # MAE on absolute predictions
-            mae = F.l1_loss(preds[mask], target[mask], reduction='sum')
-            total_mae += mae.item()
-            
-            # SSIM (requires [B, C, H, W])
-            preds_sanitized = preds.unsqueeze(1).clone()
-            target_sanitized = target.unsqueeze(1).clone()
-            mask_4d = mask.unsqueeze(1)
-            preds_sanitized[~mask_4d] = 0.0
-            target_sanitized[~mask_4d] = 0.0
-            ssim_val = ssim(preds_sanitized, target_sanitized, data_range=1.0)
-            ssim_loss = 1.0 - ssim_val
-            total_ssim += ssim_loss.item() * mask.sum().item()
-            
-            # Laplacian loss
-            lap_loss = lap_loss_fn(preds_sanitized, target_sanitized, mask=mask_4d)
-            total_lap += lap_loss.item() * mask.sum().item()
-            
-            # Histogram loss (if enabled) - use 20yr horizon (index 3)
-            if best_model.histogram_weight > 0 and hasattr(best_model, 'histogram_loss_fn'):
-                delta_true_2d = delta_true  # [B, H, W]
-                delta_pred_2d = delta_pred  # [B, H, W]
-                mask_2d = mask  # [B, H, W]
+            # Process each horizon
+            for h_idx, (h_name, target_key, pred_key) in enumerate(zip(horizon_names, horizon_keys, pred_keys)):
+                target = batch_data[target_key].to(device)
+                preds = batch_data[pred_key].to(device)
                 
-                hist_loss, _, _ = best_model.histogram_loss_fn(
-                    delta_true_2d, delta_pred_2d, mask=mask_2d, horizon_idx=3
-                )
-                total_hist += hist_loss.item() * mask.sum().item()
-            
-            total_pixels += mask.sum().item()
+                # Compute mask for valid pixels
+                mask = input_mask.squeeze(1) & torch.isfinite(last_input) & torch.isfinite(target)
+                
+                if mask.sum() == 0:
+                    continue
+                
+                # Delta predictions and targets
+                delta_pred = preds - last_input
+                delta_true = target - last_input
+                
+                valid_delta_pred = delta_pred[mask]
+                valid_delta_true = delta_true[mask]
+                
+                # MSE on deltas
+                mse = F.mse_loss(valid_delta_pred, valid_delta_true, reduction='sum')
+                horizon_metrics[h_name]['mse'] += mse.item()
+                
+                # MAE on absolute predictions
+                mae = F.l1_loss(preds[mask], target[mask], reduction='sum')
+                horizon_metrics[h_name]['mae'] += mae.item()
+                
+                # SSIM (requires [B, C, H, W])
+                preds_sanitized = preds.unsqueeze(1).clone()
+                target_sanitized = target.unsqueeze(1).clone()
+                mask_4d = mask.unsqueeze(1)
+                preds_sanitized[~mask_4d] = 0.0
+                target_sanitized[~mask_4d] = 0.0
+                ssim_val = ssim(preds_sanitized, target_sanitized, data_range=1.0)
+                ssim_loss = 1.0 - ssim_val
+                horizon_metrics[h_name]['ssim'] += ssim_loss.item() * mask.sum().item()
+                
+                # Laplacian loss
+                lap_loss = lap_loss_fn(preds_sanitized, target_sanitized, mask=mask_4d)
+                horizon_metrics[h_name]['lap'] += lap_loss.item() * mask.sum().item()
+                
+                # Histogram loss (if enabled)
+                if best_model.histogram_weight > 0 and hasattr(best_model, 'histogram_loss_fn'):
+                    hist_loss, _, _ = best_model.histogram_loss_fn(
+                        delta_true, delta_pred, mask=mask, horizon_idx=h_idx
+                    )
+                    horizon_metrics[h_name]['hist'] += hist_loss.item() * mask.sum().item()
+                
+                horizon_metrics[h_name]['pixels'] += mask.sum().item()
         
-        # Compute average metrics
-        if total_pixels > 0:
-            avg_mse = total_mse / total_pixels
-            avg_mae = total_mae / total_pixels
-            avg_ssim = total_ssim / total_pixels
-            avg_lap = total_lap / total_pixels
-            avg_hist = total_hist / total_pixels if best_model.histogram_weight > 0 else 0.0
-            
-            # Compute total loss
-            avg_total_loss = (avg_mse + 
-                            best_model.ssim_weight * avg_ssim + 
-                            best_model.laplacian_weight * avg_lap)
-            if best_model.histogram_weight > 0:
-                avg_total_loss += best_model.histogram_weight * avg_hist
-            
-            print("\n" + "="*60)
-            print("FULL VALIDATION SET METRICS (Best Model)")
-            print("="*60)
-            print(f"Total valid pixels: {total_pixels:,}")
-            print(f"\nLoss Components:")
-            print(f"  MSE (delta):        {avg_mse:.6f}")
-            print(f"  MAE (absolute):     {avg_mae:.6f}")
-            print(f"  SSIM loss:          {avg_ssim:.6f}")
-            print(f"  Laplacian loss:     {avg_lap:.6f}")
-            if best_model.histogram_weight > 0:
-                print(f"  Histogram loss (W2):{avg_hist:.6f}")
-            print(f"\nWeighted Total Loss: {avg_total_loss:.6f}")
-            print("="*60 + "\n")
-            
-            # Log to W&B
-            experiment.log({
-                "val_full/mse": avg_mse,
-                "val_full/mae": avg_mae,
-                "val_full/ssim_loss": avg_ssim,
-                "val_full/laplacian_loss": avg_lap,
-                "val_full/total_loss": avg_total_loss,
-            })
-            if best_model.histogram_weight > 0:
+        # Compute average metrics per horizon and overall
+        print("\n" + "="*70)
+        print("FULL VALIDATION SET METRICS (Best Model) - PER HORIZON")
+        print("="*70)
+        
+        horizon_years = [2005, 2010, 2015, 2020]
+        all_total_losses = []
+        
+        for h_name, h_year in zip(horizon_names, horizon_years):
+            metrics = horizon_metrics[h_name]
+            if metrics['pixels'] > 0:
+                avg_mse = metrics['mse'] / metrics['pixels']
+                avg_mae = metrics['mae'] / metrics['pixels']
+                avg_ssim = metrics['ssim'] / metrics['pixels']
+                avg_lap = metrics['lap'] / metrics['pixels']
+                avg_hist = metrics['hist'] / metrics['pixels'] if best_model.histogram_weight > 0 else 0.0
+                
+                # Compute total loss
+                avg_total = (avg_mse + 
+                           best_model.ssim_weight * avg_ssim + 
+                           best_model.laplacian_weight * avg_lap)
+                if best_model.histogram_weight > 0:
+                    avg_total += best_model.histogram_weight * avg_hist
+                
+                all_total_losses.append(avg_total)
+                
+                print(f"\n{h_name.upper()} ({h_year}): {metrics['pixels']:,} valid pixels")
+                print(f"  MSE:        {avg_mse:.6f}")
+                print(f"  MAE:        {avg_mae:.6f}")
+                print(f"  SSIM loss:  {avg_ssim:.6f}")
+                print(f"  Lap loss:   {avg_lap:.6f}")
+                if best_model.histogram_weight > 0:
+                    print(f"  Hist loss:  {avg_hist:.6f}")
+                print(f"  Total loss: {avg_total:.6f}")
+                
+                # Log per-horizon metrics to W&B
                 experiment.log({
-                    "val_full/histogram_loss": avg_hist,
+                    f"val_full/mae_{h_name}": avg_mae,
+                    f"val_full/mse_{h_name}": avg_mse,
+                    f"val_full/ssim_loss_{h_name}": avg_ssim,
+                    f"val_full/lap_loss_{h_name}": avg_lap,
+                    f"val_full/total_loss_{h_name}": avg_total,
                 })
+                if best_model.histogram_weight > 0:
+                    experiment.log({f"val_full/hist_loss_{h_name}": avg_hist})
+        
+        # Compute and log average across all horizons
+        if all_total_losses:
+            avg_total_all = sum(all_total_losses) / len(all_total_losses)
+            print(f"\nAVERAGE ACROSS ALL HORIZONS:")
+            print(f"  Total loss: {avg_total_all:.6f}")
+            print("="*70 + "\n")
+            
+            experiment.log({"val_full/total_loss_avg": avg_total_all})
         else:
             print("WARNING: No valid pixels found for metric calculation")
         
@@ -575,11 +585,11 @@ if __name__ == "__main__":
         
         B = input_dynamic.shape[0]
         for b in range(B):
-            # Create multi-horizon figure: 6 rows x 4 columns
-            # Row 0: Input HM (1990, 1995, 2000) + Elevation
-            # Rows 1-4: Each horizon (Target, Pred, Error, Delta)
+            # Create multi-horizon figure: 6 rows x 5 columns
+            # Row 0: Input HM (1990, 1995, 2000) + Elevation + empty
+            # Rows 1-4: Each horizon (Target, Pred, Error, Delta Obs, Delta Pred)
             # Row 5: Change histograms for all horizons
-            fig, axes = plt.subplots(6, 4, figsize=(16, 24))
+            fig, axes = plt.subplots(6, 5, figsize=(20, 24))
             # Use a single color ramp for all HM images in original 0-1 scale
             hm_vmin, hm_vmax = 0.0, 1.0
             # Input human footprint chips (T=3), unnormalize and label with fixed years
@@ -599,10 +609,16 @@ if __name__ == "__main__":
             axes[0, 3].axis('off')
             plt.colorbar(im, ax=axes[0, 3], fraction=0.046, pad=0.04)
             
+            # Hide empty cell in row 0, column 4
+            axes[0, 4].axis('off')
+            
             # Compute validity mask from RAW inputs
+            # For visualization: use same strict mask as training to show what model actually learns from
             input_dynamic_raw = input_dynamic[b].cpu().numpy()
+            # Note: This requires ALL dynamic channels valid (HM + components)
             dynamic_valid = np.isfinite(input_dynamic_raw).all(axis=(0, 1))
             input_static_raw = input_static[b].cpu().numpy()
+            # Note: This requires ALL static channels valid
             static_valid = np.isfinite(input_static_raw).all(axis=0)
             most_recent_in = (input_dynamic[b, -1, 0].cpu().numpy() * hm_std + hm_mean)
             
@@ -648,13 +664,20 @@ if __name__ == "__main__":
                 axes[row, 2].axis('off')
                 plt.colorbar(im, ax=axes[row, 2], fraction=0.046, pad=0.04)
                 
-                # Column 3: Delta comparison (obs vs pred)
+                # Column 3: Delta Observed
                 vmax_delta = max(np.nanmax(np.abs(delta_obs)), np.nanmax(np.abs(delta_pred))) if np.any(valid_mask) else 0.5
                 delta_obs_plot = np.where(valid_mask, delta_obs, np.nan)
                 im = axes[row, 3].imshow(delta_obs_plot, cmap='bwr', vmin=-vmax_delta, vmax=vmax_delta)
                 axes[row, 3].set_title(f'Δ Obs {h_year}')
                 axes[row, 3].axis('off')
                 plt.colorbar(im, ax=axes[row, 3], fraction=0.046, pad=0.04)
+                
+                # Column 4: Delta Predicted
+                delta_pred_plot = np.where(valid_mask, delta_pred, np.nan)
+                im = axes[row, 4].imshow(delta_pred_plot, cmap='bwr', vmin=-vmax_delta, vmax=vmax_delta)
+                axes[row, 4].set_title(f'Δ Pred {h_year}')
+                axes[row, 4].axis('off')
+                plt.colorbar(im, ax=axes[row, 4], fraction=0.046, pad=0.04)
             
             # Row 5: Histograms for all horizons
             for h_idx, h_name in enumerate(horizon_names):
@@ -684,6 +707,10 @@ if __name__ == "__main__":
                 else:
                     axes[5, h_idx].text(0.5, 0.5, 'No valid', ha='center', va='center')
                     axes[5, h_idx].axis('off')
+            
+            # Hide the 5th column in histogram row (only 4 histograms)
+            axes[5, 4].axis('off')
+            
             plt.tight_layout()
             # Convert to numpy array and log (robust for macOS backend)
             fig.canvas.draw()
@@ -1001,21 +1028,32 @@ if __name__ == "__main__":
                         if include_components and comp_srcs.get(y, []):
                             for src in comp_srcs[y]:
                                 carr = src.read(1, window=win, masked=True).filled(np.nan)
+                                # Replace NaN with 0 BEFORE normalization (missing = no pressure/activity)
+                                carr = np.nan_to_num(carr, nan=0.0)
                                 # Data is already in [0, 1] range
+                                # NOTE: Using simplified normalization here (should use per-variable stats)
                                 channels.append((carr - hm_mean) / hm_std)
                         dyn_ts.append(np.stack(channels, axis=0))  # [C_dyn, hi, wj]
                     input_dynamic_np = np.stack(dyn_ts, axis=0)  # [T, C_dyn, hi, wj]
                     static_chs = []
-                    for src in stat_srcs:
+                    # Static file order: [ele, tas, tasmin, pr, dpi_dsi, iucn_nostrict, iucn_strict]
+                    nan_to_zero_static = {0, 4, 5, 6}  # ele, dpi_dsi, iucn_nostrict, iucn_strict
+                    for static_idx, src in enumerate(stat_srcs):
                         sarr = src.read(1, window=win, masked=True).filled(np.nan)
+                        # Replace NaN with 0 for specific variables (before normalization)
+                        if static_idx in nan_to_zero_static:
+                            sarr = np.nan_to_num(sarr, nan=0.0)
+                        # NOTE: Using simplified normalization here (should use per-variable stats)
                         static_chs.append((sarr - elev_mean) / elev_std)
                     input_static_np = np.stack(static_chs, axis=0) if static_chs else np.zeros((0, hi, wj), dtype=np.float32)
 
-                    # Valid mask consistent with training logic
-                    target_valid = np.isfinite(input_dynamic_np[0, 0])  # any single HM layer as spatial support
-                    dyn_valid = np.isfinite(input_dynamic_np).all(axis=(0, 1))
-                    stat_valid = np.isfinite(input_static_np).all(axis=0) if static_chs else np.ones((hi, wj), dtype=bool)
-                    valid_mask = submask & target_valid & dyn_valid & stat_valid
+                    # Valid mask for prediction (less strict than training)
+                    # Only require HM channel (index 0) to be valid across all timesteps
+                    # Component channels can be NaN (will be replaced with 0.0)
+                    hm_valid_all_times = np.isfinite(input_dynamic_np[:, 0, :, :]).all(axis=0)  # [H, W]
+                    # Only require first static channel (elevation) to be valid
+                    stat_valid = np.isfinite(input_static_np[0]) if static_chs else np.ones((hi, wj), dtype=bool)
+                    valid_mask = submask & hm_valid_all_times & stat_valid
                     if not np.any(valid_mask):
                         tiles_skipped += 1
                         continue
@@ -1024,6 +1062,8 @@ if __name__ == "__main__":
 
                     # Forward pass
                     import torch
+                    # Replace NaN with 0.0 in normalized space = mean in original space
+                    # This assumes missing covariates have "average" values
                     in_dyn = torch.from_numpy(np.nan_to_num(input_dynamic_np, nan=0.0)).float().unsqueeze(0).to(device)
                     in_stat = torch.from_numpy(np.nan_to_num(input_static_np, nan=0.0)).float().unsqueeze(0).to(device)
                     with torch.no_grad():

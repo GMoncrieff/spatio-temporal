@@ -284,16 +284,25 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
                 if self.include_components and self._comp_srcs.get(year, []):
                     for var_idx, src in enumerate(self._comp_srcs[year]):
                         carr = src.read(1, window=rasterio.windows.Window(j, i, self.chip_size, self.chip_size), masked=True).filled(np.nan)
-                        # Use per-variable normalization (critical for GDP/population)
                         var_name = HM_VARS[var_idx]
+                        # Replace NaN with 0 BEFORE normalization for all HM components
+                        # Interpretation: missing data means "no pressure/activity"
+                        carr = np.nan_to_num(carr, nan=0.0)
+                        # Use per-variable normalization (critical for GDP/population)
                         carr = (carr - self.comp_means[var_name]) / self.comp_stds[var_name]
                         channels.append(carr)
                 dyn_list.append(np.stack(channels, axis=0))  # [C_dyn, H, W]
             input_dynamic = np.stack(dyn_list, axis=0)  # [T, C_dyn, H, W]
             # Static layers
             static_list = []
+            # Static file order: [ele, tas, tasmin, pr, dpi_dsi, iucn_nostrict, iucn_strict]
+            # Replace NaN with 0 BEFORE normalization for specific variables
+            nan_to_zero_static = {0, 4, 5, 6}  # ele, dpi_dsi, iucn_nostrict, iucn_strict
             for static_idx, src in enumerate(self._static_srcs):
                 sarr = src.read(1, window=rasterio.windows.Window(j, i, self.chip_size, self.chip_size), masked=True).filled(np.nan)
+                # Replace NaN with 0 for specific variables (before normalization)
+                if static_idx in nan_to_zero_static:
+                    sarr = np.nan_to_num(sarr, nan=0.0)
                 # Use per-variable normalization
                 sarr = (sarr - self.static_means[static_idx]) / self.static_stds[static_idx]
                 static_list.append(sarr)

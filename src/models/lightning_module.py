@@ -166,6 +166,7 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         static_valid = torch.isfinite(input_static).all(dim=1, keepdim=True).unsqueeze(1)
         
         # Replace NaNs in inputs with 0 for model forward
+        # Note: 0 in normalized space = mean in original space (mean imputation)
         input_dynamic = torch.nan_to_num(input_dynamic, nan=0.0)
         input_static = torch.nan_to_num(input_static, nan=0.0)
         
@@ -247,6 +248,7 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         static_valid = torch.isfinite(input_static).all(dim=1, keepdim=True).unsqueeze(1)
         
         # Replace NaNs in inputs with 0 for model forward
+        # Note: 0 in normalized space = mean in original space (mean imputation)
         input_dynamic = torch.nan_to_num(input_dynamic, nan=0.0)
         input_static = torch.nan_to_num(input_static, nan=0.0)
         
