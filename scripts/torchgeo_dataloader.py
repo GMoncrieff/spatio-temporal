@@ -35,10 +35,11 @@ import rasterio
 
 class HumanFootprintChipDataset(torch.utils.data.Dataset):
     """
-    Yields chips for ConvLSTM training (single-step, fixed-year forecasting):
-      - input_dynamic: [3, H, W] from years (1990, 1995, 2000)
-      - input_static: [1, H, W]
-      - target: [H, W] for year 2020
+    Yields chips for ConvLSTM training (multi-horizon forecasting):
+      - input_dynamic: [3, C_dyn, H, W] from years (1990, 1995, 2000)
+      - input_static: [C_static, H, W]
+      - targets: Dict with keys 'target_5yr', 'target_10yr', 'target_15yr', 'target_20yr'
+                 Each target is [H, W] for years 2005, 2010, 2015, 2020 respectively
     """
     def __init__(
         self,
@@ -51,7 +52,7 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
         mode="random",
         chips_per_epoch=100,
         fixed_input_years=(1990, 1995, 2000),
-        fixed_target_year=2020,
+        fixed_target_years=(2005, 2010, 2015, 2020),  # Multi-horizon targets
         stat_samples=2048,
         stat_sample_size=512,
         random_seed=42,
@@ -68,21 +69,21 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
         self.static_files = static_files
         self.chip_size = chip_size
         self.timesteps = timesteps  # kept for compatibility; must be 3
-        if self.timesteps != 3:
-            raise ValueError("Single-step setup expects exactly 3 input timesteps (1990, 1995, 2000)")
+        if len(fixed_input_years) != 3:
+            raise ValueError("Multi-horizon setup expects exactly 3 input timesteps (1990, 1995, 2000)")
         self.stride = stride
         self.mode = mode
         self.chips_per_epoch = chips_per_epoch
         # Fixed-year setup
         self.fixed_input_years = tuple(fixed_input_years)
-        self.fixed_target_year = int(fixed_target_year)
-
+        self.fixed_target_years = tuple(fixed_target_years)  # (2005, 2010, 2015, 2020)
+        # Get indices for all target years
+        self.target_t_indices = [years.index(y) for y in fixed_target_years]  # [3, 4, 5, 6]
         # Use lazy, windowed IO to avoid loading entire rasters into memory
         self.include_components = bool(include_components)
         self._hm_files = list(hm_files)
         self._static_files = list(static_files if static_channels is None else static_files[:int(static_channels)])
         self._comp_files = {y: list(component_files.get(y, [])) for y in years} if self.include_components else {y: [] for y in years}
-        
         # Split mask for train/val/test separation
         self.split_mask_file = split_mask_file
         self.split_value = split_value  # 1=train, 2=val, 3=test, 4=calib
@@ -190,14 +191,14 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
         self.years = years
         try:
             self.input_t_idxs = [year_to_idx[y] for y in self.fixed_input_years]
-            self.target_t_idx = year_to_idx[self.fixed_target_year]
+            # Target indices already computed above as self.target_t_indices
         except KeyError as e:
             raise ValueError(f"Requested year {e} not found in available years {years}")
         # Validate ordering and availability
         if len(self.input_t_idxs) != 3:
             raise ValueError("fixed_input_years must have exactly 3 entries: e.g., (1990, 1995, 2000)")
-        # Precompute valid positions (target year only)
-        self.valid_time_idxs = [self.target_t_idx]
+        # Precompute valid positions (use last target year for positioning)
+        self.valid_time_idxs = [self.target_t_indices[-1]]
         
         # Precompute valid positions for split if using split mask
         self.valid_split_positions = None
@@ -253,8 +254,8 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
             if self.mode == "grid":
                 t, i, j = self.chip_positions[idx]
             else:
-                # Target year is fixed; randomly sample spatial chips
-                t = self.target_t_idx
+                # Target years are fixed; randomly sample spatial chips
+                t = self.target_t_indices[-1]  # Use last target (2020) for grid positioning
                 
                 # If using splits, sample from pre-computed valid positions
                 if self.valid_split_positions is not None:
@@ -298,7 +299,7 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
                 static_list.append(sarr)
             input_static = np.stack(static_list, axis=0) if static_list else np.zeros((0, self.chip_size, self.chip_size), dtype=np.float32)
             # Build lon/lat grid [H, W, 2] from target raster transform, reproject to EPSG:4326 if needed
-            ref = self._hm_srcs[self.target_t_idx]
+            ref = self._hm_srcs[self.target_t_indices[-1]]  # Use last target year (2020) as reference
             rows = np.arange(i, i + self.chip_size)
             cols = np.arange(j, j + self.chip_size)
             rr, cc = np.meshgrid(rows, cols, indexing='ij')
@@ -310,27 +311,37 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
             else:
                 lon, lat = xs, ys
             lonlat = np.stack([lon, lat], axis=-1).astype(np.float32)  # [H, W, 2]
-            # Target (next time)
-            target = self._hm_srcs[self.target_t_idx].read(1, window=rasterio.windows.Window(j, i, self.chip_size, self.chip_size), masked=True).filled(np.nan)
-            # Data is already in [0, 1] range
-            target = (target - self.hm_mean) / self.hm_std
-            if not np.isnan(target).all():
+            
+            # Multi-horizon targets (2005, 2010, 2015, 2020)
+            targets = {}
+            horizon_names = ['target_5yr', 'target_10yr', 'target_15yr', 'target_20yr']
+            all_valid = False
+            
+            for horizon_name, t_idx in zip(horizon_names, self.target_t_indices):
+                target_h = self._hm_srcs[t_idx].read(1, window=rasterio.windows.Window(j, i, self.chip_size, self.chip_size), masked=True).filled(np.nan)
+                # Data is already in [0, 1] range
+                target_h = (target_h - self.hm_mean) / self.hm_std
+                targets[horizon_name] = torch.from_numpy(target_h).float()
+                if not np.isnan(target_h).all():
+                    all_valid = True
+            
+            if all_valid:
                 sample = {
                     "input_dynamic": torch.from_numpy(input_dynamic).float(),
                     "input_static": torch.from_numpy(input_static).float(),
                     "lonlat": torch.from_numpy(lonlat).float(),
-                    "target": torch.from_numpy(target).float(),
                     "timestep": t
                 }
+                sample.update(targets)  # Add all horizon targets
                 return sample
         # If all attempts fail, return anyway (will be masked out in loss)
         sample = {
             "input_dynamic": torch.from_numpy(input_dynamic).float(),
             "input_static": torch.from_numpy(input_static).float(),
             "lonlat": torch.from_numpy(lonlat).float(),
-            "target": torch.from_numpy(target).float(),
             "timestep": t
         }
+        sample.update(targets)  # Add all horizon targets
         return sample
 
 
@@ -342,7 +353,7 @@ def get_dataloader(
     mode="random",
     chips_per_epoch=100,
     fixed_input_years=(1990, 1995, 2000),
-    fixed_target_year=2020,
+    fixed_target_years=(2005, 2010, 2015, 2020),
     num_workers=0,
     pin_memory=False,
     persistent_workers=False,
@@ -371,7 +382,7 @@ def get_dataloader(
         mode=mode,
         chips_per_epoch=chips_per_epoch,
         fixed_input_years=fixed_input_years,
-        fixed_target_year=fixed_target_year,
+        fixed_target_years=fixed_target_years,
         min_valid_ratio=min_valid_ratio,
         stat_samples=stat_samples,
         enforce_input_hm_valid=enforce_input_hm_valid,

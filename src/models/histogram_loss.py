@@ -74,36 +74,50 @@ class HistogramLoss(nn.Module):
     Uses only W2 distance with rarity weights to ensure all bins contribute equally.
     """
     
-    def __init__(self, bin_edges, bin_weights=None):
+    def __init__(self, bin_edges, bin_weights=None, num_horizons=4):
         """
         Args:
             bin_edges: Tensor [num_bins+1] with bin edge values
-            bin_weights: Optional tensor [num_bins] with rarity weights (default: uniform)
+            bin_weights: Optional tensor [num_horizons, num_bins] with rarity weights per horizon
+            num_horizons: Number of forecast horizons (default: 4)
         """
         super().__init__()
         self.register_buffer('bin_edges', bin_edges)
         self.num_bins = len(bin_edges) - 1
+        self.num_horizons = num_horizons
         
         # Compute bin midpoints for Wasserstein distance
         bin_midpoints = 0.5 * (bin_edges[:-1] + bin_edges[1:])
         self.register_buffer('bin_midpoints', bin_midpoints)
         
-        # Set bin weights (default: uniform)
+        # Set bin weights per horizon (default: uniform for all horizons)
         if bin_weights is None:
-            bin_weights = torch.ones(self.num_bins)
+            bin_weights = torch.ones(num_horizons, self.num_bins)
         self.register_buffer('bin_weights', bin_weights)
     
-    def set_bin_weights(self, bin_weights):
-        """Update bin weights (used after computing from training data)."""
-        self.bin_weights = bin_weights.to(self.bin_edges.device)
+    def set_bin_weights(self, bin_weights, horizon_idx=None):
+        """
+        Update bin weights for specific horizon or all horizons.
+        
+        Args:
+            bin_weights: Tensor [num_bins] or [num_horizons, num_bins]
+            horizon_idx: Optional int, if provided updates only that horizon
+        """
+        if horizon_idx is not None:
+            # Update specific horizon
+            self.bin_weights[horizon_idx] = bin_weights.to(self.bin_edges.device)
+        else:
+            # Update all horizons
+            self.bin_weights = bin_weights.to(self.bin_edges.device)
     
-    def wasserstein2_loss_weighted(self, p_obs, p_pred):
+    def wasserstein2_loss_weighted(self, p_obs, p_pred, horizon_idx=0):
         """
         Compute rarity-weighted Wasserstein-2 distance.
         
         Args:
             p_obs: [B, num_bins] - observed distribution
             p_pred: [B, num_bins] - predicted distribution
+            horizon_idx: int - which horizon's weights to use
             
         Returns:
             Scalar rarity-weighted W2 distance
@@ -117,14 +131,17 @@ class HistogramLoss(nn.Module):
         # Pad to match num_bins
         bin_widths = torch.cat([bin_widths, bin_widths[-1:]])  # [num_bins]
         
+        # Get weights for this horizon
+        weights_h = self.bin_weights[horizon_idx]  # [num_bins]
+        
         # Apply rarity weights to emphasize rare bins
         # W2^2 distance with bin weights
-        weighted_diff = ((cdf_obs - cdf_pred) ** 2) * bin_widths.unsqueeze(0) * self.bin_weights.unsqueeze(0)
+        weighted_diff = ((cdf_obs - cdf_pred) ** 2) * bin_widths.unsqueeze(0) * weights_h.unsqueeze(0)
         w2_weighted = weighted_diff.sum(dim=1).mean()  # [B] -> scalar
         
         return w2_weighted
     
-    def forward(self, changes_obs, changes_pred, mask=None):
+    def forward(self, changes_obs, changes_pred, mask=None, horizon_idx=0):
         """
         Compute rarity-weighted W2 histogram loss.
         
@@ -132,6 +149,7 @@ class HistogramLoss(nn.Module):
             changes_obs: [B, H, W] - observed changes (target - last_input)
             changes_pred: [B, H, W] - predicted changes (pred - last_input)
             mask: [B, H, W] - validity mask
+            horizon_idx: int - which horizon (0=5yr, 1=10yr, 2=15yr, 3=20yr)
             
         Returns:
             w2_loss: Rarity-weighted Wasserstein-2 loss
@@ -142,7 +160,7 @@ class HistogramLoss(nn.Module):
         counts_obs, p_obs = compute_histogram(changes_obs, self.bin_edges, mask=mask)
         counts_pred, p_pred = compute_histogram(changes_pred, self.bin_edges, mask=mask)
         
-        # Rarity-weighted Wasserstein-2 loss
-        w2_loss = self.wasserstein2_loss_weighted(p_obs, p_pred)
+        # Rarity-weighted Wasserstein-2 loss using horizon-specific weights
+        w2_loss = self.wasserstein2_loss_weighted(p_obs, p_pred, horizon_idx=horizon_idx)
         
         return w2_loss, p_obs, p_pred

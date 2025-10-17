@@ -201,12 +201,15 @@ if __name__ == "__main__":
         histogram_warmup_epochs=args.histogram_warmup_epochs,
     )
     
-    # Compute histogram bin weights from training data
+    # Compute histogram bin weights from training data (per horizon)
     if args.histogram_weight > 0 and hasattr(model, 'histogram_loss_fn'):
-        print("\nComputing histogram bin weights from 10 training batches...")
+        print("\nComputing histogram bin weights for each horizon from 10 training batches...")
         from src.models.histogram_loss import compute_histogram
         
-        all_counts = []
+        horizon_names = ['5yr', '10yr', '15yr', '20yr']
+        horizon_keys = ['target_5yr', 'target_10yr', 'target_15yr', 'target_20yr']
+        all_horizon_counts = {h: [] for h in horizon_names}
+        
         device = next(model.parameters()).device
         num_batches_to_sample = min(10, len(train_loader))
         
@@ -215,54 +218,63 @@ if __name__ == "__main__":
                 break
             
             input_dynamic = batch['input_dynamic'].to(device)
-            target = batch['target'].to(device)
-            
-            # Get last input for delta calculation
             last_input = input_dynamic[:, -1, 0]  # [B, H, W]
             
-            # Compute mask for valid pixels
-            target_valid = torch.isfinite(target)  # [B, H, W]
-            last_input_valid = torch.isfinite(last_input)  # [B, H, W]
-            mask = target_valid & last_input_valid  # [B, H, W]
-            
-            # Compute deltas
-            delta_true = target - last_input  # [B, H, W]
-            
-            # Compute histogram
-            counts, _ = compute_histogram(delta_true, model.histogram_bins, mask=mask)
-            all_counts.append(counts.cpu())
+            # Compute histograms for each horizon
+            for h_name, h_key in zip(horizon_names, horizon_keys):
+                target_h = batch[h_key].to(device)
+                
+                # Compute mask for valid pixels
+                target_valid = torch.isfinite(target_h)
+                last_input_valid = torch.isfinite(last_input)
+                mask = target_valid & last_input_valid
+                
+                # Compute deltas
+                delta_true = target_h - last_input
+                
+                # Compute histogram
+                counts, _ = compute_histogram(delta_true, model.histogram_bins, mask=mask)
+                all_horizon_counts[h_name].append(counts.cpu())
         
-        # Aggregate counts across all batches
-        all_counts = torch.cat(all_counts, dim=0)  # [N_batches*B, num_bins]
-        total_counts = all_counts.sum(dim=0)  # [num_bins]
-        
-        # Compute inverse frequency weights
-        smoothing = 1e-3
-        bin_weights = 1.0 / (total_counts + smoothing)
-        # Normalize so average weight is 1.0
+        # Compute weights for each horizon
         num_bins = len(model.histogram_bins) - 1
-        bin_weights = bin_weights * num_bins / bin_weights.sum()
+        all_bin_weights = []
         
-        # Set weights in model
-        model.histogram_loss_fn.set_bin_weights(bin_weights.to(device))
+        print("\n" + "="*70)
+        print("HISTOGRAM BIN WEIGHTS PER HORIZON (Rarity-Weighted)")
+        print("="*70)
+        print(f"Bin edges: {model.histogram_bins.tolist()}\n")
+        
+        for h_idx, h_name in enumerate(horizon_names):
+            # Aggregate counts for this horizon
+            horizon_counts = torch.cat(all_horizon_counts[h_name], dim=0)
+            total_counts = horizon_counts.sum(dim=0)
+            
+            # Compute inverse frequency weights
+            smoothing = 1e-3
+            bin_weights = 1.0 / (total_counts + smoothing)
+            bin_weights = bin_weights * num_bins / bin_weights.sum()
+            all_bin_weights.append(bin_weights)
+            
+            # Print bin information for this horizon
+            print(f"--- {h_name} Horizon ---")
+            print(f"Bin | Count  | Proportion | Weight")
+            print("-" * 50)
+            total_pixels = total_counts.sum().item()
+            for i in range(num_bins):
+                count = total_counts[i].item()
+                proportion = count / total_pixels
+                weight = bin_weights[i].item()
+                left_edge = model.histogram_bins[i].item()
+                right_edge = model.histogram_bins[i+1].item()
+                print(f" {i}  | {count:6.0f} | {proportion:9.4f}  | {weight:6.3f}  [{left_edge:+.3f}, {right_edge:+.3f})")
+            print()
+        
+        # Stack all weights and set in model: [num_horizons, num_bins]
+        all_bin_weights = torch.stack(all_bin_weights, dim=0).to(device)
+        model.histogram_loss_fn.set_bin_weights(all_bin_weights)
         model.histogram_bins_initialized = True
-        
-        # Print bin information
-        print("\n" + "="*60)
-        print("HISTOGRAM BIN WEIGHTS (Rarity-Weighted)")
-        print("="*60)
-        print(f"Bin edges: {model.histogram_bins.tolist()}")
-        print(f"\nBin | Count  | Proportion | Weight")
-        print("-" * 45)
-        total_pixels = total_counts.sum().item()
-        for i in range(num_bins):
-            count = total_counts[i].item()
-            proportion = count / total_pixels
-            weight = bin_weights[i].item()
-            left_edge = model.histogram_bins[i].item()
-            right_edge = model.histogram_bins[i+1].item()
-            print(f" {i}  | {count:6.0f} | {proportion:9.4f}  | {weight:6.3f}  [{left_edge:+.3f}, {right_edge:+.3f})")
-        print("="*60 + "\n")
+        print("="*70 + "\n")
     
     # Print loss weights at start of training
     print("="*60)
@@ -334,7 +346,8 @@ if __name__ == "__main__":
         num_batches_processed = 0
         
         for batch_idx, batch in enumerate(val_loader):
-            target = batch['target']
+            # Use 20yr target for validation metrics (multi-horizon)
+            target = batch.get('target_20yr', batch.get('target'))
             # Check for at least one valid (non-NaN) pixel in any sample
             if torch.any(~torch.isnan(target)).item():
                 input_dynamic = batch['input_dynamic'].to(device)
@@ -361,20 +374,38 @@ if __name__ == "__main__":
                     if lonlat is not None:
                         lonlat = lonlat.to(device)
                     # Get predictions from model (learnable location encoder)
-                    preds = best_model(input_dynamic_clean, input_static_clean, lonlat=lonlat)  # Keep [B, 1, H, W]
-                
-                    # Set predictions to NaN where any input was NaN
-                    preds[~input_mask] = float('nan')
+                    preds_all = best_model(input_dynamic_clean, input_static_clean, lonlat=lonlat)  # [B, 4, H, W]
                     
-                    # Now squeeze for plotting
-                    preds = preds.squeeze(1)  # [B, H, W]
+                    # Store all 4 horizons
+                    preds_5yr = preds_all[:, 0:1, :, :].clone()  # [B, 1, H, W]
+                    preds_10yr = preds_all[:, 1:2, :, :].clone()
+                    preds_15yr = preds_all[:, 2:3, :, :].clone()
+                    preds_20yr = preds_all[:, 3:4, :, :].clone()
+                    
+                    # Set predictions to NaN where any input was NaN
+                    preds_5yr[~input_mask] = float('nan')
+                    preds_10yr[~input_mask] = float('nan')
+                    preds_15yr[~input_mask] = float('nan')
+                    preds_20yr[~input_mask] = float('nan')
+                    
+                    # Squeeze for storage
+                    preds_5yr = preds_5yr.squeeze(1)  # [B, H, W]
+                    preds_10yr = preds_10yr.squeeze(1)
+                    preds_15yr = preds_15yr.squeeze(1)
+                    preds_20yr = preds_20yr.squeeze(1)
                 
-                # Store batch data for later processing
+                # Store batch data for later processing (all horizons)
                 all_batches_data.append({
                     'input_dynamic': input_dynamic.cpu(),
                     'input_static': input_static.cpu(),
-                    'target': target.cpu(),
-                    'preds': preds.cpu(),
+                    'target_5yr': batch.get('target_5yr', target).cpu(),
+                    'target_10yr': batch.get('target_10yr', target).cpu(),
+                    'target_15yr': batch.get('target_15yr', target).cpu(),
+                    'target_20yr': batch.get('target_20yr', target).cpu(),
+                    'preds_5yr': preds_5yr.cpu(),
+                    'preds_10yr': preds_10yr.cpu(),
+                    'preds_15yr': preds_15yr.cpu(),
+                    'preds_20yr': preds_20yr.cpu(),
                     'input_mask': input_mask.cpu(),
                     'lonlat': batch.get('lonlat', None)
                 })
@@ -515,21 +546,39 @@ if __name__ == "__main__":
         elev_mean, elev_std = ds.elev_mean, ds.elev_std
         # Years for labeling come from fixed configuration in dataset
         fixed_input_years = getattr(ds, 'fixed_input_years', (None, None, None))
-        fixed_target_year = getattr(ds, 'fixed_target_year', None)
+        fixed_target_years = getattr(ds, 'fixed_target_years', (2005, 2010, 2015, 2020))
         
         # Log images from first batch only (for visualization)
-        print("\nCreating sample visualizations from first batch...")
+        print("\nCreating multi-horizon visualizations from first batch...")
         images = []
         first_batch = all_batches_data[0]
         input_dynamic = first_batch['input_dynamic']
         input_static = first_batch['input_static']
-        target = first_batch['target']
-        preds = first_batch['preds']
         input_mask = first_batch['input_mask']
+        
+        # All horizon targets and predictions
+        horizon_names = ['5yr', '10yr', '15yr', '20yr']
+        horizon_years = [2005, 2010, 2015, 2020]
+        targets_all = {
+            '5yr': first_batch['target_5yr'],
+            '10yr': first_batch['target_10yr'],
+            '15yr': first_batch['target_15yr'],
+            '20yr': first_batch['target_20yr']
+        }
+        preds_all = {
+            '5yr': first_batch['preds_5yr'],
+            '10yr': first_batch['preds_10yr'],
+            '15yr': first_batch['preds_15yr'],
+            '20yr': first_batch['preds_20yr']
+        }
         
         B = input_dynamic.shape[0]
         for b in range(B):
-            fig, axes = plt.subplots(2, 5, figsize=(20, 8))
+            # Create multi-horizon figure: 6 rows x 4 columns
+            # Row 0: Input HM (1990, 1995, 2000) + Elevation
+            # Rows 1-4: Each horizon (Target, Pred, Error, Delta)
+            # Row 5: Change histograms for all horizons
+            fig, axes = plt.subplots(6, 4, figsize=(16, 24))
             # Use a single color ramp for all HM images in original 0-1 scale
             hm_vmin, hm_vmax = 0.0, 1.0
             # Input human footprint chips (T=3), unnormalize and label with fixed years
@@ -549,87 +598,91 @@ if __name__ == "__main__":
             axes[0, 3].axis('off')
             plt.colorbar(im, ax=axes[0, 3], fraction=0.046, pad=0.04)
             
-            # Target, unnormalize and label with year
-            target_orig = target[b].cpu().numpy() * hm_std + hm_mean
-            target_year = fixed_target_year if fixed_target_year is not None else 'Target'
-            
-            # Compute validity mask from RAW inputs to match Lightning module logic
-            target_valid = np.isfinite(target_orig)
-            # Check all dynamic channels across all timesteps - BEFORE backtransformation
-            input_dynamic_raw = input_dynamic[b].cpu().numpy()  # Raw normalized values
-            dynamic_valid = np.isfinite(input_dynamic_raw).all(axis=(0, 1))  # [H, W]
-            # Check all static channels - BEFORE backtransformation  
-            input_static_raw = input_static[b].cpu().numpy()  # Raw normalized values
-            static_valid = np.isfinite(input_static_raw).all(axis=0)  # [H, W]
-            valid_pred_mask = target_valid & dynamic_valid & static_valid
-            
-            # Compute deltas for histogram (before plotting other panels)
+            # Compute validity mask from RAW inputs
+            input_dynamic_raw = input_dynamic[b].cpu().numpy()
+            dynamic_valid = np.isfinite(input_dynamic_raw).all(axis=(0, 1))
+            input_static_raw = input_static[b].cpu().numpy()
+            static_valid = np.isfinite(input_static_raw).all(axis=0)
             most_recent_in = (input_dynamic[b, -1, 0].cpu().numpy() * hm_std + hm_mean)
-            delta = target_orig - most_recent_in
-            pred_orig = preds[b].cpu().numpy() * hm_std + hm_mean
-            pred_delta = pred_orig - most_recent_in
             
-            # Histogram comparison in upper right (axes[0, 4])
-            # Define bins
+            # Histogram bins
             histogram_bins = np.array([-1.0, -0.05, -0.005, 0.005, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0])
             num_bins = len(histogram_bins) - 1
             
-            # Compute histograms for valid pixels only
-            delta_valid = delta[valid_pred_mask]
-            pred_delta_valid = pred_delta[valid_pred_mask]
-            
-            if len(delta_valid) > 0:
-                # Compute observed histogram
-                counts_obs, _ = np.histogram(delta_valid, bins=histogram_bins)
-                counts_pred, _ = np.histogram(pred_delta_valid, bins=histogram_bins)
+            # Plot each horizon in rows 1-4
+            for h_idx, (h_name, h_year) in enumerate(zip(horizon_names, horizon_years)):
+                row = h_idx + 1
                 
-                # Plot as bar chart (log scale)
-                x = np.arange(num_bins)
-                width = 0.35
-                axes[0, 4].bar(x - width/2, counts_obs, width, label='Observed', alpha=0.7, color='blue', edgecolor='black')
-                axes[0, 4].bar(x + width/2, counts_pred, width, label='Predicted', alpha=0.7, color='red', edgecolor='black')
-                axes[0, 4].set_yscale('log')
-                axes[0, 4].set_ylim([0.5, max(counts_obs.max(), counts_pred.max()) * 2])
-                axes[0, 4].set_xlabel('Bin')
-                axes[0, 4].set_ylabel('Pixel Count (log)')
-                axes[0, 4].set_title('Change Distribution')
-                axes[0, 4].legend(fontsize=8)
-                axes[0, 4].grid(alpha=0.3, which='both')
-            else:
-                axes[0, 4].text(0.5, 0.5, 'No valid pixels', ha='center', va='center', transform=axes[0, 4].transAxes)
-                axes[0, 4].axis('off')
+                # Get target and prediction for this horizon
+                target_h = targets_all[h_name][b].cpu().numpy() * hm_std + hm_mean
+                pred_h = preds_all[h_name][b].cpu().numpy() * hm_std + hm_mean
+                
+                # Compute mask for this horizon
+                target_valid = np.isfinite(target_h)
+                valid_mask = target_valid & dynamic_valid & static_valid
+                
+                # Deltas
+                delta_obs = target_h - most_recent_in
+                delta_pred = pred_h - most_recent_in
+                
+                # Column 0: Target
+                target_plot = np.where(valid_mask, target_h, np.nan)
+                im = axes[row, 0].imshow(target_plot, cmap='turbo', vmin=hm_vmin, vmax=hm_vmax)
+                axes[row, 0].set_title(f'Target {h_year}')
+                axes[row, 0].axis('off')
+                plt.colorbar(im, ax=axes[row, 0], fraction=0.046, pad=0.04)
+                
+                # Column 1: Prediction
+                pred_plot = np.where(valid_mask, pred_h, np.nan)
+                im = axes[row, 1].imshow(pred_plot, cmap='turbo', vmin=hm_vmin, vmax=hm_vmax)
+                axes[row, 1].set_title(f'Pred {h_year}')
+                axes[row, 1].axis('off')
+                plt.colorbar(im, ax=axes[row, 1], fraction=0.046, pad=0.04)
+                
+                # Column 2: Absolute Error
+                error = np.abs(pred_h - target_h)
+                error_plot = np.where(valid_mask, error, np.nan)
+                im = axes[row, 2].imshow(error_plot, cmap='hot', vmin=0.0, vmax=0.5)
+                axes[row, 2].set_title(f'Error {h_year}')
+                axes[row, 2].axis('off')
+                plt.colorbar(im, ax=axes[row, 2], fraction=0.046, pad=0.04)
+                
+                # Column 3: Delta comparison (obs vs pred)
+                vmax_delta = max(np.nanmax(np.abs(delta_obs)), np.nanmax(np.abs(delta_pred))) if np.any(valid_mask) else 0.5
+                delta_obs_plot = np.where(valid_mask, delta_obs, np.nan)
+                im = axes[row, 3].imshow(delta_obs_plot, cmap='bwr', vmin=-vmax_delta, vmax=vmax_delta)
+                axes[row, 3].set_title(f'Δ Obs {h_year}')
+                axes[row, 3].axis('off')
+                plt.colorbar(im, ax=axes[row, 3], fraction=0.046, pad=0.04)
             
-            target_plot = np.where(valid_pred_mask, target_orig, np.nan)
-            im0 = axes[1, 0].imshow(target_plot, cmap='turbo', vmin=hm_vmin, vmax=hm_vmax)
-            axes[1, 0].set_title(f'Target HM {target_year}')
-            axes[1, 0].axis('off')
-            plt.colorbar(im0, ax=axes[1, 0], fraction=0.046, pad=0.04)
-            # Prediction, unnormalize and label (already computed above)
-            pred_plot = np.where(valid_pred_mask, pred_orig, np.nan)
-            im1 = axes[1, 1].imshow(pred_plot, cmap='turbo', vmin=hm_vmin, vmax=hm_vmax)
-            axes[1, 1].set_title(f'Predicted HM {target_year}')
-            axes[1, 1].axis('off')
-            plt.colorbar(im1, ax=axes[1, 1], fraction=0.046, pad=0.04)
-            # Error (in original 0-1 scale)
-            error = np.abs(pred_orig - target_orig)
-            error_plot = np.where(valid_pred_mask, error, np.nan)
-            im2 = axes[1, 2].imshow(error_plot, cmap='hot', vmin=0.0, vmax=hm_vmax)
-            axes[1, 2].set_title('Absolute Error (0-1)')
-            axes[1, 2].axis('off')
-            plt.colorbar(im2, ax=axes[1, 2], fraction=0.046, pad=0.04)
-            # Delta image (observed): already computed above
-            delta_plot = np.where(valid_pred_mask, delta, np.nan)
-            vmax_delta = np.nanmax(np.abs(delta_plot)) if np.any(np.isfinite(delta_plot)) else 1.0
-            im3 = axes[1, 3].imshow(delta_plot, cmap='bwr', vmin=-vmax_delta, vmax=vmax_delta)
-            axes[1, 3].set_title(f'Delta HM {target_year}-{input_years[-1]}')
-            axes[1, 3].axis('off')
-            plt.colorbar(im3, ax=axes[1, 3], fraction=0.046, pad=0.04)
-            # Delta image (predicted): already computed above
-            pred_delta_plot = np.where(valid_pred_mask, pred_delta, np.nan)
-            im4 = axes[1, 4].imshow(pred_delta_plot, cmap='bwr', vmin=-vmax_delta, vmax=vmax_delta)
-            axes[1, 4].set_title(f'Pred Delta HM {target_year}-{input_years[-1]}')
-            axes[1, 4].axis('off')
-            plt.colorbar(im4, ax=axes[1, 4], fraction=0.046, pad=0.04)
+            # Row 5: Histograms for all horizons
+            for h_idx, h_name in enumerate(horizon_names):
+                target_h = targets_all[h_name][b].cpu().numpy() * hm_std + hm_mean
+                pred_h = preds_all[h_name][b].cpu().numpy() * hm_std + hm_mean
+                target_valid = np.isfinite(target_h)
+                valid_mask = target_valid & dynamic_valid & static_valid
+                
+                delta_obs = target_h - most_recent_in
+                delta_pred = pred_h - most_recent_in
+                
+                delta_obs_valid = delta_obs[valid_mask]
+                delta_pred_valid = delta_pred[valid_mask]
+                
+                if len(delta_obs_valid) > 0:
+                    counts_obs, _ = np.histogram(delta_obs_valid, bins=histogram_bins)
+                    counts_pred, _ = np.histogram(delta_pred_valid, bins=histogram_bins)
+                    
+                    x = np.arange(num_bins)
+                    width = 0.35
+                    axes[5, h_idx].bar(x - width/2, counts_obs, width, label='Obs', alpha=0.7, color='blue')
+                    axes[5, h_idx].bar(x + width/2, counts_pred, width, label='Pred', alpha=0.7, color='red')
+                    axes[5, h_idx].set_yscale('log')
+                    axes[5, h_idx].set_title(f'Δ Histogram {horizon_years[h_idx]}')
+                    axes[5, h_idx].legend(fontsize=6)
+                    axes[5, h_idx].grid(alpha=0.3)
+                else:
+                    axes[5, h_idx].text(0.5, 0.5, 'No valid', ha='center', va='center')
+                    axes[5, h_idx].axis('off')
             plt.tight_layout()
             # Convert to numpy array and log (robust for macOS backend)
             fig.canvas.draw()
@@ -809,7 +862,8 @@ if __name__ == "__main__":
             print("Empty geometry in region GeoJSON; skipping.")
             return
         # Use target HM raster (2020) as spatial reference
-        target_year = getattr(train_loader.dataset, 'fixed_target_year', 2020)
+        target_years = getattr(train_loader.dataset, 'fixed_target_years', (2005, 2010, 2015, 2020))
+        target_year = target_years[-1]  # Use 2020 as reference
         year_to_idx = {y: i for i, y in enumerate(years)}
         target_src_path = hm_files[year_to_idx[target_year]]
         with rasterio.open(target_src_path) as ref:
@@ -838,13 +892,16 @@ if __name__ == "__main__":
                 print("⚠ Region is outside raster extent; skipping.")
                 return
 
-            # Prepare accumulators over the bbox window
+            # Prepare accumulators over the bbox window (one per horizon)
             Hwin, Wwin = r1 - r0, c1 - c0
             print(f"Region bounding box: {Hwin} × {Wwin} pixels")
             print(f"  Row range: [{r0}, {r1})")
             print(f"  Col range: [{c0}, {c1})")
             
-            accum = np.zeros((Hwin, Wwin), dtype=np.float64)
+            # Multi-horizon accumulators
+            horizon_names = ['5yr', '10yr', '15yr', '20yr']
+            horizon_years = [2005, 2010, 2015, 2020]
+            accum_horizons = {h: np.zeros((Hwin, Wwin), dtype=np.float64) for h in horizon_names}
             wsum = np.zeros((Hwin, Wwin), dtype=np.float64)
             nodata_mask_total = np.zeros((Hwin, Wwin), dtype=bool)
 
@@ -896,7 +953,7 @@ if __name__ == "__main__":
             print(f"\nProcessing {total_tiles:,} tiles ({num_tiles_i} × {num_tiles_j})")
             print(f"  Tile size: {tile} × {tile} pixels")
             print(f"  Stride: {stride} pixels")
-            print(f"  Target year: {target_year}")
+            print(f"  Target horizons: {horizon_years}")
             print(f"  Input years: {input_years}")
             print()
             
@@ -971,32 +1028,38 @@ if __name__ == "__main__":
                         # Build lon/lat grid tensor for the tile if using location encoder
                         lonlat_hw2 = lonlat_grid_for_window(i, j, hi, wj)
                         lonlat_t = torch.from_numpy(lonlat_hw2).to(device).unsqueeze(0)  # [1, H, W, 2]
-                        preds = infer_model(in_dyn, in_stat, lonlat=lonlat_t)  # [1, 1, hi, wj]
-                    pred_np = preds.squeeze().detach().cpu().numpy()  # normalized (z-score)
-                    pred_np = pred_np * hm_std + hm_mean  # denormalize to [0, 1] scale
+                        preds_all = infer_model(in_dyn, in_stat, lonlat=lonlat_t)  # [1, 4, hi, wj]
+                    
+                    # Extract predictions for each horizon
+                    preds_horizons = {}
+                    for h_idx, h_name in enumerate(horizon_names):
+                        pred_h = preds_all[0, h_idx].detach().cpu().numpy()  # [hi, wj] normalized
+                        pred_h = pred_h * hm_std + hm_mean  # denormalize to [0, 1] scale
+                        preds_horizons[h_name] = pred_h
 
                     # Distance-to-edge weights within tile
-                    # Start with interior mask = valid pixels within region
                     interior = valid_mask.astype(np.uint8)
-                    # Zero-out 1-pixel border to define edges
                     interior[[0, -1], :] = 0
                     interior[:, [0, -1]] = 0
-                    weights = distance_transform_edt(interior)  # 0 at edges, grows inward
-                    # Ensure no contribution from invalid pixels
+                    weights = distance_transform_edt(interior)
                     weights = np.where(valid_mask, weights, 0.0)
+                    
                     if weights.max() > 0:
-                        # Accumulate
-                        accum[li0:li1, lj0:lj1] += pred_np * weights
+                        # Accumulate each horizon
+                        for h_name, pred_h in preds_horizons.items():
+                            accum_horizons[h_name][li0:li1, lj0:lj1] += pred_h * weights
                         wsum[li0:li1, lj0:lj1] += weights
-                    # Track nodata for areas never covered
                     nodata_mask_total[li0:li1, lj0:lj1] |= ~valid_mask
 
-            # Final blend
+            # Final blend for all horizons
             print("\n" + "-"*70)
-            print("Blending overlapping tiles...")
-            out = np.full((Hwin, Wwin), np.nan, dtype=np.float32)
+            print("Blending overlapping tiles for all horizons...")
             m = wsum > 0
-            out[m] = (accum[m] / wsum[m]).astype(np.float32)
+            out_horizons = {}
+            for h_name in horizon_names:
+                out_h = np.full((Hwin, Wwin), np.nan, dtype=np.float32)
+                out_h[m] = (accum_horizons[h_name][m] / wsum[m]).astype(np.float32)
+                out_horizons[h_name] = out_h
             
             # Calculate statistics
             num_valid_pixels = m.sum()
@@ -1006,8 +1069,8 @@ if __name__ == "__main__":
             print(f"✓ Blending complete")
             print(f"  Valid pixels: {num_valid_pixels:,} / {num_total_pixels:,} ({valid_percent:.1f}%)")
 
-            # Write GeoTIFF clipped window
-            print("\nWriting output GeoTIFF...")
+            # Write GeoTIFF for each horizon
+            print("\nWriting output GeoTIFFs...")
             out_profile = ref.profile.copy()
             out_profile.update({
                 'height': Hwin,
@@ -1019,13 +1082,17 @@ if __name__ == "__main__":
             })
             out_dir = Path(os.getcwd()) / 'data' / 'predictions'
             out_dir.mkdir(parents=True, exist_ok=True)
-            out_path = out_dir / f"prediction_{target_year}_blended.tif"
-            with rasterio.open(out_path, 'w', **out_profile) as dst:
-                dst.write(out, 1)
+            
+            out_paths = {}
+            for h_name, h_year in zip(horizon_names, horizon_years):
+                out_path = out_dir / f"prediction_{h_year}_blended.tif"
+                with rasterio.open(out_path, 'w', **out_profile) as dst:
+                    dst.write(out_horizons[h_name], 1)
+                out_paths[h_name] = out_path
+                print(f"  ✓ {h_year}: {out_path}")
             
             # Final summary
             elapsed_total = time.time() - start_time
-            print(f"✓ Output written to: {out_path}")
             print("\n" + "="*70)
             print("PREDICTION SUMMARY")
             print("="*70)
@@ -1034,7 +1101,10 @@ if __name__ == "__main__":
             print(f"  Tiles skipped (no data/outside region): {tiles_skipped:,}")
             print(f"Output dimensions: {Hwin} × {Wwin} pixels")
             print(f"Valid output pixels: {num_valid_pixels:,} ({valid_percent:.1f}%)")
-            print(f"Total time: {int(elapsed_total//60):02d}:{int(elapsed_total%60):02d}")
+            print(f"\nOutput files:")
+            for h_name, h_year in zip(horizon_names, horizon_years):
+                print(f"  {h_year}: {out_paths[h_name]}")
+            print(f"\nTotal time: {int(elapsed_total//60):02d}:{int(elapsed_total%60):02d}")
             print("="*70 + "\n")
 
             # Close sources
