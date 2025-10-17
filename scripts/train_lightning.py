@@ -77,6 +77,12 @@ if __name__ == "__main__":
         help="Stride (pixels) between prediction tiles for overlap blending",
     )
     parser.add_argument(
+        "--predict_batch_size",
+        type=int,
+        default=16,
+        help="Number of tiles to process in parallel on GPU during prediction (default: 16)",
+    )
+    parser.add_argument(
         "--use_location_encoder",
         type=lambda x: (str(x).lower() == 'true'),
         nargs='?',
@@ -986,26 +992,35 @@ if __name__ == "__main__":
             print(f"  Input years: {input_years}")
             print()
             
+            # Collect all tile coordinates first
+            tile_coords = []
+            for i in range(r0, r1, stride):
+                for j in range(c0, c1, stride):
+                    tile_coords.append((i, j))
+            
+            batch_size = args.predict_batch_size
+            print(f"  Batch size: {batch_size} tiles")
+            
             tiles_processed = 0
             tiles_skipped = 0
             tiles_with_valid = 0
             last_percent = -1
             tile_start_time = time.time()
             
-            for i in range(r0, r1, stride):
-                for j in range(c0, c1, stride):
-                    tiles_processed += 1
-                    
-                    # Progress indicator
-                    percent = int(100 * tiles_processed / total_tiles)
-                    if percent != last_percent and percent % 5 == 0:
-                        elapsed = time.time() - tile_start_time
-                        tiles_per_sec = tiles_processed / elapsed if elapsed > 0 else 0
-                        eta_sec = (total_tiles - tiles_processed) / tiles_per_sec if tiles_per_sec > 0 else 0
-                        print(f"  Progress: {percent:3d}% ({tiles_processed:,}/{total_tiles:,} tiles) | "
-                              f"Speed: {tiles_per_sec:.1f} tiles/s | "
-                              f"ETA: {int(eta_sec//60):02d}:{int(eta_sec%60):02d}")
-                        last_percent = percent
+            import torch
+            
+            # Process tiles in batches
+            for batch_start in range(0, len(tile_coords), batch_size):
+                batch_end = min(batch_start + batch_size, len(tile_coords))
+                batch_tiles = tile_coords[batch_start:batch_end]
+                
+                # Prepare batch data
+                batch_inputs_dyn = []
+                batch_inputs_stat = []
+                batch_lonlats = []
+                batch_metadata = []  # Store (i, j, hi, wj, li0, lj0, li1, lj1, valid_mask)
+                
+                for i, j in batch_tiles:
                     hi = min(tile, r1 - i)
                     wj = min(tile, c1 - j)
                     if hi <= 0 or wj <= 0:
@@ -1015,6 +1030,7 @@ if __name__ == "__main__":
                     li1, lj1 = li0 + hi, lj0 + wj
                     submask = bbox_mask[li0:li1, lj0:lj1]
                     if not np.any(submask):
+                        tiles_processed += 1
                         tiles_skipped += 1
                         continue
                     win = Window(j, i, wj, hi)
@@ -1055,43 +1071,67 @@ if __name__ == "__main__":
                     stat_valid = np.isfinite(input_static_np[0]) if static_chs else np.ones((hi, wj), dtype=bool)
                     valid_mask = submask & hm_valid_all_times & stat_valid
                     if not np.any(valid_mask):
+                        tiles_processed += 1
                         tiles_skipped += 1
                         continue
                     
                     tiles_with_valid += 1
-
-                    # Forward pass
-                    import torch
+                    tiles_processed += 1
+                    
+                    # Add to batch
                     # Replace NaN with 0.0 in normalized space = mean in original space
-                    # This assumes missing covariates have "average" values
-                    in_dyn = torch.from_numpy(np.nan_to_num(input_dynamic_np, nan=0.0)).float().unsqueeze(0).to(device)
-                    in_stat = torch.from_numpy(np.nan_to_num(input_static_np, nan=0.0)).float().unsqueeze(0).to(device)
+                    in_dyn = np.nan_to_num(input_dynamic_np, nan=0.0).astype(np.float32)
+                    in_stat = np.nan_to_num(input_static_np, nan=0.0).astype(np.float32)
+                    lonlat_hw2 = lonlat_grid_for_window(i, j, hi, wj)
+                    
+                    batch_inputs_dyn.append(in_dyn)
+                    batch_inputs_stat.append(in_stat)
+                    batch_lonlats.append(lonlat_hw2)
+                    batch_metadata.append((i, j, hi, wj, li0, lj0, li1, lj1, valid_mask))
+                
+                # Process batch on GPU if we have any valid tiles
+                if len(batch_inputs_dyn) > 0:
+                    # Stack into batch tensors
+                    batch_dyn_tensor = torch.from_numpy(np.stack(batch_inputs_dyn, axis=0)).to(device)  # [B, T, C, H, W]
+                    batch_stat_tensor = torch.from_numpy(np.stack(batch_inputs_stat, axis=0)).to(device)  # [B, C, H, W]
+                    batch_lonlat_tensor = torch.from_numpy(np.stack(batch_lonlats, axis=0)).to(device)  # [B, H, W, 2]
+                    
                     with torch.no_grad():
-                        # Build lon/lat grid tensor for the tile if using location encoder
-                        lonlat_hw2 = lonlat_grid_for_window(i, j, hi, wj)
-                        lonlat_t = torch.from_numpy(lonlat_hw2).to(device).unsqueeze(0)  # [1, H, W, 2]
-                        preds_all = infer_model(in_dyn, in_stat, lonlat=lonlat_t)  # [1, 4, hi, wj]
+                        batch_preds = infer_model(batch_dyn_tensor, batch_stat_tensor, lonlat=batch_lonlat_tensor)  # [B, 4, H, W]
                     
-                    # Extract predictions for each horizon
-                    preds_horizons = {}
-                    for h_idx, h_name in enumerate(horizon_names):
-                        pred_h = preds_all[0, h_idx].detach().cpu().numpy()  # [hi, wj] normalized
-                        pred_h = pred_h * hm_std + hm_mean  # denormalize to [0, 1] scale
-                        preds_horizons[h_name] = pred_h
-
-                    # Distance-to-edge weights within tile
-                    interior = valid_mask.astype(np.uint8)
-                    interior[[0, -1], :] = 0
-                    interior[:, [0, -1]] = 0
-                    weights = distance_transform_edt(interior)
-                    weights = np.where(valid_mask, weights, 0.0)
-                    
-                    if weights.max() > 0:
-                        # Accumulate each horizon
-                        for h_name, pred_h in preds_horizons.items():
-                            accum_horizons[h_name][li0:li1, lj0:lj1] += pred_h * weights
-                        wsum[li0:li1, lj0:lj1] += weights
-                    nodata_mask_total[li0:li1, lj0:lj1] |= ~valid_mask
+                    # Process each tile in the batch
+                    for tile_idx, (i, j, hi, wj, li0, lj0, li1, lj1, valid_mask) in enumerate(batch_metadata):
+                        # Extract predictions for this tile
+                        preds_horizons = {}
+                        for h_idx, h_name in enumerate(horizon_names):
+                            pred_h = batch_preds[tile_idx, h_idx].detach().cpu().numpy()  # [hi, wj] normalized
+                            pred_h = pred_h * hm_std + hm_mean  # denormalize to [0, 1] scale
+                            preds_horizons[h_name] = pred_h
+                        
+                        # Distance-to-edge weights within tile
+                        interior = valid_mask.astype(np.uint8)
+                        interior[[0, -1], :] = 0
+                        interior[:, [0, -1]] = 0
+                        weights = distance_transform_edt(interior)
+                        weights = np.where(valid_mask, weights, 0.0)
+                        
+                        if weights.max() > 0:
+                            # Accumulate each horizon
+                            for h_name, pred_h in preds_horizons.items():
+                                accum_horizons[h_name][li0:li1, lj0:lj1] += pred_h * weights
+                            wsum[li0:li1, lj0:lj1] += weights
+                        nodata_mask_total[li0:li1, lj0:lj1] |= ~valid_mask
+                
+                # Progress indicator (after each batch)
+                percent = int(100 * tiles_processed / total_tiles)
+                if percent != last_percent and percent % 5 == 0:
+                    elapsed = time.time() - tile_start_time
+                    tiles_per_sec = tiles_processed / elapsed if elapsed > 0 else 0
+                    eta_sec = (total_tiles - tiles_processed) / tiles_per_sec if tiles_per_sec > 0 else 0
+                    print(f"  Progress: {percent:3d}% ({tiles_processed:,}/{total_tiles:,} tiles) | "
+                          f"Speed: {tiles_per_sec:.1f} tiles/s | "
+                          f"ETA: {int(eta_sec//60):02d}:{int(eta_sec%60):02d}")
+                    last_percent = percent
 
             # Final blend for all horizons
             print("\n" + "-"*70)
