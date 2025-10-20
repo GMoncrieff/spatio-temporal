@@ -115,15 +115,15 @@ class SpatioTemporalLightningModule(pl.LightningModule):
                 'total': zero
             }
         
-        # MSE on NORMALIZED changes
+        # MSE on RAW changes (no normalization)
         mse = self.loss_fn(valid_delta_pred, valid_delta_true)
         
         # MAE on absolute values (monitoring only - not in loss)
-        # Need to denormalize changes and reconstruct absolute HM
-        if hm_std is not None and delta_std is not None:
-            # Denormalize changes
-            pred_change_raw = pred_change * delta_std + delta_mean
-            target_change_raw = target_change * delta_std + delta_mean
+        # Changes are already raw, just reconstruct absolute HM
+        if hm_std is not None:
+            # Changes are already raw - no denormalization needed
+            pred_change_raw = pred_change
+            target_change_raw = target_change
             # Denormalize last input
             last_input_raw = last_input * hm_std + hm_mean
             # Reconstruct absolute HM
@@ -134,27 +134,24 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             # Fallback if stats not provided
             mae = torch.tensor(0.0, device=pred_change.device)
         
-        # SSIM on NORMALIZED CHANGES
+        # SSIM on RAW CHANGES
         pred_change_sanitized = pred_change.clone()
         target_change_sanitized = target_change.clone()
         pred_change_sanitized[~mask_h] = 0.0
         target_change_sanitized[~mask_h] = 0.0
-        # For normalized changes, use larger data_range (changes can span several std devs)
-        ssim_val = ssim(pred_change_sanitized, target_change_sanitized, data_range=10.0)
+        # For raw changes in [0,1] range, use data_range=1.0
+        ssim_val = ssim(pred_change_sanitized, target_change_sanitized, data_range=1.0)
         ssim_loss = 1.0 - ssim_val
         
-        # Laplacian loss on NORMALIZED CHANGES
+        # Laplacian loss on RAW CHANGES
         lap_loss = self.lap_loss(pred_change_sanitized, target_change_sanitized, mask=mask_h)
         
-        # Histogram loss on DENORMALIZED changes (raw values)
+        # Histogram loss on raw changes (already raw, no denormalization needed)
         hist_loss = torch.tensor(0.0, device=pred_change.device)
-        if self.histogram_weight > 0 and self.current_epoch >= self.histogram_warmup_epochs and delta_std is not None:
-            # Denormalize changes to raw space for histogram loss
-            pred_change_raw = pred_change * delta_std + delta_mean
-            target_change_raw = target_change * delta_std + delta_mean
-            
-            target_change_2d = target_change_raw.squeeze(1)
-            pred_change_2d = pred_change_raw.squeeze(1)
+        if self.histogram_weight > 0 and self.current_epoch >= self.histogram_warmup_epochs:
+            # Changes are already raw - no denormalization needed
+            target_change_2d = target_change.squeeze(1)
+            pred_change_2d = pred_change.squeeze(1)
             mask_2d = mask_h.squeeze(1)
             # Extract horizon index from horizon_name (e.g., "5yr" -> 0)
             horizon_map = {'5yr': 0, '10yr': 1, '15yr': 2, '20yr': 3}

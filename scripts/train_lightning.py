@@ -406,11 +406,11 @@ if __name__ == "__main__":
                     last_input_norm = input_dynamic_clean[:, -1, 0:1, :, :]  # [B, 1, H, W] normalized
                     last_input_raw = last_input_norm * hm_std + hm_mean  # Denormalize to [0, 1]
                     
-                    # Denormalize predicted changes
-                    pred_changes_raw_5yr = pred_changes_all[:, 0:1, :, :] * delta_std + delta_mean
-                    pred_changes_raw_10yr = pred_changes_all[:, 1:2, :, :] * delta_std + delta_mean
-                    pred_changes_raw_15yr = pred_changes_all[:, 2:3, :, :] * delta_std + delta_mean
-                    pred_changes_raw_20yr = pred_changes_all[:, 3:4, :, :] * delta_std + delta_mean
+                    # NO denormalization - predictions are already raw changes
+                    pred_changes_raw_5yr = pred_changes_all[:, 0:1, :, :]
+                    pred_changes_raw_10yr = pred_changes_all[:, 1:2, :, :]
+                    pred_changes_raw_15yr = pred_changes_all[:, 2:3, :, :]
+                    pred_changes_raw_20yr = pred_changes_all[:, 3:4, :, :]
                     
                     # Convert to absolute HM and clip to [0, 1]
                     preds_5yr = torch.clamp(last_input_raw + pred_changes_raw_5yr, 0.0, 1.0)  # [B, 1, H, W]
@@ -436,11 +436,11 @@ if __name__ == "__main__":
                     target_change_15yr = batch.get('target_15yr', target).to(device)
                     target_change_20yr = batch.get('target_20yr', target).to(device)
                     
-                    # Denormalize changes (raw, before clipping)
-                    target_change_raw_5yr = target_change_5yr * delta_std + delta_mean
-                    target_change_raw_10yr = target_change_10yr * delta_std + delta_mean
-                    target_change_raw_15yr = target_change_15yr * delta_std + delta_mean
-                    target_change_raw_20yr = target_change_20yr * delta_std + delta_mean
+                    # NO denormalization - targets are already raw changes
+                    target_change_raw_5yr = target_change_5yr
+                    target_change_raw_10yr = target_change_10yr
+                    target_change_raw_15yr = target_change_15yr
+                    target_change_raw_20yr = target_change_20yr
                     
                     # Convert to absolute HM and clip
                     last_input_raw_2d = last_input_raw.squeeze(1)  # [B, H, W]
@@ -1255,8 +1255,7 @@ if __name__ == "__main__":
                         # Extract PREDICTED CHANGES for this tile (crop to actual size if padded)
                         preds_horizons = {}
                         for h_idx, h_name in enumerate(horizon_names):
-                            pred_change_norm = batch_pred_changes[tile_idx, h_idx, :hi, :wj].detach().cpu().numpy()  # [hi, wj] normalized change
-                            pred_change = pred_change_norm * delta_std + delta_mean  # denormalize to raw change scale
+                            pred_change = batch_pred_changes[tile_idx, h_idx, :hi, :wj].detach().cpu().numpy()  # [hi, wj] already raw change
                             # Convert to absolute HM and clip to [0, 1]
                             pred_h = np.clip(last_input_tile + pred_change, 0.0, 1.0)
                             preds_horizons[h_name] = pred_h

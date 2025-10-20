@@ -397,8 +397,8 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
                     target_hm_raw = self._hm_srcs[t_idx].read(1, window=rasterio.windows.Window(j, i, self.chip_size, self.chip_size), masked=True).filled(np.nan)
                     # Compute CHANGE in original space
                     delta_raw = target_hm_raw - last_input_raw
-                    # Normalize the CHANGE
-                    target_delta = (delta_raw - self.delta_mean) / self.delta_std
+                    # NO NORMALIZATION - use raw changes directly (TEST)
+                    target_delta = delta_raw
                 targets[horizon_name] = torch.from_numpy(target_delta).float()
                 if not np.isnan(target_delta).all():
                     all_valid = True
