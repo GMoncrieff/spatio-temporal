@@ -382,14 +382,17 @@ if __name__ == "__main__":
                     lonlat = batch.get('lonlat', None)
                     if lonlat is not None:
                         lonlat = lonlat.to(device)
-                    # Get predictions from model (learnable location encoder)
-                    preds_all = best_model(input_dynamic_clean, input_static_clean, lonlat=lonlat)  # [B, 4, H, W]
+                    # Get PREDICTED CHANGES from model (MODEL NOW PREDICTS CHANGES DIRECTLY)
+                    pred_changes_all = best_model(input_dynamic_clean, input_static_clean, lonlat=lonlat)  # [B, 4, H, W]
                     
-                    # Store all 4 horizons
-                    preds_5yr = preds_all[:, 0:1, :, :].clone()  # [B, 1, H, W]
-                    preds_10yr = preds_all[:, 1:2, :, :].clone()
-                    preds_15yr = preds_all[:, 2:3, :, :].clone()
-                    preds_20yr = preds_all[:, 3:4, :, :].clone()
+                    # Get last input for converting changes to absolute HM
+                    last_input = input_dynamic_clean[:, -1, 0:1, :, :]  # [B, 1, H, W]
+                    
+                    # Convert predicted changes to absolute HM values and clip to [0, 1]
+                    preds_5yr = torch.clamp(last_input + pred_changes_all[:, 0:1, :, :], 0.0, 1.0)  # [B, 1, H, W]
+                    preds_10yr = torch.clamp(last_input + pred_changes_all[:, 1:2, :, :], 0.0, 1.0)
+                    preds_15yr = torch.clamp(last_input + pred_changes_all[:, 2:3, :, :], 0.0, 1.0)
+                    preds_20yr = torch.clamp(last_input + pred_changes_all[:, 3:4, :, :], 0.0, 1.0)
                     
                     # Set predictions to NaN where any input was NaN
                     preds_5yr[~input_mask] = float('nan')
@@ -1158,15 +1161,25 @@ if __name__ == "__main__":
                     batch_lonlat_tensor = torch.from_numpy(np.stack(batch_lonlats, axis=0)).to(device)  # [B, H, W, 2]
                     
                     with torch.no_grad():
-                        batch_preds = infer_model(batch_dyn_tensor, batch_stat_tensor, lonlat=batch_lonlat_tensor)  # [B, 4, H, W]
+                        # MODEL NOW PREDICTS CHANGES DIRECTLY
+                        batch_pred_changes = infer_model(batch_dyn_tensor, batch_stat_tensor, lonlat=batch_lonlat_tensor)  # [B, 4, H, W]
+                    
+                    # Get last input HM for converting changes to absolute values
+                    batch_last_input = batch_dyn_tensor[:, -1, 0, :, :]  # [B, H, W] - normalized
                     
                     # Process each tile in the batch
                     for tile_idx, (i, j, hi, wj, li0, lj0, li1, lj1, valid_mask) in enumerate(batch_metadata):
-                        # Extract predictions for this tile (crop to actual size if padded)
+                        # Get last input for this tile
+                        last_input_tile = batch_last_input[tile_idx, :hi, :wj].detach().cpu().numpy()
+                        last_input_tile = last_input_tile * hm_std + hm_mean  # denormalize to [0, 1] scale
+                        
+                        # Extract PREDICTED CHANGES for this tile (crop to actual size if padded)
                         preds_horizons = {}
                         for h_idx, h_name in enumerate(horizon_names):
-                            pred_h = batch_preds[tile_idx, h_idx, :hi, :wj].detach().cpu().numpy()  # [hi, wj] normalized (crop padding)
-                            pred_h = pred_h * hm_std + hm_mean  # denormalize to [0, 1] scale
+                            pred_change = batch_pred_changes[tile_idx, h_idx, :hi, :wj].detach().cpu().numpy()  # [hi, wj] normalized (crop padding)
+                            pred_change = pred_change * hm_std + hm_mean  # denormalize to change scale
+                            # Convert to absolute HM and clip to [0, 1]
+                            pred_h = np.clip(last_input_tile + pred_change, 0.0, 1.0)
                             preds_horizons[h_name] = pred_h
                         
                         # Distance-to-edge weights within tile
