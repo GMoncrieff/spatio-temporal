@@ -67,24 +67,25 @@ class SpatioTemporalLightningModule(pl.LightningModule):
 
     # Removed AR-specific helpers and panels for single-step setup
     
-    def _compute_horizon_losses(self, pred_change, target_h, last_input, mask_h, horizon_name=""):
+    def _compute_horizon_losses(self, pred_change, target_change, last_input, mask_h, horizon_name="", hm_std=None, hm_mean=None, delta_std=None, delta_mean=None):
         """
         Compute all loss components for a single horizon.
         
         Args:
-            pred_change: [B, 1, H, W] PREDICTED CHANGES (model now predicts deltas directly)
-            target_h: [B, 1, H, W] target absolute HM values
-            last_input: [B, 1, H, W] last input timestep (absolute HM)
+            pred_change: [B, 1, H, W] PREDICTED CHANGES (normalized)
+            target_change: [B, 1, H, W] TARGET CHANGES (normalized) - NEW!
+            last_input: [B, 1, H, W] last input timestep (normalized HM)
             mask_h: [B, 1, H, W] validity mask
             horizon_name: str, for logging (e.g., "5yr")
+            hm_std, hm_mean: For denormalizing HM
+            delta_std, delta_mean: For denormalizing changes
             
         Returns:
             dict with keys: mse, mae, ssim, lap, hist, total (unweighted), and weighted versions
         """
-        # True changes
-        delta_true = target_h - last_input
+        # Both pred_change and target_change are NORMALIZED changes
         valid_delta_pred = pred_change[mask_h]
-        valid_delta_true = delta_true[mask_h]
+        valid_delta_true = target_change[mask_h]
         
         if valid_delta_pred.numel() == 0:
             zero = torch.tensor(0.0, device=pred_change.device)
@@ -100,38 +101,47 @@ class SpatioTemporalLightningModule(pl.LightningModule):
                 'total': zero
             }
         
-        # MSE on changes (deltas)
+        # MSE on NORMALIZED changes
         mse = self.loss_fn(valid_delta_pred, valid_delta_true)
         
         # MAE on absolute values (monitoring only - not in loss)
-        # Reconstruct absolute predictions: pred_absolute = last_input + pred_change
-        pred_absolute = last_input + pred_change
-        # Clip to [0, 1] range
-        pred_absolute = torch.clamp(pred_absolute, 0.0, 1.0)
-        mae = self.mae_fn(pred_absolute[mask_h], target_h[mask_h])
+        # Need to denormalize changes and reconstruct absolute HM
+        if hm_std is not None and delta_std is not None:
+            # Denormalize changes
+            pred_change_raw = pred_change * delta_std + delta_mean
+            target_change_raw = target_change * delta_std + delta_mean
+            # Denormalize last input
+            last_input_raw = last_input * hm_std + hm_mean
+            # Reconstruct absolute HM
+            pred_absolute = torch.clamp(last_input_raw + pred_change_raw, 0.0, 1.0)
+            target_absolute = torch.clamp(last_input_raw + target_change_raw, 0.0, 1.0)
+            mae = self.mae_fn(pred_absolute[mask_h], target_absolute[mask_h])
+        else:
+            # Fallback if stats not provided
+            mae = torch.tensor(0.0, device=pred_change.device)
         
-        # SSIM on CHANGES (NEW: was on absolute, now on changes)
+        # SSIM on NORMALIZED CHANGES
         pred_change_sanitized = pred_change.clone()
-        delta_true_sanitized = delta_true.clone()
+        target_change_sanitized = target_change.clone()
         pred_change_sanitized[~mask_h] = 0.0
-        delta_true_sanitized[~mask_h] = 0.0
-        # For changes, use data_range=2.0 (changes can be -1 to +1)
-        ssim_val = ssim(pred_change_sanitized, delta_true_sanitized, data_range=2.0)
+        target_change_sanitized[~mask_h] = 0.0
+        # For normalized changes, use larger data_range (changes can span several std devs)
+        ssim_val = ssim(pred_change_sanitized, target_change_sanitized, data_range=10.0)
         ssim_loss = 1.0 - ssim_val
         
-        # Laplacian loss on CHANGES (NEW: was on absolute, now on changes)
-        lap_loss = self.lap_loss(pred_change_sanitized, delta_true_sanitized, mask=mask_h)
+        # Laplacian loss on NORMALIZED CHANGES
+        lap_loss = self.lap_loss(pred_change_sanitized, target_change_sanitized, mask=mask_h)
         
-        # Histogram loss on changes
+        # Histogram loss on NORMALIZED changes
         hist_loss = torch.tensor(0.0, device=pred_change.device)
         if self.histogram_weight > 0 and self.current_epoch >= self.histogram_warmup_epochs:
-            delta_true_2d = delta_true.squeeze(1)
+            target_change_2d = target_change.squeeze(1)
             pred_change_2d = pred_change.squeeze(1)
             mask_2d = mask_h.squeeze(1)
             # Extract horizon index from horizon_name (e.g., "5yr" -> 0)
             horizon_map = {'5yr': 0, '10yr': 1, '15yr': 2, '20yr': 3}
             h_idx = horizon_map.get(horizon_name, 0)
-            hist_loss, _, _ = self.histogram_loss_fn(delta_true_2d, pred_change_2d, mask=mask_2d, horizon_idx=h_idx)
+            hist_loss, _, _ = self.histogram_loss_fn(target_change_2d, pred_change_2d, mask=mask_2d, horizon_idx=h_idx)
         
         # Total loss for this horizon (weighted)
         total = mse + self.ssim_weight * ssim_loss + self.laplacian_weight * lap_loss
@@ -159,7 +169,7 @@ class SpatioTemporalLightningModule(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         input_dynamic = batch['input_dynamic']
         input_static = batch['input_static']
-        # Multi-horizon targets
+        # Multi-horizon targets - NOW NORMALIZED CHANGES
         targets = {
             '5yr': batch['target_5yr'].unsqueeze(1),
             '10yr': batch['target_10yr'].unsqueeze(1),
@@ -194,19 +204,20 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         
         for h_idx, h_name in enumerate(horizon_names):
             # Extract PREDICTED CHANGE and target for this horizon
-            pred_change = pred_changes_all[:, h_idx:h_idx+1, :, :]  # [B, 1, H, W] - CHANGE
-            target_h = targets[h_name]  # [B, 1, H, W] - ABSOLUTE HM
+            pred_change = pred_changes_all[:, h_idx:h_idx+1, :, :]  # [B, 1, H, W] - NORMALIZED CHANGE
+            target_change = targets[h_name]  # [B, 1, H, W] - NORMALIZED CHANGE (from dataloader)
             
             # Compute mask for this horizon
-            target_valid = torch.isfinite(target_h)
+            target_valid = torch.isfinite(target_change)
             mask_h = target_valid & dynamic_valid.squeeze(2) & static_valid.squeeze(2) & torch.isfinite(last_input)
             
             # Set predicted changes to NaN where inputs were invalid
             pred_change = pred_change.clone()
             pred_change[~mask_h] = float('nan')
             
-            # Compute all losses for this horizon (pred_change, not pred_absolute)
-            losses_h = self._compute_horizon_losses(pred_change, target_h, last_input, mask_h, h_name)
+            # Compute all losses for this horizon
+            # TODO: Pass hm_std/mean and delta_std/mean for proper MAE computation
+            losses_h = self._compute_horizon_losses(pred_change, target_change, last_input, mask_h, h_name)
             horizon_losses.append(losses_h)
         
         # Log per-horizon metrics (unweighted and weighted)
@@ -261,7 +272,7 @@ class SpatioTemporalLightningModule(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         input_dynamic = batch['input_dynamic']
         input_static = batch['input_static']
-        # Multi-horizon targets
+        # Multi-horizon targets - NOW NORMALIZED CHANGES
         targets = {
             '5yr': batch['target_5yr'].unsqueeze(1),
             '10yr': batch['target_10yr'].unsqueeze(1),
@@ -296,19 +307,20 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         
         for h_idx, h_name in enumerate(horizon_names):
             # Extract PREDICTED CHANGE and target for this horizon
-            pred_change = pred_changes_all[:, h_idx:h_idx+1, :, :]  # [B, 1, H, W] - CHANGE
-            target_h = targets[h_name]  # [B, 1, H, W] - ABSOLUTE HM
+            pred_change = pred_changes_all[:, h_idx:h_idx+1, :, :]  # [B, 1, H, W] - NORMALIZED CHANGE
+            target_change = targets[h_name]  # [B, 1, H, W] - NORMALIZED CHANGE (from dataloader)
             
             # Compute mask for this horizon
-            target_valid = torch.isfinite(target_h)
+            target_valid = torch.isfinite(target_change)
             mask_h = target_valid & dynamic_valid.squeeze(2) & static_valid.squeeze(2) & torch.isfinite(last_input)
             
             # Set predicted changes to NaN where inputs were invalid
             pred_change = pred_change.clone()
             pred_change[~mask_h] = float('nan')
             
-            # Compute all losses for this horizon (pred_change, not pred_absolute)
-            losses_h = self._compute_horizon_losses(pred_change, target_h, last_input, mask_h, h_name)
+            # Compute all losses for this horizon
+            # TODO: Pass hm_std/mean and delta_std/mean for proper MAE computation
+            losses_h = self._compute_horizon_losses(pred_change, target_change, last_input, mask_h, h_name)
             horizon_losses.append(losses_h)
         
         # Log per-horizon metrics (unweighted and weighted)

@@ -125,6 +125,37 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
         hm_stack_samp = np.stack(hm_samples, axis=0)
         self.hm_mean = np.nanmean(hm_stack_samp)
         self.hm_std = np.nanstd(hm_stack_samp) + 1e-8
+        
+        # Compute CHANGE (delta) statistics
+        print("Computing delta statistics...")
+        delta_samples = []
+        # Open HM files temporarily for stats
+        with rasterio.open(self._hm_files[0]) as src:
+            Hs, Ws = src.height, src.width
+        num_delta_samples = 500
+        for _ in range(num_delta_samples):
+            if Hs < self.chip_size or Ws < self.chip_size:
+                i, j = 0, 0
+            else:
+                i = int(rng.integers(0, Hs - self.chip_size + 1))
+                j = int(rng.integers(0, Ws - self.chip_size + 1))
+            for t1 in range(len(self._hm_files) - 1):
+                t2 = t1 + 1
+                w = rasterio.windows.Window(j, i, self.chip_size, self.chip_size)
+                with rasterio.open(self._hm_files[t1]) as src1:
+                    h1 = src1.read(1, window=w, masked=True).filled(np.nan)
+                with rasterio.open(self._hm_files[t2]) as src2:
+                    h2 = src2.read(1, window=w, masked=True).filled(np.nan)
+                d = h2 - h1
+                vd = d[np.isfinite(d)]
+                if len(vd) > 0:
+                    delta_samples.extend(vd.flatten())
+        delta_samples = np.array(delta_samples)
+        self.delta_mean = np.mean(delta_samples)
+        self.delta_std = np.std(delta_samples) + 1e-8
+        print(f"HM: mean={self.hm_mean:.4f}, std={self.hm_std:.4f}")
+        print(f"Delta: mean={self.delta_mean:.6f}, std={self.delta_std:.6f}")
+        
         # Static stats (per variable) - different variables have different scales
         self.static_means = []
         self.static_stds = []
@@ -343,7 +374,12 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
                 lon, lat = xs, ys
             lonlat = np.stack([lon, lat], axis=-1).astype(np.float32)  # [H, W, 2]
             
+            # Get last input HM (RAW, for computing changes)
+            last_input_idx = input_t_idxs[-1]
+            last_input_raw = self._hm_srcs[last_input_idx].read(1, window=rasterio.windows.Window(j, i, self.chip_size, self.chip_size), masked=True).filled(np.nan)
+            
             # Multi-horizon targets (computed from end_year)
+            # TARGETS ARE NOW NORMALIZED CHANGES, NOT ABSOLUTE HM
             targets = {}
             horizon_names = ['target_5yr', 'target_10yr', 'target_15yr', 'target_20yr']
             all_valid = False
@@ -351,13 +387,16 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
             for horizon_name, t_idx, target_year in zip(horizon_names, target_t_idxs, target_years):
                 if t_idx is None or target_year > 2020:
                     # Missing year - fill with NaN (will be masked in loss)
-                    target_h = np.full((self.chip_size, self.chip_size), np.nan, dtype=np.float32)
+                    target_delta = np.full((self.chip_size, self.chip_size), np.nan, dtype=np.float32)
                 else:
-                    target_h = self._hm_srcs[t_idx].read(1, window=rasterio.windows.Window(j, i, self.chip_size, self.chip_size), masked=True).filled(np.nan)
-                    # Data is already in [0, 1] range
-                    target_h = (target_h - self.hm_mean) / self.hm_std
-                targets[horizon_name] = torch.from_numpy(target_h).float()
-                if not np.isnan(target_h).all():
+                    # Read target HM (RAW)
+                    target_hm_raw = self._hm_srcs[t_idx].read(1, window=rasterio.windows.Window(j, i, self.chip_size, self.chip_size), masked=True).filled(np.nan)
+                    # Compute CHANGE in original space
+                    delta_raw = target_hm_raw - last_input_raw
+                    # Normalize the CHANGE
+                    target_delta = (delta_raw - self.delta_mean) / self.delta_std
+                targets[horizon_name] = torch.from_numpy(target_delta).float()
+                if not np.isnan(target_delta).all():
                     all_valid = True
             
             if all_valid:
