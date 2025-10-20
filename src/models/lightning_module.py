@@ -65,8 +65,16 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         self.histogram_warmup_epochs = histogram_warmup_epochs
         self.histogram_lambda_w2 = histogram_lambda_w2  # Store for reference (not used in new implementation)
         if self.histogram_weight > 0:
-            # Define histogram bins: [-1, -0.05, -ε, +ε, 0.02, 0.05, 0.1, 0.2, 0.5, 1]
-            histogram_bins = torch.tensor([-1.0, -0.05, -0.005, 0.005, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0])
+            # Define histogram bins in RAW CHANGE space (denormalized, in [0,1] HM units)
+            # Bin 0: Large decrease (< -0.05)
+            # Bin 1: Small decrease (-0.05 to -0.005)
+            # Bin 2: No change (-0.005 to 0.005)
+            # Bin 3: Tiny increase (0.005 to 0.02)
+            # Bin 4: Small increase (0.02 to 0.05)
+            # Bin 5: Medium increase (0.05 to 0.2)
+            # Bin 6: Very large increase (0.2 to 0.5)
+            # Bin 7: Extreme increase (> 0.5)
+            histogram_bins = torch.tensor([-1.0, -0.05, -0.005, 0.005, 0.02, 0.05, 0.2, 0.5, 1.0])
             self.histogram_loss_fn = HistogramLoss(histogram_bins)  # Bin weights will be set later
             self.register_buffer('histogram_bins', histogram_bins)
             self.histogram_bins_initialized = False
@@ -138,11 +146,15 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         # Laplacian loss on NORMALIZED CHANGES
         lap_loss = self.lap_loss(pred_change_sanitized, target_change_sanitized, mask=mask_h)
         
-        # Histogram loss on NORMALIZED changes
+        # Histogram loss on DENORMALIZED changes (raw values)
         hist_loss = torch.tensor(0.0, device=pred_change.device)
-        if self.histogram_weight > 0 and self.current_epoch >= self.histogram_warmup_epochs:
-            target_change_2d = target_change.squeeze(1)
-            pred_change_2d = pred_change.squeeze(1)
+        if self.histogram_weight > 0 and self.current_epoch >= self.histogram_warmup_epochs and delta_std is not None:
+            # Denormalize changes to raw space for histogram loss
+            pred_change_raw = pred_change * delta_std + delta_mean
+            target_change_raw = target_change * delta_std + delta_mean
+            
+            target_change_2d = target_change_raw.squeeze(1)
+            pred_change_2d = pred_change_raw.squeeze(1)
             mask_2d = mask_h.squeeze(1)
             # Extract horizon index from horizon_name (e.g., "5yr" -> 0)
             horizon_map = {'5yr': 0, '10yr': 1, '15yr': 2, '20yr': 3}

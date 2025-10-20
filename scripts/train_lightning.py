@@ -689,8 +689,16 @@ if __name__ == "__main__":
             static_valid = np.isfinite(input_static_raw).all(axis=0)
             most_recent_in = (input_dynamic[b, -1, 0].cpu().numpy() * hm_std + hm_mean)
             
-            # Histogram bins
-            histogram_bins = np.array([-1.0, -0.05, -0.005, 0.005, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0])
+            # Histogram bins (in raw change space, not normalized)
+            # Bin 0: Large decrease (< -0.05)
+            # Bin 1: Small decrease (-0.05 to -0.005)
+            # Bin 2: No change (-0.005 to 0.005)
+            # Bin 3: Tiny increase (0.005 to 0.02)
+            # Bin 4: Small increase (0.02 to 0.05)
+            # Bin 5: Medium increase (0.05 to 0.2)
+            # Bin 6: Very large increase (0.2 to 0.5)
+            # Bin 7: Extreme increase (> 0.5)
+            histogram_bins = np.array([-1.0, -0.05, -0.005, 0.005, 0.02, 0.05, 0.2, 0.5, 1.0])
             num_bins = len(histogram_bins) - 1
             
             # Plot each horizon in rows 1-4
@@ -835,6 +843,14 @@ if __name__ == "__main__":
                     diffs_mod_horizons[h_name].append(pred_delta[valid_pred_mask])
         
         print(f"✓ Accumulated changes from {len(all_batches_data)} batches for all horizons")
+        
+        # DEBUG: Print stats for accumulated changes
+        for h_name in horizon_names:
+            if len(diffs_obs_horizons[h_name]) > 0:
+                obs_all = np.concatenate(diffs_obs_horizons[h_name])
+                mod_all = np.concatenate(diffs_mod_horizons[h_name])
+                print(f"  {h_name}: Obs range=[{obs_all.min():.4f}, {obs_all.max():.4f}], " 
+                      f"Pred range=[{mod_all.min():.4f}, {mod_all.max():.4f}]")
 
         # ---- Hexbin plots: Observed vs Predicted HM change (per horizon) ----
         import matplotlib.colors as mcolors
@@ -888,9 +904,19 @@ if __name__ == "__main__":
             experiment.log({"Obs_vs_Pred_HM_Change": hexbin_images})
             
         # ---- Histograms: Observed vs Predicted HM change distribution (per horizon) ----
-        bins = [-1, -0.05, 0, 0.005, 0.02, 0.05, 0.1, 0.2, 0.5, 1]
-        bin_labels = ['-1 to -0.05', '-0.05 to 0', '0 to 0.005', '0.005 to 0.02', 
-                      '0.02 to 0.05', '0.05 to 0.1', '0.1 to 0.2', '0.2 to 0.5', '0.5 to 1']
+        # Bin 0: Large decrease (< -0.05)
+        # Bin 1: Small decrease (-0.05 to -0.005)
+        # Bin 2: No change (-0.005 to 0.005)
+        # Bin 3: Tiny increase (0.005 to 0.02)
+        # Bin 4: Small increase (0.02 to 0.05)
+        # Bin 5: Medium increase (0.05 to 0.2)
+        # Bin 6: Very large increase (0.2 to 0.5)
+        # Bin 7: Extreme increase (> 0.5)
+        bins = [-1.0, -0.05, -0.005, 0.005, 0.02, 0.05, 0.2, 0.5, 1.0]
+        bin_labels = ['Large decrease\n(< -0.05)', 'Small decrease\n(-0.05 to -0.005)', 
+                      'No change\n(-0.005 to 0.005)', 'Tiny increase\n(0.005 to 0.02)',
+                      'Small increase\n(0.02 to 0.05)', 'Medium increase\n(0.05 to 0.2)', 
+                      'Very large increase\n(0.2 to 0.5)', 'Extreme increase\n(> 0.5)']
         
         histogram_images = []
         for h_name, h_year in zip(horizon_names, horizon_years):
