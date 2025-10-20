@@ -30,6 +30,10 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         histogram_weight: float = 0.67,
         histogram_lambda_w2: float = 0.1,
         histogram_warmup_epochs: int = 20,
+        hm_mean: float = None,
+        hm_std: float = None,
+        delta_mean: float = None,
+        delta_std: float = None,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -51,9 +55,11 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         self.laplacian_weight = laplacian_weight
         # 3-level Laplacian pyramid by default
         self.lap_loss = LaplacianPyramidLoss(levels=3, kernel_size=5, sigma=1.0, include_lowpass=True)
-        # Normalization stats to be set externally
-        self.hm_mean = None
-        self.hm_std = None
+        # Normalization stats from dataloader
+        self.hm_mean = hm_mean
+        self.hm_std = hm_std
+        self.delta_mean = delta_mean
+        self.delta_std = delta_std
         # Histogram loss for pixel-level change distributions
         self.histogram_weight = histogram_weight
         self.histogram_warmup_epochs = histogram_warmup_epochs
@@ -216,8 +222,11 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             pred_change[~mask_h] = float('nan')
             
             # Compute all losses for this horizon
-            # TODO: Pass hm_std/mean and delta_std/mean for proper MAE computation
-            losses_h = self._compute_horizon_losses(pred_change, target_change, last_input, mask_h, h_name)
+            losses_h = self._compute_horizon_losses(
+                pred_change, target_change, last_input, mask_h, h_name,
+                hm_std=self.hm_std, hm_mean=self.hm_mean,
+                delta_std=self.delta_std, delta_mean=self.delta_mean
+            )
             horizon_losses.append(losses_h)
         
         # Log per-horizon metrics (unweighted and weighted)
@@ -319,8 +328,11 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             pred_change[~mask_h] = float('nan')
             
             # Compute all losses for this horizon
-            # TODO: Pass hm_std/mean and delta_std/mean for proper MAE computation
-            losses_h = self._compute_horizon_losses(pred_change, target_change, last_input, mask_h, h_name)
+            losses_h = self._compute_horizon_losses(
+                pred_change, target_change, last_input, mask_h, h_name,
+                hm_std=self.hm_std, hm_mean=self.hm_mean,
+                delta_std=self.delta_std, delta_mean=self.delta_mean
+            )
             horizon_losses.append(losses_h)
         
         # Log per-horizon metrics (unweighted and weighted)

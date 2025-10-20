@@ -195,6 +195,13 @@ if __name__ == "__main__":
     # Model
     num_static_channels = getattr(train_loader.dataset, 'C_static', 1)
     num_dynamic_channels = getattr(train_loader.dataset, 'C_dyn', 1)
+    
+    # Get normalization statistics from dataloader
+    hm_mean = train_loader.dataset.hm_mean
+    hm_std = train_loader.dataset.hm_std
+    delta_mean = train_loader.dataset.delta_mean
+    delta_std = train_loader.dataset.delta_std
+    
     model = SpatioTemporalLightningModule(
         hidden_dim=args.hidden_dim,
         lr=1e-3,
@@ -208,6 +215,10 @@ if __name__ == "__main__":
         histogram_weight=args.histogram_weight,
         histogram_lambda_w2=args.histogram_lambda_w2,
         histogram_warmup_epochs=args.histogram_warmup_epochs,
+        hm_mean=hm_mean,
+        hm_std=hm_std,
+        delta_mean=delta_mean,
+        delta_std=delta_std,
     )
     
     # Compute histogram bin weights from training data (per horizon)
@@ -382,17 +393,30 @@ if __name__ == "__main__":
                     lonlat = batch.get('lonlat', None)
                     if lonlat is not None:
                         lonlat = lonlat.to(device)
-                    # Get PREDICTED CHANGES from model (MODEL NOW PREDICTS CHANGES DIRECTLY)
+                    # Get PREDICTED CHANGES from model (NORMALIZED)
                     pred_changes_all = best_model(input_dynamic_clean, input_static_clean, lonlat=lonlat)  # [B, 4, H, W]
                     
-                    # Get last input for converting changes to absolute HM
-                    last_input = input_dynamic_clean[:, -1, 0:1, :, :]  # [B, 1, H, W]
+                    # Get normalization stats from dataloader
+                    hm_mean = train_loader.dataset.hm_mean
+                    hm_std = train_loader.dataset.hm_std
+                    delta_mean = train_loader.dataset.delta_mean
+                    delta_std = train_loader.dataset.delta_std
                     
-                    # Convert predicted changes to absolute HM values and clip to [0, 1]
-                    preds_5yr = torch.clamp(last_input + pred_changes_all[:, 0:1, :, :], 0.0, 1.0)  # [B, 1, H, W]
-                    preds_10yr = torch.clamp(last_input + pred_changes_all[:, 1:2, :, :], 0.0, 1.0)
-                    preds_15yr = torch.clamp(last_input + pred_changes_all[:, 2:3, :, :], 0.0, 1.0)
-                    preds_20yr = torch.clamp(last_input + pred_changes_all[:, 3:4, :, :], 0.0, 1.0)
+                    # Get last input (normalized) and denormalize it
+                    last_input_norm = input_dynamic_clean[:, -1, 0:1, :, :]  # [B, 1, H, W] normalized
+                    last_input_raw = last_input_norm * hm_std + hm_mean  # Denormalize to [0, 1]
+                    
+                    # Denormalize predicted changes
+                    pred_changes_raw_5yr = pred_changes_all[:, 0:1, :, :] * delta_std + delta_mean
+                    pred_changes_raw_10yr = pred_changes_all[:, 1:2, :, :] * delta_std + delta_mean
+                    pred_changes_raw_15yr = pred_changes_all[:, 2:3, :, :] * delta_std + delta_mean
+                    pred_changes_raw_20yr = pred_changes_all[:, 3:4, :, :] * delta_std + delta_mean
+                    
+                    # Convert to absolute HM and clip to [0, 1]
+                    preds_5yr = torch.clamp(last_input_raw + pred_changes_raw_5yr, 0.0, 1.0)  # [B, 1, H, W]
+                    preds_10yr = torch.clamp(last_input_raw + pred_changes_raw_10yr, 0.0, 1.0)
+                    preds_15yr = torch.clamp(last_input_raw + pred_changes_raw_15yr, 0.0, 1.0)
+                    preds_20yr = torch.clamp(last_input_raw + pred_changes_raw_20yr, 0.0, 1.0)
                     
                     # Set predictions to NaN where any input was NaN
                     preds_5yr[~input_mask] = float('nan')
@@ -405,15 +429,34 @@ if __name__ == "__main__":
                     preds_10yr = preds_10yr.squeeze(1)
                     preds_15yr = preds_15yr.squeeze(1)
                     preds_20yr = preds_20yr.squeeze(1)
+                    
+                    # Denormalize target changes and convert to absolute HM
+                    target_change_5yr = batch.get('target_5yr', target).to(device)  # Normalized change
+                    target_change_10yr = batch.get('target_10yr', target).to(device)
+                    target_change_15yr = batch.get('target_15yr', target).to(device)
+                    target_change_20yr = batch.get('target_20yr', target).to(device)
+                    
+                    # Denormalize changes
+                    target_change_raw_5yr = target_change_5yr * delta_std + delta_mean
+                    target_change_raw_10yr = target_change_10yr * delta_std + delta_mean
+                    target_change_raw_15yr = target_change_15yr * delta_std + delta_mean
+                    target_change_raw_20yr = target_change_20yr * delta_std + delta_mean
+                    
+                    # Convert to absolute HM and clip
+                    last_input_raw_2d = last_input_raw.squeeze(1)  # [B, H, W]
+                    target_abs_5yr = torch.clamp(last_input_raw_2d + target_change_raw_5yr, 0.0, 1.0)
+                    target_abs_10yr = torch.clamp(last_input_raw_2d + target_change_raw_10yr, 0.0, 1.0)
+                    target_abs_15yr = torch.clamp(last_input_raw_2d + target_change_raw_15yr, 0.0, 1.0)
+                    target_abs_20yr = torch.clamp(last_input_raw_2d + target_change_raw_20yr, 0.0, 1.0)
                 
                 # Store batch data for later processing (all horizons)
                 all_batches_data.append({
                     'input_dynamic': input_dynamic.cpu(),
                     'input_static': input_static.cpu(),
-                    'target_5yr': batch.get('target_5yr', target).cpu(),
-                    'target_10yr': batch.get('target_10yr', target).cpu(),
-                    'target_15yr': batch.get('target_15yr', target).cpu(),
-                    'target_20yr': batch.get('target_20yr', target).cpu(),
+                    'target_5yr': target_abs_5yr.cpu(),
+                    'target_10yr': target_abs_10yr.cpu(),
+                    'target_15yr': target_abs_15yr.cpu(),
+                    'target_20yr': target_abs_20yr.cpu(),
                     'preds_5yr': preds_5yr.cpu(),
                     'preds_10yr': preds_10yr.cpu(),
                     'preds_15yr': preds_15yr.cpu(),
@@ -646,15 +689,15 @@ if __name__ == "__main__":
                 row = h_idx + 1
                 h_year = target_years[h_idx]  # Get actual year for this sample
                 
-                # Get target and prediction for this horizon
-                target_h = targets_all[h_name][b].cpu().numpy() * hm_std + hm_mean
-                pred_h = preds_all[h_name][b].cpu().numpy() * hm_std + hm_mean
+                # Get target and prediction for this horizon (already denormalized)
+                target_h = targets_all[h_name][b].cpu().numpy()
+                pred_h = preds_all[h_name][b].cpu().numpy()
                 
                 # Compute mask for this horizon
                 target_valid = np.isfinite(target_h)
                 valid_mask = target_valid & dynamic_valid & static_valid
                 
-                # Deltas
+                # Deltas (raw, in [0,1] space)
                 delta_obs = target_h - most_recent_in
                 delta_pred = pred_h - most_recent_in
                 
@@ -698,11 +741,13 @@ if __name__ == "__main__":
             # Row 5: Histograms for all horizons
             for h_idx, h_name in enumerate(horizon_names):
                 h_year = target_years[h_idx]  # Get actual year for this sample
-                target_h = targets_all[h_name][b].cpu().numpy() * hm_std + hm_mean
-                pred_h = preds_all[h_name][b].cpu().numpy() * hm_std + hm_mean
+                # Already denormalized absolute HM values
+                target_h = targets_all[h_name][b].cpu().numpy()
+                pred_h = preds_all[h_name][b].cpu().numpy()
                 target_valid = np.isfinite(target_h)
                 valid_mask = target_valid & dynamic_valid & static_valid
                 
+                # Calculate changes (raw, in [0,1] space)
                 delta_obs = target_h - most_recent_in
                 delta_pred = pred_h - most_recent_in
                 
@@ -766,15 +811,15 @@ if __name__ == "__main__":
                     target_batch = batch_data[f'target_{h_name}']
                     preds_batch = batch_data[f'preds_{h_name}']
                     
-                    # Denormalize
-                    target_orig = target_batch[b].numpy() * hm_std + hm_mean
-                    pred_orig = preds_batch[b].numpy() * hm_std + hm_mean
+                    # Already denormalized absolute HM values (from earlier processing)
+                    target_orig = target_batch[b].numpy()
+                    pred_orig = preds_batch[b].numpy()
                     
                     # Compute validity mask for this horizon
                     target_valid = np.isfinite(target_orig)
                     valid_pred_mask = target_valid & dynamic_valid & static_valid
                     
-                    # Calculate changes
+                    # Calculate changes (raw, in [0,1] space)
                     delta = target_orig - most_recent_in
                     pred_delta = pred_orig - most_recent_in
                     
@@ -980,6 +1025,7 @@ if __name__ == "__main__":
             # Stats and config from training dataset
             ds_train = train_loader.dataset
             hm_mean, hm_std = ds_train.hm_mean, ds_train.hm_std
+            delta_mean, delta_std = ds_train.delta_mean, ds_train.delta_std
             elev_mean, elev_std = ds_train.elev_mean, ds_train.elev_std
             include_components = bool(getattr(ds_train, 'include_components', True))
             static_list_paths = list(static_files if args.static_channels is None else static_files[:int(args.static_channels)])
@@ -1176,8 +1222,8 @@ if __name__ == "__main__":
                         # Extract PREDICTED CHANGES for this tile (crop to actual size if padded)
                         preds_horizons = {}
                         for h_idx, h_name in enumerate(horizon_names):
-                            pred_change = batch_pred_changes[tile_idx, h_idx, :hi, :wj].detach().cpu().numpy()  # [hi, wj] normalized (crop padding)
-                            pred_change = pred_change * hm_std + hm_mean  # denormalize to change scale
+                            pred_change_norm = batch_pred_changes[tile_idx, h_idx, :hi, :wj].detach().cpu().numpy()  # [hi, wj] normalized change
+                            pred_change = pred_change_norm * delta_std + delta_mean  # denormalize to raw change scale
                             # Convert to absolute HM and clip to [0, 1]
                             pred_h = np.clip(last_input_tile + pred_change, 0.0, 1.0)
                             preds_horizons[h_name] = pred_h
