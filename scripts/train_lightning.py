@@ -702,13 +702,13 @@ if __name__ == "__main__":
                 target_h = targets_all[h_name][b].cpu().numpy()
                 pred_h = preds_all[h_name][b].cpu().numpy()
                 
+                # Get raw changes (before clipping)
+                delta_obs = first_batch[f'target_change_{h_name}'][b].cpu().numpy()
+                delta_pred = first_batch[f'pred_change_{h_name}'][b].cpu().numpy()
+                
                 # Compute mask for this horizon
                 target_valid = np.isfinite(target_h)
                 valid_mask = target_valid & dynamic_valid & static_valid
-                
-                # Deltas (raw, in [0,1] space)
-                delta_obs = target_h - most_recent_in
-                delta_pred = pred_h - most_recent_in
                 
                 # Column 0: Target (show year + horizon offset)
                 target_plot = np.where(valid_mask, target_h, np.nan)
@@ -750,15 +750,15 @@ if __name__ == "__main__":
             # Row 5: Histograms for all horizons
             for h_idx, h_name in enumerate(horizon_names):
                 h_year = target_years[h_idx]  # Get actual year for this sample
-                # Already denormalized absolute HM values
-                target_h = targets_all[h_name][b].cpu().numpy()
-                pred_h = preds_all[h_name][b].cpu().numpy()
-                target_valid = np.isfinite(target_h)
-                valid_mask = target_valid & dynamic_valid & static_valid
                 
-                # Calculate changes (raw, in [0,1] space)
-                delta_obs = target_h - most_recent_in
-                delta_pred = pred_h - most_recent_in
+                # Get raw changes (before clipping)
+                delta_obs = first_batch[f'target_change_{h_name}'][b].cpu().numpy()
+                delta_pred = first_batch[f'pred_change_{h_name}'][b].cpu().numpy()
+                
+                # Compute validity mask
+                target_valid = np.isfinite(delta_obs)
+                pred_valid = np.isfinite(delta_pred)
+                valid_mask = target_valid & pred_valid & dynamic_valid & static_valid
                 
                 delta_obs_valid = delta_obs[valid_mask]
                 delta_pred_valid = delta_pred[valid_mask]
