@@ -436,7 +436,7 @@ if __name__ == "__main__":
                     target_change_15yr = batch.get('target_15yr', target).to(device)
                     target_change_20yr = batch.get('target_20yr', target).to(device)
                     
-                    # Denormalize changes
+                    # Denormalize changes (raw, before clipping)
                     target_change_raw_5yr = target_change_5yr * delta_std + delta_mean
                     target_change_raw_10yr = target_change_10yr * delta_std + delta_mean
                     target_change_raw_15yr = target_change_15yr * delta_std + delta_mean
@@ -450,6 +450,7 @@ if __name__ == "__main__":
                     target_abs_20yr = torch.clamp(last_input_raw_2d + target_change_raw_20yr, 0.0, 1.0)
                 
                 # Store batch data for later processing (all horizons)
+                # Store BOTH absolute HM (for spatial plots) and raw changes (for hexbin/histogram)
                 all_batches_data.append({
                     'input_dynamic': input_dynamic.cpu(),
                     'input_static': input_static.cpu(),
@@ -457,10 +458,18 @@ if __name__ == "__main__":
                     'target_10yr': target_abs_10yr.cpu(),
                     'target_15yr': target_abs_15yr.cpu(),
                     'target_20yr': target_abs_20yr.cpu(),
+                    'target_change_5yr': target_change_raw_5yr.cpu(),
+                    'target_change_10yr': target_change_raw_10yr.cpu(),
+                    'target_change_15yr': target_change_raw_15yr.cpu(),
+                    'target_change_20yr': target_change_raw_20yr.cpu(),
                     'preds_5yr': preds_5yr.cpu(),
                     'preds_10yr': preds_10yr.cpu(),
                     'preds_15yr': preds_15yr.cpu(),
                     'preds_20yr': preds_20yr.cpu(),
+                    'pred_change_5yr': pred_changes_raw_5yr.squeeze(1).cpu(),
+                    'pred_change_10yr': pred_changes_raw_10yr.squeeze(1).cpu(),
+                    'pred_change_15yr': pred_changes_raw_15yr.squeeze(1).cpu(),
+                    'pred_change_20yr': pred_changes_raw_20yr.squeeze(1).cpu(),
                     'input_mask': input_mask.cpu(),
                     'lonlat': batch.get('lonlat', None)
                 })
@@ -808,20 +817,18 @@ if __name__ == "__main__":
                 
                 # Process each horizon
                 for h_name in horizon_names:
-                    target_batch = batch_data[f'target_{h_name}']
-                    preds_batch = batch_data[f'preds_{h_name}']
+                    # Use raw changes directly (before clipping to [0,1])
+                    target_change_batch = batch_data[f'target_change_{h_name}']
+                    pred_change_batch = batch_data[f'pred_change_{h_name}']
                     
-                    # Already denormalized absolute HM values (from earlier processing)
-                    target_orig = target_batch[b].numpy()
-                    pred_orig = preds_batch[b].numpy()
+                    # Get raw changes
+                    delta = target_change_batch[b].numpy()
+                    pred_delta = pred_change_batch[b].numpy()
                     
                     # Compute validity mask for this horizon
-                    target_valid = np.isfinite(target_orig)
-                    valid_pred_mask = target_valid & dynamic_valid & static_valid
-                    
-                    # Calculate changes (raw, in [0,1] space)
-                    delta = target_orig - most_recent_in
-                    pred_delta = pred_orig - most_recent_in
+                    target_valid = np.isfinite(delta)
+                    pred_valid = np.isfinite(pred_delta)
+                    valid_pred_mask = target_valid & pred_valid & dynamic_valid & static_valid
                     
                     # Accumulate valid pixels only
                     diffs_obs_horizons[h_name].append(delta[valid_pred_mask])

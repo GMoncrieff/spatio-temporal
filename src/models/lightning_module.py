@@ -229,16 +229,14 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             )
             horizon_losses.append(losses_h)
         
-        # Log per-horizon metrics (unweighted and weighted)
+        # Log per-horizon metrics (unweighted only)
         horizon_suffixes = ['5yr', '10yr', '15yr', '20yr']
         for h_name, losses_h in zip(horizon_suffixes, horizon_losses):
+            self.log(f'train_mse_{h_name}', losses_h['mse'])
             self.log(f'train_mae_{h_name}', losses_h['mae'])
-            self.log(f'train_ssim_{h_name}', losses_h['ssim'])  # unweighted
-            self.log(f'train_ssim_weighted_{h_name}', losses_h['ssim_weighted'])
-            self.log(f'train_lap_{h_name}', losses_h['lap'])  # unweighted
-            self.log(f'train_lap_weighted_{h_name}', losses_h['lap_weighted'])
-            self.log(f'train_hist_{h_name}', losses_h['hist'])  # unweighted
-            self.log(f'train_hist_weighted_{h_name}', losses_h['hist_weighted'])
+            self.log(f'train_ssim_{h_name}', losses_h['ssim'])
+            self.log(f'train_lap_{h_name}', losses_h['lap'])
+            self.log(f'train_hist_{h_name}', losses_h['hist'])
         
         # Average losses across horizons
         avg_mse = torch.stack([h['mse'] for h in horizon_losses]).mean()
@@ -251,15 +249,12 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         avg_hist_weighted = torch.stack([h['hist_weighted'] for h in horizon_losses]).mean()
         avg_total = torch.stack([h['total'] for h in horizon_losses]).mean()
         
-        # Log averaged metrics (both unweighted and weighted)
-        self.log('train_loss', avg_mse)
+        # Log averaged metrics (unweighted only)
+        self.log('train_mse', avg_mse)
         self.log('train_mae', avg_mae, prog_bar=True)
-        self.log('train_ssim', avg_ssim, prog_bar=True)  # unweighted
-        self.log('train_ssim_weighted', avg_ssim_weighted)
-        self.log('train_lap', avg_lap)  # unweighted
-        self.log('train_lap_weighted', avg_lap_weighted)
-        self.log('train_hist', avg_hist)  # unweighted
-        self.log('train_hist_weighted', avg_hist_weighted)
+        self.log('train_ssim', avg_ssim)
+        self.log('train_lap', avg_lap)
+        self.log('train_hist', avg_hist)
         self.log('train_total_loss', avg_total, prog_bar=True)
         
         # Print detailed loss breakdown to console (every 50 batches)
@@ -335,16 +330,14 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             )
             horizon_losses.append(losses_h)
         
-        # Log per-horizon metrics (unweighted and weighted)
+        # Log per-horizon metrics (unweighted only)
         horizon_suffixes = ['5yr', '10yr', '15yr', '20yr']
         for h_name, losses_h in zip(horizon_suffixes, horizon_losses):
+            self.log(f'val_mse_{h_name}', losses_h['mse'], on_step=False, on_epoch=True)
             self.log(f'val_mae_{h_name}', losses_h['mae'], on_step=False, on_epoch=True)
-            self.log(f'val_ssim_{h_name}', losses_h['ssim'], on_step=False, on_epoch=True)  # unweighted
-            self.log(f'val_ssim_weighted_{h_name}', losses_h['ssim_weighted'], on_step=False, on_epoch=True)
-            self.log(f'val_lap_{h_name}', losses_h['lap'], on_step=False, on_epoch=True)  # unweighted
-            self.log(f'val_lap_weighted_{h_name}', losses_h['lap_weighted'], on_step=False, on_epoch=True)
-            self.log(f'val_hist_{h_name}', losses_h['hist'], on_step=False, on_epoch=True)  # unweighted
-            self.log(f'val_hist_weighted_{h_name}', losses_h['hist_weighted'], on_step=False, on_epoch=True)
+            self.log(f'val_ssim_{h_name}', losses_h['ssim'], on_step=False, on_epoch=True)
+            self.log(f'val_lap_{h_name}', losses_h['lap'], on_step=False, on_epoch=True)
+            self.log(f'val_hist_{h_name}', losses_h['hist'], on_step=False, on_epoch=True)
         
         # Average losses across horizons
         avg_mse = torch.stack([h['mse'] for h in horizon_losses]).mean()
@@ -357,15 +350,12 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         avg_hist_weighted = torch.stack([h['hist_weighted'] for h in horizon_losses]).mean()
         avg_total = torch.stack([h['total'] for h in horizon_losses]).mean()
         
-        # Log averaged metrics (both unweighted and weighted)
-        self.log('val_loss', avg_mse, on_step=False, on_epoch=True)
+        # Log averaged metrics (unweighted only)
+        self.log('val_mse', avg_mse, on_step=False, on_epoch=True)
         self.log('val_mae', avg_mae, on_step=False, on_epoch=True, prog_bar=True)
-        self.log('val_ssim', avg_ssim, on_step=False, on_epoch=True)  # unweighted
-        self.log('val_ssim_weighted', avg_ssim_weighted, on_step=False, on_epoch=True)
-        self.log('val_lap', avg_lap, on_step=False, on_epoch=True)  # unweighted
-        self.log('val_lap_weighted', avg_lap_weighted, on_step=False, on_epoch=True)
-        self.log('val_hist', avg_hist, on_step=False, on_epoch=True)  # unweighted
-        self.log('val_hist_weighted', avg_hist_weighted, on_step=False, on_epoch=True)
+        self.log('val_ssim', avg_ssim, on_step=False, on_epoch=True)
+        self.log('val_lap', avg_lap, on_step=False, on_epoch=True)
+        self.log('val_hist', avg_hist, on_step=False, on_epoch=True)
         self.log('val_total_loss', avg_total, on_step=False, on_epoch=True, prog_bar=True)
         
         # Print validation metrics with weighted and unweighted losses
