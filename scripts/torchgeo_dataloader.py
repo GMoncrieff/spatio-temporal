@@ -126,21 +126,24 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
         self.hm_mean = np.nanmean(hm_stack_samp)
         self.hm_std = np.nanstd(hm_stack_samp) + 1e-8
         
-        # Compute CHANGE (delta) statistics
-        print("Computing delta statistics...")
+        # Compute CHANGE (delta) statistics from 20-YEAR HORIZON
+        # Use 20-year statistics for all horizons (covers maximum expected changes)
+        print("Computing delta statistics from 20-year horizon...")
         delta_samples = []
         # Open HM files temporarily for stats
         with rasterio.open(self._hm_files[0]) as src:
             Hs, Ws = src.height, src.width
         num_delta_samples = 500
+        offset_20yr = 4  # 20-year horizon (4 timesteps)
+        
         for _ in range(num_delta_samples):
             if Hs < self.chip_size or Ws < self.chip_size:
                 i, j = 0, 0
             else:
                 i = int(rng.integers(0, Hs - self.chip_size + 1))
                 j = int(rng.integers(0, Ws - self.chip_size + 1))
-            for t1 in range(len(self._hm_files) - 1):
-                t2 = t1 + 1
+            for t1 in range(len(self._hm_files) - offset_20yr):
+                t2 = t1 + offset_20yr
                 w = rasterio.windows.Window(j, i, self.chip_size, self.chip_size)
                 with rasterio.open(self._hm_files[t1]) as src1:
                     h1 = src1.read(1, window=w, masked=True).filled(np.nan)
@@ -154,7 +157,8 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
         self.delta_mean = np.mean(delta_samples)
         self.delta_std = np.std(delta_samples) + 1e-8
         print(f"HM: mean={self.hm_mean:.4f}, std={self.hm_std:.4f}")
-        print(f"Delta: mean={self.delta_mean:.6f}, std={self.delta_std:.6f}")
+        print(f"Delta (20yr): mean={self.delta_mean:.6f}, std={self.delta_std:.6f}")
+        print("  (Applied uniformly to all horizons: 5yr, 10yr, 15yr, 20yr)")
         
         # Static stats (per variable) - different variables have different scales
         self.static_means = []
