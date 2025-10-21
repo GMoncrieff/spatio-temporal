@@ -91,6 +91,18 @@ if __name__ == "__main__":
         help="Whether to append per-pixel LocationEncoder features to static inputs (default: True)",
     )
     parser.add_argument(
+        "--locenc_out_channels",
+        type=int,
+        default=8,
+        help="Number of output channels from LocationEncoder (default: 8)",
+    )
+    parser.add_argument(
+        "--locenc_legendre_polys",
+        type=int,
+        default=10,
+        help="Degree of Legendre polynomials for spherical harmonics in LocationEncoder (default: 10)",
+    )
+    parser.add_argument(
         "--num_workers",
         type=int,
         default=0,
@@ -203,6 +215,8 @@ if __name__ == "__main__":
         num_layers=args.num_layers,
         kernel_size=args.kernel_size,
         use_location_encoder=args.use_location_encoder,
+        locenc_out_channels=args.locenc_out_channels,
+        locenc_legendre_polys=args.locenc_legendre_polys,
         ssim_weight=args.ssim_weight,
         laplacian_weight=args.laplacian_weight,
         histogram_weight=args.histogram_weight,

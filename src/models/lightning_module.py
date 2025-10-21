@@ -27,12 +27,24 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         locenc_backbone=("sphericalharmonics", "siren"),
         locenc_hparams=None,
         locenc_out_channels: int = 8,
+        locenc_legendre_polys: int = 10,
         histogram_weight: float = 0.67,
         histogram_lambda_w2: float = 0.1,
         histogram_warmup_epochs: int = 20,
     ):
         super().__init__()
         self.save_hyperparameters()
+        
+        # Build LocationEncoder hparams if not provided
+        if locenc_hparams is None and use_location_encoder:
+            locenc_hparams = {
+                'legendre_polys': locenc_legendre_polys,
+                'dim_hidden': 64,
+                'num_layers': 2,
+                'optimizer': {'lr': 1e-4, 'wd': 1e-3},
+                'num_classes': locenc_out_channels
+            }
+        
         self.model = SpatioTemporalPredictor(
             hidden_dim=hidden_dim,
             num_static_channels=num_static_channels,
