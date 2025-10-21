@@ -19,13 +19,13 @@ parameters:
   
   # Fixed parameters from command line
   accumulate_grad_batches:
-    value: 8
+    value: 1
   train_chips:
-    value: 1600
-  val_chips:
     value: 800
+  val_chips:
+    value: 200
   batch_size:
-    value: 8
+    value: 32
   train_mode:
     value: random
   val_mode:
@@ -33,7 +33,7 @@ parameters:
   stride:
     value: 64
   max_epochs:
-    value: 50
+    value: 200
   use_location_encoder:
     value: true
   predict_after_training:
@@ -41,8 +41,8 @@ parameters:
   histogram_warmup_epochs:
     value: 0
   ssim_weight:
-    value: 0.15
+    value: 0.015
   laplacian_weight:
-    value: 0.2
+    value: 0.02
   histogram_weight:
-    value: 1.15
+    value: 0.115
