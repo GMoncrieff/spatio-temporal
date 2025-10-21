@@ -444,7 +444,9 @@ if __name__ == "__main__":
         pred_keys = ['preds_5yr', 'preds_10yr', 'preds_15yr', 'preds_20yr']
         
         horizon_metrics = {h: {
-            'mse': 0.0, 'mae': 0.0, 'ssim': 0.0, 'lap': 0.0, 'hist': 0.0, 'pixels': 0
+            'mse': 0.0, 'mae': 0.0, 'ssim': 0.0, 'lap': 0.0, 'hist': 0.0, 'pixels': 0,
+            'mae_no_change': 0.0,  # Baseline: assume no change from last input
+            'mae_linear': 0.0       # Baseline: linear extrapolation from recent trend
         } for h in horizon_names}
         
         for batch_data in all_batches_data:
@@ -474,9 +476,25 @@ if __name__ == "__main__":
                 mse = F.mse_loss(valid_delta_pred, valid_delta_true, reduction='sum')
                 horizon_metrics[h_name]['mse'] += mse.item()
                 
-                # MAE on absolute predictions
+                # MAE on absolute predictions (Conv-CNN model)
                 mae = F.l1_loss(preds[mask], target[mask], reduction='sum')
                 horizon_metrics[h_name]['mae'] += mae.item()
+                
+                # Baseline 1: "No Change" - assume future = most recent past
+                pred_no_change = last_input  # Simply use last input as prediction
+                mae_no_change = F.l1_loss(pred_no_change[mask], target[mask], reduction='sum')
+                horizon_metrics[h_name]['mae_no_change'] += mae_no_change.item()
+                
+                # Baseline 2: "Linear" - extrapolate from recent trend
+                # Calculate trend between last two timesteps
+                if input_dynamic.shape[1] >= 2:
+                    second_last_input = input_dynamic[:, -2, 0]  # [B, H, W]
+                    trend = last_input - second_last_input
+                    # Multiply trend by horizon multiplier (1x for 5yr, 2x for 10yr, etc.)
+                    horizon_multiplier = h_idx + 1  # 1, 2, 3, 4 for 5yr, 10yr, 15yr, 20yr
+                    pred_linear = last_input + (trend * horizon_multiplier)
+                    mae_linear = F.l1_loss(pred_linear[mask], target[mask], reduction='sum')
+                    horizon_metrics[h_name]['mae_linear'] += mae_linear.item()
                 
                 # SSIM (requires [B, C, H, W])
                 preds_sanitized = preds.unsqueeze(1).clone()
@@ -507,16 +525,29 @@ if __name__ == "__main__":
         print("="*70)
         
         horizon_years = [2005, 2010, 2015, 2020]
+        horizon_labels = [5, 10, 15, 20]  # Years into future for plotting
         all_total_losses = []
+        
+        # Store MAEs for plotting
+        mae_conv_cnn = []
+        mae_no_change_list = []
+        mae_linear_list = []
         
         for h_name, h_year in zip(horizon_names, horizon_years):
             metrics = horizon_metrics[h_name]
             if metrics['pixels'] > 0:
                 avg_mse = metrics['mse'] / metrics['pixels']
                 avg_mae = metrics['mae'] / metrics['pixels']
+                avg_mae_no_change = metrics['mae_no_change'] / metrics['pixels']
+                avg_mae_linear = metrics['mae_linear'] / metrics['pixels']
                 avg_ssim = metrics['ssim'] / metrics['pixels']
                 avg_lap = metrics['lap'] / metrics['pixels']
                 avg_hist = metrics['hist'] / metrics['pixels'] if best_model.histogram_weight > 0 else 0.0
+                
+                # Store for plotting
+                mae_conv_cnn.append(avg_mae)
+                mae_no_change_list.append(avg_mae_no_change)
+                mae_linear_list.append(avg_mae_linear)
                 
                 # Compute total loss
                 avg_total = (avg_mse + 
@@ -528,17 +559,21 @@ if __name__ == "__main__":
                 all_total_losses.append(avg_total)
                 
                 print(f"\n{h_name.upper()} ({h_year}): {metrics['pixels']:,} valid pixels")
-                print(f"  MSE:        {avg_mse:.6f}")
-                print(f"  MAE:        {avg_mae:.6f}")
-                print(f"  SSIM loss:  {avg_ssim:.6f}")
-                print(f"  Lap loss:   {avg_lap:.6f}")
+                print(f"  MSE:              {avg_mse:.6f}")
+                print(f"  MAE (Conv-CNN):   {avg_mae:.6f}")
+                print(f"  MAE (No Change):  {avg_mae_no_change:.6f}")
+                print(f"  MAE (Linear):     {avg_mae_linear:.6f}")
+                print(f"  SSIM loss:        {avg_ssim:.6f}")
+                print(f"  Lap loss:         {avg_lap:.6f}")
                 if best_model.histogram_weight > 0:
-                    print(f"  Hist loss:  {avg_hist:.6f}")
-                print(f"  Total loss: {avg_total:.6f}")
+                    print(f"  Hist loss:        {avg_hist:.6f}")
+                print(f"  Total loss:       {avg_total:.6f}")
                 
                 # Log per-horizon metrics to W&B
                 experiment.log({
                     f"val_full/mae_{h_name}": avg_mae,
+                    f"val_full/mae_no_change_{h_name}": avg_mae_no_change,
+                    f"val_full/mae_linear_{h_name}": avg_mae_linear,
                     f"val_full/mse_{h_name}": avg_mse,
                     f"val_full/ssim_loss_{h_name}": avg_ssim,
                     f"val_full/lap_loss_{h_name}": avg_lap,
@@ -874,6 +909,36 @@ if __name__ == "__main__":
         
         if histogram_images:
             experiment.log({"HM_Change_Histogram": histogram_images})
+        
+        # ---- MAE Comparison Plot: Conv-CNN vs Baselines ----
+        print("\nCreating MAE comparison plot (Conv-CNN vs Baselines)...")
+        if len(mae_conv_cnn) > 0 and len(mae_no_change_list) > 0 and len(mae_linear_list) > 0:
+            fig_mae, ax_mae = plt.subplots(figsize=(10, 6))
+            
+            # Plot three lines
+            ax_mae.plot(horizon_labels, mae_conv_cnn, marker='o', linewidth=2.5, 
+                       label='Conv-CNN', color='#3498db', markersize=8)
+            ax_mae.plot(horizon_labels, mae_no_change_list, marker='s', linewidth=2.5, 
+                       label='No Change', color='#e74c3c', markersize=8, linestyle='--')
+            ax_mae.plot(horizon_labels, mae_linear_list, marker='^', linewidth=2.5, 
+                       label='Linear', color='#f39c12', markersize=8, linestyle='--')
+            
+            # Formatting
+            ax_mae.set_xlabel('Forecast Horizon (years)', fontsize=12, fontweight='bold')
+            ax_mae.set_ylabel('Mean Absolute Error (MAE)', fontsize=12, fontweight='bold')
+            ax_mae.set_title('MAE vs Forecast Horizon: Model Comparison', fontsize=14, fontweight='bold')
+            ax_mae.set_xticks(horizon_labels)
+            ax_mae.legend(fontsize=11, loc='upper left')
+            ax_mae.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            fig_mae.canvas.draw()
+            img_rgba_mae = np.array(fig_mae.canvas.buffer_rgba())
+            img_rgb_mae = img_rgba_mae[..., :3]
+            experiment.log({"MAE_Comparison": wandb.Image(img_rgb_mae, 
+                           caption="MAE comparison: Conv-CNN vs Baselines")})
+            plt.close(fig_mae)
+            print("✓ MAE comparison plot created and logged")
 
         # Ensure wandb shuts down cleanly
         experiment.finish()
