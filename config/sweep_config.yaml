@@ -1,0 +1,56 @@
+program: scripts/train_lightning.py
+method: bayes  # Options: grid, random, bayes
+metric:
+  name: val_full/total_loss_avg
+  goal: minimize
+
+parameters:
+  # Model architecture
+  hidden_dim:
+    values: [32, 64, 128]
+  num_layers:
+    values: [1, 2, 3]
+  kernel_size:
+    values: [3, 5]
+  
+  # LocationEncoder
+  locenc_out_channels:
+    values: [4, 8, 16]
+  locenc_legendre_polys:
+    values: [5, 10, 20]
+  
+  # Loss weights
+  ssim_weight:
+    min: 0.5
+    max: 5.0
+  laplacian_weight:
+    min: 0.5
+    max: 2.0
+  histogram_weight:
+    min: 0.2
+    max: 1.5
+  histogram_warmup_epochs:
+    values: [10, 20, 30]
+  
+  # Training
+  batch_size:
+    values: [4, 8, 16]
+  accumulate_grad_batches:
+    values: [1, 2, 4]
+  
+  # Fixed parameters (not swept)
+  max_epochs:
+    value: 50
+  train_chips:
+    value: 200
+  val_chips:
+    value: 40
+  predict_after_training:
+    value: false
+
+# Early termination - stop poorly performing runs
+early_terminate:
+  type: hyperband
+  min_iter: 10
+  eta: 2
+  s: 2

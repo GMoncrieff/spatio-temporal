@@ -1,0 +1,56 @@
+program: scripts/train_lightning.py
+method: bayes
+metric:
+  name: val_full/total_loss_avg
+  goal: minimize
+
+parameters:
+  # Focus on LocationEncoder hyperparameters
+  locenc_out_channels:
+    values: [4, 8, 12, 16, 24]
+  locenc_legendre_polys:
+    values: [5, 10, 15, 20, 30]
+  use_location_encoder:
+    values: [true]  # Always enabled for this sweep
+  
+  # Keep model architecture fixed but reasonable
+  hidden_dim:
+    value: 64
+  num_layers:
+    value: 2
+  kernel_size:
+    value: 3
+  
+  # Keep loss weights at defaults
+  ssim_weight:
+    value: 2.0
+  laplacian_weight:
+    value: 1.0
+  histogram_weight:
+    value: 0.67
+  histogram_warmup_epochs:
+    value: 20
+  
+  # Training settings
+  max_epochs:
+    value: 30
+  train_chips:
+    value: 200
+  val_chips:
+    value: 40
+  batch_size:
+    value: 8
+  predict_after_training:
+    value: false
+
+# Stop poorly performing runs early
+early_terminate:
+  type: hyperband
+  min_iter: 10
+  eta: 2
+  s: 2
+
+# Goal: Find optimal LocationEncoder configuration
+# Trade-off between:
+# - More channels = more capacity but more parameters
+# - Higher degree = finer spatial resolution but slower
