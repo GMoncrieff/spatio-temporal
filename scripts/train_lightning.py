@@ -146,12 +146,73 @@ if __name__ == "__main__":
         help="Number of epochs before histogram loss is applied (default: 20)",
     )
     parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Path to checkpoint file or W&B artifact (e.g., 'model-txn1v2kp:v0' or 'path/to/model.ckpt')",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
         help="Random seed for reproducibility (default: 42)",
     )
     args = parser.parse_args()
+    
+    # Helper function to load checkpoint from W&B artifact or local path
+    def load_checkpoint_path(checkpoint_arg):
+        """
+        Load checkpoint from W&B artifact or local file path.
+        
+        Args:
+            checkpoint_arg: Either a local path or W&B artifact name (e.g., 'model-txn1v2kp:v0')
+        
+        Returns:
+            Path to checkpoint file, or None if not found
+        """
+        if checkpoint_arg is None:
+            return None
+        
+        # Check if it's a local file first
+        if os.path.exists(checkpoint_arg):
+            print(f"Using local checkpoint: {checkpoint_arg}")
+            return checkpoint_arg
+        
+        # Try to load as W&B artifact
+        try:
+            import wandb
+            print(f"Attempting to download W&B artifact: {checkpoint_arg}")
+            
+            # Initialize W&B (will use existing run if in training, or create temp run)
+            if wandb.run is None:
+                run = wandb.init(project="spatio-temporal-convlstm", job_type="load_checkpoint")
+            else:
+                run = wandb.run
+            
+            # Handle different artifact name formats
+            if '/' not in checkpoint_arg:
+                # Short form: 'model-txn1v2kp:v0' -> 'glennwithtwons/spatio-temporal-convlstm/model-txn1v2kp:v0'
+                artifact_name = f"glennwithtwons/spatio-temporal-convlstm/{checkpoint_arg}"
+            else:
+                artifact_name = checkpoint_arg
+            
+            artifact = run.use_artifact(artifact_name, type='model')
+            artifact_dir = artifact.download()
+            
+            # Find .ckpt file in artifact directory
+            import glob
+            ckpt_files = glob.glob(os.path.join(artifact_dir, "*.ckpt"))
+            if ckpt_files:
+                ckpt_path = ckpt_files[0]
+                print(f"✓ Downloaded checkpoint to: {ckpt_path}")
+                return ckpt_path
+            else:
+                print(f"⚠️  No .ckpt file found in artifact")
+                return None
+                
+        except Exception as e:
+            print(f"⚠️  Could not load checkpoint '{checkpoint_arg}': {e}")
+            return None
     
     # Set seeds for reproducibility (without strict determinism)
     random.seed(args.seed)
@@ -207,22 +268,38 @@ if __name__ == "__main__":
     # Model
     num_static_channels = getattr(train_loader.dataset, 'C_static', 1)
     num_dynamic_channels = getattr(train_loader.dataset, 'C_dyn', 1)
-    model = SpatioTemporalLightningModule(
-        hidden_dim=args.hidden_dim,
-        lr=1e-3,
-        num_static_channels=num_static_channels,
-        num_dynamic_channels=num_dynamic_channels,
-        num_layers=args.num_layers,
-        kernel_size=args.kernel_size,
-        use_location_encoder=args.use_location_encoder,
-        locenc_out_channels=args.locenc_out_channels,
-        locenc_legendre_polys=args.locenc_legendre_polys,
-        ssim_weight=args.ssim_weight,
-        laplacian_weight=args.laplacian_weight,
-        histogram_weight=args.histogram_weight,
-        histogram_lambda_w2=args.histogram_lambda_w2,
-        histogram_warmup_epochs=args.histogram_warmup_epochs,
-    )
+    
+    # Load from checkpoint if provided
+    checkpoint_path = load_checkpoint_path(args.checkpoint)
+    if checkpoint_path:
+        print("\n" + "="*70)
+        print(f"Loading model from checkpoint: {checkpoint_path}")
+        print("="*70)
+        model = SpatioTemporalLightningModule.load_from_checkpoint(checkpoint_path)
+        print(f"✓ Checkpoint loaded successfully!")
+        print(f"\nModel configuration from checkpoint:")
+        for key in ['hidden_dim', 'num_layers', 'kernel_size', 'num_static_channels', 
+                    'num_dynamic_channels', 'use_location_encoder', 'locenc_out_channels']:
+            if key in model.hparams:
+                print(f"  {key}: {model.hparams[key]}")
+        print("="*70 + "\n")
+    else:
+        model = SpatioTemporalLightningModule(
+            hidden_dim=args.hidden_dim,
+            lr=1e-3,
+            num_static_channels=num_static_channels,
+            num_dynamic_channels=num_dynamic_channels,
+            num_layers=args.num_layers,
+            kernel_size=args.kernel_size,
+            use_location_encoder=args.use_location_encoder,
+            locenc_out_channels=args.locenc_out_channels,
+            locenc_legendre_polys=args.locenc_legendre_polys,
+            ssim_weight=args.ssim_weight,
+            laplacian_weight=args.laplacian_weight,
+            histogram_weight=args.histogram_weight,
+            histogram_lambda_w2=args.histogram_lambda_w2,
+            histogram_warmup_epochs=args.histogram_warmup_epochs,
+        )
     
     # Compute histogram bin weights from training data (per horizon)
     if args.histogram_weight > 0 and hasattr(model, 'histogram_loss_fn'):
@@ -1060,6 +1137,14 @@ if __name__ == "__main__":
             static_list_paths = list(static_files if args.static_channels is None else static_files[:int(args.static_channels)])
             input_years = list(getattr(ds_train, 'fixed_input_years', (1990, 1995, 2000)))
             t_idxs = [year_to_idx[y] for y in input_years]
+            
+            # CRITICAL: Get per-variable normalization stats (NOT pooled hm_mean/hm_std)
+            comp_means = ds_train.comp_means  # Dict: {var_name: mean}
+            comp_stds = ds_train.comp_stds    # Dict: {var_name: std}
+            static_means = ds_train.static_means  # List: [mean_0, mean_1, ...]
+            static_stds = ds_train.static_stds    # List: [std_0, std_1, ...]
+            # HM_VARS from module (not instance attribute)
+            HM_VARS = ["AG", "BU", "EX", "FR", "HI", "NS", "PO", "TI", "gdp", "population"]
 
             # Open all sources
             hm_srcs = [rasterio.open(p) for p in hm_files]
@@ -1138,7 +1223,7 @@ if __name__ == "__main__":
                 batch_inputs_dyn = []
                 batch_inputs_stat = []
                 batch_lonlats = []
-                batch_metadata = []  # Store (i, j, hi, wj, li0, lj0, li1, lj1, valid_mask)
+                batch_metadata = []  # Store (i, j, hi, wj, li0, lj0, li1, lj1, valid_mask, input_invalid_mask)
                 
                 for i, j in batch_tiles:
                     hi = min(tile, r1 - i)
@@ -1162,13 +1247,12 @@ if __name__ == "__main__":
                         # Data is already in [0, 1] range
                         channels.append((arr_hm - hm_mean) / hm_std)
                         if include_components and comp_srcs.get(y, []):
-                            for src in comp_srcs[y]:
+                            for var_idx, (var_name, src) in enumerate(zip(HM_VARS, comp_srcs[y])):
                                 carr = src.read(1, window=win, masked=True).filled(np.nan)
                                 # Replace NaN with 0 BEFORE normalization (missing = no pressure/activity)
                                 carr = np.nan_to_num(carr, nan=0.0)
-                                # Data is already in [0, 1] range
-                                # NOTE: Using simplified normalization here (should use per-variable stats)
-                                channels.append((carr - hm_mean) / hm_std)
+                                # Use per-variable normalization (CRITICAL for GDP/population)
+                                channels.append((carr - comp_means[var_name]) / comp_stds[var_name])
                         dyn_ts.append(np.stack(channels, axis=0))  # [C_dyn, hi, wj]
                     input_dynamic_np = np.stack(dyn_ts, axis=0)  # [T, C_dyn, hi, wj]
                     static_chs = []
@@ -1179,8 +1263,8 @@ if __name__ == "__main__":
                         # Replace NaN with 0 for specific variables (before normalization)
                         if static_idx in nan_to_zero_static:
                             sarr = np.nan_to_num(sarr, nan=0.0)
-                        # NOTE: Using simplified normalization here (should use per-variable stats)
-                        static_chs.append((sarr - elev_mean) / elev_std)
+                        # Use per-variable normalization (CRITICAL for different scales)
+                        static_chs.append((sarr - static_means[static_idx]) / static_stds[static_idx])
                     input_static_np = np.stack(static_chs, axis=0) if static_chs else np.zeros((0, hi, wj), dtype=np.float32)
 
                     # Valid mask for prediction (less strict than training)
@@ -1197,6 +1281,12 @@ if __name__ == "__main__":
                     
                     tiles_with_valid += 1
                     tiles_processed += 1
+                    
+                    # Track which pixels had valid inputs (BEFORE replacing NaN)
+                    # This matches the validation code approach (lines 465-467)
+                    dynamic_has_nan = ~np.isfinite(input_dynamic_np).all(axis=(0, 1))  # [hi, wj]
+                    static_has_nan = ~np.isfinite(input_static_np).all(axis=0) if static_chs else np.zeros((hi, wj), dtype=bool)
+                    input_invalid_mask = dynamic_has_nan | static_has_nan  # Pixels to mask in predictions
                     
                     # Add to batch
                     # Replace NaN with 0.0 in normalized space = mean in original space
@@ -1226,7 +1316,7 @@ if __name__ == "__main__":
                     batch_inputs_dyn.append(in_dyn)
                     batch_inputs_stat.append(in_stat)
                     batch_lonlats.append(lonlat_hw2)
-                    batch_metadata.append((i, j, hi, wj, li0, lj0, li1, lj1, valid_mask))
+                    batch_metadata.append((i, j, hi, wj, li0, lj0, li1, lj1, valid_mask, input_invalid_mask))
                 
                 # Process batch on GPU if we have any valid tiles
                 if len(batch_inputs_dyn) > 0:
@@ -1239,12 +1329,14 @@ if __name__ == "__main__":
                         batch_preds = infer_model(batch_dyn_tensor, batch_stat_tensor, lonlat=batch_lonlat_tensor)  # [B, 4, H, W]
                     
                     # Process each tile in the batch
-                    for tile_idx, (i, j, hi, wj, li0, lj0, li1, lj1, valid_mask) in enumerate(batch_metadata):
+                    for tile_idx, (i, j, hi, wj, li0, lj0, li1, lj1, valid_mask, input_invalid_mask) in enumerate(batch_metadata):
                         # Extract predictions for this tile (crop to actual size if padded)
                         preds_horizons = {}
                         for h_idx, h_name in enumerate(horizon_names):
                             pred_h = batch_preds[tile_idx, h_idx, :hi, :wj].detach().cpu().numpy()  # [hi, wj] normalized (crop padding)
                             pred_h = pred_h * hm_std + hm_mean  # denormalize to [0, 1] scale
+                            # CRITICAL: Mask predictions where inputs had NaN (same as validation code)
+                            pred_h[input_invalid_mask] = np.nan
                             preds_horizons[h_name] = pred_h
                         
                         # Distance-to-edge weights within tile
@@ -1280,6 +1372,8 @@ if __name__ == "__main__":
             for h_name in horizon_names:
                 out_h = np.full((Hwin, Wwin), np.nan, dtype=np.float32)
                 out_h[m] = (accum_horizons[h_name][m] / wsum[m]).astype(np.float32)
+                # Clamp predictions to valid range [0, 1]
+                out_h[m] = np.clip(out_h[m], 0.0, 1.0)
                 out_horizons[h_name] = out_h
             
             # Calculate statistics
@@ -1337,5 +1431,12 @@ if __name__ == "__main__":
             for src in stat_srcs:
                 src.close()
 
-    if args.predict_after_training and checkpoint_cb.best_model_path:
-        _predict_region_and_write(checkpoint_cb.best_model_path)
+    # Run prediction if requested
+    if args.predict_after_training:
+        # Use provided checkpoint, or best from training
+        pred_checkpoint = checkpoint_path if checkpoint_path else checkpoint_cb.best_model_path
+        if pred_checkpoint:
+            _predict_region_and_write(pred_checkpoint)
+        else:
+            print("\n⚠️  No checkpoint available for prediction!")
+            print("   Provide --checkpoint or train a model (--max_epochs > 0)")
