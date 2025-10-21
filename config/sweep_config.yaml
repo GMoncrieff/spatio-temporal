@@ -41,8 +41,8 @@ parameters:
   histogram_warmup_epochs:
     value: 0
   ssim_weight:
-    value: 0.015
+    value: 0.15
   laplacian_weight:
-    value: 0.02
+    value: 0.2
   histogram_weight:
-    value: 0.115
+    value: 1.15
