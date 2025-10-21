@@ -59,8 +59,12 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         self.histogram_warmup_epochs = histogram_warmup_epochs
         self.histogram_lambda_w2 = histogram_lambda_w2  # Store for reference (not used in new implementation)
         if self.histogram_weight > 0:
-            # Define histogram bins: [-1, -0.05, -ε, +ε, 0.02, 0.05, 0.1, 0.2, 0.5, 1]
-            histogram_bins = torch.tensor([-1.0, -0.05, -0.005, 0.005, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0])
+            # Define histogram bins: 8 bins from decrease to extreme increase
+            # Bin 1: decrease (<-0.005), Bin 2: no change (-0.005 to 0.005), 
+            # Bin 3: tiny increase (0.005-0.02), Bin 4: small (0.02-0.1),
+            # Bin 5: moderate (0.1-0.2), Bin 6: large (0.2-0.4),
+            # Bin 7: very large (0.4-0.6), Bin 8: extreme (>0.6)
+            histogram_bins = torch.tensor([-1.0, -0.005, 0.005, 0.02, 0.1, 0.2, 0.4, 0.6, 1.0])
             self.histogram_loss_fn = HistogramLoss(histogram_bins)  # Bin weights will be set later
             self.register_buffer('histogram_bins', histogram_bins)
             self.histogram_bins_initialized = False

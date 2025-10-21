@@ -634,8 +634,8 @@ if __name__ == "__main__":
             static_valid = np.isfinite(input_static_raw).all(axis=0)
             most_recent_in = (input_dynamic[b, -1, 0].cpu().numpy() * hm_std + hm_mean)
             
-            # Histogram bins
-            histogram_bins = np.array([-1.0, -0.05, -0.005, 0.005, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0])
+            # Histogram bins: 8 bins from decrease to extreme increase
+            histogram_bins = np.array([-1.0, -0.005, 0.005, 0.02, 0.1, 0.2, 0.4, 0.6, 1.0])
             num_bins = len(histogram_bins) - 1
             
             # Plot each horizon in rows 1-4
@@ -678,16 +678,15 @@ if __name__ == "__main__":
                 plt.colorbar(im, ax=axes[row, 2], fraction=0.046, pad=0.04)
                 
                 # Column 3: Delta Observed
-                vmax_delta = max(np.nanmax(np.abs(delta_obs)), np.nanmax(np.abs(delta_pred))) if np.any(valid_mask) else 0.5
                 delta_obs_plot = np.where(valid_mask, delta_obs, np.nan)
-                im = axes[row, 3].imshow(delta_obs_plot, cmap='bwr', vmin=-vmax_delta, vmax=vmax_delta)
+                im = axes[row, 3].imshow(delta_obs_plot, cmap='seismic', vmin=-0.3, vmax=0.3)
                 axes[row, 3].set_title(f'Δ Obs {h_year}')
                 axes[row, 3].axis('off')
                 plt.colorbar(im, ax=axes[row, 3], fraction=0.046, pad=0.04)
                 
                 # Column 4: Delta Predicted
                 delta_pred_plot = np.where(valid_mask, delta_pred, np.nan)
-                im = axes[row, 4].imshow(delta_pred_plot, cmap='bwr', vmin=-vmax_delta, vmax=vmax_delta)
+                im = axes[row, 4].imshow(delta_pred_plot, cmap='seismic', vmin=-0.3, vmax=0.3)
                 axes[row, 4].set_title(f'Δ Pred {h_year}')
                 axes[row, 4].axis('off')
                 plt.colorbar(im, ax=axes[row, 4], fraction=0.046, pad=0.04)
