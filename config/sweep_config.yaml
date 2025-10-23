@@ -19,13 +19,13 @@ parameters:
   
   # Fixed parameters from command line
   accumulate_grad_batches:
-    value: 1
+    value: 4
   train_chips:
     value: 800
   val_chips:
-    value: 200
+    value: 800
   batch_size:
-    value: 32
+    value: 8
   train_mode:
     value: random
   val_mode:
@@ -46,3 +46,5 @@ parameters:
     value: 0.2
   histogram_weight:
     value: 1.15
+  num_workers:
+    value: 8
