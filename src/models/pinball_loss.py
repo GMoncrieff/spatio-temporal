@@ -38,8 +38,20 @@ class PinballLoss(nn.Module):
         Returns:
             Scalar loss (if reduction='mean' or 'sum') or tensor (if reduction='none')
         """
-        # Compute error
-        error = target - pred  # [B, *, H, W]
+        # Apply mask first to filter valid pixels only
+        if mask is not None:
+            # Only compute loss on valid pixels
+            pred_valid = pred[mask]
+            target_valid = target[mask]
+            
+            if pred_valid.numel() == 0:
+                return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
+        else:
+            pred_valid = pred
+            target_valid = target
+        
+        # Compute error on valid pixels only
+        error = target_valid - pred_valid
         
         # Pinball loss: q * max(error, 0) + (1-q) * max(-error, 0)
         # Equivalent to: q * error if error > 0, else (q-1) * error
@@ -49,18 +61,9 @@ class PinballLoss(nn.Module):
             (self.quantile - 1) * error
         )
         
-        # Apply mask if provided
-        if mask is not None:
-            loss = loss * mask
-            n_valid = mask.sum()
-            if n_valid == 0:
-                return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
-        else:
-            n_valid = loss.numel()
-        
         # Apply reduction
         if self.reduction == 'mean':
-            return loss.sum() / n_valid
+            return loss.mean()
         elif self.reduction == 'sum':
             return loss.sum()
         else:  # 'none'
