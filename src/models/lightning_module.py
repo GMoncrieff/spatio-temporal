@@ -261,14 +261,14 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         avg_total = torch.stack([h['total'] for h in horizon_losses]).mean()
         
         # Log averaged metrics (total)
-        self.log('train_loss', avg_mse)
-        self.log('train_mae_total', avg_mae)
+        self.log('train_loss', avg_mse, prog_bar=True)
+        self.log('train_mae_total', avg_mae, prog_bar=True)
         self.log('train_ssim_loss_total', avg_ssim)
         self.log('train_lap_loss_total', avg_lap)
         self.log('train_hist_loss_total', avg_hist)
-        self.log('train_pinball_lower_total', avg_pinball_lower)
-        self.log('train_pinball_upper_total', avg_pinball_upper)
-        self.log('train_total_loss', avg_total)
+        self.log('train_pinball_lower_total', avg_pinball_lower, prog_bar=True)
+        self.log('train_pinball_upper_total', avg_pinball_upper, prog_bar=True)
+        self.log('train_total_loss', avg_total, prog_bar=True)
         
         # Debug print on first batch of warmup epoch
         if batch_idx == 0 and self.current_epoch == self.histogram_warmup_epochs and self.histogram_weight > 0:
@@ -373,8 +373,8 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         self.log('val_ssim_loss_total', avg_ssim, on_step=False, on_epoch=True)
         self.log('val_lap_loss_total', avg_lap, on_step=False, on_epoch=True)
         self.log('val_hist_loss_total', avg_hist, on_step=False, on_epoch=True)
-        self.log('val_pinball_lower_total', avg_pinball_lower, on_step=False, on_epoch=True)
-        self.log('val_pinball_upper_total', avg_pinball_upper, on_step=False, on_epoch=True)
+        self.log('val_pinball_lower_total', avg_pinball_lower, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('val_pinball_upper_total', avg_pinball_upper, on_step=False, on_epoch=True, prog_bar=True)
         self.log('val_coverage_total', avg_coverage, on_step=False, on_epoch=True, prog_bar=True)
         self.log('val_total_loss', avg_total, on_step=False, on_epoch=True, prog_bar=True)
         
@@ -384,9 +384,15 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             hist_active = self.histogram_weight > 0 and self.current_epoch >= self.histogram_warmup_epochs
             hist_str = f", Hist: {losses_20yr['hist'].item():.5f}" if hist_active else " [hist off]"
             coverage_20yr = coverage_stats[-1][1] if coverage_stats else 0.0
-            print(f"[VAL] 20yr - MSE: {losses_20yr['mse'].item():.5f}, MAE: {losses_20yr['mae'].item():.5f}, SSIM: {1.0 - losses_20yr['ssim'].item():.5f}, Lap: {losses_20yr['lap'].item():.5f}{hist_str}")
-            print(f"[VAL] 20yr - Coverage: {coverage_20yr:.1f}% (target: 95%)")
-            print(f"[VAL] Avg across horizons - Total: {avg_total.item():.5f}, Coverage: {avg_coverage.item():.1f}%")
+            print(f"\n{'='*70}")
+            print(f"[VAL] Epoch {self.current_epoch} - 20yr Horizon Metrics:")
+            print(f"  MSE: {losses_20yr['mse'].item():.5f}, MAE: {losses_20yr['mae'].item():.5f}, SSIM: {1.0 - losses_20yr['ssim'].item():.5f}, Lap: {losses_20yr['lap'].item():.5f}{hist_str}")
+            print(f"  Pinball Lower: {losses_20yr['pinball_lower'].item():.5f}, Pinball Upper: {losses_20yr['pinball_upper'].item():.5f}")
+            print(f"  Coverage: {coverage_20yr:.1f}% (target: 95%)")
+            print(f"[VAL] Average across all horizons:")
+            print(f"  Total Loss: {avg_total.item():.5f}, Coverage: {avg_coverage.item():.1f}%")
+            print(f"  Pinball Lower: {avg_pinball_lower.item():.5f}, Pinball Upper: {avg_pinball_upper.item():.5f}")
+            print(f"{'='*70}\n")
         
         return avg_total
     
