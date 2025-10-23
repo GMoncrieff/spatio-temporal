@@ -1,15 +1,32 @@
 import torch
 import torch.nn as nn
-from .convlstm import ConvLSTM
 from ..locationencoder import LocationEncoder
+from .convlstm import ConvLSTM
 
 class SpatioTemporalPredictor(nn.Module):
     """
-    Model for multi-horizon prediction with ConvLSTM and static variables.
-    - input_dynamic: [B, T, C_d, H, W] (C_d dynamic channels per timestep; channel 0 is HM)
-    - input_static: [B, C_s, H, W] (C_s static channels, e.g., elevation, slope, climate)
-    - lonlat: [B, H, W, 2] (per-pixel longitude, latitude in degrees), optional
-    - output: [B, 4, H, W] (predicted human footprint at 4 horizons: 5yr, 10yr, 15yr, 20yr)
+    Multi-horizon spatio-temporal predictor using ConvLSTM with independent prediction heads.
+    
+    Architecture:
+    - input: [B, T, C_d, H, W] dynamic + [B, C_s, H, W] static
+    - ConvLSTM processes temporal sequence → shared representation
+    - 12 independent prediction heads:
+        * 4 central heads (one per horizon): Optimized for accuracy + spatial patterns
+        * 4 lower quantile heads (2.5%): Optimized for lower bound estimation
+        * 4 upper quantile heads (97.5%): Optimized for upper bound estimation
+    - output: [B, 12, H, W] (predicted HM at 4 horizons × 3 predictions)
+      
+      Output channel ordering:
+        - Channels [0, 3, 6, 9]: Lower 2.5% quantile (q=0.025)
+        - Channels [1, 4, 7, 10]: Central prediction (optimized for MSE+SSIM+Lap+Hist)
+        - Channels [2, 5, 8, 11]: Upper 97.5% quantile (q=0.975)
+      Horizons: 5yr, 10yr, 15yr, 20yr
+    
+    Key Design:
+    - Central heads are INDEPENDENT from quantile heads (no shared gradients)
+    - Central prediction optimized for multiple objectives, not statistical median
+    - Quantile heads only receive pinball loss gradients
+    - Quantile heads are smaller (hidden_dim/2) for efficiency
     """
     def __init__(self, hidden_dim=16, kernel_size=3, num_layers=1, num_static_channels=1, num_dynamic_channels=1,
                  use_location_encoder: bool = True,
@@ -42,13 +59,39 @@ class SpatioTemporalPredictor(nn.Module):
             bias=True,
             return_all_layers=False
         )
-        # Multi-horizon prediction heads (4 horizons: 5yr, 10yr, 15yr, 20yr)
+        # Multi-horizon prediction with independent heads for central and quantile predictions
+        # Central heads: Optimized for accuracy + spatial patterns (MSE, SSIM, Laplacian, Histogram)
+        # Quantile heads: Optimized purely for uncertainty estimation (Pinball loss only)
         self.num_horizons = 4
-        self.heads = nn.ModuleList([
+        
+        # Central prediction heads (one per horizon)
+        # These produce the "best estimate" optimized for multiple objectives
+        self.central_heads = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, bias=True),
                 nn.ReLU(inplace=True),
                 nn.Conv2d(hidden_dim, 1, kernel_size=1, bias=True),
+            )
+            for _ in range(self.num_horizons)
+        ])
+        
+        # Lower quantile heads (2.5%, one per horizon)
+        # Smaller networks since quantile estimation is simpler than full prediction
+        self.lower_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(hidden_dim, hidden_dim // 2, kernel_size=3, padding=1, bias=True),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(hidden_dim // 2, 1, kernel_size=1, bias=True),
+            )
+            for _ in range(self.num_horizons)
+        ])
+        
+        # Upper quantile heads (97.5%, one per horizon)
+        self.upper_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(hidden_dim, hidden_dim // 2, kernel_size=3, padding=1, bias=True),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(hidden_dim // 2, 1, kernel_size=1, bias=True),
             )
             for _ in range(self.num_horizons)
         ])
@@ -73,12 +116,18 @@ class SpatioTemporalPredictor(nn.Module):
         # output[0]: [B, T, hidden_dim, H, W] (last layer)
         last_hidden = output[0][:, -1]  # [B, hidden_dim, H, W] (last timestep)
         
-        # Generate predictions for each horizon
+        # Generate independent predictions for each horizon
+        # Each horizon has 3 separate heads: lower, central, upper
         preds = []
-        for head in self.heads:
-            pred_h = head(last_hidden)  # [B, 1, H, W]
-            preds.append(pred_h)
+        for h_idx in range(self.num_horizons):
+            pred_lower = self.lower_heads[h_idx](last_hidden)    # [B, 1, H, W]
+            pred_central = self.central_heads[h_idx](last_hidden) # [B, 1, H, W]
+            pred_upper = self.upper_heads[h_idx](last_hidden)    # [B, 1, H, W]
+            
+            # Append in order: lower, central, upper for this horizon
+            preds.extend([pred_lower, pred_central, pred_upper])
         
-        # Stack predictions: [B, 4, H, W]
+        # Stack predictions: [B, 12, H, W] (4 horizons × 3 predictions)
+        # Channel ordering: [lower_5yr, central_5yr, upper_5yr, lower_10yr, central_10yr, upper_10yr, ...]
         pred = torch.cat(preds, dim=1)
         return pred

@@ -473,28 +473,52 @@ if __name__ == "__main__":
                     lonlat = batch.get('lonlat', None)
                     if lonlat is not None:
                         lonlat = lonlat.to(device)
-                    # Get predictions from model (learnable location encoder)
-                    preds_all = best_model(input_dynamic_clean, input_static_clean, lonlat=lonlat)  # [B, 4, H, W]
+                    # Get predictions from model: [B, 12, H, W] (4 horizons × 3 quantiles)
+                    preds_all = best_model(input_dynamic_clean, input_static_clean, lonlat=lonlat)
                     
-                    # Store all 4 horizons
-                    preds_5yr = preds_all[:, 0:1, :, :].clone()  # [B, 1, H, W]
-                    preds_10yr = preds_all[:, 1:2, :, :].clone()
-                    preds_15yr = preds_all[:, 2:3, :, :].clone()
-                    preds_20yr = preds_all[:, 3:4, :, :].clone()
+                    # Extract quantile predictions for each horizon
+                    # Channel ordering: [lower_5yr, median_5yr, upper_5yr, lower_10yr, median_10yr, upper_10yr, ...]
+                    preds_5yr_lower = preds_all[:, 0:1, :, :].clone()  # [B, 1, H, W]
+                    preds_5yr = preds_all[:, 1:2, :, :].clone()  # Median
+                    preds_5yr_upper = preds_all[:, 2:3, :, :].clone()
+                    
+                    preds_10yr_lower = preds_all[:, 3:4, :, :].clone()
+                    preds_10yr = preds_all[:, 4:5, :, :].clone()  # Median
+                    preds_10yr_upper = preds_all[:, 5:6, :, :].clone()
+                    
+                    preds_15yr_lower = preds_all[:, 6:7, :, :].clone()
+                    preds_15yr = preds_all[:, 7:8, :, :].clone()  # Median
+                    preds_15yr_upper = preds_all[:, 8:9, :, :].clone()
+                    
+                    preds_20yr_lower = preds_all[:, 9:10, :, :].clone()
+                    preds_20yr = preds_all[:, 10:11, :, :].clone()  # Median
+                    preds_20yr_upper = preds_all[:, 11:12, :, :].clone()
                     
                     # Set predictions to NaN where any input was NaN
-                    preds_5yr[~input_mask] = float('nan')
-                    preds_10yr[~input_mask] = float('nan')
-                    preds_15yr[~input_mask] = float('nan')
-                    preds_20yr[~input_mask] = float('nan')
+                    for pred in [preds_5yr_lower, preds_5yr, preds_5yr_upper,
+                                 preds_10yr_lower, preds_10yr, preds_10yr_upper,
+                                 preds_15yr_lower, preds_15yr, preds_15yr_upper,
+                                 preds_20yr_lower, preds_20yr, preds_20yr_upper]:
+                        pred[~input_mask] = float('nan')
                     
                     # Squeeze for storage
-                    preds_5yr = preds_5yr.squeeze(1)  # [B, H, W]
+                    preds_5yr_lower = preds_5yr_lower.squeeze(1)  # [B, H, W]
+                    preds_5yr = preds_5yr.squeeze(1)
+                    preds_5yr_upper = preds_5yr_upper.squeeze(1)
+                    
+                    preds_10yr_lower = preds_10yr_lower.squeeze(1)
                     preds_10yr = preds_10yr.squeeze(1)
+                    preds_10yr_upper = preds_10yr_upper.squeeze(1)
+                    
+                    preds_15yr_lower = preds_15yr_lower.squeeze(1)
                     preds_15yr = preds_15yr.squeeze(1)
+                    preds_15yr_upper = preds_15yr_upper.squeeze(1)
+                    
+                    preds_20yr_lower = preds_20yr_lower.squeeze(1)
                     preds_20yr = preds_20yr.squeeze(1)
+                    preds_20yr_upper = preds_20yr_upper.squeeze(1)
                 
-                # Store batch data for later processing (all horizons)
+                # Store batch data for later processing (all horizons with quantiles)
                 all_batches_data.append({
                     'input_dynamic': input_dynamic.cpu(),
                     'input_static': input_static.cpu(),
@@ -502,10 +526,18 @@ if __name__ == "__main__":
                     'target_10yr': batch.get('target_10yr', target).cpu(),
                     'target_15yr': batch.get('target_15yr', target).cpu(),
                     'target_20yr': batch.get('target_20yr', target).cpu(),
+                    'preds_5yr_lower': preds_5yr_lower.cpu(),
                     'preds_5yr': preds_5yr.cpu(),
+                    'preds_5yr_upper': preds_5yr_upper.cpu(),
+                    'preds_10yr_lower': preds_10yr_lower.cpu(),
                     'preds_10yr': preds_10yr.cpu(),
+                    'preds_10yr_upper': preds_10yr_upper.cpu(),
+                    'preds_15yr_lower': preds_15yr_lower.cpu(),
                     'preds_15yr': preds_15yr.cpu(),
+                    'preds_15yr_upper': preds_15yr_upper.cpu(),
+                    'preds_20yr_lower': preds_20yr_lower.cpu(),
                     'preds_20yr': preds_20yr.cpu(),
+                    'preds_20yr_upper': preds_20yr_upper.cpu(),
                     'input_mask': input_mask.cpu(),
                     'lonlat': batch.get('lonlat', None)
                 })
@@ -699,7 +731,7 @@ if __name__ == "__main__":
         input_static = first_batch['input_static']
         input_mask = first_batch['input_mask']
         
-        # All horizon targets and predictions
+        # All horizon targets and independent predictions
         horizon_names = ['5yr', '10yr', '15yr', '20yr']
         targets_all = {
             '5yr': first_batch['target_5yr'],
@@ -707,11 +739,23 @@ if __name__ == "__main__":
             '15yr': first_batch['target_15yr'],
             '20yr': first_batch['target_20yr']
         }
-        preds_all = {
+        preds_central = {
             '5yr': first_batch['preds_5yr'],
             '10yr': first_batch['preds_10yr'],
             '15yr': first_batch['preds_15yr'],
             '20yr': first_batch['preds_20yr']
+        }
+        preds_lower = {
+            '5yr': first_batch['preds_5yr_lower'],
+            '10yr': first_batch['preds_10yr_lower'],
+            '15yr': first_batch['preds_15yr_lower'],
+            '20yr': first_batch['preds_20yr_lower']
+        }
+        preds_upper = {
+            '5yr': first_batch['preds_5yr_upper'],
+            '10yr': first_batch['preds_10yr_upper'],
+            '15yr': first_batch['preds_15yr_upper'],
+            '20yr': first_batch['preds_20yr_upper']
         }
         
         B = input_dynamic.shape[0]
@@ -724,11 +768,11 @@ if __name__ == "__main__":
                 input_years = input_years[b]  # Extract for this sample
                 target_years = target_years[b]
             
-            # Create multi-horizon figure: 6 rows x 5 columns
-            # Row 0: Input HM (dynamic years) + Elevation + empty
-            # Rows 1-4: Each horizon (Target, Pred, Error, Delta Obs, Delta Pred)
+            # Create multi-horizon figure: 6 rows x 7 columns (added 2 for quantiles)
+            # Row 0: Input HM (dynamic years) + Elevation + 3 empty
+            # Rows 1-4: Each horizon (Target, Pred, Error, Delta Obs, Delta Pred, Delta Lower, Delta Upper)
             # Row 5: Change histograms for all horizons
-            fig, axes = plt.subplots(6, 5, figsize=(20, 24))
+            fig, axes = plt.subplots(6, 7, figsize=(28, 24))
             # Use a single color ramp for all HM images in original 0-1 scale
             hm_vmin, hm_vmax = 0.0, 1.0
             # Input human footprint chips (T=3), unnormalize and label with actual years
@@ -747,8 +791,10 @@ if __name__ == "__main__":
             axes[0, 3].axis('off')
             plt.colorbar(im, ax=axes[0, 3], fraction=0.046, pad=0.04)
             
-            # Hide empty cell in row 0, column 4
+            # Hide empty cells in row 0
             axes[0, 4].axis('off')
+            axes[0, 5].axis('off')
+            axes[0, 6].axis('off')
             
             # Compute validity mask from RAW inputs
             # For visualization: use same strict mask as training to show what model actually learns from
@@ -769,9 +815,11 @@ if __name__ == "__main__":
                 row = h_idx + 1
                 h_year = target_years[h_idx]  # Get actual year for this sample
                 
-                # Get target and prediction for this horizon
+                # Get target and independent predictions for this horizon
                 target_h = targets_all[h_name][b].cpu().numpy() * hm_std + hm_mean
-                pred_h = preds_all[h_name][b].cpu().numpy() * hm_std + hm_mean
+                pred_h = preds_central[h_name][b].cpu().numpy() * hm_std + hm_mean
+                pred_lower = preds_lower[h_name][b].cpu().numpy() * hm_std + hm_mean
+                pred_upper = preds_upper[h_name][b].cpu().numpy() * hm_std + hm_mean
                 
                 # Compute mask for this horizon
                 target_valid = np.isfinite(target_h)
@@ -780,6 +828,8 @@ if __name__ == "__main__":
                 # Deltas
                 delta_obs = target_h - most_recent_in
                 delta_pred = pred_h - most_recent_in
+                delta_lower = pred_lower - most_recent_in
+                delta_upper = pred_upper - most_recent_in
                 
                 # Column 0: Target (show year + horizon offset)
                 target_plot = np.where(valid_mask, target_h, np.nan)
@@ -788,14 +838,14 @@ if __name__ == "__main__":
                 axes[row, 0].axis('off')
                 plt.colorbar(im, ax=axes[row, 0], fraction=0.046, pad=0.04)
                 
-                # Column 1: Prediction (show year + horizon offset)
+                # Column 1: Central Prediction (show year + horizon offset)
                 pred_plot = np.where(valid_mask, pred_h, np.nan)
                 im = axes[row, 1].imshow(pred_plot, cmap='turbo', vmin=hm_vmin, vmax=hm_vmax)
-                axes[row, 1].set_title(f'Pred {h_year} (+{(h_idx+1)*5}yr)')
+                axes[row, 1].set_title(f'Pred Central {h_year}')
                 axes[row, 1].axis('off')
                 plt.colorbar(im, ax=axes[row, 1], fraction=0.046, pad=0.04)
                 
-                # Column 2: Absolute Error
+                # Column 2: Absolute Error (central)
                 error = np.abs(pred_h - target_h)
                 error_plot = np.where(valid_mask, error, np.nan)
                 im = axes[row, 2].imshow(error_plot, cmap='hot', vmin=0.0, vmax=0.5)
@@ -810,18 +860,32 @@ if __name__ == "__main__":
                 axes[row, 3].axis('off')
                 plt.colorbar(im, ax=axes[row, 3], fraction=0.046, pad=0.04)
                 
-                # Column 4: Delta Predicted
+                # Column 4: Delta Predicted (central)
                 delta_pred_plot = np.where(valid_mask, delta_pred, np.nan)
                 im = axes[row, 4].imshow(delta_pred_plot, cmap='seismic', vmin=-0.3, vmax=0.3)
-                axes[row, 4].set_title(f'Δ Pred {h_year}')
+                axes[row, 4].set_title(f'Δ Pred Central {h_year}')
                 axes[row, 4].axis('off')
                 plt.colorbar(im, ax=axes[row, 4], fraction=0.046, pad=0.04)
+                
+                # Column 5: Delta Lower (2.5% quantile)
+                delta_lower_plot = np.where(valid_mask, delta_lower, np.nan)
+                im = axes[row, 5].imshow(delta_lower_plot, cmap='seismic', vmin=-0.3, vmax=0.3)
+                axes[row, 5].set_title(f'Δ Lower 2.5% {h_year}')
+                axes[row, 5].axis('off')
+                plt.colorbar(im, ax=axes[row, 5], fraction=0.046, pad=0.04)
+                
+                # Column 6: Delta Upper (97.5% quantile)
+                delta_upper_plot = np.where(valid_mask, delta_upper, np.nan)
+                im = axes[row, 6].imshow(delta_upper_plot, cmap='seismic', vmin=-0.3, vmax=0.3)
+                axes[row, 6].set_title(f'Δ Upper 97.5% {h_year}')
+                axes[row, 6].axis('off')
+                plt.colorbar(im, ax=axes[row, 6], fraction=0.046, pad=0.04)
             
             # Row 5: Histograms for all horizons
             for h_idx, h_name in enumerate(horizon_names):
                 h_year = target_years[h_idx]  # Get actual year for this sample
                 target_h = targets_all[h_name][b].cpu().numpy() * hm_std + hm_mean
-                pred_h = preds_all[h_name][b].cpu().numpy() * hm_std + hm_mean
+                pred_h = preds_central[h_name][b].cpu().numpy() * hm_std + hm_mean
                 target_valid = np.isfinite(target_h)
                 valid_mask = target_valid & dynamic_valid & static_valid
                 
@@ -847,8 +911,10 @@ if __name__ == "__main__":
                     axes[5, h_idx].text(0.5, 0.5, 'No valid', ha='center', va='center')
                     axes[5, h_idx].axis('off')
             
-            # Hide the 5th column in histogram row (only 4 histograms)
+            # Hide the extra columns in histogram row (only 4 histograms)
             axes[5, 4].axis('off')
+            axes[5, 5].axis('off')
+            axes[5, 6].axis('off')
             
             plt.tight_layout()
             # Convert to numpy array and log (robust for macOS backend)
@@ -1122,10 +1188,18 @@ if __name__ == "__main__":
             print(f"  Row range: [{r0}, {r1})")
             print(f"  Col range: [{c0}, {c1})")
             
-            # Multi-horizon accumulators
+            # Multi-horizon quantile accumulators (3 quantiles × 4 horizons = 12 outputs)
             horizon_names = ['5yr', '10yr', '15yr', '20yr']
             horizon_years = [2005, 2010, 2015, 2020]
-            accum_horizons = {h: np.zeros((Hwin, Wwin), dtype=np.float64) for h in horizon_names}
+            quantile_names = ['lower', 'median', 'upper']
+            
+            # Create accumulators for each horizon-quantile combination
+            accum_horizons = {}
+            for h in horizon_names:
+                for q in quantile_names:
+                    key = f"{h}_{q}"
+                    accum_horizons[key] = np.zeros((Hwin, Wwin), dtype=np.float64)
+            
             wsum = np.zeros((Hwin, Wwin), dtype=np.float64)
             nodata_mask_total = np.zeros((Hwin, Wwin), dtype=bool)
 
@@ -1326,18 +1400,34 @@ if __name__ == "__main__":
                     batch_lonlat_tensor = torch.from_numpy(np.stack(batch_lonlats, axis=0)).to(device)  # [B, H, W, 2]
                     
                     with torch.no_grad():
-                        batch_preds = infer_model(batch_dyn_tensor, batch_stat_tensor, lonlat=batch_lonlat_tensor)  # [B, 4, H, W]
+                        batch_preds = infer_model(batch_dyn_tensor, batch_stat_tensor, lonlat=batch_lonlat_tensor)  # [B, 12, H, W]
                     
                     # Process each tile in the batch
                     for tile_idx, (i, j, hi, wj, li0, lj0, li1, lj1, valid_mask, input_invalid_mask) in enumerate(batch_metadata):
-                        # Extract predictions for this tile (crop to actual size if padded)
+                        # Extract quantile predictions for this tile (crop to actual size if padded)
+                        # batch_preds: [B, 12, H, W] where 12 = 4 horizons × 3 quantiles
+                        # Channel ordering: [lower_5yr, median_5yr, upper_5yr, lower_10yr, ...]
                         preds_horizons = {}
                         for h_idx, h_name in enumerate(horizon_names):
-                            pred_h = batch_preds[tile_idx, h_idx, :hi, :wj].detach().cpu().numpy()  # [hi, wj] normalized (crop padding)
-                            pred_h = pred_h * hm_std + hm_mean  # denormalize to [0, 1] scale
+                            # Extract 3 quantiles for this horizon
+                            pred_lower = batch_preds[tile_idx, 3*h_idx, :hi, :wj].detach().cpu().numpy()
+                            pred_median = batch_preds[tile_idx, 3*h_idx+1, :hi, :wj].detach().cpu().numpy()
+                            pred_upper = batch_preds[tile_idx, 3*h_idx+2, :hi, :wj].detach().cpu().numpy()
+                            
+                            # Denormalize to [0, 1] scale
+                            pred_lower = pred_lower * hm_std + hm_mean
+                            pred_median = pred_median * hm_std + hm_mean
+                            pred_upper = pred_upper * hm_std + hm_mean
+                            
                             # CRITICAL: Mask predictions where inputs had NaN (same as validation code)
-                            pred_h[input_invalid_mask] = np.nan
-                            preds_horizons[h_name] = pred_h
+                            pred_lower[input_invalid_mask] = np.nan
+                            pred_median[input_invalid_mask] = np.nan
+                            pred_upper[input_invalid_mask] = np.nan
+                            
+                            # Store with keys matching accumulator dict
+                            preds_horizons[f"{h_name}_lower"] = pred_lower
+                            preds_horizons[f"{h_name}_median"] = pred_median
+                            preds_horizons[f"{h_name}_upper"] = pred_upper
                         
                         # Distance-to-edge weights within tile
                         interior = valid_mask.astype(np.uint8)
@@ -1347,9 +1437,9 @@ if __name__ == "__main__":
                         weights = np.where(valid_mask, weights, 0.0)
                         
                         if weights.max() > 0:
-                            # Accumulate each horizon
-                            for h_name, pred_h in preds_horizons.items():
-                                accum_horizons[h_name][li0:li1, lj0:lj1] += pred_h * weights
+                            # Accumulate each horizon-quantile combination
+                            for key, pred in preds_horizons.items():
+                                accum_horizons[key][li0:li1, lj0:lj1] += pred * weights
                             wsum[li0:li1, lj0:lj1] += weights
                         nodata_mask_total[li0:li1, lj0:lj1] |= ~valid_mask
                 
@@ -1364,17 +1454,19 @@ if __name__ == "__main__":
                           f"ETA: {int(eta_sec//60):02d}:{int(eta_sec%60):02d}")
                     last_percent = percent
 
-            # Final blend for all horizons
+            # Final blend for all horizon-quantile combinations
             print("\n" + "-"*70)
-            print("Blending overlapping tiles for all horizons...")
+            print("Blending overlapping tiles for all horizons and quantiles...")
             m = wsum > 0
             out_horizons = {}
             for h_name in horizon_names:
-                out_h = np.full((Hwin, Wwin), np.nan, dtype=np.float32)
-                out_h[m] = (accum_horizons[h_name][m] / wsum[m]).astype(np.float32)
-                # Clamp predictions to valid range [0, 1]
-                out_h[m] = np.clip(out_h[m], 0.0, 1.0)
-                out_horizons[h_name] = out_h
+                for q_name in quantile_names:
+                    key = f"{h_name}_{q_name}"
+                    out_h = np.full((Hwin, Wwin), np.nan, dtype=np.float32)
+                    out_h[m] = (accum_horizons[key][m] / wsum[m]).astype(np.float32)
+                    # Clamp predictions to valid range [0, 1]
+                    out_h[m] = np.clip(out_h[m], 0.0, 1.0)
+                    out_horizons[key] = out_h
             
             # Calculate statistics
             num_valid_pixels = m.sum()
@@ -1383,8 +1475,9 @@ if __name__ == "__main__":
             
             print(f"✓ Blending complete")
             print(f"  Valid pixels: {num_valid_pixels:,} / {num_total_pixels:,} ({valid_percent:.1f}%)")
+            print(f"  Generated 12 predictions (3 quantiles × 4 horizons)")
 
-            # Write GeoTIFF for each horizon
+            # Write GeoTIFF for each horizon-quantile combination
             print("\nWriting output GeoTIFFs...")
             out_profile = ref.profile.copy()
             out_profile.update({
@@ -1400,11 +1493,13 @@ if __name__ == "__main__":
             
             out_paths = {}
             for h_name, h_year in zip(horizon_names, horizon_years):
-                out_path = out_dir / f"prediction_{h_year}_blended.tif"
-                with rasterio.open(out_path, 'w', **out_profile) as dst:
-                    dst.write(out_horizons[h_name], 1)
-                out_paths[h_name] = out_path
-                print(f"  ✓ {h_year}: {out_path}")
+                for q_name in quantile_names:
+                    key = f"{h_name}_{q_name}"
+                    out_path = out_dir / f"prediction_{h_year}_{q_name}_blended.tif"
+                    with rasterio.open(out_path, 'w', **out_profile) as dst:
+                        dst.write(out_horizons[key], 1)
+                    out_paths[key] = out_path
+                    print(f"  ✓ {h_year} {q_name}: {out_path}")
             
             # Final summary
             elapsed_total = time.time() - start_time
@@ -1416,9 +1511,12 @@ if __name__ == "__main__":
             print(f"  Tiles skipped (no data/outside region): {tiles_skipped:,}")
             print(f"Output dimensions: {Hwin} × {Wwin} pixels")
             print(f"Valid output pixels: {num_valid_pixels:,} ({valid_percent:.1f}%)")
-            print(f"\nOutput files:")
+            print(f"\nOutput files (12 total: 3 quantiles × 4 horizons):")
             for h_name, h_year in zip(horizon_names, horizon_years):
-                print(f"  {h_year}: {out_paths[h_name]}")
+                print(f"  {h_year}:")
+                for q_name in quantile_names:
+                    key = f"{h_name}_{q_name}"
+                    print(f"    {q_name}: {out_paths[key]}")
             print(f"\nTotal time: {int(elapsed_total//60):02d}:{int(elapsed_total%60):02d}")
             print("="*70 + "\n")
 
