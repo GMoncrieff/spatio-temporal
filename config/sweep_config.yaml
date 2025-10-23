@@ -4,6 +4,14 @@ metric:
   name: val_full/total_loss_avg
   goal: minimize
 
+# Environment variables to set for all sweep runs
+command:
+  - ${env}
+  - PYTORCH_NVFUSER_DISABLE=1
+  - ${interpreter}
+  - ${program}
+  - ${args}
+
 parameters:
   # Model architecture - sweep between default and 2x default
   hidden_dim:
