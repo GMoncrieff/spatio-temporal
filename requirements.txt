@@ -1,47 +1,36 @@
-# Core deep learning frameworks
-# (Install PyTorch separately, see README)
+# Spatio-Temporal Human Modification Forecasting
+# Requirements for pip installation
 
-# Scientific computing
-numpy>=1.24.0
-scipy>=1.10.0
-pandas>=2.0.0
+# NOTE: PyTorch should be installed using light-the-torch for optimal hardware support
+# See README.md for installation instructions
+
+# Deep Learning
+pytorch-lightning
+torchmetrics
+
+# Geospatial
+torchgeo
+rasterio
+shapely
+pyproj
+
+# Scientific Computing
+numpy
+scipy
+pandas
+scikit-learn
 
 # Visualization
-matplotlib>=3.7.0
-seaborn>=0.12.0
-plotly>=5.14.0
+matplotlib
+seaborn
 
-# Machine learning utilities
-scikit-learn>=1.3.0
-xgboost>=1.7.0
+# Configuration
+hydra-core
+omegaconf
 
-# Geospatial libraries (for spatio-temporal analysis)
-geopandas>=0.13.0
-rasterio>=1.3.0
-folium>=0.14.0
-shapely>=2.0.0
+# Utilities
+einops
+wandb
 
-# Data processing
-h5py>=3.8.0
-netcdf4>=1.6.0
-xarray>=2023.1.0
-
-# Experiment tracking and MLOps
-mlflow>=2.4.0
-wandb>=0.15.0
-tensorboard>=2.13.0
-
-# Development tools
-jupyter>=1.0.0
-ipykernel>=6.22.0
-pytest>=7.3.0
-black>=23.3.0
-flake8>=6.0.0
-
-# Configuration management
-hydra-core>=1.3.0
-omegaconf>=2.3.0
-
-# Progress bars and utilities
-tqdm>=4.65.0
-click>=8.1.0
+# PyTorch installation tool
+light-the-torch

@@ -66,16 +66,52 @@ spatio_temporal/
 
 ## Setup
 
-### 1. Environment
+### 1. Environment Setup
+
+#### Option A: Using Conda (Recommended)
 
 ```bash
-# Using conda (recommended)
-conda env create -f environment.yml
-conda activate spatio_temporal
+# Create environment with Python 3.12
+conda create -n hmforecast python=3.12
+conda activate hmforecast
 
-# Or using pip
-pip install -r requirements.txt
+# Install conda packages
+conda install pytorch-lightning torchmetrics rasterio shapely pyproj scipy matplotlib seaborn pandas numpy scikit-learn -c conda-forge
+conda install hydra-core omegaconf -c conda-forge
+
+# Install pip packages
+pip install torchgeo einops wandb light-the-torch
+
+# Install PyTorch with optimal hardware support (CPU/CUDA/MPS)
+ltt install torch torchvision
 ```
+
+#### Option B: Using environment.yml
+
+```bash
+# Create environment from file
+conda env create -f environment.yml
+conda activate hmforecast
+
+# Install PyTorch with optimal hardware support
+ltt install torch torchvision
+```
+
+#### Option C: Using pip only
+
+```bash
+# Create virtual environment
+python3.12 -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Install requirements
+pip install -r requirements.txt
+
+# Install PyTorch with optimal hardware support
+ltt install torch torchvision
+```
+
+**Note**: `light-the-torch` (ltt) automatically detects your hardware and installs the appropriate PyTorch version (CPU, CUDA, or Apple Silicon MPS).
 
 ### 2. Data Structure
 
