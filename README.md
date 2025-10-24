@@ -50,12 +50,14 @@ spatio_temporal/
 │
 ├── tests/                        # Unit tests
 │
-├── Documentation (markdown files)
+├── docs/                         # Documentation
 │   ├── QUANTILE_PREDICTION_IMPLEMENTATION.md
 │   ├── INDEPENDENT_HEADS_IMPLEMENTATION.md
 │   ├── LOSS_WEIGHTING_EXPLAINED.md
 │   ├── WANDB_SWEEP_GUIDE.md
-│   └── CHECKPOINT_USAGE.md
+│   ├── CHECKPOINT_USAGE.md
+│   ├── PREDICTION_YEARS_UPDATE.md
+│   └── ... (additional guides)
 │
 ├── requirements.txt              # Python dependencies
 ├── environment.yml               # Conda environment
@@ -290,15 +292,16 @@ Upper quantile receives:
 
 **Gradients flow independently** - central and quantile heads do not interfere with each other.
 
-See `LOSS_WEIGHTING_EXPLAINED.md` for details.
+See [`docs/LOSS_WEIGHTING_EXPLAINED.md`](docs/LOSS_WEIGHTING_EXPLAINED.md) for details.
 
 ## Documentation
 
-- **`QUANTILE_PREDICTION_IMPLEMENTATION.md`**: Quantile regression architecture and calibration
-- **`INDEPENDENT_HEADS_IMPLEMENTATION.md`**: Details on separate prediction heads
-- **`LOSS_WEIGHTING_EXPLAINED.md`**: Loss composition and gradient flow
-- **`WANDB_SWEEP_GUIDE.md`**: Hyperparameter sweeps with W&B
-- **`CHECKPOINT_USAGE.md`**: Loading and using trained models
+- **[`docs/QUANTILE_PREDICTION_IMPLEMENTATION.md`](docs/QUANTILE_PREDICTION_IMPLEMENTATION.md)**: Quantile regression architecture and calibration
+- **[`docs/INDEPENDENT_HEADS_IMPLEMENTATION.md`](docs/INDEPENDENT_HEADS_IMPLEMENTATION.md)**: Details on separate prediction heads
+- **[`docs/LOSS_WEIGHTING_EXPLAINED.md`](docs/LOSS_WEIGHTING_EXPLAINED.md)**: Loss composition and gradient flow
+- **[`docs/WANDB_SWEEP_GUIDE.md`](docs/WANDB_SWEEP_GUIDE.md)**: Hyperparameter sweeps with W&B
+- **[`docs/CHECKPOINT_USAGE.md`](docs/CHECKPOINT_USAGE.md)**: Loading and using trained models
+- **[`docs/PREDICTION_YEARS_UPDATE.md`](docs/PREDICTION_YEARS_UPDATE.md)**: Predicting future years (2025-2040)
 
 ## Testing
 
