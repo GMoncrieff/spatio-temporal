@@ -477,21 +477,21 @@ if __name__ == "__main__":
                     preds_all = best_model(input_dynamic_clean, input_static_clean, lonlat=lonlat)
                     
                     # Extract quantile predictions for each horizon
-                    # Channel ordering: [lower_5yr, median_5yr, upper_5yr, lower_10yr, median_10yr, upper_10yr, ...]
+                    # Channel ordering: [lower_5yr, central_5yr, upper_5yr, lower_10yr, central_10yr, upper_10yr, ...]
                     preds_5yr_lower = preds_all[:, 0:1, :, :].clone()  # [B, 1, H, W]
-                    preds_5yr = preds_all[:, 1:2, :, :].clone()  # Median
+                    preds_5yr = preds_all[:, 1:2, :, :].clone()  # Central
                     preds_5yr_upper = preds_all[:, 2:3, :, :].clone()
                     
                     preds_10yr_lower = preds_all[:, 3:4, :, :].clone()
-                    preds_10yr = preds_all[:, 4:5, :, :].clone()  # Median
+                    preds_10yr = preds_all[:, 4:5, :, :].clone()  # Central
                     preds_10yr_upper = preds_all[:, 5:6, :, :].clone()
                     
                     preds_15yr_lower = preds_all[:, 6:7, :, :].clone()
-                    preds_15yr = preds_all[:, 7:8, :, :].clone()  # Median
+                    preds_15yr = preds_all[:, 7:8, :, :].clone()  # Central
                     preds_15yr_upper = preds_all[:, 8:9, :, :].clone()
                     
                     preds_20yr_lower = preds_all[:, 9:10, :, :].clone()
-                    preds_20yr = preds_all[:, 10:11, :, :].clone()  # Median
+                    preds_20yr = preds_all[:, 10:11, :, :].clone()  # Central
                     preds_20yr_upper = preds_all[:, 11:12, :, :].clone()
                     
                     # Set predictions to NaN where any input was NaN
@@ -1151,11 +1151,12 @@ if __name__ == "__main__":
         if not geoms:
             print("Empty geometry in region GeoJSON; skipping.")
             return
-        # Use target HM raster (2020) as spatial reference
-        target_years = getattr(train_loader.dataset, 'fixed_target_years', (2005, 2010, 2015, 2020))
-        target_year = target_years[-1]  # Use 2020 as reference
+        # Use most recent HM raster (2020) as spatial reference
+        # For prediction: use 2020 as base, predict 2025, 2030, 2035, 2040
+        target_years = (2025, 2030, 2035, 2040)
+        base_year = 2020  # Use 2020 as spatial reference
         year_to_idx = {y: i for i, y in enumerate(years)}
-        target_src_path = hm_files[year_to_idx[target_year]]
+        target_src_path = hm_files[year_to_idx[base_year]]
         with rasterio.open(target_src_path) as ref:
             ref_crs = ref.crs
             ref_transform = ref.transform
@@ -1190,8 +1191,8 @@ if __name__ == "__main__":
             
             # Multi-horizon quantile accumulators (3 quantiles × 4 horizons = 12 outputs)
             horizon_names = ['5yr', '10yr', '15yr', '20yr']
-            horizon_years = [2005, 2010, 2015, 2020]
-            quantile_names = ['lower', 'median', 'upper']
+            horizon_years = [2025, 2030, 2035, 2040]  # Predict future from 2020 base
+            quantile_names = ['lower', 'central', 'upper']  # Updated to match independent heads terminology
             
             # Create accumulators for each horizon-quantile combination
             accum_horizons = {}
@@ -1209,7 +1210,8 @@ if __name__ == "__main__":
             elev_mean, elev_std = ds_train.elev_mean, ds_train.elev_std
             include_components = bool(getattr(ds_train, 'include_components', True))
             static_list_paths = list(static_files if args.static_channels is None else static_files[:int(args.static_channels)])
-            input_years = list(getattr(ds_train, 'fixed_input_years', (1990, 1995, 2000)))
+            # Use most recent 3 timesteps as input for prediction (2010, 2015, 2020)
+            input_years = [2010, 2015, 2020]
             t_idxs = [year_to_idx[y] for y in input_years]
             
             # CRITICAL: Get per-variable normalization stats (NOT pooled hm_mean/hm_std)
@@ -1406,27 +1408,27 @@ if __name__ == "__main__":
                     for tile_idx, (i, j, hi, wj, li0, lj0, li1, lj1, valid_mask, input_invalid_mask) in enumerate(batch_metadata):
                         # Extract quantile predictions for this tile (crop to actual size if padded)
                         # batch_preds: [B, 12, H, W] where 12 = 4 horizons × 3 quantiles
-                        # Channel ordering: [lower_5yr, median_5yr, upper_5yr, lower_10yr, ...]
+                        # Channel ordering: [lower_5yr, central_5yr, upper_5yr, lower_10yr, ...]
                         preds_horizons = {}
                         for h_idx, h_name in enumerate(horizon_names):
                             # Extract 3 quantiles for this horizon
                             pred_lower = batch_preds[tile_idx, 3*h_idx, :hi, :wj].detach().cpu().numpy()
-                            pred_median = batch_preds[tile_idx, 3*h_idx+1, :hi, :wj].detach().cpu().numpy()
+                            pred_central = batch_preds[tile_idx, 3*h_idx+1, :hi, :wj].detach().cpu().numpy()
                             pred_upper = batch_preds[tile_idx, 3*h_idx+2, :hi, :wj].detach().cpu().numpy()
                             
                             # Denormalize to [0, 1] scale
                             pred_lower = pred_lower * hm_std + hm_mean
-                            pred_median = pred_median * hm_std + hm_mean
+                            pred_central = pred_central * hm_std + hm_mean
                             pred_upper = pred_upper * hm_std + hm_mean
                             
                             # CRITICAL: Mask predictions where inputs had NaN (same as validation code)
                             pred_lower[input_invalid_mask] = np.nan
-                            pred_median[input_invalid_mask] = np.nan
+                            pred_central[input_invalid_mask] = np.nan
                             pred_upper[input_invalid_mask] = np.nan
                             
                             # Store with keys matching accumulator dict
                             preds_horizons[f"{h_name}_lower"] = pred_lower
-                            preds_horizons[f"{h_name}_median"] = pred_median
+                            preds_horizons[f"{h_name}_central"] = pred_central
                             preds_horizons[f"{h_name}_upper"] = pred_upper
                         
                         # Distance-to-edge weights within tile

@@ -1,79 +1,330 @@
-# Spatio-Temporal Deep Learning Project
+# Spatio-Temporal Human Modification Forecasting
 
 ## Overview
-This project implements a ConvLSTM-based spatio-temporal forecasting pipeline for the Human Modification (HM) index. The model consumes recent HM chips plus static covariates (elevation) and predicts future HM images over multiple autoregressive horizons (e.g., h=1..4). Experiments, metrics, and visualizations are tracked with Weights & Biases (W&B).
+
+This project implements a **ConvLSTM-based spatio-temporal forecasting** pipeline with **quantile regression** for uncertainty quantification of the Human Modification (HM) index. The model predicts future HM values at **four forecast horizons** (5, 10, 15, 20 years) with **three predictions per horizon**: lower quantile (2.5%), central estimate, and upper quantile (97.5%).
+
+### Key Features
+
+- **Multi-horizon forecasting**: 5yr, 10yr, 15yr, 20yr ahead predictions
+- **Uncertainty quantification**: Probabilistic predictions with calibrated confidence intervals
+- **Independent prediction heads**: Separate neural networks for central estimate vs. uncertainty bounds
+- **Rich covariates**: 11 dynamic variables (HM components + GDP + population) and 7 static variables (elevation, climate, protected areas)
+- **Per-variable normalization**: Handles vastly different scales (GDP in billions, HM in 0-1 range)
+- **Location encoding**: Learnable positional embeddings for spatial awareness
+- **W&B integration**: Comprehensive experiment tracking and visualization
 
 ## Project Structure
+
 ```
-├── data/                   # Data directory
-│   ├── raw/               # Raw, immutable data
-│   ├── processed/         # Cleaned and processed data
-│   └── external/          # External datasets
-├── src/                   # Source code
-│   ├── models/            # Model definitions
-│   ├── utils/             # Utility functions
-│   ├── preprocessing/     # Data preprocessing scripts
-│   ├── training/          # Training scripts
-│   └── evaluation/        # Model evaluation scripts
-├── notebooks/             # Jupyter notebooks for exploration
-├── experiments/           # Experiment tracking and results
-├── models/                # Trained models
-│   ├── saved_models/      # Final trained models
-│   └── checkpoints/       # Training checkpoints
-├── logs/                  # Training and experiment logs
-├── tests/                 # Unit tests
-├── docs/                  # Documentation
-├── scripts/               # Utility scripts
-├── config/                # Configuration files
-├── requirements.txt       # Python dependencies
-└── setup.py              # Package setup
+spatio_temporal/
+├── config/                         # Configuration files
+│   ├── config.yaml                 # Main training config
+│   ├── sweep_config.yaml           # W&B hyperparameter sweep config
+│   ├── region_to_predict.geojson   # Region boundaries for prediction
+│   └── region_to_predict_small.geojson
+│
+├── data/
+│   └── raw/
+│       └── hm_global/              # Global training data
+│           ├── HM_YEAR_VARIABLE_1000.tiff  # Dynamic variables (1990-2020)
+│           └── hm_static_VARIABLE_1000.tiff # Static covariates
+│
+├── src/
+│   ├── models/                     # Model architecture
+│   │   ├── spatiotemporal_predictor.py  # Main ConvLSTM + independent heads
+│   │   ├── lightning_module.py     # PyTorch Lightning wrapper
+│   │   ├── convlstm.py            # ConvLSTM implementation
+│   │   ├── pinball_loss.py        # Quantile regression loss
+│   │   ├── laplacian_pyramid_loss.py
+│   │   └── histogram_loss.py
+│   ├── locationencoder/           # Spatial position encoding
+│   ├── evaluation/                # Evaluation utilities
+│   ├── preprocessing/             # Data preprocessing
+│   └── utils/                     # Helper functions
+│
+├── scripts/                       # Main scripts
+│   ├── train_lightning.py        # Training + prediction pipeline
+│   ├── torchgeo_dataloader.py   # Data loading with per-variable normalization
+│   └── create_validity_mask.py  # NaN/no-data handling
+│
+├── tests/                        # Unit tests
+│
+├── Documentation (markdown files)
+│   ├── QUANTILE_PREDICTION_IMPLEMENTATION.md
+│   ├── INDEPENDENT_HEADS_IMPLEMENTATION.md
+│   ├── LOSS_WEIGHTING_EXPLAINED.md
+│   ├── WANDB_SWEEP_GUIDE.md
+│   └── CHECKPOINT_USAGE.md
+│
+├── requirements.txt              # Python dependencies
+├── environment.yml               # Conda environment
+└── setup.py                      # Package setup
 ```
 
 ## Setup
-1. Install dependencies: `pip install -r requirements.txt`
-2. Configure your environment variables
-3. Run initial data preprocessing
-4. Start training your models
+
+### 1. Environment
+
+```bash
+# Using conda (recommended)
+conda env create -f environment.yml
+conda activate spatio_temporal
+
+# Or using pip
+pip install -r requirements.txt
+```
+
+### 2. Data Structure
+
+Data should be organized in `data/raw/hm_global/`:
+
+**Dynamic variables** (time-varying, 1990-2020 at 5-year intervals):
+```
+HM_1990_AA_1000.tiff    # Target variable (Human Modification total)
+HM_1990_AG_1000.tiff    # Agriculture
+HM_1990_BU_1000.tiff    # Built-up areas
+HM_1990_gdp_1000.tiff   # GDP
+HM_1990_population_1000.tiff
+... (repeat for 1995, 2000, 2005, 2010, 2015, 2020)
+```
+
+**Static variables** (time-invariant):
+```
+hm_static_ele_1000.tiff          # Elevation
+hm_static_tas_1000.tiff          # Mean temperature
+hm_static_pr_1000.tiff           # Precipitation
+hm_static_iucn_strict_1000.tiff  # Protected areas
+...
+```
+
+### 3. W&B Setup (Optional but Recommended)
+
+```bash
+wandb login
+# Or set WANDB_API_KEY environment variable
+```
 
 ## Usage
 
-### Training
-- Default training script:
-  ```bash
-  python scripts/train_lightning.py
-  ```
-- Key options (configured in `scripts/train_lightning.py`):
-  - `forecast_horizon`: number of AR steps to evaluate and visualize (e.g., 4).
-  - Validation dataloader’s `future_horizons` should match or exceed `forecast_horizon` when ground truth is available.
+### Training from Scratch
 
-### Experiment tracking (W&B)
-We log training/validation metrics and visualizations to W&B:
+#### Basic Training Run
 
-- Project: https://wandb.ai/glennwithtwons/spatio-temporal-convlstm
+```bash
+python scripts/train_lightning.py \
+  --max_epochs 50 \
+  --batch_size 8 \
+  --hidden_dim 64 \
+  --num_layers 2
+```
 
-Highlights:
-- Per-epoch aggregated multi-horizon validation metrics (h=1..K).
-- A single end-of-fit panel from the best checkpoint showing targets, predictions, and differences per horizon. Missing ground-truth is masked (distinct “bad” color) and each row is annotated with the count of valid pixels.
+#### Full Training with All Options
 
-See the W&B project page for complete run details and artifacts.
+```bash
+python scripts/train_lightning.py \
+  --max_epochs 100 \
+  --train_chips 500 \
+  --val_chips 100 \
+  --batch_size 8 \
+  --hidden_dim 64 \
+  --num_layers 2 \
+  --num_workers 4 \
+  --ssim_weight 2.0 \
+  --laplacian_weight 1.0 \
+  --histogram_weight 0.67 \
+  --histogram_warmup_epochs 20 \
+  --use_location_encoder true \
+  --locenc_out_channels 8 \
+  --predict_after_training true \
+  --predict_region config/region_to_predict.geojson
+```
+
+#### Quick Development Run (Smoke Test)
+
+```bash
+python scripts/train_lightning.py \
+  --fast_dev_run \
+  --batch_size 2 \
+  --hidden_dim 16
+```
+
+### Key Training Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--max_epochs` | 100 | Number of training epochs |
+| `--train_chips` | 200 | Chips sampled per training epoch |
+| `--val_chips` | 40 | Chips sampled per validation epoch |
+| `--batch_size` | 8 | Batch size for training/validation |
+| `--hidden_dim` | 64 | ConvLSTM hidden dimension |
+| `--num_layers` | 2 | Number of ConvLSTM layers |
+| `--num_workers` | 0 | Data loader workers (0=single-threaded) |
+| `--ssim_weight` | 2.0 | Weight for SSIM loss |
+| `--laplacian_weight` | 1.0 | Weight for Laplacian pyramid loss |
+| `--histogram_weight` | 0.67 | Weight for histogram loss |
+| `--use_location_encoder` | true | Use learnable spatial position encoding |
+| `--predict_after_training` | true | Run prediction after training completes |
+
+### Making Predictions with Existing Checkpoint
+
+#### Option 1: Load from W&B Artifact
+
+```bash
+python scripts/train_lightning.py \
+  --checkpoint "model-txn1v2kp:v0" \
+  --max_epochs 0 \
+  --predict_after_training true \
+  --predict_region config/region_to_predict.geojson \
+  --predict_stride 64 \
+  --predict_batch_size 16
+```
+
+**How to find your W&B artifact name:**
+1. Go to your W&B project: https://wandb.ai/glennwithtwons/spatio-temporal-convlstm
+2. Click on a run
+3. Go to "Artifacts" tab
+4. Copy the artifact name (e.g., `model-txn1v2kp:v0`)
+
+#### Option 2: Load from Local Checkpoint File
+
+```bash
+python scripts/train_lightning.py \
+  --checkpoint "checkpoints/best_model.ckpt" \
+  --max_epochs 0 \
+  --predict_after_training true \
+  --predict_region config/region_to_predict.geojson
+```
+
+#### Prediction Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--predict_region` | None | Path to GeoJSON file defining prediction area |
+| `--predict_stride` | 64 | Stride between tiles for overlap blending |
+| `--predict_batch_size` | 16 | Tiles processed in parallel on GPU |
+
+#### Prediction Output
+
+For each horizon (5yr, 10yr, 15yr, 20yr), three GeoTIFF files are created:
+
+```
+data/predictions/REGION_NAME/
+├── prediction_2025_lower_blended.tif    # Lower 2.5% quantile
+├── prediction_2025_central_blended.tif  # Central estimate
+├── prediction_2025_upper_blended.tif    # Upper 97.5% quantile
+├── prediction_2030_lower_blended.tif
+├── prediction_2030_central_blended.tif
+├── prediction_2030_upper_blended.tif
+... (and so on for 2035, 2040)
+```
+
+**Uncertainty mapping:**
+```python
+uncertainty = upper - lower  # Width of 95% confidence interval
+```
+
+### Experiment Tracking (W&B)
+
+All training runs are logged to: **https://wandb.ai/glennwithtwons/spatio-temporal-convlstm**
+
+**Logged metrics include:**
+- Per-horizon losses: `train/val_mae_5yr`, `train/val_ssim_loss_10yr`, etc.
+- Quantile losses: `train/val_pinball_lower_total`, `train/val_pinball_upper_total`
+- Coverage calibration: `val_coverage_total` (target: ~95%)
+- Visualizations: Multi-horizon predictions with uncertainty bounds
+
+**Disable W&B:**
+```bash
+python scripts/train_lightning.py --disable_wandb
+```
 
 ## Data: Human Modification (HM)
 
-We forecast the Human Modification (HM) index, a spatially explicit measure of anthropogenic modification across landscapes. HM values are scaled to 0–10,000 for regression stability and interpretability in physical units during logging.
+We forecast the Human Modification (HM) index, a spatially explicit measure of anthropogenic modification across landscapes.
 
-- Source paper (Nature Scientific Data):
-  - “Global human modification time series (1990–2020) at 5-year intervals”
+- **Source paper** (Nature Scientific Data):
+  - "Global human modification time series (1990–2020) at 5-year intervals"
   - https://www.nature.com/articles/s41597-025-04892-2
 
-Key characteristics used here:
-- Temporal cadence: 5-year intervals (1990 → 1995 → … → 2020).
-- Model inputs: 3 most recent HM timesteps per chip plus a static elevation raster.
-- Targets: immediate next HM image (h=1) and optional future images for h≥2 evaluation when available.
-- Normalization: z-score normalization applied internally; all W&B images and “original” MAE metrics are logged after inverse-transform to physical HM units (0–10k).
+**Key characteristics:**
+- **Temporal cadence**: 5-year intervals (1990, 1995, ..., 2020)
+- **Model inputs**: 3 most recent HM timesteps + 11 dynamic covariates + 7 static variables
+- **Target variable**: AA (total Human Modification)
+- **Data range**: [0, 1] (rescaled from original [0, 10000])
+- **Coverage**: Near-global extent
 
-Data directories (example):
-- `data/raw/hm/` — HM GeoTIFFs (1990–2020, 5-year intervals), pre-aligned/cropped.
-- `data/raw/static/` — Static elevation GeoTIFF (aligned to HM grid).
+## Model Architecture
+
+### Independent Prediction Heads
+
+The model uses **12 separate neural network heads** (3 per horizon):
+
+```
+ConvLSTM → Shared representation
+           ↓
+    ┌──────┼──────┐
+    ↓      ↓      ↓
+ Lower  Central Upper
+  Head    Head   Head
+    ↓      ↓      ↓
+  2.5%   Best   97.5%
+         Est.
+```
+
+**Central heads**: Full-size (hidden_dim → hidden_dim → 1), optimized for accuracy + spatial patterns  
+**Quantile heads**: Smaller (hidden_dim → hidden_dim/2 → 1), optimized only for uncertainty bounds
+
+### Loss Function
+
+```
+Central prediction receives:
+  MSE + 2.0×SSIM + 1.0×Laplacian + 0.67×Histogram
+
+Lower quantile receives:
+  Pinball loss (q=0.025)
+
+Upper quantile receives:
+  Pinball loss (q=0.975)
+```
+
+**Gradients flow independently** - central and quantile heads do not interfere with each other.
+
+See `LOSS_WEIGHTING_EXPLAINED.md` for details.
+
+## Documentation
+
+- **`QUANTILE_PREDICTION_IMPLEMENTATION.md`**: Quantile regression architecture and calibration
+- **`INDEPENDENT_HEADS_IMPLEMENTATION.md`**: Details on separate prediction heads
+- **`LOSS_WEIGHTING_EXPLAINED.md`**: Loss composition and gradient flow
+- **`WANDB_SWEEP_GUIDE.md`**: Hyperparameter sweeps with W&B
+- **`CHECKPOINT_USAGE.md`**: Loading and using trained models
+
+## Testing
+
+Run architecture tests:
+```bash
+python test_independent_heads.py
+```
+
+Run unit tests:
+```bash
+pytest tests/
+```
 
 ## Contributing
+
 Pull requests and issues are welcome. Please open an issue to discuss significant changes beforehand.
+
+## Citation
+
+If you use this code, please cite the HM dataset:
+
+```bibtex
+@article{theobald2025global,
+  title={Global human modification time series (1990--2020) at 5-year intervals},
+  journal={Nature Scientific Data},
+  year={2025},
+  url={https://www.nature.com/articles/s41597-025-04892-2}
+}
+```
