@@ -110,19 +110,19 @@ data/raw/hm_global/
 
 Time-varying data available at 5-year intervals: **1990, 1995, 2000, 2005, 2010, 2015, 2020**
 
-| Variable | Code | Description | Original Scale | Notes |
-|----------|------|-------------|----------------|-------|
-| **Human Modification** | AA | Target variable: composite index of anthropogenic modification | [0, 1] | Primary prediction target |
-| Agricultural | AG | Agricultural land extent and intensity | [0, 1] | Crops, pastures, rangeland |
-| Built-up | BU | Urban and built-up areas | [0, 1] | Cities, towns, infrastructure |
-| Extraction | EX | Resource extraction activities | [0, 1] | Mining, drilling, quarrying |
-| Forest | FR | Forest cover and disturbance | [0, 1] | Natural and plantation forests |
-| Human Intrusion | HI | Human access and presence | [0, 1] | Roads, settlements, access points |
-| Natural Systems | NS | Naturalness/intactness | [0, 1] | Inverse of modification |
-| Population | PO | Human population density | [0, 1] | People per km² |
-| Transportation | TI | Transportation infrastructure | [0, 1] | Roads, railways, airports |
-| **GDP** | gdp | Gross Domestic Product per grid cell | ~[0, millions] | Economic activity indicator |
-| **Population Count** | population | Total population per grid cell | ~[0, thousands] | Absolute population numbers |
+| Variable | Code | Description | Original Scale |
+|----------|------|-------------|----------------|
+| **Human Modification** | AA | All threats combined (composite index of anthropogenic modification) | [0, 1] |
+| Agricultural | AG | Agricultural land extent and intensity | [0, 1] |
+| Built-up | BU | Residential, commercial and recreation areas | [0, 1] |
+| Extraction | EX | Energy production and mining | [0, 1] |
+| Biological Resource Use | FR | Forest harvest, logging, and other biological resource use | [0, 1] |
+| Human Accessibility | HI | Human accessibility and intrusion (HA and HI are interchangeable) | [0, 1] |
+| Natural Systems Modification | NS | Natural systems modification | [0, 1] |
+| Pollution | PO | Pollution sources and impacts | [0, 1] |
+| Transportation | TI | Transportation and service corridors | [0, 1] |
+| **GDP** | gdp | Gross Domestic Product per grid cell | ~[0, millions] |
+| **Population Count** | population | Total population per grid cell | ~[0, thousands] |
 
 **Key Notes on Dynamic Variables:**
 - All HM component variables (AA, AG, BU, etc.) are pre-scaled to [0, 1] in the source data
@@ -134,15 +134,15 @@ Time-varying data available at 5-year intervals: **1990, 1995, 2000, 2005, 2010,
 
 Time-invariant geographic and climatic variables:
 
-| Variable | Code | Description | Original Scale | Notes |
-|----------|------|-------------|----------------|-------|
-| **Elevation** | ele | Height above sea level | meters | Mean: ~-4200m, Std: ~11km |
-| **Temperature** | tas | Mean annual temperature | °C | Mean: ~13°C, Std: ~13°C |
-| **Minimum Temperature** | tasmin | Mean minimum temperature | °C | Cold extremes |
-| **Precipitation** | pr | Mean annual precipitation | mm/year | Rainfall patterns |
-| **Distance to Protected** | dpi_dsi | Distance to protected areas | varies | Conservation pressure |
-| **IUCN (Not Strict)** | iucn_nostrict | Protected areas (categories III-VI) | [0, 1] | Less restrictive protection |
-| **IUCN (Strict)** | iucn_strict | Protected areas (categories Ia-II) | [0, 1] | Strict conservation |
+| Variable | Code | Description | Original Scale |
+|----------|------|-------------|----------------|
+| **Elevation** | ele | Height above sea level | meters |
+| **Temperature** | tas | Mean annual temperature | °C |
+| **Minimum Temperature** | tasmin | Mean minimum temperature | °C |
+| **Precipitation** | pr | Mean annual precipitation | mm/year |
+| **Distance to Protected** | dpi_dsi | Distance to protected areas | varies |
+| **IUCN (Not Strict)** | iucn_nostrict | Protected areas (categories III-VI) | [0, 1] |
+| **IUCN (Strict)** | iucn_strict | Protected areas (categories Ia-II) | [0, 1] |
 
 **Excluded Static Variables:**
 - `ele_asp_cosin`, `ele_asp_sin`: Aspect (circular) - removed to reduce redundancy
