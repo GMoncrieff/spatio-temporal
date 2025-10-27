@@ -15,13 +15,7 @@ This project implements a **ConvLSTM-based spatio-temporal forecasting** pipelin
 - **W&B integration**: Comprehensive experiment tracking and visualization
 
 ## Documentation
-
-📘 **[Model Architecture and Training Guide](docs/model_architecture_and_training.md)**
-
-Choose the version that fits your needs:
-
-- **[Simplified Guide](docs/simple_model_architecture_and_training.md)** - Concise overview without code examples (~20 pages)
-- **[Complete Technical Documentation](docs/model_architecture_and_training.md)** - Detailed guide with implementation code (~100 pages)
+- **[Technical Documentation](docs/simple_model_architecture_and_training.md)** - Detailed guide with implementation code
 
 **Topics covered:**
 - **Input Data**: Dynamic variables, static covariates, location encoding
@@ -69,15 +63,7 @@ spatio_temporal/
 ├── tests/                        # Unit tests
 │
 ├── docs/                         # Documentation
-│   ├── simple_model_architecture_and_training.md  # 📗 Simplified guide
-│   ├── model_architecture_and_training.md        # 📘 Complete technical guide
-│   ├── QUANTILE_PREDICTION_IMPLEMENTATION.md
-│   ├── INDEPENDENT_HEADS_IMPLEMENTATION.md
-│   ├── LOSS_WEIGHTING_EXPLAINED.md
-│   ├── WANDB_SWEEP_GUIDE.md
-│   ├── CHECKPOINT_USAGE.md
-│   ├── PREDICTION_YEARS_UPDATE.md
-│   └── ... (additional guides)
+│   └── model_architecture_and_training.md  # 📘 Complete technical guide
 │
 ├── requirements.txt              # Python dependencies
 ├── environment.yml               # Conda environment
@@ -86,24 +72,16 @@ spatio_temporal/
 
 ## Setup
 
-### 1. Environment Setup
-
-#### Option A: Using Conda (Recommended)
-
 ```bash
-# Create environment with Python 3.11 or 3.12
-conda create -n hmforecast python=3.11
+# Create environment with Python 3.12
+conda create -n hmforecast python=3.12
 conda activate hmforecast
 
 # Install PyTorch (choose based on your hardware)
-# For CPU only:
-conda install pytorch torchvision cpuonly -c pytorch
+pip install light-the-torch
 
-# For CUDA (Linux/Windows with NVIDIA GPU):
-conda install pytorch torchvision pytorch-cuda=12.1 -c pytorch -c nvidia
-
-# For Apple Silicon (M1/M2/M3):
-conda install pytorch torchvision -c pytorch
+# Install PyTorch with optimal hardware support (CPU/CUDA/MPS)
+ltt install torch torchvision
 
 # Install core dependencies via conda
 conda install -c conda-forge \
@@ -121,38 +99,11 @@ conda install -c conda-forge \
 
 # Install additional packages via pip
 pip install torchgeo einops wandb
-
-# Install the project in editable mode
-pip install -e .
-```
-
-#### Option B: Using pip + light-the-torch (Auto-detects Hardware)
-
-```bash
-# Create virtual environment
-python3.11 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install light-the-torch for automatic PyTorch installation
-pip install light-the-torch
-
-# Install PyTorch with optimal hardware support (CPU/CUDA/MPS)
-ltt install torch torchvision
-
-# Install all dependencies
-pip install pytorch-lightning torchmetrics torchgeo \
-    rasterio shapely pyproj scipy matplotlib seaborn \
-    pandas numpy scikit-learn einops wandb
-
-# Install the project in editable mode
-pip install -e .
 ```
 
 **Notes**:
-- Python 3.11 is recommended for best compatibility
-- `light-the-torch` (ltt) in Option B automatically detects your hardware and installs the appropriate PyTorch version
-- CUDA 12.1 is specified for Option A but adjust based on your GPU driver version
-- Apple Silicon users should use the standard pytorch channel (includes MPS support)
+- Python 3.12 is recommended for best compatibility
+- `light-the-torch` (ltt)  automatically detects your hardware and installs the appropriate PyTorch version
 
 ### 2. Data Structure
 
@@ -165,7 +116,7 @@ HM_1990_AG_1000.tiff    # Agriculture
 HM_1990_BU_1000.tiff    # Built-up areas
 HM_1990_gdp_1000.tiff   # GDP
 HM_1990_population_1000.tiff
-... (repeat for 1995, 2000, 2005, 2010, 2015, 2020)
+... (repeat for 1995, 2000, 2005, 2010, 2015, 2020 and all HM stressors)
 ```
 
 **Static variables** (time-invariant):
@@ -251,7 +202,7 @@ python scripts/train_lightning.py \
 
 ```bash
 python scripts/train_lightning.py \
-  --checkpoint "model-txn1v2kp:v0" \
+  --checkpoint "model-xxxxxx:v0" \
   --max_epochs 0 \
   --predict_after_training true \
   --predict_region config/region_to_predict.geojson \
@@ -263,7 +214,7 @@ python scripts/train_lightning.py \
 1. Go to your W&B project: https://wandb.ai/glennwithtwons/spatio-temporal-convlstm
 2. Click on a run
 3. Go to "Artifacts" tab
-4. Copy the artifact name (e.g., `model-txn1v2kp:v0`)
+4. Copy the artifact name (e.g., `model-xxxxxx:v0`)
 
 #### Option 2: Load from Local Checkpoint File
 
@@ -323,14 +274,15 @@ python scripts/train_lightning.py --disable_wandb
 We forecast the Human Modification (HM) index, a spatially explicit measure of anthropogenic modification across landscapes.
 
 - **Source paper** (Nature Scientific Data):
-  - "Global human modification time series (1990–2020) at 5-year intervals"
-  - https://www.nature.com/articles/s41597-025-04892-2
+  - "Theobald, D. M., Oakleaf, J. R., Moncrieff, G., Voigt, M., Kiesecker, J., & Kennedy, C. M. (2025). Global extent and change in human modification of terrestrial ecosystems from 1990 to 2022. Scientific Data, 12(1), 606."
+  - paper available at https://www.nature.com/articles/s41597-025-04892-2
+  - data available at https://zenodo.org/records/16907328
 
 **Key characteristics:**
 - **Temporal cadence**: 5-year intervals (1990, 1995, ..., 2020)
 - **Model inputs**: 3 most recent HM timesteps + 11 dynamic covariates + 7 static variables
 - **Target variable**: AA (total Human Modification)
-- **Data range**: [0, 1] (rescaled from original [0, 10000])
+- **Data range**: [0, 1]
 - **Coverage**: Near-global extent
 
 ## Model Architecture
@@ -367,31 +319,6 @@ Upper quantile receives:
   Pinball loss (q=0.975)
 ```
 
-**Gradients flow independently** - central and quantile heads do not interfere with each other.
-
-See [`docs/LOSS_WEIGHTING_EXPLAINED.md`](docs/LOSS_WEIGHTING_EXPLAINED.md) for details.
-
-## Documentation
-
-- **[`docs/QUANTILE_PREDICTION_IMPLEMENTATION.md`](docs/QUANTILE_PREDICTION_IMPLEMENTATION.md)**: Quantile regression architecture and calibration
-- **[`docs/INDEPENDENT_HEADS_IMPLEMENTATION.md`](docs/INDEPENDENT_HEADS_IMPLEMENTATION.md)**: Details on separate prediction heads
-- **[`docs/LOSS_WEIGHTING_EXPLAINED.md`](docs/LOSS_WEIGHTING_EXPLAINED.md)**: Loss composition and gradient flow
-- **[`docs/WANDB_SWEEP_GUIDE.md`](docs/WANDB_SWEEP_GUIDE.md)**: Hyperparameter sweeps with W&B
-- **[`docs/CHECKPOINT_USAGE.md`](docs/CHECKPOINT_USAGE.md)**: Loading and using trained models
-- **[`docs/PREDICTION_YEARS_UPDATE.md`](docs/PREDICTION_YEARS_UPDATE.md)**: Predicting future years (2025-2040)
-
-## Testing
-
-Run architecture tests:
-```bash
-python test_independent_heads.py
-```
-
-Run unit tests:
-```bash
-pytest tests/
-```
-
 ## Contributing
 
 Pull requests and issues are welcome. Please open an issue to discuss significant changes beforehand.
@@ -402,9 +329,13 @@ If you use this code, please cite the HM dataset:
 
 ```bibtex
 @article{theobald2025global,
-  title={Global human modification time series (1990--2020) at 5-year intervals},
-  journal={Nature Scientific Data},
+  title={Global extent and change in human modification of terrestrial ecosystems from 1990 to 2022},
+  author={Theobald, David M and Oakleaf, James R and Moncrieff, Glenn and Voigt, Maria and Kiesecker, Joe and Kennedy, Christina M},
+  journal={Scientific Data},
+  volume={12},
+  number={1},
+  pages={606},
   year={2025},
-  url={https://www.nature.com/articles/s41597-025-04892-2}
+  publisher={Nature Publishing Group UK London}
 }
 ```
