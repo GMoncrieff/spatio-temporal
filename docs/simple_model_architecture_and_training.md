@@ -1,10 +1,8 @@
-# Model Architecture and Training Pipeline (Simplified)
+# Model Architecture and Training Pipeline
 
 **Document Version:** 1.0  
 **Last Updated:** 2025-10-27  
 **Model:** SpatioTemporalPredictor with ConvLSTM
-
-This is a condensed version of the full technical documentation. For detailed implementation examples and code, see `model_architecture_and_training.md`.
 
 ---
 
@@ -86,7 +84,7 @@ Time-invariant geographic characteristics:
 | tas | Temperature | °C |
 | tasmin | Min Temperature | °C |
 | pr | Precipitation | mm/year |
-| dpi_dsi | Distance to Protected Areas | varies |
+| dpi_dsi | Development suitability | [0, 1] |
 | iucn_nostrict | Protected Areas (III-VI) | [0, 1] |
 | iucn_strict | Protected Areas (Ia-II) | [0, 1] |
 
@@ -144,7 +142,6 @@ Without normalization, large-magnitude variables dominate gradients during train
 4. **Apply mask to loss** computation (exclude invalid pixels from gradients)
 5. **Set predictions to NaN** for invalid regions in outputs
 
-**Note:** Pixels adjacent to NaN regions may still show edge artifacts due to convolution operations spreading information from sanitized (NaN→0) regions.
 
 ### Data Augmentation
 
@@ -153,12 +150,6 @@ Without normalization, large-magnitude variables dominate gradients during train
 - Prevents overfitting to specific geographic regions
 
 **No other augmentation:** Rotations/flips not used to preserve geographic meaning
-
-### Data Leakage Prevention
-
-**Critical:** Only use data **up to the last input year** when preparing sequences
-- Never peek at future timesteps
-- Example: If predicting 2010-2025 from inputs [1990-2005], don't load 2010+ data for covariates
 
 ---
 
@@ -222,18 +213,6 @@ Each head is a small convolutional network:
 - Channels 6-8: 15yr (lower, central, upper)
 - Channels 9-11: 20yr (lower, central, upper)
 
-### Design Rationale
-
-**Why small model?**
-- Global 1km data = millions of pixels → small model prevents overfitting
-- Rich input features (26 channels) provide sufficient information
-- Computational efficiency for inference on large regions
-
-**Why independent heads?**
-- Different horizons have different uncertainty characteristics
-- Separate optimization prevents interference between objectives
-- Explicit quantile modeling ensures calibrated prediction intervals
-
 ---
 
 ## Loss Functions
@@ -289,7 +268,7 @@ Each head is a small convolutional network:
 
 ### 4. Histogram Loss
 
-**Purpose:** Match distribution of predicted changes to real change distributions
+**Purpose:** Match distribution of predicted changes over entire tile to real change distributions
 
 **How it works:**
 - Bin change values (Δ = prediction - last_input) into 8 bins
@@ -373,51 +352,11 @@ total_loss = 1.0×MSE + 2.0×SSIM + 1.0×Laplacian + 0.67×Histogram + Pinball_l
 - Geographically separate from training regions
 - Shuffle: False
 
-### Training Loop
-
-**Each Epoch:**
-1. **Training phase:** Process all training batches with gradient updates
-2. **Validation phase:** Evaluate on validation set (no gradient updates)
-3. **Checkpointing:** Save if validation loss improved
-4. **Early stopping check:** Stop if no improvement for 10 epochs
-
-**Histogram Warmup:**
-- Epochs 0-19: Histogram loss = 0 (not active)
-- Epoch 20+: Histogram loss activates
-- Allows model to learn basic patterns before enforcing distributional constraints
-
 ### Model Selection
 
 **Primary metric:** `val_total_loss`
 
 Best checkpoint selected based on lowest combined validation loss, ensuring model generalizes to unseen regions while balancing all objectives.
-
-### Experiment Tracking
-
-**Weights & Biases Integration:**
-
-Logged metrics (per epoch):
-- Training: `train_loss`, `train_mae_total`, `train_ssim_loss_total`, `train_lap_loss_total`, `train_hist_loss_total`, `train_total_loss`
-- Validation: Same metrics with `val_` prefix
-- Per-horizon: MAE and coverage for each forecast horizon
-- System: GPU utilization, memory usage, training speed
-
-### Common Issues
-
-| Issue | Solution |
-|-------|----------|
-| GPU OOM | Reduce batch_size or patch_size |
-| Loss not decreasing | Check data loading, verify gradient flow |
-| Validation loss increasing | Overfitting - stop earlier or add regularization |
-| Blurry predictions | Increase SSIM weight |
-| Poor coverage (≠95%) | Check pinball loss implementation |
-
-### Computational Requirements
-
-**Single training run:**
-- Time: 12-48 hours (GPU dependent)
-- GPU memory: 8-16 GB
-- Recommended: NVIDIA RTX 3090, A100, or equivalent
 
 ---
 
@@ -450,56 +389,11 @@ Logged metrics (per epoch):
 - Target: 95% (for 2.5th-97.5th percentile interval)
 - Acceptable: 93-97%
 
-**4. Other Metrics**
-- Laplacian loss: Multi-scale detail (lower is better)
-- Histogram loss: Distribution match (lower is better)
-- Pinball loss: Quantile quality (lower is better)
-
-### Per-Horizon Analysis
-
-**Expected degradation:** Accuracy decreases with forecast horizon
-
-| Horizon | Expected MAE | Expected SSIM |
-|---------|--------------|---------------|
-| 5yr     | 0.05-0.08    | 0.85-0.90     |
-| 10yr    | 0.07-0.11    | 0.80-0.85     |
-| 15yr    | 0.09-0.14    | 0.75-0.82     |
-| 20yr    | 0.11-0.17    | 0.70-0.80     |
-
-**Why degradation?** Longer extrapolation = more uncertainty, cumulative errors, unpredictable events
-
-**Red flags:**
-- Flat performance across horizons → Model not learning temporal dynamics
-- Sudden drop at one horizon → Issue with specific target data
-- Better long-term than short-term → Data leakage
-
 ### Validation Strategy
 
 **Spatial split:**
 - Training and validation regions geographically separate
 - Tests if model learned general dynamics vs. memorizing locations
-
-**Overfitting indicators:**
-- Training MAE 10-20% better than validation: Acceptable
-- Training MAE >30% better than validation: Problem
-
-### Reporting
-
-**Standard table:**
-
-| Metric | 5yr | 10yr | 15yr | 20yr | Average |
-|--------|-----|------|------|------|---------|
-| MAE | 0.063 | 0.091 | 0.118 | 0.152 | 0.106 |
-| SSIM | 0.874 | 0.832 | 0.791 | 0.743 | 0.810 |
-| Coverage | 94.8% | 95.2% | 95.7% | 96.1% | 95.5% |
-
-**Key takeaways:**
-1. Overall performance level
-2. Temporal degradation pattern
-3. Uncertainty calibration
-4. Generalization ability
-5. Qualitative spatial patterns
-
 ---
 
 ## Prediction
@@ -525,67 +419,5 @@ Once trained, the model generates predictions for any region:
 - Use overlap (64-128 pixels) to prevent edge artifacts
 - Blend overlapping regions with distance-weighted averaging
 
-**Processing time estimates:**
-
-| Region Size | Tiles | GPU Time | CPU Time |
-|-------------|-------|----------|----------|
-| 100×100 km | ~100 | ~2 min | ~10 min |
-| 500×500 km | ~1000 | ~20 min | ~2 hours |
-| 1000×1000 km | ~4000 | ~80 min | ~8 hours |
-
-### Output Format
-
-**GeoTIFF Structure (12 bands):**
-- Band 1: Lower bound, 5yr (2.5th percentile)
-- Band 2: Central prediction, 5yr
-- Band 3: Upper bound, 5yr (97.5th percentile)
-- Band 4-6: 10yr (lower, central, upper)
-- Band 7-9: 15yr (lower, central, upper)
-- Band 10-12: 20yr (lower, central, upper)
-
-**Properties:**
-- Data type: Float32
-- No data value: NaN
-- Georeference: Matches input data (e.g., WGS84)
-- Compression: LZW
-
-### Post-Processing
-
-**Change maps:** Compute difference from last input year to predictions
-
-**Risk maps:** Binary maps of areas predicted to exceed threshold (e.g., HM > 0.7)
-
-**Uncertainty maps:** Interval width (upper - lower) as measure of prediction uncertainty
-
-### Visualization
-
-**Map types:**
-- **Prediction maps:** Show predicted HM values for each horizon
-- **Error maps:** Prediction - actual (for validation)
-- **Uncertainty maps:** Interval width visualization
-- **Change distributions:** Histograms comparing predicted vs. actual changes
-
-**Color schemes:**
-- HM values: White (low) to red (high)
-- Change: Blue (decrease) to red (increase)
-- Uncertainty: Viridis colormap
-
-### GIS Integration
-
-**QGIS/ArcGIS:** Load GeoTIFF directly, each band as separate layer
-
-**Python (rasterio/GeoPandas):** Read bands, overlay with vector boundaries, perform spatial analysis
-
-**Use cases:**
-- Conservation planning
-- Policy evaluation
-- Risk assessment
-- Monitoring target setting
-
 ---
 
-## Summary
-
-This pipeline combines spatio-temporal modeling (ConvLSTM), multi-objective optimization (5 loss functions), and uncertainty quantification (quantile regression) to produce probabilistic forecasts of landscape change. Key innovations include per-variable normalization for heterogeneous data, independent prediction heads for multi-horizon forecasting, and careful handling of missing data to prevent contamination.
-
-For full implementation details, code examples, and formulas, see the complete technical documentation: `model_architecture_and_training.md`
