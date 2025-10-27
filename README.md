@@ -14,6 +14,21 @@ This project implements a **ConvLSTM-based spatio-temporal forecasting** pipelin
 - **Location encoding**: Learnable positional embeddings for spatial awareness
 - **W&B integration**: Comprehensive experiment tracking and visualization
 
+## Documentation
+
+📘 **[Complete Technical Documentation](docs/model_architecture_and_training.md)**
+
+A comprehensive guide covering:
+- **Input Data**: Dynamic variables, static covariates, location encoding
+- **Data Transformations**: Per-variable normalization, NaN handling, data leakage prevention
+- **Model Architecture**: ConvLSTM, independent prediction heads, design decisions
+- **Loss Functions**: MSE, SSIM, Laplacian, Histogram (with warmup), Pinball loss
+- **Training**: Hyperparameters, optimization, early stopping, W&B tracking
+- **Accuracy Assessment**: Evaluation metrics, validation protocols, visualization
+- **Prediction**: Tile-based processing, output formats, GIS integration
+
+Each section includes both intuitive explanations and technical implementation details.
+
 ## Project Structure
 
 ```
@@ -51,6 +66,7 @@ spatio_temporal/
 ├── tests/                        # Unit tests
 │
 ├── docs/                         # Documentation
+│   ├── model_architecture_and_training.md  # 📘 Comprehensive technical guide
 │   ├── QUANTILE_PREDICTION_IMPLEMENTATION.md
 │   ├── INDEPENDENT_HEADS_IMPLEMENTATION.md
 │   ├── LOSS_WEIGHTING_EXPLAINED.md
@@ -71,47 +87,68 @@ spatio_temporal/
 #### Option A: Using Conda (Recommended)
 
 ```bash
-# Create environment with Python 3.12
-conda create -n hmforecast python=3.12
+# Create environment with Python 3.11 or 3.12
+conda create -n hmforecast python=3.11
 conda activate hmforecast
 
-# Install conda packages
-conda install pytorch-lightning torchmetrics rasterio shapely pyproj scipy matplotlib seaborn pandas numpy scikit-learn -c conda-forge
-conda install hydra-core omegaconf -c conda-forge
+# Install PyTorch (choose based on your hardware)
+# For CPU only:
+conda install pytorch torchvision cpuonly -c pytorch
 
-# Install pip packages
-pip install torchgeo einops wandb light-the-torch
+# For CUDA (Linux/Windows with NVIDIA GPU):
+conda install pytorch torchvision pytorch-cuda=12.1 -c pytorch -c nvidia
 
-# Install PyTorch with optimal hardware support (CPU/CUDA/MPS)
-ltt install torch torchvision
+# For Apple Silicon (M1/M2/M3):
+conda install pytorch torchvision -c pytorch
+
+# Install core dependencies via conda
+conda install -c conda-forge \
+    pytorch-lightning \
+    torchmetrics \
+    rasterio \
+    shapely \
+    pyproj \
+    scipy \
+    matplotlib \
+    seaborn \
+    pandas \
+    numpy \
+    scikit-learn
+
+# Install additional packages via pip
+pip install torchgeo einops wandb
+
+# Install the project in editable mode
+pip install -e .
 ```
 
-#### Option B: Using environment.yml
-
-```bash
-# Create environment from file
-conda env create -f environment.yml
-conda activate hmforecast
-
-# Install PyTorch with optimal hardware support
-ltt install torch torchvision
-```
-
-#### Option C: Using pip only
+#### Option B: Using pip + light-the-torch (Auto-detects Hardware)
 
 ```bash
 # Create virtual environment
-python3.12 -m venv venv
+python3.11 -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 
-# Install requirements
-pip install -r requirements.txt
+# Install light-the-torch for automatic PyTorch installation
+pip install light-the-torch
 
-# Install PyTorch with optimal hardware support
+# Install PyTorch with optimal hardware support (CPU/CUDA/MPS)
 ltt install torch torchvision
+
+# Install all dependencies
+pip install pytorch-lightning torchmetrics torchgeo \
+    rasterio shapely pyproj scipy matplotlib seaborn \
+    pandas numpy scikit-learn einops wandb
+
+# Install the project in editable mode
+pip install -e .
 ```
 
-**Note**: `light-the-torch` (ltt) automatically detects your hardware and installs the appropriate PyTorch version (CPU, CUDA, or Apple Silicon MPS).
+**Notes**:
+- Python 3.11 is recommended for best compatibility
+- `light-the-torch` (ltt) in Option B automatically detects your hardware and installs the appropriate PyTorch version
+- CUDA 12.1 is specified for Option A but adjust based on your GPU driver version
+- Apple Silicon users should use the standard pytorch channel (includes MPS support)
 
 ### 2. Data Structure
 
