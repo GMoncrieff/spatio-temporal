@@ -16,9 +16,14 @@ This project implements a **ConvLSTM-based spatio-temporal forecasting** pipelin
 
 ## Documentation
 
-📘 **[Complete Technical Documentation](docs/model_architecture_and_training.md)**
+📘 **[Model Architecture and Training Guide](docs/model_architecture_and_training.md)**
 
-A comprehensive guide covering:
+Choose the version that fits your needs:
+
+- **[Simplified Guide](docs/simple_model_architecture_and_training.md)** - Concise overview without code examples (~20 pages)
+- **[Complete Technical Documentation](docs/model_architecture_and_training.md)** - Detailed guide with implementation code (~100 pages)
+
+**Topics covered:**
 - **Input Data**: Dynamic variables, static covariates, location encoding
 - **Data Transformations**: Per-variable normalization, NaN handling, data leakage prevention
 - **Model Architecture**: ConvLSTM, independent prediction heads, design decisions
@@ -26,8 +31,6 @@ A comprehensive guide covering:
 - **Training**: Hyperparameters, optimization, early stopping, W&B tracking
 - **Accuracy Assessment**: Evaluation metrics, validation protocols, visualization
 - **Prediction**: Tile-based processing, output formats, GIS integration
-
-Each section includes both intuitive explanations and technical implementation details.
 
 ## Project Structure
 
@@ -66,7 +69,8 @@ spatio_temporal/
 ├── tests/                        # Unit tests
 │
 ├── docs/                         # Documentation
-│   ├── model_architecture_and_training.md  # 📘 Comprehensive technical guide
+│   ├── simple_model_architecture_and_training.md  # 📗 Simplified guide
+│   ├── model_architecture_and_training.md        # 📘 Complete technical guide
 │   ├── QUANTILE_PREDICTION_IMPLEMENTATION.md
 │   ├── INDEPENDENT_HEADS_IMPLEMENTATION.md
 │   ├── LOSS_WEIGHTING_EXPLAINED.md
