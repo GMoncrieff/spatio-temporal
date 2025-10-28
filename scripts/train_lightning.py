@@ -567,9 +567,17 @@ if __name__ == "__main__":
         pred_keys = ['preds_5yr', 'preds_10yr', 'preds_15yr', 'preds_20yr']
         
         horizon_metrics = {h: {
-            'mse': 0.0, 'mae': 0.0, 'ssim': 0.0, 'lap': 0.0, 'hist': 0.0, 'pixels': 0,
-            'mae_no_change': 0.0,  # Baseline: assume no change from last input
-            'mae_linear': 0.0       # Baseline: linear extrapolation from recent trend
+            'mse': 0.0,              # Model MSE on deltas (existing)
+            'mae': 0.0,              # Model MAE on absolute predictions
+            'mse_abs': 0.0,          # NEW: Model MSE on absolute predictions
+            'ssim': 0.0,
+            'lap': 0.0,
+            'hist': 0.0,
+            'pixels': 0,
+            'mae_no_change': 0.0,    # Baseline: MAE assuming no change
+            'mae_linear': 0.0,       # Baseline: MAE linear extrapolation
+            'mse_no_change': 0.0,    # NEW: Baseline MSE assuming no change (absolute)
+            'mse_linear': 0.0        # NEW: Baseline MSE linear extrapolation (absolute)
         } for h in horizon_names}
         
         for batch_data in all_batches_data:
@@ -602,11 +610,18 @@ if __name__ == "__main__":
                 # MAE on absolute predictions (Conv-CNN model)
                 mae = F.l1_loss(preds[mask], target[mask], reduction='sum')
                 horizon_metrics[h_name]['mae'] += mae.item()
+
+                # NEW: MSE on absolute predictions (Conv-CNN model)
+                mse_abs = F.mse_loss(preds[mask], target[mask], reduction='sum')
+                horizon_metrics[h_name]['mse_abs'] += mse_abs.item()
                 
                 # Baseline 1: "No Change" - assume future = most recent past
                 pred_no_change = last_input  # Simply use last input as prediction
                 mae_no_change = F.l1_loss(pred_no_change[mask], target[mask], reduction='sum')
                 horizon_metrics[h_name]['mae_no_change'] += mae_no_change.item()
+                # NEW: Baseline MSE (No Change)
+                mse_no_change = F.mse_loss(pred_no_change[mask], target[mask], reduction='sum')
+                horizon_metrics[h_name]['mse_no_change'] += mse_no_change.item()
                 
                 # Baseline 2: "Linear" - extrapolate from recent trend
                 # Calculate trend between last two timesteps
@@ -618,6 +633,9 @@ if __name__ == "__main__":
                     pred_linear = last_input + (trend * horizon_multiplier)
                     mae_linear = F.l1_loss(pred_linear[mask], target[mask], reduction='sum')
                     horizon_metrics[h_name]['mae_linear'] += mae_linear.item()
+                    # NEW: Baseline MSE (Linear)
+                    mse_linear = F.mse_loss(pred_linear[mask], target[mask], reduction='sum')
+                    horizon_metrics[h_name]['mse_linear'] += mse_linear.item()
                 
                 # SSIM (requires [B, C, H, W])
                 preds_sanitized = preds.unsqueeze(1).clone()
@@ -655,6 +673,10 @@ if __name__ == "__main__":
         mae_conv_cnn = []
         mae_no_change_list = []
         mae_linear_list = []
+        # NEW: Store MSEs for plotting
+        mse_conv_cnn = []
+        mse_no_change_list = []
+        mse_linear_list = []
         
         for h_name, h_year in zip(horizon_names, horizon_years):
             metrics = horizon_metrics[h_name]
@@ -663,6 +685,10 @@ if __name__ == "__main__":
                 avg_mae = metrics['mae'] / metrics['pixels']
                 avg_mae_no_change = metrics['mae_no_change'] / metrics['pixels']
                 avg_mae_linear = metrics['mae_linear'] / metrics['pixels']
+                # NEW: Absolute prediction MSEs
+                avg_mse_abs = metrics['mse_abs'] / metrics['pixels']
+                avg_mse_no_change = metrics['mse_no_change'] / metrics['pixels']
+                avg_mse_linear = metrics['mse_linear'] / metrics['pixels']
                 avg_ssim = metrics['ssim'] / metrics['pixels']
                 avg_lap = metrics['lap'] / metrics['pixels']
                 avg_hist = metrics['hist'] / metrics['pixels'] if best_model.histogram_weight > 0 else 0.0
@@ -671,6 +697,10 @@ if __name__ == "__main__":
                 mae_conv_cnn.append(avg_mae)
                 mae_no_change_list.append(avg_mae_no_change)
                 mae_linear_list.append(avg_mae_linear)
+                # NEW: Store MSEs for plotting
+                mse_conv_cnn.append(avg_mse_abs)
+                mse_no_change_list.append(avg_mse_no_change)
+                mse_linear_list.append(avg_mse_linear)
                 
                 # Compute total loss
                 avg_total = (avg_mse + 
@@ -1096,6 +1126,36 @@ if __name__ == "__main__":
                            caption="MAE comparison: Conv-CNN vs Baselines")})
             plt.close(fig_mae)
             print("✓ MAE comparison plot created and logged")
+
+        # ---- MSE Comparison Plot: Conv-CNN vs Baselines ----
+        print("\nCreating MSE comparison plot (Conv-CNN vs Baselines)...")
+        if len(mse_conv_cnn) > 0 and len(mse_no_change_list) > 0 and len(mse_linear_list) > 0:
+            fig_mse, ax_mse = plt.subplots(figsize=(10, 6))
+            
+            # Plot three lines
+            ax_mse.plot(horizon_labels, mse_conv_cnn, marker='o', linewidth=2.5, 
+                        label='Conv-CNN', color='#3498db', markersize=8)
+            ax_mse.plot(horizon_labels, mse_no_change_list, marker='s', linewidth=2.5, 
+                        label='No Change', color='#e74c3c', markersize=8, linestyle='--')
+            ax_mse.plot(horizon_labels, mse_linear_list, marker='^', linewidth=2.5, 
+                        label='Linear', color='#f39c12', markersize=8, linestyle='--')
+            
+            # Formatting
+            ax_mse.set_xlabel('Forecast Horizon (years)', fontsize=12, fontweight='bold')
+            ax_mse.set_ylabel('Mean Squared Error (MSE)', fontsize=12, fontweight='bold')
+            ax_mse.set_title('MSE vs Forecast Horizon: Model Comparison', fontsize=14, fontweight='bold')
+            ax_mse.set_xticks(horizon_labels)
+            ax_mse.legend(fontsize=11, loc='upper left')
+            ax_mse.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            fig_mse.canvas.draw()
+            img_rgba_mse = np.array(fig_mse.canvas.buffer_rgba())
+            img_rgb_mse = img_rgba_mse[..., :3]
+            experiment.log({"MSE_Comparison": wandb.Image(img_rgb_mse, 
+                               caption="MSE comparison: Conv-CNN vs Baselines")})
+            plt.close(fig_mse)
+            print("✓ MSE comparison plot created and logged")
 
         # Ensure wandb shuts down cleanly
         experiment.finish()
