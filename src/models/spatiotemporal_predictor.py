@@ -22,10 +22,13 @@ class SpatioTemporalPredictor(nn.Module):
         - Channels [2, 5, 8, 11]: Upper 97.5% quantile (q=0.975)
       Horizons: 5yr, 10yr, 15yr, 20yr
     
-    Key Design:
-    - Central heads are INDEPENDENT from quantile heads (no shared gradients)
-    - Central prediction optimized for multiple objectives, not statistical median
-    - Quantile heads only receive pinball loss gradients
+    Key Design - Gradient Flow:
+    - Central loss (MSE+SSIM+Lap+Hist) → backprops through: ConvLSTM + central_heads
+    - Pinball loss → backprops through: lower_heads/upper_heads ONLY (NOT ConvLSTM)
+    - Central heads never receive pinball loss gradients
+    - Quantile heads never receive central loss gradients (MSE/SSIM/Lap/Hist)
+    - ConvLSTM backbone is ONLY updated by central loss, never by pinball loss
+    - This ensures quantile heads focus purely on uncertainty estimation
     - Quantile heads are smaller (hidden_dim/2) for efficiency
     """
     def __init__(self, hidden_dim=16, kernel_size=3, num_layers=1, num_static_channels=1, num_dynamic_channels=1,

@@ -36,6 +36,9 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         
+        # Enable manual optimization to separately handle pinball loss gradients
+        self.automatic_optimization = False
+        
         # Build LocationEncoder hparams if not provided
         if locenc_hparams is None and use_location_encoder:
             locenc_hparams = {
@@ -91,10 +94,17 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         """
         Compute all loss components for a single horizon with independent predictions.
         
-        Loss Assignment (INDEPENDENT GRADIENTS):
+        Loss Assignment (SEPARATED GRADIENT FLOW):
         - Central prediction: MSE + SSIM + Laplacian + Histogram (multi-objective optimization)
-        - Lower quantile: Pinball loss ONLY (pure uncertainty estimation)
-        - Upper quantile: Pinball loss ONLY (pure uncertainty estimation)
+          → Gradients backprop through: ConvLSTM backbone + central_heads
+        - Lower/Upper quantiles: Pinball loss ONLY (pure uncertainty estimation)
+          → Gradients backprop through: lower_heads/upper_heads ONLY (NOT backbone)
+        
+        The manual optimization in training_step ensures:
+        - Pinball loss never affects ConvLSTM or central_heads parameters
+        - Central losses never affect quantile head parameters
+        - Backbone learns from accuracy/spatial quality objectives only
+        - Quantile heads learn from calibration objectives only
         
         Args:
             pred_lower: [B, 1, H, W] lower quantile (2.5%) predictions
@@ -182,6 +192,9 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         return self.model(input_dynamic, input_static, lonlat=lonlat)
 
     def training_step(self, batch, batch_idx):
+        # Get optimizer (manual optimization)
+        opt = self.optimizers()
+        
         input_dynamic = batch['input_dynamic']
         input_static = batch['input_static']
         # Multi-horizon targets
@@ -258,7 +271,48 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         avg_hist = torch.stack([h['hist'] for h in horizon_losses]).mean()
         avg_pinball_lower = torch.stack([h['pinball_lower'] for h in horizon_losses]).mean()
         avg_pinball_upper = torch.stack([h['pinball_upper'] for h in horizon_losses]).mean()
-        avg_total = torch.stack([h['total'] for h in horizon_losses]).mean()
+        
+        # Compute total losses separately for central vs quantile heads
+        # Central loss: MSE + SSIM + Laplacian + Histogram (affects backbone + central heads)
+        central_loss = avg_mse + self.ssim_weight * avg_ssim + self.laplacian_weight * avg_lap
+        if self.histogram_weight > 0 and self.current_epoch >= self.histogram_warmup_epochs:
+            central_loss = central_loss + self.histogram_weight * avg_hist
+        
+        # Pinball loss: Only affects quantile heads (lower_heads + upper_heads)
+        pinball_loss = avg_pinball_lower + avg_pinball_upper
+        
+        # MANUAL BACKWARD PASS:
+        # Step 1: Backprop central loss through all parameters
+        opt.zero_grad()
+        self.manual_backward(central_loss, retain_graph=True)
+        
+        # Step 2: Backprop pinball loss ONLY through quantile head parameters
+        # First, zero out gradients for non-quantile parameters
+        quantile_params = set()
+        for param in self.model.lower_heads.parameters():
+            quantile_params.add(param)
+        for param in self.model.upper_heads.parameters():
+            quantile_params.add(param)
+        
+        # Store central loss gradients for non-quantile params
+        saved_grads = {}
+        for name, param in self.named_parameters():
+            if param.grad is not None and param not in quantile_params:
+                saved_grads[name] = param.grad.clone()
+        
+        # Backprop pinball loss (no need to retain graph on second backward)
+        self.manual_backward(pinball_loss)
+        
+        # Restore gradients for non-quantile params (so pinball doesn't affect them)
+        for name, param in self.named_parameters():
+            if name in saved_grads:
+                param.grad = saved_grads[name]
+        
+        # Optimizer step
+        opt.step()
+        
+        # Total loss for logging (not used for backprop)
+        avg_total = central_loss + pinball_loss
         
         # Log averaged metrics (total)
         self.log('train_loss', avg_mse, prog_bar=True)
@@ -273,6 +327,20 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         # Debug print on first batch of warmup epoch
         if batch_idx == 0 and self.current_epoch == self.histogram_warmup_epochs and self.histogram_weight > 0:
             print(f"\n[HISTOGRAM ACTIVATED] Epoch {self.current_epoch}: avg_hist_loss={avg_hist.item():.6f}, weighted={self.histogram_weight * avg_hist.item():.6f}\n")
+        
+        # Debug gradient isolation on first epoch (optional)
+        if batch_idx == 0 and self.current_epoch == 0:
+            # Verify gradient isolation: ConvLSTM should only have central loss grads
+            convlstm_grad_norm = sum(p.grad.norm().item()**2 for p in self.model.convlstm.parameters() if p.grad is not None)**0.5
+            lower_head_grad_norm = sum(p.grad.norm().item()**2 for p in self.model.lower_heads.parameters() if p.grad is not None)**0.5
+            upper_head_grad_norm = sum(p.grad.norm().item()**2 for p in self.model.upper_heads.parameters() if p.grad is not None)**0.5
+            central_head_grad_norm = sum(p.grad.norm().item()**2 for p in self.model.central_heads.parameters() if p.grad is not None)**0.5
+            print(f"\n[GRADIENT ISOLATION CHECK] Epoch {self.current_epoch}, Batch {batch_idx}:")
+            print(f"  ConvLSTM grad norm: {convlstm_grad_norm:.6f} (from central loss only)")
+            print(f"  Central heads grad norm: {central_head_grad_norm:.6f} (from central loss only)")
+            print(f"  Lower heads grad norm: {lower_head_grad_norm:.6f} (from pinball loss only)")
+            print(f"  Upper heads grad norm: {upper_head_grad_norm:.6f} (from pinball loss only)")
+            print(f"  Central loss: {central_loss.item():.6f}, Pinball loss: {pinball_loss.item():.6f}\n")
         
         return avg_total
 
