@@ -333,13 +333,19 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         
         # Debug gradient isolation on first epoch (optional)
         if batch_idx == 0 and self.current_epoch == 0:
-            # Verify gradient isolation: ConvLSTM should only have central loss grads
-            convlstm_grad_norm = sum(p.grad.norm().item()**2 for p in self.model.convlstm.parameters() if p.grad is not None)**0.5
+            # Verify gradient isolation: temporal processor should only have central loss grads
+            # Works for both ConvLSTM and UNet3D
+            temporal_processor = getattr(self.model, 'convlstm', None) or getattr(self.model, 'unet3d', None)
+            if temporal_processor is not None:
+                temporal_grad_norm = sum(p.grad.norm().item()**2 for p in temporal_processor.parameters() if p.grad is not None)**0.5
+            else:
+                temporal_grad_norm = 0.0
+            
             lower_head_grad_norm = sum(p.grad.norm().item()**2 for p in self.model.lower_heads.parameters() if p.grad is not None)**0.5
             upper_head_grad_norm = sum(p.grad.norm().item()**2 for p in self.model.upper_heads.parameters() if p.grad is not None)**0.5
             central_head_grad_norm = sum(p.grad.norm().item()**2 for p in self.model.central_heads.parameters() if p.grad is not None)**0.5
             print(f"\n[GRADIENT ISOLATION CHECK] Epoch {self.current_epoch}, Batch {batch_idx}:")
-            print(f"  ConvLSTM grad norm: {convlstm_grad_norm:.6f} (from central loss only)")
+            print(f"  Temporal processor grad norm: {temporal_grad_norm:.6f} (from central loss only)")
             print(f"  Central heads grad norm: {central_head_grad_norm:.6f} (from central loss only)")
             print(f"  Lower heads grad norm: {lower_head_grad_norm:.6f} (from pinball loss only)")
             print(f"  Upper heads grad norm: {upper_head_grad_norm:.6f} (from pinball loss only)")
