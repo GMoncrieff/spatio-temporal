@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from ..locationencoder import LocationEncoder
 from .convlstm import ConvLSTM
+from .unet3d import UNet3D
 
 class SpatioTemporalPredictor(nn.Module):
     """
@@ -35,7 +36,10 @@ class SpatioTemporalPredictor(nn.Module):
                  use_location_encoder: bool = True,
                  locenc_backbone=("sphericalharmonics", "siren"),
                  locenc_hparams=None,
-                 locenc_out_channels: int = 8):
+                 locenc_out_channels: int = 8,
+                 temporal_processor: str = "convlstm",
+                 unet3d_temporal_processor: str = "none",
+                 unet3d_temporal_layers: int = 1):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_static_channels = int(num_static_channels)
@@ -53,15 +57,34 @@ class SpatioTemporalPredictor(nn.Module):
             self.location_encoder = LocationEncoder(locenc_backbone[0], locenc_backbone[1], locenc_hparams)
         else:
             self.location_encoder = None
-        self.convlstm = ConvLSTM(
-            input_dim=self.num_dynamic_channels + self.num_static_channels + (self.locenc_out_channels if (self.use_location_encoder and self.locenc_out_channels > 0) else 0),  # C_d dynamic + C_s static + C_loc
-            hidden_dim=hidden_dim,
-            kernel_size=(kernel_size, kernel_size),
-            num_layers=num_layers,
-            batch_first=True,
-            bias=True,
-            return_all_layers=False
-        )
+        
+        # Choose temporal processor
+        temporal_processor = temporal_processor.lower()
+        input_channels = self.num_dynamic_channels + self.num_static_channels + (self.locenc_out_channels if (self.use_location_encoder and self.locenc_out_channels > 0) else 0)
+        
+        if temporal_processor == "convlstm":
+            self.temporal_processor = ConvLSTM(
+                input_dim=input_channels,
+                hidden_dim=hidden_dim,
+                kernel_size=(kernel_size, kernel_size),
+                num_layers=num_layers,
+                batch_first=True,
+                bias=True,
+                return_all_layers=False
+            )
+            self.temporal_processor_type = "convlstm"
+        elif temporal_processor == "unet3d":
+            self.temporal_processor = UNet3D(
+                in_channels=input_channels,
+                hidden_dim=hidden_dim,
+                kernel_size=kernel_size,
+                layers=num_layers,
+                temporal_processor_type=unet3d_temporal_processor,
+                temporal_layers=unet3d_temporal_layers,
+            )
+            self.temporal_processor_type = "unet3d"
+        else:
+            raise ValueError(f"Unknown temporal_processor: {temporal_processor}. Choose 'convlstm' or 'unet3d'")
         # Multi-horizon prediction with independent heads for central and quantile predictions
         # Central heads: Optimized for accuracy + spatial patterns (MSE, SSIM, Laplacian, Histogram)
         # Quantile heads: Optimized purely for uncertainty estimation (Pinball loss only)
@@ -114,10 +137,19 @@ class SpatioTemporalPredictor(nn.Module):
         # Repeat all static channels for each timestep and concat
         static_rep = input_static.unsqueeze(1).repeat(1, T, 1, 1, 1)  # [B, T, C_s, H, W]
         x = torch.cat([input_dynamic, static_rep], dim=2)  # [B, T, C_d+C_s, H, W]
-        # ConvLSTM expects [B, T, C, H, W]
-        output, _ = self.convlstm(x)
-        # output[0]: [B, T, hidden_dim, H, W] (last layer)
-        last_hidden = output[0][:, -1]  # [B, hidden_dim, H, W] (last timestep)
+        
+        # Process with temporal processor
+        if self.temporal_processor_type == "convlstm":
+            # ConvLSTM expects [B, T, C, H, W]
+            output, _ = self.temporal_processor(x)
+            # output[0]: [B, T, hidden_dim, H, W] (last layer)
+            last_hidden = output[0][:, -1]  # [B, hidden_dim, H, W] (last timestep)
+        elif self.temporal_processor_type == "unet3d":
+            # UNet3D expects [B, C, T, H, W]
+            x = x.permute(0, 2, 1, 3, 4)  # [B, T, C, H, W] → [B, C, T, H, W]
+            last_hidden = self.temporal_processor(x)  # [B, hidden_dim, H, W]
+        else:
+            raise ValueError(f"Unknown temporal_processor_type: {self.temporal_processor_type}")
         
         # Generate independent predictions for each horizon
         # Each horizon has 3 separate heads: lower, central, upper

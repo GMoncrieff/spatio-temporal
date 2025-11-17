@@ -59,6 +59,9 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             locenc_backbone=locenc_backbone,
             locenc_hparams=locenc_hparams,
             locenc_out_channels=locenc_out_channels,
+            temporal_processor="unet3d",  # Default to UNet3D
+            unet3d_temporal_processor="lstm",  # Fixed: LSTM on skip connections
+            unet3d_temporal_layers=1,  # Fixed: 1 LSTM layer
         )
         self.loss_fn = nn.MSELoss(reduction='mean')
         self.mae_fn = nn.L1Loss(reduction='mean')

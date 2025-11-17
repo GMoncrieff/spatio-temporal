@@ -52,9 +52,9 @@ if __name__ == "__main__":
         help="Limit number of static channels (e.g., 1 to use only elevation)",
     )
     # Model complexity
-    parser.add_argument("--hidden_dim", type=int, default=64, help="ConvLSTM hidden dimension")
-    parser.add_argument("--num_layers", type=int, default=2, help="Number of ConvLSTM layers")
-    parser.add_argument("--kernel_size", type=int, default=3, help="Conv kernel size for ConvLSTM")
+    parser.add_argument("--hidden_dim", type=int, default=64, help="Hidden dimension for temporal processor")
+    parser.add_argument("--num_layers", type=int, default=2, help="Number of layers for temporal processor")
+    parser.add_argument("--kernel_size", type=int, default=3, help="Conv kernel size for temporal processor")
     # Inference flags
     parser.add_argument(
         "--predict_after_training",
