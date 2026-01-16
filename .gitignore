@@ -13,6 +13,9 @@ develop-eggs/
 dist/
 downloads/
 context/
+data/predictions/
+data/prompts/
+scripts/notebooks/
 eggs/
 .eggs/
 lib/
@@ -62,6 +65,9 @@ ipython_config.py
 
 # pipenv
 Pipfile.lock
+
+#reqs
+requirements.txt
 
 # PEP 582
 __pypackages__/

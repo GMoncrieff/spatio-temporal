@@ -157,6 +157,19 @@ if __name__ == "__main__":
         default=42,
         help="Random seed for reproducibility (default: 42)",
     )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="geotiff",
+        choices=["geotiff", "zarr"],
+        help="Data backend: 'geotiff' (windowed rasterio) or 'zarr' (xbatcher) (default: geotiff)",
+    )
+    parser.add_argument(
+        "--zarr_path",
+        type=str,
+        default="scripts/notebooks/hm_global.icechunk",
+        help="Path to icechunk repo when backend='zarr' (local path or s3://bucket/prefix). Default: scripts/notebooks/hm_global.icechunk",
+    )
     args = parser.parse_args()
     
     # Helper function to load checkpoint from W&B artifact or local path
@@ -246,6 +259,8 @@ if __name__ == "__main__":
         persistent_workers=True if args.num_workers > 0 else False,
         split_mask_file=split_mask_file,
         split_value=1,  # Train split
+        backend=args.backend,
+        zarr_path=args.zarr_path,
     )
     # Validation uses fixed years (1990, 1995, 2000 -> 2005-2020) for consistent metrics
     val_loader = get_dataloader(
@@ -263,6 +278,8 @@ if __name__ == "__main__":
         persistent_workers=True if args.num_workers > 0 else False,
         split_mask_file=split_mask_file,
         split_value=2,  # Validation split
+        backend=args.backend,
+        zarr_path=args.zarr_path,
     )
 
     # Model
