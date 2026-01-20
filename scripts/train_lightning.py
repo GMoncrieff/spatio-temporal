@@ -167,8 +167,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--zarr_path",
         type=str,
-        default="scripts/notebooks/hm_global.icechunk",
-        help="Path to icechunk repo when backend='zarr' (local path or s3://bucket/prefix). Default: scripts/notebooks/hm_global.icechunk",
+        default="scripts/notebooks/hm.icechunk",
+        help="Path to icechunk repo when backend='zarr' (local path or s3://bucket/prefix). Default: scripts/notebooks/hm.icechunk",
     )
     args = parser.parse_args()
     

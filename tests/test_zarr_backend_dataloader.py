@@ -19,16 +19,16 @@ def _has_deps() -> bool:
 
 
 def _default_icechunk_repo_exists() -> bool:
-    repo_path = Path(__file__).parent.parent / "scripts" / "notebooks" / "hm_global.icechunk"
+    repo_path = Path(__file__).parent.parent / "scripts" / "notebooks" / "hm.icechunk"
     return repo_path.exists()
 
 
 @pytest.mark.skipif(
     (not _has_deps()) or (not _default_icechunk_repo_exists()),
-    reason="Zarr backend requires xarray/xbatcher/dask/icechunk and an existing scripts/notebooks/hm_global.icechunk repo",
+    reason="Zarr backend requires xarray/xbatcher/dask/icechunk and an existing scripts/notebooks/hm.icechunk repo",
 )
 def test_zarr_dataloader_batch_shapes():
-    repo_path = str(Path(__file__).parent.parent / "scripts" / "notebooks" / "hm_global.icechunk")
+    repo_path = str(Path(__file__).parent.parent / "scripts" / "notebooks" / "hm.icechunk")
     loader = get_dataloader(
         backend="zarr",
         zarr_path=repo_path,
@@ -55,12 +55,12 @@ def test_zarr_dataloader_batch_shapes():
 
 @pytest.mark.skipif(
     (not _has_deps()) or (not _default_icechunk_repo_exists()),
-    reason="Zarr backend requires xarray/xbatcher/dask/icechunk and an existing scripts/notebooks/hm_global.icechunk repo",
+    reason="Zarr backend requires xarray/xbatcher/dask/icechunk and an existing scripts/notebooks/hm.icechunk repo",
 )
 def test_zarr_dataloader_compatible_with_convlstm():
     from src.models.convlstm import ConvLSTM
 
-    repo_path = str(Path(__file__).parent.parent / "scripts" / "notebooks" / "hm_global.icechunk")
+    repo_path = str(Path(__file__).parent.parent / "scripts" / "notebooks" / "hm.icechunk")
     loader = get_dataloader(
         backend="zarr",
         zarr_path=repo_path,
@@ -89,11 +89,11 @@ def test_zarr_dataloader_compatible_with_convlstm():
 
 @pytest.mark.skipif(
     (not _has_deps()) or (not _default_icechunk_repo_exists()),
-    reason="Zarr backend requires xarray/xbatcher/dask/icechunk and an existing scripts/notebooks/hm_global.icechunk repo",
+    reason="Zarr backend requires xarray/xbatcher/dask/icechunk and an existing scripts/notebooks/hm.icechunk repo",
 )
 def test_icechunk_data_reading():
     """Test that icechunk data reading works and returns expected variables."""
-    repo_path = str(Path(__file__).parent.parent / "scripts" / "notebooks" / "hm_global.icechunk")
+    repo_path = str(Path(__file__).parent.parent / "scripts" / "notebooks" / "hm.icechunk")
     loader = get_dataloader(
         backend="zarr",
         zarr_path=repo_path,

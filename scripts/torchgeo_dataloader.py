@@ -8,7 +8,7 @@ from pyproj import Transformer
 # Paths (updated to hm_medium dataset)
 HM_DIR = os.path.join("data", "raw", "hm_global")
 STATIC_DIR = HM_DIR
-ZARR_PATH = os.path.join("scripts", "notebooks", "hm_global.icechunk")
+ZARR_PATH = os.path.join("scripts", "notebooks", "hm.icechunk")
 
 # List of years for which we have human footprint data
 years = [1990, 1995, 2000, 2005, 2010, 2015, 2020]
@@ -449,7 +449,28 @@ class HumanFootprintZarrChipDataset(torch.utils.data.Dataset):
         repo = icechunk.Repository.open(store)
         session = repo.readonly_session("main")
 
-        ds = xr.open_zarr(session.store, group="hm", consolidated=False)
+        try:
+            ds = xr.open_zarr(session.store, group="hm", consolidated=False)
+        except Exception:
+            ds = xr.open_zarr(session.store, consolidated=False)
+
+        if "dynamic" in ds.data_vars and "static" in ds.data_vars:
+            ds_expanded = xr.Dataset(coords={k: ds.coords[k] for k in ("time", "y", "x") if k in ds.coords})
+
+            if "var_dynamic" not in ds.coords:
+                raise ValueError("Expected coord 'var_dynamic' when 'dynamic' variable is present")
+            if "var_static" not in ds.coords:
+                raise ValueError("Expected coord 'var_static' when 'static' variable is present")
+
+            for v in ds.coords["var_dynamic"].values:
+                vname = str(v)
+                ds_expanded[vname] = ds["dynamic"].sel(var_dynamic=v).drop_vars("var_dynamic")
+
+            for v in ds.coords["var_static"].values:
+                vname = str(v)
+                ds_expanded[vname] = ds["static"].sel(var_static=v).drop_vars("var_static")
+
+            ds = ds_expanded
 
         keep_vars = [v for v in dynamic_var_names if v in ds.data_vars]
         keep_vars += [v for v in static_var_names if v in ds.data_vars]
