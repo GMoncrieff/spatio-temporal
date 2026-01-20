@@ -454,6 +454,17 @@ class HumanFootprintZarrChipDataset(torch.utils.data.Dataset):
         except Exception:
             ds = xr.open_zarr(session.store, consolidated=False)
 
+        # Print dataset info immediately after loading
+        print("=== Zarr Dataset Info ===")
+        print(f"Dataset dimensions: {dict(ds.sizes)}")
+        print(f"Data variables: {list(ds.data_vars.keys())}")
+        print(f"Coordinates: {list(ds.coords.keys())}")
+        if "var_dynamic" in ds.coords:
+            print(f"Dynamic variables (var_dynamic): {list(ds.coords['var_dynamic'].values)}")
+        if "var_static" in ds.coords:
+            print(f"Static variables (var_static): {list(ds.coords['var_static'].values)}")
+        print("========================")
+
         if "dynamic" in ds.data_vars and "static" in ds.data_vars:
             ds_expanded = xr.Dataset(coords={k: ds.coords[k] for k in ("time", "y", "x") if k in ds.coords})
 
