@@ -446,7 +446,7 @@ class HumanFootprintZarrChipDataset(torch.utils.data.Dataset):
             prefix = parsed.path.lstrip("/")
             print(f"Bucket: {bucket}")
             print(f"Prefix: {prefix}")
-            store = icechunk.s3_storage(bucket=bucket, prefix=prefix, from_env=True)
+            store = icechunk.s3_storage(bucket=bucket, prefix=prefix, region=None, endpoint_url=None, anonymous=False, allow_http=False, force_path_style=False)
             print(store)
         else:
             store = icechunk.local_filesystem_storage(repo_path)
