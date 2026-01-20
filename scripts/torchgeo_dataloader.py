@@ -447,10 +447,12 @@ class HumanFootprintZarrChipDataset(torch.utils.data.Dataset):
             print(f"Bucket: {bucket}")
             print(f"Prefix: {prefix}")
             store = icechunk.s3_storage(bucket=bucket, prefix=prefix, from_env=True)
+            print(store)
         else:
             store = icechunk.local_filesystem_storage(repo_path)
 
         repo = icechunk.Repository.open(store)
+        print(repo)
         session = repo.readonly_session("main")
 
         try:
