@@ -438,10 +438,14 @@ class HumanFootprintZarrChipDataset(torch.utils.data.Dataset):
         dynamic_var_names = ["AA"] + (list(HM_VARS) if self.include_components else [])
 
         repo_path = str(self.zarr_path)
+        print("=== Zarr Dataset Info ===")
+        print(f"Repository path: {repo_path}")
         if repo_path.startswith("s3://"):
             parsed = urlparse(repo_path)
             bucket = parsed.netloc
             prefix = parsed.path.lstrip("/")
+            print(f"Bucket: {bucket}")
+            print(f"Prefix: {prefix}")
             store = icechunk.s3_storage(bucket=bucket, prefix=prefix, from_env=True)
         else:
             store = icechunk.local_filesystem_storage(repo_path)
