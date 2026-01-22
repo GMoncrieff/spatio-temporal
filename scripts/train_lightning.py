@@ -160,9 +160,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--backend",
         type=str,
-        default="geotiff",
-        choices=["geotiff", "zarr"],
-        help="Data backend: 'geotiff' (windowed rasterio) or 'zarr' (xbatcher) (default: geotiff)",
+        default="zarr",
+        choices=["zarr"],
+        help="Data backend: 'zarr' (xbatcher with icechunk) (default: zarr)",
     )
     parser.add_argument(
         "--zarr_path",
