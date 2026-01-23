@@ -13,7 +13,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import WandbLogger
 from torch.utils.data import DataLoader
 from src.models.lightning_module import SpatioTemporalLightningModule
-from torchgeo_dataloader import get_dataloader, hm_files, component_files, static_files, years
+from torchgeo_dataloader import get_dataloader, static_files, years, HM_VARS
 
 # Geospatial imports for inference
 import rasterio
@@ -31,12 +31,19 @@ if __name__ == "__main__":
     parser.add_argument("--fast_dev_run", action="store_true", help="Run 1 train/val batch for a quick smoke test")
     parser.add_argument("--max_epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--disable_wandb", action="store_true", help="Disable Weights & Biases logging")
-    parser.add_argument("--train_chips", type=int, default=200, help="Chips per epoch for training")
-    parser.add_argument("--val_chips", type=int, default=40, help="Chips per epoch for validation")
+    parser.add_argument("--train_chips", type=int, default=None, help="Chips per epoch for training (None = all valid chips)")
+    parser.add_argument("--val_chips", type=int, default=None, help="Chips per epoch for validation (None = all valid chips)")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for train/val")
-    parser.add_argument("--train_mode", type=str, default="random", choices=["random", "grid"], help="Sampling mode for training")
-    parser.add_argument("--val_mode", type=str, default="grid", choices=["random", "grid"], help="Sampling mode for validation")
-    parser.add_argument("--stride", type=int, default=128, help="Stride for grid sampling (pixels)")
+    parser.add_argument("--stride", type=int, default=128, help="Stride between chips (pixels)")
+    parser.add_argument(
+        "--platform",
+        type=str,
+        default="auto",
+        choices=["auto", "aws", "m1_mac"],
+        help="Platform type for optimal defaults ('auto' = detect, 'aws' = cloud with S3, 'm1_mac' = local Mac)",
+    )
+    parser.add_argument("--dask_threads", type=int, default=None, help="Dask threads for parallel chunk loading (None = platform default)")
+    parser.add_argument("--prefetch_factor", type=int, default=None, help="DataLoader prefetch factor (None = platform default)")
     parser.add_argument(
         "--include_components",
         type=lambda x: (str(x).lower() == 'true'),
@@ -105,8 +112,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_workers",
         type=int,
-        default=0,
-        help="Number of data loading workers (default: 0 for single-threaded)",
+        default=None,
+        help="Number of data loading workers (None = use platform default: 16 for AWS, 4 for M1 Mac)",
     )
     parser.add_argument(
         "--accumulate_grad_batches",
@@ -158,17 +165,10 @@ if __name__ == "__main__":
         help="Random seed for reproducibility (default: 42)",
     )
     parser.add_argument(
-        "--backend",
-        type=str,
-        default="zarr",
-        choices=["zarr"],
-        help="Data backend: 'zarr' (xbatcher with icechunk) (default: zarr)",
-    )
-    parser.add_argument(
         "--zarr_path",
         type=str,
         default="scripts/notebooks/hm.icechunk",
-        help="Path to icechunk repo when backend='zarr' (local path or s3://bucket/prefix). Default: scripts/notebooks/hm.icechunk",
+        help="Path to icechunk repo (local path or s3://bucket/prefix). Default: scripts/notebooks/hm.icechunk",
     )
     args = parser.parse_args()
     
@@ -235,51 +235,45 @@ if __name__ == "__main__":
         torch.cuda.manual_seed_all(args.seed)
     pl.seed_everything(args.seed, workers=True)
     
-    # Split mask file
-    split_mask_file = "data/raw/hm_global/split_mask_1000.tif"
-    if not os.path.exists(split_mask_file):
-        print(f"WARNING: Split mask not found: {split_mask_file}")
-        print("Training without train/val/test separation. Run scripts/create_validity_mask.py to create splits.")
-        split_mask_file = None
+    # Data - using deterministic geographic splits
+    print("\n" + "="*70)
+    print("Setting up data loaders with geographic splits")
+    print("="*70)
     
-    # Data
     train_loader = get_dataloader(
+        split="train",
         batch_size=args.batch_size,
         chip_size=128,
-        timesteps=3,
+        stride=args.stride,
         chips_per_epoch=args.train_chips,
-        mode=args.train_mode,
-        stride=args.stride,
+        use_temporal_sampling=True,
+        end_year_options=(2000, 2005, 2010, 2015),
         include_components=args.include_components,
         static_channels=args.static_channels,
-        use_temporal_sampling=True,  # Enable temporal sampling for training
-        end_year_options=(2000, 2005, 2010, 2015),
-        num_workers=args.num_workers,
-        pin_memory=True if args.num_workers > 0 else False,
-        persistent_workers=True if args.num_workers > 0 else False,
-        split_mask_file=split_mask_file,
-        split_value=1,  # Train split
-        backend=args.backend,
         zarr_path=args.zarr_path,
+        platform=args.platform,
+        num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
+        dask_threads=args.dask_threads,
+        random_seed=args.seed,
     )
-    # Validation uses fixed years (1990, 1995, 2000 -> 2005-2020) for consistent metrics
+    
+    # Validation uses fixed years for consistent metrics
     val_loader = get_dataloader(
+        split="val",
         batch_size=args.batch_size,
         chip_size=128,
-        timesteps=3,
-        chips_per_epoch=args.val_chips,
-        mode=args.val_mode,
         stride=args.stride,
+        chips_per_epoch=args.val_chips,
+        use_temporal_sampling=False,
         include_components=args.include_components,
         static_channels=args.static_channels,
-        use_temporal_sampling=False,  # Fixed years for validation (Option A)
-        num_workers=args.num_workers,
-        pin_memory=True if args.num_workers > 0 else False,
-        persistent_workers=True if args.num_workers > 0 else False,
-        split_mask_file=split_mask_file,
-        split_value=2,  # Validation split
-        backend=args.backend,
         zarr_path=args.zarr_path,
+        platform=args.platform,
+        num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
+        dask_threads=args.dask_threads,
+        random_seed=args.seed,
     )
 
     # Model
@@ -768,7 +762,9 @@ if __name__ == "__main__":
         if hasattr(ds, 'dataset'):
             ds = ds.dataset  # Unwrap DataLoader if needed
         hm_mean, hm_std = ds.hm_mean, ds.hm_std
-        elev_mean, elev_std = ds.elev_mean, ds.elev_std
+        # Elevation is the first static variable (index 0)
+        elev_mean = ds.static_means[0] if hasattr(ds, 'static_means') else 0.0
+        elev_std = ds.static_stds[0] if hasattr(ds, 'static_stds') else 1.0
         
         # Log images from first batch only (for visualization)
         print("\nCreating multi-horizon visualizations from first batch...")
@@ -1233,7 +1229,9 @@ if __name__ == "__main__":
         target_years = (2025, 2030, 2035, 2040)
         base_year = 2020  # Use 2020 as spatial reference
         year_to_idx = {y: i for i, y in enumerate(years)}
-        target_src_path = hm_files[year_to_idx[base_year]]
+        # Construct HM file path directly
+        HM_DIR = os.path.join("data", "raw", "hm_global")
+        target_src_path = os.path.join(HM_DIR, f"HM_{base_year}_AA_1000.tiff")
         with rasterio.open(target_src_path) as ref:
             ref_crs = ref.crs
             ref_transform = ref.transform
@@ -1284,7 +1282,9 @@ if __name__ == "__main__":
             # Stats and config from training dataset
             ds_train = train_loader.dataset
             hm_mean, hm_std = ds_train.hm_mean, ds_train.hm_std
-            elev_mean, elev_std = ds_train.elev_mean, ds_train.elev_std
+            # Elevation is the first static variable (index 0)
+            elev_mean = ds_train.static_means[0] if hasattr(ds_train, 'static_means') else 0.0
+            elev_std = ds_train.static_stds[0] if hasattr(ds_train, 'static_stds') else 1.0
             include_components = bool(getattr(ds_train, 'include_components', True))
             static_list_paths = list(static_files if args.static_channels is None else static_files[:int(args.static_channels)])
             # Use most recent 3 timesteps as input for prediction (2010, 2015, 2020)
@@ -1299,9 +1299,21 @@ if __name__ == "__main__":
             # HM_VARS from module (not instance attribute)
             HM_VARS = ["AG", "BU", "EX", "FR", "HI", "NS", "PO", "TI", "gdp", "population"]
 
+            # Construct file paths directly
+            HM_DIR = os.path.join("data", "raw", "hm_global")
+            hm_files = [os.path.join(HM_DIR, f"HM_{year}_AA_1000.tiff") for year in years]
+            
+            # Build component file paths if needed
+            if include_components:
+                component_files = {}
+                for year in years:
+                    component_files[year] = [os.path.join(HM_DIR, f"HM_{year}_{var}_1000.tiff") for var in HM_VARS]
+            else:
+                component_files = {y: [] for y in years}
+
             # Open all sources
             hm_srcs = [rasterio.open(p) for p in hm_files]
-            comp_srcs = {y: [rasterio.open(p) for p in component_files[y]] for y in years} if include_components else {y: [] for y in years}
+            comp_srcs = {y: [rasterio.open(p) for p in component_files[y]] for y in years}
             stat_srcs = [rasterio.open(p) for p in static_list_paths]
 
             tile = 128

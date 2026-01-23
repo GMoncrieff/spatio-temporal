@@ -1,3 +1,6 @@
+"""
+Tests for the Zarr/Icechunk dataloader with performance optimizations.
+"""
 import importlib.util
 import sys
 from pathlib import Path
@@ -6,7 +9,7 @@ import pytest
 import torch
 
 sys.path.append(str(Path(__file__).parent.parent / "scripts"))
-from torchgeo_dataloader import get_dataloader
+from torchgeo_dataloader import get_dataloader, detect_platform, SPLIT_RANGES
 
 
 def _has_deps() -> bool:
@@ -28,15 +31,17 @@ def _default_icechunk_repo_exists() -> bool:
     reason="Zarr backend requires xarray/xbatcher/dask/icechunk and an existing scripts/notebooks/hm.icechunk repo",
 )
 def test_zarr_dataloader_batch_shapes():
+    """Test that batch shapes are correct."""
     repo_path = str(Path(__file__).parent.parent / "scripts" / "notebooks" / "hm.icechunk")
     loader = get_dataloader(
-        backend="zarr",
+        split="train",
         zarr_path=repo_path,
         batch_size=2,
         chip_size=128,
-        timesteps=3,
+        stride=128,
         chips_per_epoch=2,
-        mode="random",
+        platform="m1_mac",
+        stat_samples=32,
     )
     batch = next(iter(loader))
     C_dyn = loader.dataset.C_dyn
@@ -58,17 +63,19 @@ def test_zarr_dataloader_batch_shapes():
     reason="Zarr backend requires xarray/xbatcher/dask/icechunk and an existing scripts/notebooks/hm.icechunk repo",
 )
 def test_zarr_dataloader_compatible_with_convlstm():
+    """Test that dataloader output is compatible with ConvLSTM model."""
     from src.models.convlstm import ConvLSTM
 
     repo_path = str(Path(__file__).parent.parent / "scripts" / "notebooks" / "hm.icechunk")
     loader = get_dataloader(
-        backend="zarr",
+        split="train",
         zarr_path=repo_path,
         batch_size=2,
         chip_size=64,
-        timesteps=3,
+        stride=64,
         chips_per_epoch=2,
-        mode="random",
+        platform="m1_mac",
+        stat_samples=32,
     )
     batch = next(iter(loader))
 
@@ -95,13 +102,14 @@ def test_icechunk_data_reading():
     """Test that icechunk data reading works and returns expected variables."""
     repo_path = str(Path(__file__).parent.parent / "scripts" / "notebooks" / "hm.icechunk")
     loader = get_dataloader(
-        backend="zarr",
+        split="train",
         zarr_path=repo_path,
         batch_size=1,
         chip_size=64,
-        timesteps=3,
+        stride=64,
         chips_per_epoch=1,
-        mode="random",
+        platform="m1_mac",
+        stat_samples=32,
     )
     batch = next(iter(loader))
     
@@ -116,9 +124,8 @@ def test_icechunk_data_reading():
     assert len(actual_dynamic_vars) > 0, "Should have at least AA variable"
     assert "AA" in actual_dynamic_vars, "AA variable must be present"
     
-    # Check static variables - they might have different naming convention
+    # Check static variables
     actual_static_vars = [v for v in available_vars if v not in expected_dynamic_vars]
-    
     assert len(actual_static_vars) > 0, f"Should have at least some static variables. Available: {available_vars}"
     
     # Verify data shapes
@@ -132,3 +139,62 @@ def test_icechunk_data_reading():
     assert batch["input_static"].shape[1] == len(actual_static_vars)  # static channels
     assert batch["input_static"].shape[2] == 64  # height
     assert batch["input_static"].shape[3] == 64  # width
+
+
+@pytest.mark.skipif(
+    (not _has_deps()) or (not _default_icechunk_repo_exists()),
+    reason="Zarr backend requires xarray/xbatcher/dask/icechunk and an existing scripts/notebooks/hm.icechunk repo",
+)
+def test_geographic_splits():
+    """Test that geographic splits produce non-overlapping chip assignments."""
+    repo_path = str(Path(__file__).parent.parent / "scripts" / "notebooks" / "hm.icechunk")
+    
+    # Get valid chip counts for each split
+    split_counts = {}
+    for split_name in ["train", "val", "test", "calib"]:
+        loader = get_dataloader(
+            split=split_name,
+            zarr_path=repo_path,
+            batch_size=1,
+            chip_size=128,
+            stride=128,
+            chips_per_epoch=1,
+            platform="m1_mac",
+            stat_samples=16,
+        )
+        split_counts[split_name] = len(loader.dataset.valid_chip_indices)
+    
+    total = sum(split_counts.values())
+    
+    # Verify approximate percentages (allow some variance due to validity filtering)
+    train_pct = split_counts["train"] / total * 100
+    val_pct = split_counts["val"] / total * 100
+    test_pct = split_counts["test"] / total * 100
+    calib_pct = split_counts["calib"] / total * 100
+    
+    print(f"Split percentages: train={train_pct:.1f}%, val={val_pct:.1f}%, test={test_pct:.1f}%, calib={calib_pct:.1f}%")
+    
+    # Train should be ~70%, others ~10% each (with some tolerance)
+    assert 60 < train_pct < 80, f"Train should be ~70%, got {train_pct:.1f}%"
+    assert 5 < val_pct < 15, f"Val should be ~10%, got {val_pct:.1f}%"
+    assert 5 < test_pct < 15, f"Test should be ~10%, got {test_pct:.1f}%"
+    assert 5 < calib_pct < 15, f"Calib should be ~10%, got {calib_pct:.1f}%"
+
+
+def test_platform_detection():
+    """Test that platform detection returns valid values."""
+    platform = detect_platform()
+    assert platform in ["aws", "m1_mac", "other"]
+
+
+def test_split_ranges_sum_to_100():
+    """Test that split ranges cover 0-100 without gaps."""
+    ranges = list(SPLIT_RANGES.values())
+    ranges.sort(key=lambda x: x[0])
+    
+    # Check no gaps and covers 0-100
+    assert ranges[0][0] == 0, "First range should start at 0"
+    assert ranges[-1][1] == 100, "Last range should end at 100"
+    
+    for i in range(len(ranges) - 1):
+        assert ranges[i][1] == ranges[i + 1][0], f"Gap between ranges {i} and {i+1}"
