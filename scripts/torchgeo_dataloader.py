@@ -13,6 +13,7 @@ import os
 import sys
 import platform
 import hashlib
+import pickle
 from urllib.parse import urlparse
 from typing import Optional, Literal, List, Tuple
 
@@ -38,6 +39,7 @@ except ImportError:
 HM_DIR = os.path.join("data", "raw", "hm_global")
 STATIC_DIR = HM_DIR
 ZARR_PATH = os.path.join("scripts", "notebooks", "hm.icechunk")
+CACHE_DIR = os.path.join("data", "cache")
 
 years = [1990, 1995, 2000, 2005, 2010, 2015, 2020]
 HM_VARS = ["AG", "BU", "EX", "FR", "HI", "NS", "PO", "TI", "gdp", "population"]
@@ -59,6 +61,27 @@ SPLIT_RANGES = {
     "test": (80, 90),    # 80-89
     "calib": (90, 100),  # 90-99
 }
+
+# =============================================================================
+# Cache Loading Utilities
+# =============================================================================
+
+def load_cached_stats(cache_dir: str = CACHE_DIR):
+    """Load cached normalization statistics if available."""
+    stats_file = os.path.join(cache_dir, "normalization_stats.pkl")
+    if os.path.exists(stats_file):
+        with open(stats_file, "rb") as f:
+            return pickle.load(f)
+    return None
+
+
+def load_cached_valid_chips(chip_size: int, stride: int, min_valid_ratio: float, cache_dir: str = CACHE_DIR):
+    """Load cached valid chips if available."""
+    chips_file = os.path.join(cache_dir, f"valid_chips_{chip_size}_{stride}_{min_valid_ratio}.pkl")
+    if os.path.exists(chips_file):
+        with open(chips_file, "rb") as f:
+            return pickle.load(f)
+    return None
 
 # =============================================================================
 # Platform Detection & Defaults
@@ -328,77 +351,91 @@ class HumanFootprintZarrDataset(Dataset):
         y_coords = ds["y"].values
         x_coords = ds["x"].values
         
-        # Compute all chip positions and their splits
-        print(f"Computing chip positions and geographic splits...")
-        y_starts = list(range(0, self.H - chip_size + 1, stride))
-        x_starts = list(range(0, self.W - chip_size + 1, stride))
-        self._n_x = len(x_starts)
-        self._n_y = len(y_starts)
+        # Try to load cached valid chips
+        cached_chips = load_cached_valid_chips(chip_size, stride, min_valid_ratio)
         
-        # Filter chips by split
-        split_chip_indices = []
-        for yi, y_start in enumerate(y_starts):
-            for xi, x_start in enumerate(x_starts):
-                y_center, x_center = get_chip_center_coords(
-                    y_start, x_start, chip_size, y_coords, x_coords
-                )
-                chip_split = compute_chip_split(y_center, x_center, random_seed)
-                if chip_split == split:
-                    bgen_idx = yi * self._n_x + xi
-                    split_chip_indices.append((bgen_idx, y_start, x_start))
-        
-        print(f"  {split} split: {len(split_chip_indices)} chips (of {len(y_starts) * len(x_starts)} total)")
-        
-        # Pre-filter valid chips (check NaN ratio)
-        print(f"Pre-filtering chips with min_valid_ratio={min_valid_ratio}...")
-        rng = np.random.default_rng(random_seed)
-        
-        valid_chip_indices = []
-        sample_var = "AA"  # Use target variable for validity check
-        
-        # Sample a subset of chips if there are many
-        if len(split_chip_indices) > 1000:
-            # Sample 20% of chips for validity check (faster)
-            sample_size = max(200, len(split_chip_indices) // 5)
-            sample_indices = rng.choice(len(split_chip_indices), sample_size, replace=False)
-            chips_to_check = [split_chip_indices[i] for i in sample_indices]
-            # Assume similar validity ratio for unchecked chips
-            check_ratio = True
+        if cached_chips is not None:
+            print(f"Loading valid chips from cache...")
+            # Use cached data
+            self.valid_chip_indices = cached_chips["valid_chips"][split]
+            y_starts = cached_chips["y_starts"]
+            x_starts = cached_chips["x_starts"]
+            self._n_x = len(x_starts)
+            self._n_y = len(y_starts)
+            print(f"  {split} split: {len(self.valid_chip_indices)} valid chips (from cache)")
         else:
-            chips_to_check = split_chip_indices
-            check_ratio = False
-        
-        n_valid_checked = 0
-        for bgen_idx, y_start, x_start in chips_to_check:
-            # Check validity using first and last time step
-            arr = ds[sample_var].isel(
-                time=0, 
-                y=slice(y_start, y_start + chip_size),
-                x=slice(x_start, x_start + chip_size)
-            ).load().values
+            print(f"Cache not found, computing chip positions and geographic splits...")
+            # Compute all chip positions and their splits
+            y_starts = list(range(0, self.H - chip_size + 1, stride))
+            x_starts = list(range(0, self.W - chip_size + 1, stride))
+            self._n_x = len(x_starts)
+            self._n_y = len(y_starts)
             
-            valid_ratio = np.sum(np.isfinite(arr)) / arr.size
-            if valid_ratio >= min_valid_ratio:
-                valid_chip_indices.append(bgen_idx)
-                n_valid_checked += 1
+            # Filter chips by split
+            split_chip_indices = []
+            for yi, y_start in enumerate(y_starts):
+                for xi, x_start in enumerate(x_starts):
+                    y_center, x_center = get_chip_center_coords(
+                        y_start, x_start, chip_size, y_coords, x_coords
+                    )
+                    chip_split = compute_chip_split(y_center, x_center, random_seed)
+                    if chip_split == split:
+                        bgen_idx = yi * self._n_x + xi
+                        split_chip_indices.append((bgen_idx, y_start, x_start))
+            
+            print(f"  {split} split: {len(split_chip_indices)} chips (of {len(y_starts) * len(x_starts)} total)")
+            
+            # Pre-filter valid chips (check NaN ratio)
+            print(f"Pre-filtering chips with min_valid_ratio={min_valid_ratio}...")
+            rng = np.random.default_rng(random_seed)
+            
+            valid_chip_indices = []
+            sample_var = "AA"  # Use target variable for validity check
+            
+            # Sample a subset of chips if there are many
+            if len(split_chip_indices) > 1000:
+                # Sample 20% of chips for validity check (faster)
+                sample_size = max(200, len(split_chip_indices) // 5)
+                sample_indices = rng.choice(len(split_chip_indices), sample_size, replace=False)
+                chips_to_check = [split_chip_indices[i] for i in sample_indices]
+                # Assume similar validity ratio for unchecked chips
+                check_ratio = True
+            else:
+                chips_to_check = split_chip_indices
+                check_ratio = False
+            
+            n_valid_checked = 0
+            for bgen_idx, y_start, x_start in chips_to_check:
+                # Check validity using first and last time step
+                arr = ds[sample_var].isel(
+                    time=0, 
+                    y=slice(y_start, y_start + chip_size),
+                    x=slice(x_start, x_start + chip_size)
+                ).load().values
+                
+                valid_ratio = np.sum(np.isfinite(arr)) / arr.size
+                if valid_ratio >= min_valid_ratio:
+                    valid_chip_indices.append(bgen_idx)
+                    n_valid_checked += 1
+            
+            # If we sampled, extrapolate to full set
+            if check_ratio and len(chips_to_check) > 0:
+                validity_rate = n_valid_checked / len(chips_to_check)
+                print(f"  Sampled validity rate: {validity_rate:.1%}")
+                # Add remaining unchecked chips probabilistically
+                unchecked_indices = [
+                    idx for idx in range(len(split_chip_indices)) 
+                    if idx not in sample_indices
+                ]
+                # Just add all unchecked (they'll be filtered at runtime if needed)
+                for idx in unchecked_indices:
+                    valid_chip_indices.append(split_chip_indices[idx][0])
+            
+            self.valid_chip_indices = valid_chip_indices
+            print(f"  Final: {len(valid_chip_indices)} valid chips for {split} split")
+            print(f"  TIP: Run 'python scripts/preprocess/run_all_preprocessing.py' to cache this computation")
         
-        # If we sampled, extrapolate to full set
-        if check_ratio and len(chips_to_check) > 0:
-            validity_rate = n_valid_checked / len(chips_to_check)
-            print(f"  Sampled validity rate: {validity_rate:.1%}")
-            # Add remaining unchecked chips probabilistically
-            unchecked_indices = [
-                idx for idx in range(len(split_chip_indices)) 
-                if idx not in sample_indices
-            ]
-            # Just add all unchecked (they'll be filtered at runtime if needed)
-            for idx in unchecked_indices:
-                valid_chip_indices.append(split_chip_indices[idx][0])
-        
-        self.valid_chip_indices = valid_chip_indices
-        print(f"  Final: {len(valid_chip_indices)} valid chips for {split} split")
-        
-        if len(valid_chip_indices) == 0:
+        if len(self.valid_chip_indices) == 0:
             raise ValueError(f"No valid chips found for {split} split!")
         
         # Setup xbatcher
@@ -414,7 +451,8 @@ class HumanFootprintZarrDataset(Dataset):
             preload_batch=False,
         )
         
-        # Compute normalization statistics
+        # Compute normalization statistics (or load from cache)
+        rng = np.random.default_rng(random_seed)
         self._compute_normalization_stats(ds, static_var_names, rng, stat_samples)
         
         # Store metadata
@@ -431,8 +469,23 @@ class HumanFootprintZarrDataset(Dataset):
     def _compute_normalization_stats(
         self, ds, static_var_names: List[str], rng, stat_samples: int
     ):
-        """Compute per-variable normalization statistics."""
-        print("Computing normalization statistics...")
+        """Compute per-variable normalization statistics (or load from cache)."""
+        # Try to load cached stats
+        cached_stats = load_cached_stats()
+        
+        if cached_stats is not None:
+            print("Loading normalization statistics from cache...")
+            self.hm_mean = cached_stats["hm_mean"]
+            self.hm_std = cached_stats["hm_std"]
+            self.static_means = cached_stats["static_means"]
+            self.static_stds = cached_stats["static_stds"]
+            self.comp_means = cached_stats["comp_means"]
+            self.comp_stds = cached_stats["comp_stds"]
+            print(f"  AA: mean={self.hm_mean:.4f}, std={self.hm_std:.4f}")
+            return
+        
+        print("Cache not found, computing normalization statistics...")
+        print("  TIP: Run 'python scripts/preprocess/run_all_preprocessing.py' to cache this computation")
         
         # HM (AA) stats
         hm_samples = []
