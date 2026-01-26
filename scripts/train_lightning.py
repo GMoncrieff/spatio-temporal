@@ -149,8 +149,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--histogram_warmup_epochs",
         type=int,
-        default=20,
-        help="Number of epochs before histogram loss is applied (default: 20)",
+        default=0,
+        help="Number of epochs before histogram loss is applied (default: 0)",
     )
     parser.add_argument(
         "--checkpoint",

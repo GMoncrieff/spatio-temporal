@@ -223,6 +223,8 @@ class HumanFootprintZarrDataset(Dataset):
         stat_samples: int = 256,
         random_seed: int = 42,
         dask_threads: int = 4,
+        cache_chips: bool = True,
+        max_cache_size: int = 500,
     ):
         """
         Initialize the dataset.
@@ -244,6 +246,8 @@ class HumanFootprintZarrDataset(Dataset):
             stat_samples: Number of samples for computing normalization stats
             random_seed: Seed for reproducibility
             dask_threads: Number of Dask threads for parallel chunk loading
+            cache_chips: Whether to cache loaded chips in memory (default: True)
+            max_cache_size: Maximum number of chips to cache (default: 500)
         """
         # Lazy imports
         try:
@@ -464,7 +468,13 @@ class HumanFootprintZarrDataset(Dataset):
         self.target_t_indices = [years.index(y) for y in fixed_target_years]
         self.year_to_idx = {y: i for i, y in enumerate(years)}
         
-        print(f"=== Dataset ready: {len(self)} chips per epoch ===")
+        # Chip caching for performance
+        self.cache_chips = cache_chips
+        self.max_cache_size = max_cache_size
+        self._chip_cache = {} if cache_chips else None
+        
+        cache_info = f" (caching up to {max_cache_size} chips)" if cache_chips else ""
+        print(f"=== Dataset ready: {len(self)} chips per epoch{cache_info} ===")
     
     def _compute_normalization_stats(
         self, ds, static_var_names: List[str], rng, stat_samples: int
@@ -555,8 +565,16 @@ class HumanFootprintZarrDataset(Dataset):
         chip_idx = idx % len(self.valid_chip_indices)
         bgen_idx = self.valid_chip_indices[chip_idx]
         
-        # Load batch from xbatcher
-        batch = self._bgen[bgen_idx].load()
+        # Check cache first
+        if self.cache_chips and bgen_idx in self._chip_cache:
+            batch = self._chip_cache[bgen_idx]
+        else:
+            # Load batch from xbatcher
+            batch = self._bgen[bgen_idx].load()
+            
+            # Cache if enabled and under size limit
+            if self.cache_chips and len(self._chip_cache) < self.max_cache_size:
+                self._chip_cache[bgen_idx] = batch
         
         # Temporal sampling
         if self.use_temporal_sampling:
@@ -668,6 +686,8 @@ def get_dataloader(
     # Additional settings
     random_seed: int = 42,
     stat_samples: int = 256,
+    cache_chips: bool = True,
+    max_cache_size: int = 500,
 ) -> DataLoader:
     """
     Create a DataLoader for the Human Footprint dataset.
@@ -692,6 +712,8 @@ def get_dataloader(
         dask_threads: Dask threads (None = platform default)
         random_seed: Random seed
         stat_samples: Samples for normalization stats
+        cache_chips: Whether to cache loaded chips in memory
+        max_cache_size: Maximum number of chips to cache
         
     Returns:
         DataLoader instance
@@ -732,6 +754,8 @@ def get_dataloader(
         stat_samples=stat_samples,
         random_seed=random_seed,
         dask_threads=dask_threads,
+        cache_chips=cache_chips,
+        max_cache_size=max_cache_size,
     )
     
     # Build DataLoader kwargs
