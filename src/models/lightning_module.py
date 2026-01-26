@@ -125,15 +125,17 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         valid_delta_true = delta_true[mask_h]
         
         if valid_delta_central.numel() == 0:
+            # Return zeros that maintain gradient flow
+            zero_loss = pred_central.sum() * 0.0  # Ensures gradient connection
             return {
-                'mse': torch.tensor(0.0, device=pred_central.device),
-                'mae': torch.tensor(0.0, device=pred_central.device),
-                'ssim': torch.tensor(0.0, device=pred_central.device),
-                'lap': torch.tensor(0.0, device=pred_central.device),
-                'hist': torch.tensor(0.0, device=pred_central.device),
-                'pinball_lower': torch.tensor(0.0, device=pred_central.device),
-                'pinball_upper': torch.tensor(0.0, device=pred_central.device),
-                'total': torch.tensor(0.0, device=pred_central.device)
+                'mse': zero_loss,
+                'mae': zero_loss,
+                'ssim': zero_loss,
+                'lap': zero_loss,
+                'hist': zero_loss,
+                'pinball_lower': zero_loss,
+                'pinball_upper': zero_loss,
+                'total': zero_loss
             }
         
         # MSE on deltas (CENTRAL ONLY - independent from quantiles)

@@ -42,25 +42,19 @@ class HumanFootprintZarrChipDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         zarr_path,
-        chip_size=512,
+        split='train',
+        valid_chips_metadata_path='data/processed/valid_chips_metadata.json',
+        chip_size=128,
         timesteps=3,
-        stride=256,
-        mode="random",
-        chips_per_epoch=100,
+        chips_per_epoch=None,
         fixed_input_years=(1990, 1995, 2000),
         fixed_target_years=(2005, 2010, 2015, 2020),
         use_temporal_sampling=True,
         end_year_options=(2000, 2005, 2010, 2015),
-        stat_samples=2048,
-        stat_sample_size=512,
+        stat_samples=256,
         random_seed=42,
-        min_valid_ratio=0.8,
-        use_validity_filter=True,
-        enforce_input_hm_valid=True,
         include_components=True,
         static_channels=None,
-        split_mask_file=None,
-        split_value=None,
         static_files=None,
     ):
         try:
@@ -73,20 +67,60 @@ class HumanFootprintZarrChipDataset(torch.utils.data.Dataset):
             ) from e
 
         self.zarr_path = zarr_path
+        self.split = split
         self.chip_size = chip_size
         self.timesteps = timesteps
         if len(fixed_input_years) != 3:
             raise ValueError("Multi-horizon setup expects exactly 3 input timesteps (1990, 1995, 2000)")
-        self.stride = stride
-        self.mode = mode
-        self.chips_per_epoch = chips_per_epoch
-        self.use_temporal_sampling = use_temporal_sampling and mode == "random"
+        self.use_temporal_sampling = use_temporal_sampling and split == 'train'
         self.end_year_options = list(end_year_options)
         self.fixed_input_years = tuple(fixed_input_years)
         self.fixed_target_years = tuple(fixed_target_years)
         self.target_t_indices = [years.index(y) for y in fixed_target_years]
         self.year_to_idx = {y: i for i, y in enumerate(years)}
         self.include_components = bool(include_components)
+        
+        # Load pre-computed valid chip positions
+        import json
+        from pathlib import Path
+        metadata_path = Path(valid_chips_metadata_path)
+        if not metadata_path.exists():
+            raise FileNotFoundError(
+                f"Valid chips metadata not found at {metadata_path}. "
+                f"Run 'python scripts/precompute_valid_chips.py' first."
+            )
+        
+        with open(metadata_path, 'r') as f:
+            metadata = json.load(f)
+        
+        # Validate metadata matches current settings
+        if metadata['chip_size'] != chip_size:
+            raise ValueError(
+                f"Chip size mismatch: metadata has {metadata['chip_size']}, "
+                f"but requested {chip_size}. Re-run precompute_valid_chips.py."
+            )
+        
+        # Get valid chip positions for this split
+        all_valid_positions = metadata['splits'][split]
+        self.stride = metadata['stride']
+        self.random_seed = random_seed
+        
+        # Optionally limit number of chips per epoch
+        if chips_per_epoch is not None and chips_per_epoch < len(all_valid_positions):
+            # Sample a subset for this epoch (will be re-sampled each epoch via __len__)
+            self.all_valid_chip_positions = all_valid_positions
+            self.chips_per_epoch = chips_per_epoch
+            # Initial random sample
+            rng = np.random.default_rng(random_seed)
+            indices = rng.choice(len(all_valid_positions), size=chips_per_epoch, replace=False)
+            self.valid_chip_positions = [all_valid_positions[i] for i in indices]
+            print(f"Loaded {len(all_valid_positions):,} valid chips for split '{split}', sampling {chips_per_epoch:,} per epoch")
+        else:
+            # Use all valid chips
+            self.valid_chip_positions = all_valid_positions
+            self.all_valid_chip_positions = all_valid_positions
+            self.chips_per_epoch = None
+            print(f"Loaded {len(self.valid_chip_positions):,} valid chips for split '{split}'")
 
         self._static_files = list(static_files if static_files is not None else [])
         if static_channels is not None:
@@ -158,67 +192,28 @@ class HumanFootprintZarrChipDataset(torch.utils.data.Dataset):
         if self.T != len(years):
             raise ValueError(f"Unexpected time dimension length in Zarr: {self.T}, expected {len(years)}")
 
-        input_dims = {"time": self.T, "y": self.chip_size, "x": self.chip_size}
-        overlap_y = max(0, int(self.chip_size - self.stride))
-        overlap_x = max(0, int(self.chip_size - self.stride))
-        if overlap_y >= self.chip_size or overlap_x >= self.chip_size:
-            raise ValueError("stride must be <= chip_size and produce overlap < chip_size")
-        input_overlap = {"time": 0, "y": overlap_y, "x": overlap_x}
-        self._bgen = xbatcher.BatchGenerator(
-            ds,
-            input_dims=input_dims,
-            input_overlap=input_overlap,
-            preload_batch=False,
-        )
-
-        y_starts = list(range(0, self.H - self.chip_size + 1, self.stride))
-        x_starts = list(range(0, self.W - self.chip_size + 1, self.stride))
-        self._n_x = len(x_starts)
-        self._n_y = len(y_starts)
-
-        self.split_mask_file = split_mask_file
-        self.split_value = split_value
-        self.valid_bgen_indices = None
-        if self.split_mask_file is not None and self.split_value is not None:
-            print(f"Pre-computing valid positions for split_value={self.split_value}...")
-            with rasterio.open(self.split_mask_file) as split_src:
-                split_data = split_src.read(1)
-                if split_data.shape != (self.H, self.W):
-                    raise ValueError(
-                        f"Split mask shape {split_data.shape} does not match Zarr spatial shape {(self.H, self.W)}"
-                    )
-                valid_indices = []
-                for yi, i in enumerate(y_starts):
-                    for xi, j in enumerate(x_starts):
-                        chip = split_data[i : i + self.chip_size, j : j + self.chip_size]
-                        if (chip == self.split_value).any():
-                            valid_indices.append(yi * self._n_x + xi)
-                self.valid_bgen_indices = valid_indices
-                print(f"  Found {len(valid_indices)} valid chip positions for split {self.split_value}")
-                if len(valid_indices) == 0:
-                    raise ValueError(
-                        f"No valid positions found for split_value={self.split_value}. Check split mask."
-                    )
-
+        # Sample from valid chip positions for normalization statistics
         rng = np.random.default_rng(random_seed)
         hm_samples = []
-        total_samps = max(64, int(stat_samples))
-        per_time = max(1, int(np.ceil(total_samps / self.T)))
-        for t_idx in range(self.T):
-            for _ in range(per_time):
-                if self.H < self.chip_size or self.W < self.chip_size:
-                    i = 0
-                    j = 0
-                else:
-                    i = int(rng.integers(0, self.H - self.chip_size + 1))
-                    j = int(rng.integers(0, self.W - self.chip_size + 1))
-                arr = (
-                    ds["AA"]
-                    .isel(time=t_idx, y=slice(i, i + self.chip_size), x=slice(j, j + self.chip_size))
-                    .load()
-                    .values
-                )
-                hm_samples.append(arr)
+        total_samps = min(len(self.valid_chip_positions), max(64, int(stat_samples)))
+        
+        # Sample random valid chips
+        sampled_positions = rng.choice(len(self.valid_chip_positions), size=total_samps, replace=False)
+        
+        for pos_idx in sampled_positions:
+            yi, xi = self.valid_chip_positions[pos_idx]
+            y_start = yi * self.stride
+            x_start = xi * self.stride
+            
+            # Sample one random time step for this position
+            t_idx = int(rng.integers(0, self.T))
+            arr = (
+                ds["AA"]
+                .isel(time=t_idx, y=slice(y_start, y_start + self.chip_size), x=slice(x_start, x_start + self.chip_size))
+                .load()
+                .values
+            )
+            hm_samples.append(arr)
         hm_stack_samp = np.stack(hm_samples, axis=0)
         self.hm_mean = np.nanmean(hm_stack_samp)
         self.hm_std = np.nanstd(hm_stack_samp) + 1e-8
@@ -227,20 +222,18 @@ class HumanFootprintZarrChipDataset(torch.utils.data.Dataset):
         self.static_stds = []
         if len(static_var_names) > 0:
             print("Computing per-variable normalization statistics for static layers...")
-            total_static_samps = max(32, int(stat_samples))
+            total_static_samps = min(len(self.valid_chip_positions), max(32, int(stat_samples)))
+            sampled_positions_static = rng.choice(len(self.valid_chip_positions), size=total_static_samps, replace=False)
+            
             for static_idx, var_name in enumerate(static_var_names):
                 static_samples = []
-                per_static = max(1, int(np.ceil(total_static_samps / max(1, len(static_var_names)))))
-                for _ in range(per_static):
-                    if self.H < self.chip_size or self.W < self.chip_size:
-                        i = 0
-                        j = 0
-                    else:
-                        i = int(rng.integers(0, self.H - self.chip_size + 1))
-                        j = int(rng.integers(0, self.W - self.chip_size + 1))
+                for pos_idx in sampled_positions_static:
+                    yi, xi = self.valid_chip_positions[pos_idx]
+                    y_start = yi * self.stride
+                    x_start = xi * self.stride
                     sarr = (
                         ds[var_name]
-                        .isel(y=slice(i, i + self.chip_size), x=slice(j, j + self.chip_size))
+                        .isel(y=slice(y_start, y_start + self.chip_size), x=slice(x_start, x_start + self.chip_size))
                         .load()
                         .values
                     )
@@ -259,24 +252,25 @@ class HumanFootprintZarrChipDataset(torch.utils.data.Dataset):
         self.comp_stds = {}
         if self.include_components:
             print("Computing per-variable normalization statistics for components...")
+            total_comp_samps = min(len(self.valid_chip_positions), max(32, int(stat_samples)))
+            sampled_positions_comp = rng.choice(len(self.valid_chip_positions), size=total_comp_samps, replace=False)
+            
             for var_name in HM_VARS:
                 var_samples = []
-                per_var_time = max(1, int(np.ceil(stat_samples / self.T)))
-                for t_idx in range(self.T):
-                    for _ in range(per_var_time):
-                        if self.H < self.chip_size or self.W < self.chip_size:
-                            i = 0
-                            j = 0
-                        else:
-                            i = int(rng.integers(0, self.H - self.chip_size + 1))
-                            j = int(rng.integers(0, self.W - self.chip_size + 1))
-                        arr = (
-                            ds[var_name]
-                            .isel(time=t_idx, y=slice(i, i + self.chip_size), x=slice(j, j + self.chip_size))
-                            .load()
-                            .values
-                        )
-                        var_samples.append(arr)
+                for pos_idx in sampled_positions_comp:
+                    yi, xi = self.valid_chip_positions[pos_idx]
+                    y_start = yi * self.stride
+                    x_start = xi * self.stride
+                    
+                    # Sample one random time step
+                    t_idx = int(rng.integers(0, self.T))
+                    arr = (
+                        ds[var_name]
+                        .isel(time=t_idx, y=slice(y_start, y_start + self.chip_size), x=slice(x_start, x_start + self.chip_size))
+                        .load()
+                        .values
+                    )
+                    var_samples.append(arr)
                 var_stack = np.stack(var_samples, axis=0)
                 self.comp_means[var_name] = np.nanmean(var_stack)
                 self.comp_stds[var_name] = np.nanstd(var_stack) + 1e-8
@@ -290,21 +284,22 @@ class HumanFootprintZarrChipDataset(torch.utils.data.Dataset):
         self._static_var_names = static_var_names
 
     def __len__(self):
-        return self.chips_per_epoch
+        return len(self.valid_chip_positions)
 
     def __getitem__(self, idx):
-        # Choose batch generator index
-        if self.valid_bgen_indices is not None:
-            bidx = self.valid_bgen_indices[idx]
-        else:
-            bidx = idx
-
-        # Load batch from xbatcher
-        batch = self._bgen[bidx].load()
+        # Get chip position from pre-computed valid positions
+        yi, xi = self.valid_chip_positions[idx]
+        y_start = yi * self.stride
+        x_start = xi * self.stride
+        
+        # Extract chip directly from dataset
+        chip = self.ds.isel(
+            y=slice(y_start, y_start + self.chip_size),
+            x=slice(x_start, x_start + self.chip_size)
+        ).load()
 
         # Multi-horizon: always use fixed input years (1990, 1995, 2000)
         input_years = self.fixed_input_years
-        input_times = [np.datetime64(f"{y}-01-01") for y in input_years]
 
         # Temporal sampling for training: random end year determines targets
         if self.use_temporal_sampling:
@@ -320,14 +315,14 @@ class HumanFootprintZarrChipDataset(torch.utils.data.Dataset):
         input_dynamic = np.empty((self.timesteps, self.C_dyn, self.chip_size, self.chip_size), dtype=np.float32)
         for t_idx, year in enumerate(input_years):
             # HM target
-            arr_hm = batch["AA"].isel(time=t_idx).values
+            arr_hm = chip["AA"].isel(time=t_idx).values
             arr_hm = (arr_hm - self.hm_mean) / self.hm_std
             input_dynamic[t_idx, 0, :, :] = arr_hm
 
             # Components if enabled
             if self.include_components:
                 for c_idx, var_name in enumerate(HM_VARS):
-                    carr = batch[var_name].isel(time=t_idx).values
+                    carr = chip[var_name].isel(time=t_idx).values
                     carr = np.nan_to_num(carr, nan=0.0)
                     carr = (carr - self.comp_means[var_name]) / self.comp_stds[var_name]
                     input_dynamic[t_idx, 1 + c_idx, :, :] = carr
@@ -335,55 +330,28 @@ class HumanFootprintZarrChipDataset(torch.utils.data.Dataset):
         # Load static data (same for all timesteps)
         input_static = np.empty((self.C_static, self.chip_size, self.chip_size), dtype=np.float32)
         for static_idx, var_name in enumerate(self._static_var_names):
-            sarr = batch[var_name].values
+            sarr = chip[var_name].values
             sarr = np.nan_to_num(sarr, nan=0.0)
             sarr = (sarr - self.static_means[static_idx]) / self.static_stds[static_idx]
             input_static[static_idx, :, :] = sarr
 
-        # Coordinates
-        xs, ys = np.meshgrid(
-            np.arange(self.chip_size), np.arange(self.chip_size), indexing="ij"
-        )
-        # Get geographic coordinates from the dataset's coordinate system
-        if "x" in batch.coords and "y" in batch.coords:
-            # Use actual coordinates from the batch
-            x_coords = batch["x"].values
-            y_coords = batch["y"].values
-            # Get the actual spatial coordinates for this chip
-            # This is a simplified approach - in practice you'd need to map batch indices to geographic coordinates
-            lonlat = np.stack([xs.flatten(), ys.flatten()], axis=-1).reshape(self.chip_size, self.chip_size, 2).astype(np.float32)
-        else:
-            # Fallback: create dummy coordinates
-            lonlat = np.stack([xs, ys], axis=-1).astype(np.float32)
+        # Coordinates from actual chip position
+        x_coords = chip["x"].values
+        y_coords = chip["y"].values
+        xx, yy = np.meshgrid(x_coords, y_coords, indexing="xy")
+        lonlat = np.stack([xx, yy], axis=-1).astype(np.float32)
 
         # Multi-horizon targets
         targets = {}
         horizon_names = ['target_5yr', 'target_10yr', 'target_15yr', 'target_20yr']
-        all_valid = False
 
         for horizon_name, t_idx, target_year in zip(horizon_names, target_t_idxs, target_years):
             if t_idx is None or target_year > 2020:
                 target_h = np.full((self.chip_size, self.chip_size), np.nan, dtype=np.float32)
             else:
-                target_h = batch["AA"].isel(time=t_idx).values
+                target_h = chip["AA"].isel(time=t_idx).values
                 target_h = (target_h - self.hm_mean) / self.hm_std
             targets[horizon_name] = torch.from_numpy(target_h).float()
-            if not np.isnan(target_h).all():
-                all_valid = True
-
-        if all_valid:
-            sample = {
-                "input_dynamic": torch.from_numpy(input_dynamic).float(),
-                "input_static": torch.from_numpy(input_static).float(),
-                "lonlat": torch.from_numpy(lonlat).float(),
-                "timestep": self.target_t_indices[-1],
-                "input_years": input_years,
-                "target_years": target_years,
-                "end_year": end_year,
-            }
-            sample.update(targets)
-            sample["target"] = sample.get("target_5yr")
-            return sample
 
         sample = {
             "input_dynamic": torch.from_numpy(input_dynamic).float(),
@@ -395,17 +363,16 @@ class HumanFootprintZarrChipDataset(torch.utils.data.Dataset):
             "end_year": end_year,
         }
         sample.update(targets)
-        sample["target"] = sample.get("target_5yr")
+        sample["target"] = sample["target_5yr"]
         return sample
 
 
 def get_dataloader(
+    split='train',
     batch_size=1,
     chip_size=128,
     timesteps=3,
-    stride=64,
-    mode="random",
-    chips_per_epoch=100,
+    chips_per_epoch=None,
     fixed_input_years=(1990, 1995, 2000),
     fixed_target_years=(2005, 2010, 2015, 2020),
     use_temporal_sampling=True,
@@ -413,65 +380,69 @@ def get_dataloader(
     num_workers=0,
     pin_memory=False,
     persistent_workers=False,
-    min_valid_ratio=0.8,
     stat_samples=256,
-    enforce_input_hm_valid=True,
     include_components=True,
     static_channels=None,
-    split_mask_file=None,
-    split_value=None,
-    backend="zarr",
     zarr_path=ZARR_PATH,
+    valid_chips_metadata_path='data/processed/valid_chips_metadata.json',
 ):
     """
-    Create a DataLoader for Human Footprint dataset.
+    Create a DataLoader for Human Footprint dataset using pre-computed valid chips.
     
     Args:
-        split_mask_file: Path to split mask GeoTIFF (e.g., 'data/raw/hm_global/split_mask_1000.tif')
-        split_value: Which split to use (1=train, 2=val, 3=test, 4=calib, None=all data)
+        split: Which split to use ('train', 'val', 'test', 'calib')
+        batch_size: Batch size
+        chip_size: Size of spatial chips
+        chips_per_epoch: Number of chips to sample per epoch (None = use all valid chips)
+        valid_chips_metadata_path: Path to pre-computed valid chips metadata
+        zarr_path: Path to Zarr/Icechunk repository
+        
+    Note:
+        - Shuffle is always True for train split, False for others
+        - All chips are guaranteed to have valid data (no empty chips)
+        - Splits are geographically deterministic
+        - If chips_per_epoch is specified, a random subset is sampled each epoch
     """
-    # Only Zarr backend supported - geotiff batch loading removed
-    if backend == "zarr":
-        ds = HumanFootprintZarrChipDataset(
-            zarr_path=zarr_path,
-            chip_size=chip_size,
-            timesteps=timesteps,
-            stride=stride,
-            mode=mode,
-            chips_per_epoch=chips_per_epoch,
-            fixed_input_years=fixed_input_years,
-            fixed_target_years=fixed_target_years,
-            use_temporal_sampling=use_temporal_sampling,
-            end_year_options=end_year_options,
-            min_valid_ratio=min_valid_ratio,
-            stat_samples=stat_samples,
-            enforce_input_hm_valid=enforce_input_hm_valid,
-            include_components=include_components,
-            static_channels=static_channels,
-            split_mask_file=split_mask_file,
-            split_value=split_value,
-            static_files=static_files,
-        )
-    else:
-        raise ValueError(f"Unknown backend: {backend} (expected 'zarr')")
+    ds = HumanFootprintZarrChipDataset(
+        zarr_path=zarr_path,
+        split=split,
+        valid_chips_metadata_path=valid_chips_metadata_path,
+        chip_size=chip_size,
+        timesteps=timesteps,
+        chips_per_epoch=chips_per_epoch,
+        fixed_input_years=fixed_input_years,
+        fixed_target_years=fixed_target_years,
+        use_temporal_sampling=use_temporal_sampling,
+        end_year_options=end_year_options,
+        stat_samples=stat_samples,
+        include_components=include_components,
+        static_channels=static_channels,
+        static_files=static_files,
+    )
+    
+    # Always shuffle for train, never for val/test/calib
+    shuffle = (split == 'train')
+    
     return DataLoader(
         ds,
         batch_size=batch_size,
+        shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
     )
 
 if __name__ == "__main__":
-    # Only Zarr backend supported now
+    # Test with pre-computed valid chips
     loader = get_dataloader(
-        batch_size=2, chip_size=128, timesteps=3, chips_per_epoch=2, backend="zarr"
+        split='train',
+        batch_size=2,
+        chip_size=128,
+        timesteps=3
     )
     batch = next(iter(loader))
-    print(f"input_dynamic shape: {batch['input_dynamic'].shape}")  # [B, 3, 128, 128]
-    print(f"input_static shape: {batch['input_static'].shape}")    # [B, 1, 128, 128]
-    print(f"target shape: {batch['target'].shape}")               # [B, 128, 128]
-    print(f"target timestep index: {batch['timestep']}")
-    ds = loader.dataset
-    print("Fixed input years:", getattr(ds, 'fixed_input_years', None))
-    print("Fixed target year:", getattr(ds, 'fixed_target_year', None))
+    print(f"input_dynamic shape: {batch['input_dynamic'].shape}")
+    print(f"input_static shape: {batch['input_static'].shape}")
+    print(f"target shape: {batch['target'].shape}")
+    print(f"Dataset size: {len(loader.dataset)} chips")
+    print(f"Shuffle enabled: {loader.shuffle}")

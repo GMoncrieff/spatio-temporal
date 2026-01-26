@@ -31,12 +31,9 @@ if __name__ == "__main__":
     parser.add_argument("--fast_dev_run", action="store_true", help="Run 1 train/val batch for a quick smoke test")
     parser.add_argument("--max_epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--disable_wandb", action="store_true", help="Disable Weights & Biases logging")
-    parser.add_argument("--train_chips", type=int, default=200, help="Chips per epoch for training")
-    parser.add_argument("--val_chips", type=int, default=40, help="Chips per epoch for validation")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for train/val")
-    parser.add_argument("--train_mode", type=str, default="random", choices=["random", "grid"], help="Sampling mode for training")
-    parser.add_argument("--val_mode", type=str, default="grid", choices=["random", "grid"], help="Sampling mode for validation")
-    parser.add_argument("--stride", type=int, default=128, help="Stride for grid sampling (pixels)")
+    parser.add_argument("--train_chips", type=int, default=None, help="Number of chips to sample per training epoch (default: use all valid chips)")
+    parser.add_argument("--val_chips", type=int, default=None, help="Number of chips to sample per validation epoch (default: use all valid chips)")
     parser.add_argument(
         "--include_components",
         type=lambda x: (str(x).lower() == 'true'),
@@ -235,21 +232,13 @@ if __name__ == "__main__":
         torch.cuda.manual_seed_all(args.seed)
     pl.seed_everything(args.seed, workers=True)
     
-    # Split mask file
-    split_mask_file = "data/raw/hm_global/split_mask_1000.tif"
-    if not os.path.exists(split_mask_file):
-        print(f"WARNING: Split mask not found: {split_mask_file}")
-        print("Training without train/val/test separation. Run scripts/create_validity_mask.py to create splits.")
-        split_mask_file = None
-    
-    # Data
+    # Data - using pre-computed valid chips with geographic splits
     train_loader = get_dataloader(
+        split='train',
         batch_size=args.batch_size,
         chip_size=128,
         timesteps=3,
         chips_per_epoch=args.train_chips,
-        mode=args.train_mode,
-        stride=args.stride,
         include_components=args.include_components,
         static_channels=args.static_channels,
         use_temporal_sampling=True,  # Enable temporal sampling for training
@@ -257,28 +246,21 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         pin_memory=True if args.num_workers > 0 else False,
         persistent_workers=True if args.num_workers > 0 else False,
-        split_mask_file=split_mask_file,
-        split_value=1,  # Train split
-        backend=args.backend,
         zarr_path=args.zarr_path,
     )
     # Validation uses fixed years (1990, 1995, 2000 -> 2005-2020) for consistent metrics
     val_loader = get_dataloader(
+        split='val',
         batch_size=args.batch_size,
         chip_size=128,
         timesteps=3,
         chips_per_epoch=args.val_chips,
-        mode=args.val_mode,
-        stride=args.stride,
         include_components=args.include_components,
         static_channels=args.static_channels,
-        use_temporal_sampling=False,  # Fixed years for validation (Option A)
+        use_temporal_sampling=False,  # Fixed years for validation
         num_workers=args.num_workers,
         pin_memory=True if args.num_workers > 0 else False,
         persistent_workers=True if args.num_workers > 0 else False,
-        split_mask_file=split_mask_file,
-        split_value=2,  # Validation split
-        backend=args.backend,
         zarr_path=args.zarr_path,
     )
 
