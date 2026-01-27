@@ -21,6 +21,10 @@ import hashlib
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
+import warnings
+
+# Suppress Pydantic warnings from icechunk
+warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
 
 
 def hash_position_to_split(y_idx, x_idx, seed=42):
