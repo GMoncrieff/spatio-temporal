@@ -34,6 +34,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for train/val")
     parser.add_argument("--train_chips", type=int, default=None, help="Number of chips to sample per training epoch (default: use all valid chips)")
     parser.add_argument("--val_chips", type=int, default=None, help="Number of chips to sample per validation epoch (default: use all valid chips)")
+    parser.add_argument("--dask_threads", type=int, default=4, help="Dask threads per worker for parallel I/O (default: 4)")
+    parser.add_argument("--prefetch_factor", type=int, default=None, help="Batches to prefetch per worker (default: None, recommended: 3 for S3)")
     parser.add_argument(
         "--include_components",
         type=lambda x: (str(x).lower() == 'true'),
@@ -233,6 +235,7 @@ if __name__ == "__main__":
     pl.seed_everything(args.seed, workers=True)
     
     # Data - using pre-computed valid chips with geographic splits
+    # Performance: xbatcher + Dask cache + threading for optimal I/O
     train_loader = get_dataloader(
         split='train',
         batch_size=args.batch_size,
@@ -246,6 +249,8 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         pin_memory=True if args.num_workers > 0 else False,
         persistent_workers=True if args.num_workers > 0 else False,
+        prefetch_factor=args.prefetch_factor,
+        dask_threads=args.dask_threads,
         zarr_path=args.zarr_path,
     )
     # Validation uses fixed years (1990, 1995, 2000 -> 2005-2020) for consistent metrics
@@ -261,6 +266,8 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         pin_memory=True if args.num_workers > 0 else False,
         persistent_workers=True if args.num_workers > 0 else False,
+        prefetch_factor=args.prefetch_factor,
+        dask_threads=args.dask_threads,
         zarr_path=args.zarr_path,
     )
 
