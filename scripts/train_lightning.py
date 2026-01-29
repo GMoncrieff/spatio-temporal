@@ -36,7 +36,7 @@ if __name__ == "__main__":
     parser.add_argument("--val_chips", type=int, default=None, help="Number of chips to sample per validation epoch (default: use all valid chips)")
     parser.add_argument("--dask_threads", type=int, default=4, help="Dask threads per worker for parallel I/O (default: 4)")
     parser.add_argument("--prefetch_factor", type=int, default=None, help="Batches to prefetch per worker (default: None, recommended: 3 for S3)")
-    parser.add_argument("--persistent_workers", action="store_true", help="Keep workers alive between epochs (faster but uses more memory, default: False)")
+    parser.add_argument("--no_persistent_workers", action="store_true", help="Recreate workers each epoch (slower but uses less memory, default: keep workers alive)")
     parser.add_argument(
         "--include_components",
         type=lambda x: (str(x).lower() == 'true'),
@@ -249,7 +249,7 @@ if __name__ == "__main__":
         end_year_options=(2000, 2005, 2010, 2015),
         num_workers=args.num_workers,
         pin_memory=True if args.num_workers > 0 else False,
-        persistent_workers=args.persistent_workers and args.num_workers > 0,
+        persistent_workers=(not args.no_persistent_workers) and args.num_workers > 0,
         prefetch_factor=args.prefetch_factor,
         dask_threads=args.dask_threads,
         zarr_path=args.zarr_path,
@@ -266,7 +266,7 @@ if __name__ == "__main__":
         use_temporal_sampling=False,  # Fixed years for validation
         num_workers=args.num_workers,
         pin_memory=True if args.num_workers > 0 else False,
-        persistent_workers=args.persistent_workers and args.num_workers > 0,
+        persistent_workers=(not args.no_persistent_workers) and args.num_workers > 0,
         prefetch_factor=args.prefetch_factor,
         dask_threads=args.dask_threads,
         zarr_path=args.zarr_path,

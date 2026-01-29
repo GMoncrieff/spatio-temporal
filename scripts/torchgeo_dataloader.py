@@ -605,6 +605,22 @@ class HumanFootprintZarrChipDataset(torch.utils.data.Dataset):
         # Ensure initialized (handles worker process lazy init)
         self._ensure_initialized()
         
+        # Periodic cache clearing to prevent memory accumulation in persistent workers
+        # Clear every 500 batches to balance performance vs memory
+        if not hasattr(self, '_batch_counter'):
+            self._batch_counter = 0
+        self._batch_counter += 1
+        
+        if self._batch_counter % 500 == 0:
+            import gc
+            try:
+                from dask.cache import Cache
+                for cache in Cache._caches:
+                    cache.clear()
+            except:
+                pass
+            gc.collect()
+        
         # Map our index to xbatcher batch index
         batch_idx = self._batch_index_map[idx]
         
