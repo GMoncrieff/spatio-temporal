@@ -243,13 +243,10 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             target_valid = torch.isfinite(target_h)
             mask_h = target_valid & dynamic_valid.squeeze(2) & static_valid.squeeze(2) & torch.isfinite(last_input)
             
-            # Set predictions to NaN where inputs were invalid
-            pred_lower = pred_lower.clone()
-            pred_central = pred_central.clone()
-            pred_upper = pred_upper.clone()
-            pred_lower[~mask_h] = float('nan')
-            pred_central[~mask_h] = float('nan')
-            pred_upper[~mask_h] = float('nan')
+            # Set predictions to NaN where inputs were invalid (in-place to avoid cloning)
+            pred_lower = pred_lower.masked_fill(~mask_h, float('nan'))
+            pred_central = pred_central.masked_fill(~mask_h, float('nan'))
+            pred_upper = pred_upper.masked_fill(~mask_h, float('nan'))
             
             # Compute all losses for this horizon
             losses_h = self._compute_horizon_losses(pred_lower, pred_central, pred_upper, target_h, last_input, mask_h, h_name)
@@ -300,7 +297,7 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         saved_grads = {}
         for name, param in self.named_parameters():
             if param.grad is not None and param not in quantile_params:
-                saved_grads[name] = param.grad.clone()
+                saved_grads[name] = param.grad.clone().detach()  # Detach to break computation graph
         
         # Backprop pinball loss (no need to retain graph on second backward)
         self.manual_backward(pinball_loss)
@@ -309,6 +306,10 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         for name, param in self.named_parameters():
             if name in saved_grads:
                 param.grad = saved_grads[name]
+        
+        # CRITICAL: Delete saved_grads and clear quantile_params to prevent memory leak
+        del saved_grads
+        del quantile_params
         
         # Optimizer step
         opt.step()
@@ -344,7 +345,8 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             print(f"  Upper heads grad norm: {upper_head_grad_norm:.6f} (from pinball loss only)")
             print(f"  Central loss: {central_loss.item():.6f}, Pinball loss: {pinball_loss.item():.6f}\n")
         
-        return avg_total
+        # CRITICAL: Detach loss tensors to prevent memory accumulation
+        return avg_total.detach()
 
     def validation_step(self, batch, batch_idx):
         input_dynamic = batch['input_dynamic']
@@ -465,6 +467,30 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             print(f"{'='*70}\n")
         
         return avg_total
+    
+    def on_train_epoch_end(self):
+        """Clean up memory at the end of each training epoch."""
+        import gc
+        import torch
+        
+        # Force garbage collection
+        gc.collect()
+        
+        # Clear CUDA cache if using GPU
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    
+    def on_validation_epoch_end(self):
+        """Clean up memory at the end of each validation epoch."""
+        import gc
+        import torch
+        
+        # Force garbage collection
+        gc.collect()
+        
+        # Clear CUDA cache if using GPU
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.lr)

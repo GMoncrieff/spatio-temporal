@@ -35,12 +35,15 @@ import dask
 
 # Try to enable Dask cache (requires cachey package)
 # This significantly speeds up repeated chunk access for overlapping chips
+# IMPORTANT: Use a limited cache size to prevent unbounded memory growth
 _DASK_CACHE = None
 try:
     from dask.cache import Cache
-    _DASK_CACHE = Cache(10e9)  # 10GB cache
+    # Reduced from 10GB to 2GB to prevent memory leaks
+    # Cache will evict old entries when full (LRU policy)
+    _DASK_CACHE = Cache(2e9)  # 2GB cache (was 10GB)
     _DASK_CACHE.register()
-    print("Dask cache enabled (10GB)")
+    print("Dask cache enabled (2GB)")
 except ImportError:
     print("Warning: cachey not installed, Dask cache disabled. Install with: pip install cachey")
 
@@ -90,10 +93,11 @@ def _worker_init_fn(worker_id: int):
     # Suppress Pydantic warnings in worker processes
     warnings.filterwarnings("ignore", category=UserWarning)
     
-    # Each worker gets its own smaller cache (2GB) if cachey is available
+    # Each worker gets its own smaller cache (500MB) if cachey is available
+    # Reduced to prevent memory leaks with multiple workers
     try:
         from dask.cache import Cache
-        worker_cache = Cache(2e9)
+        worker_cache = Cache(5e8)  # 500MB per worker (was 2GB)
         worker_cache.register()
     except ImportError:
         pass  # Cache not available, continue without
