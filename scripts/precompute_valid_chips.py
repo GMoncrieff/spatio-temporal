@@ -15,6 +15,7 @@ Usage:
 """
 
 import os
+import sys
 import json
 import argparse
 import hashlib
@@ -23,8 +24,9 @@ from pathlib import Path
 from tqdm import tqdm
 import warnings
 
-# Suppress Pydantic warnings from icechunk
-warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
+# Suppress all Pydantic warnings (must be before importing icechunk/xarray)
+warnings.filterwarnings("ignore", category=UserWarning)
+os.environ['PYTHONWARNINGS'] = 'ignore::UserWarning'
 
 
 def hash_position_to_split(y_idx, x_idx, seed=42):

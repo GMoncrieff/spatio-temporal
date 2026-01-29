@@ -85,6 +85,11 @@ def _worker_init_fn(worker_id: int):
     Called once per worker when using num_workers > 0.
     Sets up Dask cache and threading for parallel I/O.
     """
+    import warnings
+    
+    # Suppress Pydantic warnings in worker processes
+    warnings.filterwarnings("ignore", category=UserWarning)
+    
     # Each worker gets its own smaller cache (2GB) if cachey is available
     try:
         from dask.cache import Cache
