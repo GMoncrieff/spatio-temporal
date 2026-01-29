@@ -362,8 +362,86 @@ class HumanFootprintZarrChipDataset(torch.utils.data.Dataset):
         self._bgen = bgen
         self._initialized = True
     
+    def _get_stats_cache_path(self):
+        """Generate cache file path based on dataset configuration."""
+        import hashlib
+        
+        # Create unique cache key from dataset parameters
+        cache_key_parts = [
+            str(self._zarr_path),
+            str(self._split),
+            str(self._chip_size),
+            str(self._stride),
+            str(self._include_components),
+            str(len(self._static_var_names)),
+            str(self._random_seed),
+        ]
+        cache_key = "_".join(cache_key_parts)
+        cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:12]
+        
+        cache_dir = Path("data/processed/stats_cache")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir / f"norm_stats_{self._split}_{cache_hash}.json"
+    
+    def _load_cached_stats(self):
+        """Load normalization statistics from cache if available."""
+        cache_path = self._get_stats_cache_path()
+        
+        if not cache_path.exists():
+            return False
+        
+        try:
+            with open(cache_path, 'r') as f:
+                cached = json.load(f)
+            
+            self._hm_mean = cached['hm_mean']
+            self._hm_std = cached['hm_std']
+            self._static_means = cached['static_means']
+            self._static_stds = cached['static_stds']
+            self._comp_means = cached['comp_means']
+            self._comp_stds = cached['comp_stds']
+            
+            print(f"✓ Loaded cached normalization statistics from {cache_path.name}")
+            return True
+        except Exception as e:
+            print(f"Warning: Failed to load cached stats: {e}")
+            return False
+    
+    def _save_stats_to_cache(self):
+        """Save normalization statistics to cache."""
+        cache_path = self._get_stats_cache_path()
+        
+        try:
+            cached = {
+                'hm_mean': self._hm_mean,
+                'hm_std': self._hm_std,
+                'static_means': self._static_means,
+                'static_stds': self._static_stds,
+                'comp_means': self._comp_means,
+                'comp_stds': self._comp_stds,
+                'zarr_path': str(self._zarr_path),
+                'split': self._split,
+                'chip_size': self._chip_size,
+                'stride': self._stride,
+                'include_components': self._include_components,
+                'num_static_vars': len(self._static_var_names),
+                'random_seed': self._random_seed,
+            }
+            
+            with open(cache_path, 'w') as f:
+                json.dump(cached, f, indent=2)
+            
+            print(f"✓ Saved normalization statistics to cache: {cache_path.name}")
+        except Exception as e:
+            print(f"Warning: Failed to save stats to cache: {e}")
+    
     def _compute_normalization_stats(self, ds, bgen, stat_samples: int):
         """Compute per-variable normalization statistics from sampled batches."""
+        # Try to load from cache first
+        if self._load_cached_stats():
+            return
+        
+        print("Computing normalization statistics from data...")
         rng = np.random.default_rng(self._random_seed)
         
         # Sample valid batch indices
@@ -430,6 +508,9 @@ class HumanFootprintZarrChipDataset(torch.utils.data.Dataset):
             print("Component normalization stats:")
             for var_name in HM_VARS:
                 print(f"  {var_name}: mean={self._comp_means[var_name]:.6e}, std={self._comp_stds[var_name]:.6e}")
+        
+        # Save computed stats to cache for future runs
+        self._save_stats_to_cache()
     
     def _ensure_initialized(self):
         """Ensure dataset is initialized (lazy init for worker processes)."""

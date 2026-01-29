@@ -309,78 +309,122 @@ if __name__ == "__main__":
     
     # Compute histogram bin weights from training data (per horizon)
     if args.histogram_weight > 0 and hasattr(model, 'histogram_loss_fn'):
-        print("\nComputing histogram bin weights for each horizon from 10 training batches...")
         from src.models.histogram_loss import compute_histogram
+        import hashlib
+        from pathlib import Path
         
-        horizon_names = ['5yr', '10yr', '15yr', '20yr']
-        horizon_keys = ['target_5yr', 'target_10yr', 'target_15yr', 'target_20yr']
-        all_horizon_counts = {h: [] for h in horizon_names}
+        # Generate cache path based on dataset configuration
+        cache_key_parts = [
+            str(args.zarr_path),
+            str(args.train_chips) if args.train_chips else "all",
+            str(args.batch_size),
+            str(model.histogram_bins.tolist()),
+        ]
+        cache_key = "_".join(cache_key_parts)
+        cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:12]
+        cache_dir = Path("data/processed/stats_cache")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        hist_cache_path = cache_dir / f"histogram_weights_{cache_hash}.pt"
         
-        device = next(model.parameters()).device
-        num_batches_to_sample = min(10, len(train_loader))
+        # Try to load from cache
+        if hist_cache_path.exists():
+            try:
+                cached_weights = torch.load(hist_cache_path)
+                device = next(model.parameters()).device
+                all_bin_weights = cached_weights.to(device)
+                model.histogram_loss_fn.set_bin_weights(all_bin_weights)
+                model.histogram_bins_initialized = True
+                print(f"\n✓ Loaded cached histogram bin weights from {hist_cache_path.name}")
+                print(f"  Shape: {all_bin_weights.shape} (4 horizons × {all_bin_weights.shape[1]} bins)\n")
+            except Exception as e:
+                print(f"Warning: Failed to load cached histogram weights: {e}")
+                print("Will recompute from data...\n")
+                hist_cache_path = None  # Force recomputation
+        else:
+            hist_cache_path = None  # Will compute and save
         
-        for batch_idx, batch in enumerate(train_loader):
-            if batch_idx >= num_batches_to_sample:
-                break
+        # Compute if not cached
+        if not model.histogram_bins_initialized:
+            print("\nComputing histogram bin weights for each horizon from 10 training batches...")
             
-            input_dynamic = batch['input_dynamic'].to(device)
-            last_input = input_dynamic[:, -1, 0]  # [B, H, W]
+            horizon_names = ['5yr', '10yr', '15yr', '20yr']
+            horizon_keys = ['target_5yr', 'target_10yr', 'target_15yr', 'target_20yr']
+            all_horizon_counts = {h: [] for h in horizon_names}
             
-            # Compute histograms for each horizon
-            for h_name, h_key in zip(horizon_names, horizon_keys):
-                target_h = batch[h_key].to(device)
+            device = next(model.parameters()).device
+            num_batches_to_sample = min(10, len(train_loader))
+            
+            for batch_idx, batch in enumerate(train_loader):
+                if batch_idx >= num_batches_to_sample:
+                    break
                 
-                # Compute mask for valid pixels
-                target_valid = torch.isfinite(target_h)
-                last_input_valid = torch.isfinite(last_input)
-                mask = target_valid & last_input_valid
+                input_dynamic = batch['input_dynamic'].to(device)
+                last_input = input_dynamic[:, -1, 0]  # [B, H, W]
                 
-                # Compute deltas
-                delta_true = target_h - last_input
+                # Compute histograms for each horizon
+                for h_name, h_key in zip(horizon_names, horizon_keys):
+                    target_h = batch[h_key].to(device)
+                    
+                    # Compute mask for valid pixels
+                    target_valid = torch.isfinite(target_h)
+                    last_input_valid = torch.isfinite(last_input)
+                    mask = target_valid & last_input_valid
+                    
+                    # Compute deltas
+                    delta_true = target_h - last_input
+                    
+                    # Compute histogram
+                    counts, _ = compute_histogram(delta_true, model.histogram_bins, mask=mask)
+                    all_horizon_counts[h_name].append(counts.cpu())
+            
+            # Compute weights for each horizon
+            num_bins = len(model.histogram_bins) - 1
+            all_bin_weights = []
+            
+            print("\n" + "="*70)
+            print("HISTOGRAM BIN WEIGHTS PER HORIZON (Rarity-Weighted)")
+            print("="*70)
+            print(f"Bin edges: {model.histogram_bins.tolist()}\n")
+            
+            for h_idx, h_name in enumerate(horizon_names):
+                # Aggregate counts for this horizon
+                horizon_counts = torch.cat(all_horizon_counts[h_name], dim=0)
+                total_counts = horizon_counts.sum(dim=0)
                 
-                # Compute histogram
-                counts, _ = compute_histogram(delta_true, model.histogram_bins, mask=mask)
-                all_horizon_counts[h_name].append(counts.cpu())
-        
-        # Compute weights for each horizon
-        num_bins = len(model.histogram_bins) - 1
-        all_bin_weights = []
-        
-        print("\n" + "="*70)
-        print("HISTOGRAM BIN WEIGHTS PER HORIZON (Rarity-Weighted)")
-        print("="*70)
-        print(f"Bin edges: {model.histogram_bins.tolist()}\n")
-        
-        for h_idx, h_name in enumerate(horizon_names):
-            # Aggregate counts for this horizon
-            horizon_counts = torch.cat(all_horizon_counts[h_name], dim=0)
-            total_counts = horizon_counts.sum(dim=0)
+                # Compute inverse frequency weights
+                smoothing = 1e-3
+                bin_weights = 1.0 / (total_counts + smoothing)
+                bin_weights = bin_weights * num_bins / bin_weights.sum()
+                all_bin_weights.append(bin_weights)
+                
+                # Print bin information for this horizon
+                print(f"--- {h_name} Horizon ---")
+                print(f"Bin | Count  | Proportion | Weight")
+                print("-" * 50)
+                total_pixels = total_counts.sum().item()
+                for i in range(num_bins):
+                    count = total_counts[i].item()
+                    proportion = count / total_pixels
+                    weight = bin_weights[i].item()
+                    left_edge = model.histogram_bins[i].item()
+                    right_edge = model.histogram_bins[i+1].item()
+                    print(f" {i}  | {count:6.0f} | {proportion:9.4f}  | {weight:6.3f}  [{left_edge:+.3f}, {right_edge:+.3f})")
+                print()
             
-            # Compute inverse frequency weights
-            smoothing = 1e-3
-            bin_weights = 1.0 / (total_counts + smoothing)
-            bin_weights = bin_weights * num_bins / bin_weights.sum()
-            all_bin_weights.append(bin_weights)
+            # Stack all weights and set in model: [num_horizons, num_bins]
+            all_bin_weights = torch.stack(all_bin_weights, dim=0).to(device)
+            model.histogram_loss_fn.set_bin_weights(all_bin_weights)
+            model.histogram_bins_initialized = True
             
-            # Print bin information for this horizon
-            print(f"--- {h_name} Horizon ---")
-            print(f"Bin | Count  | Proportion | Weight")
-            print("-" * 50)
-            total_pixels = total_counts.sum().item()
-            for i in range(num_bins):
-                count = total_counts[i].item()
-                proportion = count / total_pixels
-                weight = bin_weights[i].item()
-                left_edge = model.histogram_bins[i].item()
-                right_edge = model.histogram_bins[i+1].item()
-                print(f" {i}  | {count:6.0f} | {proportion:9.4f}  | {weight:6.3f}  [{left_edge:+.3f}, {right_edge:+.3f})")
-            print()
-        
-        # Stack all weights and set in model: [num_horizons, num_bins]
-        all_bin_weights = torch.stack(all_bin_weights, dim=0).to(device)
-        model.histogram_loss_fn.set_bin_weights(all_bin_weights)
-        model.histogram_bins_initialized = True
-        print("="*70 + "\n")
+            # Save to cache for future runs
+            if hist_cache_path:
+                try:
+                    torch.save(all_bin_weights.cpu(), hist_cache_path)
+                    print(f"✓ Saved histogram bin weights to cache: {hist_cache_path.name}")
+                except Exception as e:
+                    print(f"Warning: Failed to save histogram weights to cache: {e}")
+            
+            print("="*70 + "\n")
     
     # Print loss weights at start of training
     print("="*60)
