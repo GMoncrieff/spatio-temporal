@@ -583,6 +583,22 @@ class HumanFootprintZarrChipDataset(torch.utils.data.Dataset):
     
     def __len__(self):
         return len(self._batch_index_map)
+    
+    def __del__(self):
+        """Clean up resources when dataset is destroyed."""
+        # Close xarray dataset to release file handles and caches
+        if hasattr(self, '_ds') and self._ds is not None:
+            try:
+                self._ds.close()
+            except:
+                pass
+        
+        # Delete batch generator to free Dask task graphs
+        if hasattr(self, '_bgen') and self._bgen is not None:
+            try:
+                del self._bgen
+            except:
+                pass
 
     def __getitem__(self, idx):
         """Get a single chip by index using xbatcher."""

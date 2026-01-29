@@ -473,6 +473,16 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         import gc
         import torch
         
+        # Clear Dask caches to prevent epoch-to-epoch accumulation
+        try:
+            import dask
+            from dask.cache import Cache
+            # Clear all registered caches
+            for cache in Cache._caches:
+                cache.clear()
+        except:
+            pass
+        
         # Force garbage collection
         gc.collect()
         
@@ -484,6 +494,16 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         """Clean up memory at the end of each validation epoch."""
         import gc
         import torch
+        
+        # Clear Dask caches to prevent epoch-to-epoch accumulation
+        try:
+            import dask
+            from dask.cache import Cache
+            # Clear all registered caches
+            for cache in Cache._caches:
+                cache.clear()
+        except:
+            pass
         
         # Force garbage collection
         gc.collect()
