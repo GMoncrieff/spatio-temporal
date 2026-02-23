@@ -124,6 +124,10 @@ dmypy.json
 data/raw/
 data/processed/
 data/external/
+data/predictions/
+data/prompts/
+scripts/notebooks/
+plots/
 
 # Logs
 logs/

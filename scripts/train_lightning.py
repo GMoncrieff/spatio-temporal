@@ -83,6 +83,13 @@ if __name__ == "__main__":
         help="Number of tiles to process in parallel on GPU during prediction (default: 16)",
     )
     parser.add_argument(
+        "--predict_final_year",
+        type=int,
+        default=2040,
+        choices=[2020, 2040],
+        help="Final prediction year for large-area GeoTIFF output: 2040 (inputs 2010/2015/2020) or 2020 (inputs 1990/1995/2000)",
+    )
+    parser.add_argument(
         "--use_location_encoder",
         type=lambda x: (str(x).lower() == 'true'),
         nargs='?',
@@ -264,6 +271,23 @@ if __name__ == "__main__":
         split_mask_file=split_mask_file,
         split_value=2,  # Validation split
     )
+    # Test uses fixed years (1990, 1995, 2000 -> 2005-2020) for final evaluation
+    test_loader = get_dataloader(
+        batch_size=args.batch_size,
+        chip_size=128,
+        timesteps=3,
+        chips_per_epoch=args.val_chips,
+        mode=args.val_mode,
+        stride=args.stride,
+        include_components=args.include_components,
+        static_channels=args.static_channels,
+        use_temporal_sampling=False,
+        num_workers=args.num_workers,
+        pin_memory=True if args.num_workers > 0 else False,
+        persistent_workers=True if args.num_workers > 0 else False,
+        split_mask_file=split_mask_file,
+        split_value=3,  # Test split
+    )
 
     # Model
     num_static_channels = getattr(train_loader.dataset, 'C_static', 1)
@@ -415,12 +439,14 @@ if __name__ == "__main__":
     # Train
     trainer.fit(model, train_loader, val_loader)
 
-    # --- Log predictions from best checkpoint to wandb (rank 0 only) ---
+    # --- Log validation predictions/metrics from checkpoint to wandb (rank 0 only) ---
     import torch
     import matplotlib.pyplot as plt
     import numpy as np
     # Only the global zero process should log to W&B
-    best_ckpt = checkpoint_cb.best_model_path
+    # Prefer best checkpoint from current training run; fall back to user-provided checkpoint
+    # so this block also works when --max_epochs=0.
+    best_ckpt = checkpoint_cb.best_model_path if checkpoint_cb.best_model_path else checkpoint_path
     should_log_wandb = (
         best_ckpt
         and use_wandb
@@ -440,12 +466,12 @@ if __name__ == "__main__":
             if hasattr(ds_train, 'hm_mean') and hasattr(ds_train, 'hm_std'):
                 best_model.hm_mean = ds_train.hm_mean
                 best_model.hm_std = ds_train.hm_std
-        # Inference on entire validation set
-        print("\nRunning inference on entire validation set for plotting...")
+        # Inference on entire test set
+        print("\nRunning inference on entire test set for plotting...")
         all_batches_data = []
         num_batches_processed = 0
         
-        for batch_idx, batch in enumerate(val_loader):
+        for batch_idx, batch in enumerate(test_loader):
             # Use 20yr target for validation metrics (multi-horizon)
             target = batch.get('target_20yr', batch.get('target'))
             # Check for at least one valid (non-NaN) pixel in any sample
@@ -547,13 +573,13 @@ if __name__ == "__main__":
                     print(f"  Processed {batch_idx + 1} batches...")
         
         if num_batches_processed == 0:
-            print("WARNING: No valid (non-NaN) target pixels found in any validation batch for image logging.")
+            print("WARNING: No valid (non-NaN) target pixels found in any test batch for image logging.")
             sys.exit(0)
         
-        print(f"✓ Processed {num_batches_processed} validation batches")
+        print(f"✓ Processed {num_batches_processed} test batches")
         
-        # ===== Calculate validation metrics over full validation set =====
-        print("\nCalculating validation metrics over full validation set...")
+        # ===== Calculate metrics over full test set =====
+        print("\nCalculating metrics over full test set...")
         from src.models.losses import LaplacianPyramidLoss
         from torchmetrics.functional import structural_similarity_index_measure as ssim
         import torch.nn.functional as F
@@ -662,7 +688,7 @@ if __name__ == "__main__":
         
         # Compute average metrics per horizon and overall
         print("\n" + "="*70)
-        print("FULL VALIDATION SET METRICS (Best Model) - PER HORIZON")
+        print("FULL TEST SET METRICS (Best Model) - PER HORIZON")
         print("="*70)
         
         horizon_years = [2005, 2010, 2015, 2020]
@@ -724,16 +750,16 @@ if __name__ == "__main__":
                 
                 # Log per-horizon metrics to W&B
                 experiment.log({
-                    f"val_full/mae_{h_name}": avg_mae,
-                    f"val_full/mae_no_change_{h_name}": avg_mae_no_change,
-                    f"val_full/mae_linear_{h_name}": avg_mae_linear,
-                    f"val_full/mse_{h_name}": avg_mse,
-                    f"val_full/ssim_loss_{h_name}": avg_ssim,
-                    f"val_full/lap_loss_{h_name}": avg_lap,
-                    f"val_full/total_loss_{h_name}": avg_total,
+                    f"test_full/mae_{h_name}": avg_mae,
+                    f"test_full/mae_no_change_{h_name}": avg_mae_no_change,
+                    f"test_full/mae_linear_{h_name}": avg_mae_linear,
+                    f"test_full/mse_{h_name}": avg_mse,
+                    f"test_full/ssim_loss_{h_name}": avg_ssim,
+                    f"test_full/lap_loss_{h_name}": avg_lap,
+                    f"test_full/total_loss_{h_name}": avg_total,
                 })
                 if best_model.histogram_weight > 0:
-                    experiment.log({f"val_full/hist_loss_{h_name}": avg_hist})
+                    experiment.log({f"test_full/hist_loss_{h_name}": avg_hist})
         
         # Compute and log average across all horizons
         if all_total_losses:
@@ -742,12 +768,12 @@ if __name__ == "__main__":
             print(f"  Total loss: {avg_total_all:.6f}")
             print("="*70 + "\n")
             
-            experiment.log({"val_full/total_loss_avg": avg_total_all})
+            experiment.log({"test_full/total_loss_avg": avg_total_all})
         else:
             print("WARNING: No valid pixels found for metric calculation")
         
         # Retrieve means/stds for inverse transform
-        ds = val_loader.dataset
+        ds = test_loader.dataset
         if hasattr(ds, 'dataset'):
             ds = ds.dataset  # Unwrap DataLoader if needed
         hm_mean, hm_std = ds.hm_mean, ds.hm_std
@@ -957,7 +983,7 @@ if __name__ == "__main__":
         experiment.log({"Predictions_vs_Targets": images})
         
         # ---- Accumulate diffs from ALL batches for hexbin and histogram (per horizon) ----
-        print("\nAccumulating changes from all validation batches (per horizon)...")
+        print("\nAccumulating changes from all test batches (per horizon)...")
         horizon_names = ['5yr', '10yr', '15yr', '20yr']
         horizon_years = [2005, 2010, 2015, 2020]
         
@@ -1211,10 +1237,19 @@ if __name__ == "__main__":
         if not geoms:
             print("Empty geometry in region GeoJSON; skipping.")
             return
-        # Use most recent HM raster (2020) as spatial reference
-        # For prediction: use 2020 as base, predict 2025, 2030, 2035, 2040
-        target_years = (2025, 2030, 2035, 2040)
-        base_year = 2020  # Use 2020 as spatial reference
+        # Configure prediction years from CLI
+        if args.predict_final_year == 2040:
+            # Use 2020 as base, predict 2025, 2030, 2035, 2040
+            input_years = [2010, 2015, 2020]
+            target_years = (2025, 2030, 2035, 2040)
+            base_year = 2020
+        else:
+            # Use 2000 as base, predict 2005, 2010, 2015, 2020
+            input_years = [1990, 1995, 2000]
+            target_years = (2005, 2010, 2015, 2020)
+            base_year = 2000
+
+        # Use base-year HM raster as spatial reference
         year_to_idx = {y: i for i, y in enumerate(years)}
         target_src_path = hm_files[year_to_idx[base_year]]
         with rasterio.open(target_src_path) as ref:
@@ -1251,7 +1286,7 @@ if __name__ == "__main__":
             
             # Multi-horizon quantile accumulators (3 quantiles × 4 horizons = 12 outputs)
             horizon_names = ['5yr', '10yr', '15yr', '20yr']
-            horizon_years = [2025, 2030, 2035, 2040]  # Predict future from 2020 base
+            horizon_years = list(target_years)
             quantile_names = ['lower', 'central', 'upper']  # Updated to match independent heads terminology
             
             # Create accumulators for each horizon-quantile combination
@@ -1270,8 +1305,6 @@ if __name__ == "__main__":
             elev_mean, elev_std = ds_train.elev_mean, ds_train.elev_std
             include_components = bool(getattr(ds_train, 'include_components', True))
             static_list_paths = list(static_files if args.static_channels is None else static_files[:int(args.static_channels)])
-            # Use most recent 3 timesteps as input for prediction (2010, 2015, 2020)
-            input_years = [2010, 2015, 2020]
             t_idxs = [year_to_idx[y] for y in input_years]
             
             # CRITICAL: Get per-variable normalization stats (NOT pooled hm_mean/hm_std)
