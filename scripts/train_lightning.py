@@ -61,8 +61,24 @@ if __name__ == "__main__":
         type=lambda x: (str(x).lower() == 'true'),
         nargs='?',
         const=True,
+        default=None,
+        help="[Legacy] Run large-area prediction and write GeoTIFF after training. Overrides --run_large_area_prediction when set.",
+    )
+    parser.add_argument(
+        "--run_full_set_evaluation",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?',
+        const=True,
         default=True,
-        help="Run large-area prediction and write GeoTIFF after training (default: True)",
+        help="Run full test-set evaluation/prediction logging block after training (default: True)",
+    )
+    parser.add_argument(
+        "--run_large_area_prediction",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?',
+        const=True,
+        default=True,
+        help="Run large-area prediction and write GeoTIFFs after training (default: True)",
     )
     parser.add_argument(
         "--predict_region",
@@ -165,6 +181,13 @@ if __name__ == "__main__":
         help="Random seed for reproducibility (default: 42)",
     )
     args = parser.parse_args()
+
+    # Backward compatibility: legacy flag overrides the new large-area prediction toggle when provided
+    run_large_area_prediction = (
+        args.predict_after_training
+        if args.predict_after_training is not None
+        else args.run_large_area_prediction
+    )
     
     # Helper function to load checkpoint from W&B artifact or local path
     def load_checkpoint_path(checkpoint_arg):
@@ -448,6 +471,8 @@ if __name__ == "__main__":
     # so this block also works when --max_epochs=0.
     best_ckpt = checkpoint_cb.best_model_path if checkpoint_cb.best_model_path else checkpoint_path
     should_log_wandb = (
+        args.run_full_set_evaluation
+        and
         best_ckpt
         and use_wandb
         and isinstance(trainer.logger, WandbLogger)
@@ -1186,7 +1211,9 @@ if __name__ == "__main__":
         # Ensure wandb shuts down cleanly
         experiment.finish()
     else:
-        if best_ckpt and use_wandb:
+        if not args.run_full_set_evaluation:
+            print("Skipping full test-set evaluation/prediction logging (--run_full_set_evaluation false).")
+        elif best_ckpt and use_wandb:
             # Only non-zero ranks should skip W&B logging to avoid crashes on multi-GPU
             print("Skipping W&B image logging: not global rank 0 or WandbLogger not active.")
 
@@ -1625,7 +1652,7 @@ if __name__ == "__main__":
                 src.close()
 
     # Run prediction if requested
-    if args.predict_after_training:
+    if run_large_area_prediction:
         # Use provided checkpoint, or best from training
         pred_checkpoint = checkpoint_path if checkpoint_path else checkpoint_cb.best_model_path
         if pred_checkpoint:
