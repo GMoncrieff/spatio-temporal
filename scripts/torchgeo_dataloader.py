@@ -1,4 +1,5 @@
 import os
+import json
 from torch.utils.data import DataLoader
 from torchgeo.datasets import RasterDataset
 import torch
@@ -7,27 +8,37 @@ from pyproj import Transformer
 # Paths (updated to hm_medium dataset)
 HM_DIR = os.path.join("data", "raw", "hm_global")
 STATIC_DIR = HM_DIR
+# Some files were originally staged under HM_DIR/smal/ (full-globe rasters,
+# same grid). Resolve transparently from either directory.
+_FALLBACK_DIRS = [HM_DIR, os.path.join(HM_DIR, "smal")]
+
+
+def _resolve(name: str) -> str:
+    for d in _FALLBACK_DIRS:
+        p = os.path.join(d, name)
+        if os.path.exists(p):
+            return p
+    # Fall back to primary path; rasterio will surface a clear error.
+    return os.path.join(HM_DIR, name)
+
 
 # List of years for which we have human footprint data
 years = [1990, 1995, 2000, 2005, 2010, 2015, 2020]
-hm_files = [os.path.join(HM_DIR, f"HM_{year}_AA_1000.tiff") for year in years]
+hm_files = [_resolve(f"HM_{year}_AA_1000.tiff") for year in years]
 # Time-varying HM covariates
 HM_VARS = ["AG", "BU", "EX", "FR", "HI", "NS", "PO", "TI", "gdp", "population"]
 component_files = {
-    y: [os.path.join(HM_DIR, f"HM_{y}_{v}_1000.tiff") for v in HM_VARS]
+    y: [_resolve(f"HM_{y}_{v}_1000.tiff") for v in HM_VARS]
     for y in years
 }
 static_files = [
-    os.path.join(STATIC_DIR, "hm_static_ele_1000.tiff"),
-   # os.path.join(STATIC_DIR, "hm_static_ele_asp_cosin_1000.tiff"),
-   # os.path.join(STATIC_DIR, "hm_static_ele_asp_sin_1000.tiff"),
-   # os.path.join(STATIC_DIR, "hm_static_ele_slope_1000.tiff"),
-    os.path.join(STATIC_DIR, "hm_static_tas_1000.tiff"),
-    os.path.join(STATIC_DIR, "hm_static_tasmin_1000.tiff"),
-    os.path.join(STATIC_DIR, "hm_static_pr_1000.tiff"),
-    os.path.join(STATIC_DIR, "hm_static_dpi_dsi_1000.tiff"),
-    os.path.join(STATIC_DIR, "hm_static_iucn_nostrict_1000.tiff"),
-    os.path.join(STATIC_DIR, "hm_static_iucn_strict_1000.tiff"),
+    _resolve("hm_static_ele_1000.tiff"),
+    _resolve("hm_static_tas_1000.tiff"),
+    _resolve("hm_static_tasmin_1000.tiff"),
+    _resolve("hm_static_pr_1000.tiff"),
+    _resolve("hm_static_dpi_dsi_1000.tiff"),
+    _resolve("hm_static_iucn_nostrict_1000.tiff"),
+    _resolve("hm_static_iucn_strict_1000.tiff"),
 ]
 
 import numpy as np
@@ -65,24 +76,44 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
         static_channels=None,
         split_mask_file=None,
         split_value=None,
+        target_mode="absolute_4horizons",
+        restrict_to_region=None,
+        dhm_stats_cache=None,
     ):
         self.hm_files = hm_files
         self.component_files = component_files
         self.static_files = static_files
         self.chip_size = chip_size
         self.timesteps = timesteps  # kept for compatibility; must be 3
-        if len(fixed_input_years) != 3:
-            raise ValueError("Multi-horizon setup expects exactly 3 input timesteps (1990, 1995, 2000)")
         self.stride = stride
         self.mode = mode
         self.chips_per_epoch = chips_per_epoch
+        if target_mode not in ("absolute_4horizons", "delta_20yr"):
+            raise ValueError(
+                f"target_mode must be 'absolute_4horizons' or 'delta_20yr', got {target_mode!r}"
+            )
+        self.target_mode = target_mode
+        self.restrict_to_region = restrict_to_region
+        self.dhm_stats_cache = dhm_stats_cache
+
+        if target_mode == "delta_20yr":
+            if list(end_year_options) != [2000] or use_temporal_sampling \
+               or tuple(fixed_input_years) != (1990, 1995, 2000) \
+               or tuple(fixed_target_years) != (2020,):
+                print("[delta_20yr] Forcing input_years=(1990,1995,2000), target=(2020,), end_year_options=[2000], use_temporal_sampling=False (only valid (t, t+20) config in available data)")
+            end_year_options = [2000]
+            use_temporal_sampling = False
+            fixed_input_years = (1990, 1995, 2000)
+            fixed_target_years = (2020,)
+        if len(fixed_input_years) != 3:
+            raise ValueError("Multi-horizon setup expects exactly 3 input timesteps (1990, 1995, 2000)")
         # Temporal sampling setup
         self.use_temporal_sampling = use_temporal_sampling and mode == "random"  # Only for training
         self.end_year_options = list(end_year_options)
         self.fixed_input_years = tuple(fixed_input_years)
-        self.fixed_target_years = tuple(fixed_target_years)  # (2005, 2010, 2015, 2020)
+        self.fixed_target_years = tuple(fixed_target_years)
         # Get indices for all target years
-        self.target_t_indices = [years.index(y) for y in fixed_target_years]  # [3, 4, 5, 6]
+        self.target_t_indices = [years.index(y) for y in fixed_target_years]
         # Year to index mapping
         self.year_to_idx = {y: i for i, y in enumerate(years)}
         # Use lazy, windowed IO to avoid loading entire rasters into memory
@@ -190,7 +221,13 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
             print("Component normalization stats:")
             for var_name in HM_VARS:
                 print(f"  {var_name}: mean={self.comp_means[var_name]:.6e}, std={self.comp_stds[var_name]:.6e}")
-        
+
+        # Δhm stats (only when target_mode == "delta_20yr")
+        self.dhm_mean = 0.0
+        self.dhm_std = 1.0
+        if self.target_mode == "delta_20yr":
+            self._compute_dhm_stats(rng, stat_samples)
+
         # Map fixed years to indices in the stacked timeline
         year_to_idx = {y: i for i, y in enumerate(years)}
         # Expose available years for downstream labeling
@@ -224,13 +261,41 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
                 print(f"  Found {len(valid_positions)} valid chip positions for split {self.split_value}")
                 if len(valid_positions) == 0:
                     raise ValueError(f"No valid positions found for split_value={self.split_value}. Check split mask.")
-        
+
+        # Optionally restrict valid positions to a GeoJSON region
+        if self.restrict_to_region is not None:
+            print(f"Restricting chip positions to region {self.restrict_to_region}...")
+            region_mask = self._rasterize_region_to_mask(self.restrict_to_region)
+            if self.valid_split_positions is not None:
+                before = len(self.valid_split_positions)
+                positions = [(i, j) for (i, j) in self.valid_split_positions
+                             if region_mask[i:i+chip_size, j:j+chip_size].any()]
+                self.valid_split_positions = positions
+                print(f"  Region-restricted: {before} -> {len(positions)} positions")
+            else:
+                positions = []
+                for i in range(0, self.H - chip_size + 1, chip_size):
+                    for j in range(0, self.W - chip_size + 1, chip_size):
+                        if region_mask[i:i+chip_size, j:j+chip_size].any():
+                            positions.append((i, j))
+                self.valid_split_positions = positions
+                print(f"  Region: {len(positions)} positions")
+            if len(self.valid_split_positions) == 0:
+                raise ValueError(f"No valid positions inside region {self.restrict_to_region}")
+
         # Precompute all chip positions if not random
         if self.mode == "grid":
             self.chip_positions = []
+            allowed = set(self.valid_split_positions) if self.valid_split_positions is not None else None
             for t in self.valid_time_idxs:
                 for i in range(0, self.H - chip_size + 1, stride):
                     for j in range(0, self.W - chip_size + 1, stride):
+                        if allowed is None or (i, j) in allowed:
+                            self.chip_positions.append((t, i, j))
+            if len(self.chip_positions) == 0 and allowed is not None:
+                # Fall back: use the explicit allowed positions even if they are off-stride
+                for t in self.valid_time_idxs:
+                    for (i, j) in self.valid_split_positions:
                         self.chip_positions.append((t, i, j))
         else:
             self.chip_positions = None
@@ -238,6 +303,84 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
         self.C_comp = len(self._comp_files[years[0]]) if self.include_components else 0
         self.C_dyn = 1 + self.C_comp
         self.C_static = len(self._static_files)
+
+    def _compute_dhm_stats(self, rng, stat_samples):
+        """Compute or load Δhm = HM(2020) - HM(2000) normalization stats."""
+        if self.dhm_stats_cache and os.path.exists(self.dhm_stats_cache):
+            try:
+                with open(self.dhm_stats_cache, "r") as f:
+                    stats = json.load(f)
+                self.dhm_mean = float(stats["dhm_mean"])
+                self.dhm_std = float(stats["dhm_std"])
+                print(f"Loaded Δhm stats from {self.dhm_stats_cache}: mean={self.dhm_mean:.6e} std={self.dhm_std:.6e}")
+                return
+            except Exception as e:
+                print(f"Failed to load Δhm stats cache ({e}); recomputing")
+
+        print("Computing Δhm normalization stats from random (HM_2020 - HM_2000) windows...")
+        idx_2000 = self.year_to_idx[2000]
+        idx_2020 = self.year_to_idx[2020]
+        f_2000 = self._hm_files[idx_2000]
+        f_2020 = self._hm_files[idx_2020]
+        n_samples = max(64, int(stat_samples))
+        samples = []
+        with rasterio.open(f_2000) as s00, rasterio.open(f_2020) as s20:
+            Hs, Ws = s00.height, s00.width
+            for _ in range(n_samples):
+                if Hs < self.chip_size or Ws < self.chip_size:
+                    i = 0; j = 0
+                else:
+                    i = int(rng.integers(0, Hs - self.chip_size + 1))
+                    j = int(rng.integers(0, Ws - self.chip_size + 1))
+                window = rasterio.windows.Window(j, i, self.chip_size, self.chip_size)
+                arr00 = s00.read(1, window=window, masked=True).filled(np.nan)
+                arr20 = s20.read(1, window=window, masked=True).filled(np.nan)
+                samples.append(arr20 - arr00)
+        arr = np.stack(samples, axis=0)
+        self.dhm_mean = float(np.nanmean(arr))
+        self.dhm_std = float(np.nanstd(arr) + 1e-8)
+        print(f"Computed Δhm stats: mean={self.dhm_mean:.6e} std={self.dhm_std:.6e}")
+        if self.dhm_stats_cache:
+            try:
+                cache_dir = os.path.dirname(self.dhm_stats_cache)
+                if cache_dir:
+                    os.makedirs(cache_dir, exist_ok=True)
+                with open(self.dhm_stats_cache, "w") as f:
+                    json.dump({"dhm_mean": self.dhm_mean, "dhm_std": self.dhm_std}, f)
+                print(f"Cached Δhm stats to {self.dhm_stats_cache}")
+            except Exception as e:
+                print(f"Failed to write Δhm stats cache: {e}")
+
+    def _rasterize_region_to_mask(self, geojson_path):
+        """Rasterize a GeoJSON region into a boolean mask in the dataset's reference grid."""
+        from shapely.geometry import shape
+        from shapely.ops import unary_union, transform as shp_transform
+        from rasterio import features as rio_features
+
+        with rasterio.open(self._hm_files[0]) as ref:
+            ref_crs = ref.crs
+            ref_transform = ref.transform
+            ref_h, ref_w = ref.height, ref.width
+
+        with open(geojson_path) as f:
+            gj = json.load(f)
+        if gj.get("type") == "FeatureCollection":
+            geoms = [shape(feat["geometry"]) for feat in gj["features"]]
+        elif gj.get("type") == "Feature":
+            geoms = [shape(gj["geometry"])]
+        else:
+            geoms = [shape(gj)]
+        geom = unary_union(geoms)
+
+        if ref_crs and ref_crs.to_string() not in ("EPSG:4326", "OGC:CRS84"):
+            transformer = Transformer.from_crs("EPSG:4326", ref_crs, always_xy=True)
+            geom = shp_transform(lambda x, y, z=None: transformer.transform(x, y), geom)
+
+        mask = rio_features.rasterize(
+            [(geom, 1)], out_shape=(ref_h, ref_w), transform=ref_transform,
+            fill=0, dtype="uint8",
+        )
+        return mask.astype(bool)
 
     def _ensure_open(self):
         # Open datasets lazily per worker process
@@ -343,48 +486,89 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
                 lon, lat = xs, ys
             lonlat = np.stack([lon, lat], axis=-1).astype(np.float32)  # [H, W, 2]
             
-            # Multi-horizon targets (computed from end_year)
+            common = {
+                "input_dynamic": torch.from_numpy(input_dynamic).float(),
+                "input_static": torch.from_numpy(input_static).float(),
+                "lonlat": torch.from_numpy(lonlat).float(),
+                "timestep": t,
+                "input_years": input_years,
+                "target_years": list(target_years),
+                "end_year": end_year,
+            }
+
+            if self.target_mode == "delta_20yr":
+                idx_2000 = self.year_to_idx[2000]
+                idx_2020 = self.year_to_idx[2020]
+                arr_2000 = self._hm_srcs[idx_2000].read(
+                    1, window=rasterio.windows.Window(j, i, self.chip_size, self.chip_size),
+                    masked=True,
+                ).filled(np.nan)
+                arr_2020 = self._hm_srcs[idx_2020].read(
+                    1, window=rasterio.windows.Window(j, i, self.chip_size, self.chip_size),
+                    masked=True,
+                ).filled(np.nan)
+                dhm_raw = arr_2020 - arr_2000
+                target_dhm = (dhm_raw - self.dhm_mean) / self.dhm_std
+
+                target_finite = np.isfinite(target_dhm)
+                dyn_finite = np.isfinite(input_dynamic).all(axis=(0, 1))
+                stat_finite = (
+                    np.isfinite(input_static).all(axis=0)
+                    if input_static.size
+                    else np.ones((self.chip_size, self.chip_size), dtype=bool)
+                )
+                valid_mask = target_finite & dyn_finite & stat_finite
+
+                hm_t_normalized = input_dynamic[2, 0]
+
+                if valid_mask.any():
+                    sample = dict(common)
+                    sample["target_dhm"] = torch.from_numpy(
+                        np.nan_to_num(target_dhm, nan=0.0)[None, ...]
+                    ).float()
+                    sample["hm_t_normalized"] = torch.from_numpy(
+                        np.nan_to_num(hm_t_normalized, nan=0.0)[None, ...]
+                    ).float()
+                    sample["valid_mask"] = torch.from_numpy(valid_mask)
+                    sample["target_year"] = 2020
+                    return sample
+                continue
+
+            # absolute_4horizons (legacy default): produce target_5yr..target_20yr
             targets = {}
             horizon_names = ['target_5yr', 'target_10yr', 'target_15yr', 'target_20yr']
             all_valid = False
-            
             for horizon_name, t_idx, target_year in zip(horizon_names, target_t_idxs, target_years):
                 if t_idx is None or target_year > 2020:
-                    # Missing year - fill with NaN (will be masked in loss)
                     target_h = np.full((self.chip_size, self.chip_size), np.nan, dtype=np.float32)
                 else:
-                    target_h = self._hm_srcs[t_idx].read(1, window=rasterio.windows.Window(j, i, self.chip_size, self.chip_size), masked=True).filled(np.nan)
-                    # Data is already in [0, 1] range
+                    target_h = self._hm_srcs[t_idx].read(
+                        1, window=rasterio.windows.Window(j, i, self.chip_size, self.chip_size),
+                        masked=True,
+                    ).filled(np.nan)
                     target_h = (target_h - self.hm_mean) / self.hm_std
                 targets[horizon_name] = torch.from_numpy(target_h).float()
                 if not np.isnan(target_h).all():
                     all_valid = True
-            
+
             if all_valid:
-                sample = {
-                    "input_dynamic": torch.from_numpy(input_dynamic).float(),
-                    "input_static": torch.from_numpy(input_static).float(),
-                    "lonlat": torch.from_numpy(lonlat).float(),
-                    "timestep": t,
-                    # NEW: Year metadata for visualization
-                    "input_years": input_years,
-                    "target_years": target_years,
-                    "end_year": end_year,
-                }
-                sample.update(targets)  # Add all horizon targets
+                sample = dict(common)
+                sample.update(targets)
                 return sample
-        # If all attempts fail, return anyway (will be masked out in loss)
-        sample = {
-            "input_dynamic": torch.from_numpy(input_dynamic).float(),
-            "input_static": torch.from_numpy(input_static).float(),
-            "lonlat": torch.from_numpy(lonlat).float(),
-            "timestep": t,
-            # NEW: Year metadata for visualization
-            "input_years": input_years,
-            "target_years": target_years,
-            "end_year": end_year,
-        }
-        sample.update(targets)  # Add all horizon targets
+
+        # All retries exhausted — return whatever we last built (will be masked downstream).
+        sample = dict(common)
+        if self.target_mode == "delta_20yr":
+            sample["target_dhm"] = torch.from_numpy(
+                np.nan_to_num(target_dhm, nan=0.0)[None, ...]
+            ).float()
+            sample["hm_t_normalized"] = torch.from_numpy(
+                np.nan_to_num(hm_t_normalized, nan=0.0)[None, ...]
+            ).float()
+            sample["valid_mask"] = torch.from_numpy(valid_mask)
+            sample["target_year"] = 2020
+        else:
+            sample.update(targets)
         return sample
 
 
@@ -409,13 +593,21 @@ def get_dataloader(
     static_channels=None,
     split_mask_file=None,
     split_value=None,
+    target_mode="absolute_4horizons",
+    restrict_to_region=None,
+    dhm_stats_cache=None,
 ):
     """
     Create a DataLoader for the Human Footprint dataset.
-    
+
     Args:
         split_mask_file: Path to split mask GeoTIFF (e.g., 'data/raw/hm_global/split_mask_1000.tif')
         split_value: Which split to use (1=train, 2=val, 3=test, 4=calib, None=all data)
+        target_mode: "absolute_4horizons" (legacy) or "delta_20yr" (single Δhm target).
+        restrict_to_region: Path to a GeoJSON file. If set, only chip positions whose window
+            overlaps the rasterized region are kept.
+        dhm_stats_cache: Optional path to cache (mean, std) of Δhm; ignored unless
+            target_mode == "delta_20yr".
     """
     ds = HumanFootprintChipDataset(
         hm_files,
@@ -437,6 +629,9 @@ def get_dataloader(
         static_channels=static_channels,
         split_mask_file=split_mask_file,
         split_value=split_value,
+        target_mode=target_mode,
+        restrict_to_region=restrict_to_region,
+        dhm_stats_cache=dhm_stats_cache,
     )
     return DataLoader(
         ds,

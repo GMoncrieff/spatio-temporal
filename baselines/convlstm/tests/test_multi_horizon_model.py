@@ -1,9 +1,14 @@
 """
 Test multi-horizon SpatioTemporalPredictor model.
 """
+import sys
+from pathlib import Path
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(PROJECT_ROOT))
+
 import torch
 import pytest
-from src.models.spatiotemporal_predictor import SpatioTemporalPredictor
+from baselines.convlstm.models.spatiotemporal_predictor import SpatioTemporalPredictor
 
 
 def test_model_output_shape():

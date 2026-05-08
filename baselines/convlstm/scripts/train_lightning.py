@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
-sys.path.append(str(Path(__file__).parent.parent))
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 import os
 import argparse
 import json
@@ -12,7 +14,7 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import WandbLogger
 from torch.utils.data import DataLoader
-from src.models.lightning_module import SpatioTemporalLightningModule
+from baselines.convlstm.models.lightning_module import SpatioTemporalLightningModule
 from torchgeo_dataloader import get_dataloader, hm_files, component_files, static_files, years
 
 # Geospatial imports for inference
@@ -351,7 +353,7 @@ if __name__ == "__main__":
     # Compute histogram bin weights from training data (per horizon)
     if args.histogram_weight > 0 and hasattr(model, 'histogram_loss_fn'):
         print("\nComputing histogram bin weights for each horizon from 10 training batches...")
-        from src.models.histogram_loss import compute_histogram
+        from baselines.convlstm.models.histogram_loss import compute_histogram
         
         horizon_names = ['5yr', '10yr', '15yr', '20yr']
         horizon_keys = ['target_5yr', 'target_10yr', 'target_15yr', 'target_20yr']
@@ -605,7 +607,7 @@ if __name__ == "__main__":
         
         # ===== Calculate metrics over full test set =====
         print("\nCalculating metrics over full test set...")
-        from src.models.losses import LaplacianPyramidLoss
+        from baselines.convlstm.models.losses import LaplacianPyramidLoss
         from torchmetrics.functional import structural_similarity_index_measure as ssim
         import torch.nn.functional as F
         

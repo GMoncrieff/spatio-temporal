@@ -1,0 +1,204 @@
+"""Train the conditional diffusion U-Net on 20yr Δhm.
+
+Usage:
+    python scripts/train_diffusion.py --max_epochs 5 --restrict_to_region config/region_to_predict_small.geojson
+
+Defaults are tuned for the dev region; override for full-scale runs.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+
+import torch
+
+try:
+    import lightning as pl
+    from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
+    from lightning.pytorch.loggers import WandbLogger
+except ImportError:  # pragma: no cover
+    import pytorch_lightning as pl
+    from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+    from pytorch_lightning.loggers import WandbLogger
+
+from torchgeo_dataloader import get_dataloader
+from src.models.diffusion_lightning import DiffusionLightningModule
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    # Data
+    p.add_argument("--split_mask_file",
+                   default="data/raw/hm_global/split_mask_1000.tif")
+    p.add_argument("--restrict_to_region",
+                   default="config/region_to_predict_small.geojson",
+                   help="GeoJSON region to confine training/val chips to.")
+    p.add_argument("--chip_size", type=int, default=64)
+    p.add_argument("--train_chips", type=int, default=256)
+    p.add_argument("--val_chips", type=int, default=64)
+    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--num_workers", type=int, default=0)
+    p.add_argument("--stat_samples", type=int, default=512,
+                   help="Random windows per raster for normalization-stat sampling. "
+                        "Lower (e.g. 64) for quick smoke runs.")
+    p.add_argument("--dhm_stats_cache",
+                   default="data/raw/hm_global/dhm_stats_20yr.json")
+
+    # Trainer
+    p.add_argument("--max_epochs", type=int, default=5)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--weight_decay", type=float, default=1e-2)
+    p.add_argument("--precision", default="32-true",
+                   help="Lightning precision: '32-true' (Apple Silicon/CPU safe), "
+                        "'16-mixed', or 'bf16-mixed' (CUDA/Ampere+).")
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--fast_dev_run", action="store_true")
+    p.add_argument("--accumulate_grad_batches", type=int, default=1)
+
+    # Model architecture
+    p.add_argument("--base_channels", type=int, default=128)
+    p.add_argument("--channel_mults", type=int, nargs="+", default=[1, 2, 2, 4])
+    p.add_argument("--attention_head_dim", type=int, default=64)
+
+    # Diffusion
+    p.add_argument("--num_train_timesteps", type=int, default=1000)
+    p.add_argument("--num_inference_steps", type=int, default=30)
+    p.add_argument("--ensemble_n", type=int, default=16)
+
+    # Location encoder
+    p.add_argument("--use_location_encoder", action="store_true", default=True)
+    p.add_argument("--no_location_encoder", dest="use_location_encoder",
+                   action="store_false")
+    p.add_argument("--locenc_out_channels", type=int, default=8)
+    p.add_argument("--locenc_legendre_polys", type=int, default=10)
+
+    # W&B
+    p.add_argument("--wandb_project", default="spatio-temporal-diffusion")
+    p.add_argument("--wandb_run_name", default=None)
+    p.add_argument("--disable_wandb", action="store_true")
+    p.add_argument("--checkpoint", default=None,
+                   help="Path to a checkpoint to resume from.")
+    p.add_argument("--default_root_dir", default="models/checkpoints_diffusion")
+
+    return p.parse_args()
+
+
+def make_loaders(args):
+    common = dict(
+        chip_size=args.chip_size,
+        timesteps=3,
+        target_mode="delta_20yr",
+        restrict_to_region=args.restrict_to_region,
+        dhm_stats_cache=args.dhm_stats_cache,
+        split_mask_file=args.split_mask_file,
+        include_components=True,
+        stat_samples=args.stat_samples,
+        num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+    train_loader = get_dataloader(
+        batch_size=args.batch_size,
+        chips_per_epoch=args.train_chips,
+        mode="random",
+        split_value=1,
+        **common,
+    )
+    val_loader = get_dataloader(
+        batch_size=args.batch_size,
+        chips_per_epoch=args.val_chips,
+        mode="random",
+        split_value=2,
+        **common,
+    )
+    return train_loader, val_loader
+
+
+def compute_cond_channels(sample_batch, args):
+    """Total conditioning channels = T*C_dyn + C_static + locenc_out + 1 (hm_t)."""
+    T = sample_batch["input_dynamic"].shape[1]
+    C_dyn = sample_batch["input_dynamic"].shape[2]
+    C_static = sample_batch["input_static"].shape[1]
+    locenc = args.locenc_out_channels if args.use_location_encoder else 0
+    return T * C_dyn + C_static + locenc + 1  # +1 for hm_t_normalized
+
+
+def main():
+    args = parse_args()
+    pl.seed_everything(args.seed, workers=True)
+
+    print("Building dataloaders...")
+    train_loader, val_loader = make_loaders(args)
+
+    print("Introspecting one batch to determine conditioning channel count...")
+    sample_batch = next(iter(train_loader))
+    cond_channels = compute_cond_channels(sample_batch, args)
+    print(f"  cond_channels = {cond_channels}")
+
+    locenc_kwargs = None
+    if args.use_location_encoder:
+        locenc_kwargs = dict(
+            backbone=("sphericalharmonics", "siren"),
+            out_channels=args.locenc_out_channels,
+            hparams=dict(legendre_polys=args.locenc_legendre_polys,
+                         dim_hidden=64, num_layers=2,
+                         optimizer=dict(lr=1e-4, wd=1e-3)),
+        )
+
+    module = DiffusionLightningModule(
+        cond_channels=cond_channels,
+        sample_size=args.chip_size,
+        base_channels=args.base_channels,
+        channel_mults=tuple(args.channel_mults),
+        attention_head_dim=args.attention_head_dim,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        num_train_timesteps=args.num_train_timesteps,
+        num_inference_steps=args.num_inference_steps,
+        ensemble_n=args.ensemble_n,
+        location_encoder_kwargs=locenc_kwargs,
+    )
+    n_params = sum(p.numel() for p in module.parameters())
+    print(f"  module param count: {n_params/1e6:.1f}M")
+
+    callbacks = [
+        ModelCheckpoint(
+            monitor="val/loss",
+            mode="min",
+            save_top_k=2,
+            filename="dhm-diffusion-epoch{epoch:02d}-valloss{val/loss:.4f}",
+            auto_insert_metric_name=False,
+        ),
+        LearningRateMonitor(logging_interval="step"),
+    ]
+    logger = None
+    if not args.disable_wandb:
+        logger = WandbLogger(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            log_model=True,
+        )
+        logger.log_hyperparams(vars(args) | {"cond_channels": cond_channels,
+                                             "param_count_m": n_params / 1e6})
+
+    trainer = pl.Trainer(
+        max_epochs=args.max_epochs,
+        precision=args.precision,
+        logger=logger,
+        callbacks=callbacks,
+        fast_dev_run=args.fast_dev_run,
+        default_root_dir=args.default_root_dir,
+        accelerator="auto",
+        log_every_n_steps=10,
+        accumulate_grad_batches=args.accumulate_grad_batches,
+    )
+    trainer.fit(module, train_loader, val_loader, ckpt_path=args.checkpoint)
+
+
+if __name__ == "__main__":
+    main()

@@ -120,19 +120,12 @@ dmypy.json
 *.xlsx
 *.xls
 
-python scripts/train_lightning.py \
-  --checkpoint "model-khrpthgy:v0" \
-  --max_epochs 0 \
-  --predict_after_training true \
-  --predict_region "config/region_to_predict.geojson" \
-  --predict_stride 64 \
-  --predict_batch_size 16
-
 # Large datasets
 data/raw/
 data/processed/
 data/external/
 data/predictions/
+data/predictions_diffusion/
 data/prompts/
 scripts/notebooks/
 plots/
@@ -147,19 +140,33 @@ lightning_logs/
 mlruns/
 mlartifacts/
 
-# Weights & Biases
+# Weights & Biases (local cache + per-project run dirs created by WandbLogger)
 wandb/
+artifacts/
+spatio-temporal-convlstm/
+spatio-temporal-diffusion/
+
+# Local checkpoint trees
+models/checkpoints/
+models/checkpoints_diffusion/
 
 # TensorBoard
 tensorboard_logs/
 
-# Hydra
-outputs/
+# Hydra run directories — but keep the curated outputs/diffusion_v1 results
+outputs/*
+!outputs/diffusion_v1/
+!outputs/diffusion_v1/**
 .hydra/
 
-# IDE
+# Markdown preview artifacts
+docs/*.html
+docs/*_files/
+
+# IDE / agent
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
 *~

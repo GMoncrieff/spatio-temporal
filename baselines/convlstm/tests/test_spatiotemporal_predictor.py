@@ -1,8 +1,9 @@
 import torch
 import sys
 from pathlib import Path
-sys.path.append(str(Path(__file__).parent.parent))
-from src.models.spatiotemporal_predictor import SpatioTemporalPredictor
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(PROJECT_ROOT))
+from baselines.convlstm.models.spatiotemporal_predictor import SpatioTemporalPredictor
 
 def test_spatiotemporal_predictor_forward():
     # Simulate dataloader output

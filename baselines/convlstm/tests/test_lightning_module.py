@@ -1,9 +1,10 @@
 import torch
 import sys
 from pathlib import Path
-sys.path.append(str(Path(__file__).parent.parent))
-from src.models.lightning_module import SpatioTemporalLightningModule
-sys.path.append(str(Path(__file__).parent.parent / "scripts"))
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+from baselines.convlstm.models.lightning_module import SpatioTemporalLightningModule
 from torchgeo_dataloader import get_dataloader
 
 def test_lightning_module_forward():

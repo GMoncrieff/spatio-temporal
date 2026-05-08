@@ -10,13 +10,12 @@ This test ensures that:
 import sys
 from pathlib import Path
 
-# Add project root to path
-project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
 import pytest
-from src.models.lightning_module import SpatioTemporalLightningModule
+from baselines.convlstm.models.lightning_module import SpatioTemporalLightningModule
 
 
 def test_pinball_gradient_isolation():

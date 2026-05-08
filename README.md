@@ -2,330 +2,227 @@
 
 ## Overview
 
-This project implements a **ConvLSTM-based spatio-temporal forecasting** pipeline with **quantile regression** for uncertainty quantification of the Human Modification (HM) index. The model predicts future HM values at **four forecast horizons** (5, 10, 15, 20 years) with **three predictions per horizon**: lower quantile (2.5%), central estimate, and upper quantile (97.5%).
+This project forecasts the Human Modification (HM) index 20 years ahead using a
+**conditional 2D diffusion U-Net**. Quantile bounds and uncertainty come from
+ensemble sampling at inference rather than dedicated quantile heads — every
+prediction is a draw from the conditional posterior P(Δhm | covariates), so
+quantiles emerge as empirical statistics over N samples per chip.
 
-### Key Features
+The earlier ConvLSTM + hybrid-loss approach is preserved verbatim under
+`baselines/convlstm/` for the data-paper comparison.
 
-- **Multi-horizon forecasting**: 5yr, 10yr, 15yr, 20yr ahead predictions
-- **Uncertainty quantification**: Probabilistic predictions with calibrated confidence intervals
-- **Independent prediction heads**: Separate neural networks for central estimate vs. uncertainty bounds
-- **Rich covariates**: 11 dynamic variables (HM components + GDP + population) and 7 static variables (elevation, climate, protected areas)
-- **Per-variable normalization**: Handles vastly different scales (GDP in billions, HM in 0-1 range)
-- **Location encoding**: Learnable positional embeddings for spatial awareness
-- **W&B integration**: Comprehensive experiment tracking and visualization
+### Key features
+
+- **Single 20-year horizon, generative**: predicts Δhm = HM(t+20) − HM(t)
+  rather than absolute HM, with HM(t) supplied as an explicit conditioning
+  channel.
+- **Distributional fidelity over pointwise accuracy**: ensemble samples capture
+  *where* and *how much* change occurs, instead of collapsing the conditional
+  to a smeared mean.
+- **Reuses the existing data layer**: per-variable normalization, validity
+  masks, regional GeoJSON masking, and W&B integration carry over unchanged.
+- **MPS / CUDA / CPU**: end-to-end pipeline runs on Apple Silicon, NVIDIA, or
+  CPU with no code changes.
 
 ## Documentation
-- **[Technical Documentation](docs/simple_model_architecture_and_training.md)** - Detailed guide with implementation code
 
-**Topics covered:**
-- **Input Data**: Dynamic variables, static covariates, location encoding
-- **Data Transformations**: Per-variable normalization, NaN handling, data leakage prevention
-- **Model Architecture**: ConvLSTM, independent prediction heads, design decisions
-- **Loss Functions**: MSE, SSIM, Laplacian, Histogram (with warmup), Pinball loss
-- **Training**: Hyperparameters, optimization, early stopping, W&B tracking
-- **Accuracy Assessment**: Evaluation metrics, validation protocols, visualization
-- **Prediction**: Tile-based processing, output formats, GIS integration
+- **[Diffusion v1 results](docs/diffusion_v1_results.md)** — end-to-end
+  evaluation on the small dev region (model details, metrics, sample grid).
+- **[Baseline (ConvLSTM) technical guide](docs/simple_model_architecture_and_training.md)**
+  — original multi-horizon, quantile-head ConvLSTM design.
 
-## Project Structure
+## Project structure
 
 ```
 spatio_temporal/
-├── config/                         # Configuration files
-│   ├── config.yaml                 # Main training config
-│   ├── sweep_config.yaml           # W&B hyperparameter sweep config
-│   ├── region_to_predict.geojson   # Region boundaries for prediction
-│   └── region_to_predict_small.geojson
+├── config/
+│   ├── region_to_predict.geojson
+│   ├── region_to_predict_small.geojson      # dev region used by default
+│   └── ...
 │
-├── data/
-│   └── raw/
-│       └── hm_global/              # Global training data
-│           ├── HM_YEAR_VARIABLE_1000.tiff  # Dynamic variables (1990-2020)
-│           └── hm_static_VARIABLE_1000.tiff # Static covariates
+├── data/raw/hm_global/                       # rasters (not tracked)
 │
 ├── src/
-│   ├── models/                     # Model architecture
-│   │   ├── spatiotemporal_predictor.py  # Main ConvLSTM + independent heads
-│   │   ├── lightning_module.py     # PyTorch Lightning wrapper
-│   │   ├── convlstm.py            # ConvLSTM implementation
-│   │   ├── pinball_loss.py        # Quantile regression loss
-│   │   ├── laplacian_pyramid_loss.py
-│   │   └── histogram_loss.py
-│   ├── locationencoder/           # Spatial position encoding
-│   ├── evaluation/                # Evaluation utilities
-│   ├── preprocessing/             # Data preprocessing
-│   └── utils/                     # Helper functions
+│   ├── locationencoder/                      # shared LocationEncoder package
+│   └── models/
+│       ├── diffusion_unet.py                 # ConditionalDiffusionUNet (UNet2DModel wrapper)
+│       └── diffusion_lightning.py            # DiffusionLightningModule
 │
-├── scripts/                       # Main scripts
-│   ├── train_lightning.py        # Training + prediction pipeline
-│   ├── torchgeo_dataloader.py   # Data loading with per-variable normalization
-│   └── create_validity_mask.py  # NaN/no-data handling
+├── baselines/
+│   └── convlstm/                             # FROZEN ConvLSTM baseline
+│       ├── models/                           # convlstm.py, spatiotemporal_predictor.py,
+│       │                                     #   lightning_module.py, hybrid losses
+│       ├── scripts/train_lightning.py
+│       └── tests/                            # 21 ConvLSTM tests
 │
-├── tests/                        # Unit tests
+├── scripts/
+│   ├── torchgeo_dataloader.py                # adapted: target_mode='delta_20yr', restrict_to_region
+│   ├── train_diffusion.py                    # diffusion training entrypoint
+│   ├── predict_region_diffusion.py           # ensemble region prediction
+│   ├── evaluate_diffusion.py                 # tile-level MAE + histogram-intersection eval
+│   └── ...                                   # shared visualization utilities
 │
-├── docs/                         # Documentation
-│   └── model_architecture_and_training.md  # 📘 Complete technical guide
+├── tests/
+│   ├── test_diffusion_dataloader.py          # delta_20yr dataloader shape tests
+│   ├── test_diffusion_unet.py                # forward shape / param count
+│   ├── test_diffusion_training.py            # loss decreases on synthetic batch
+│   └── test_torchgeo_dataloader.py
 │
-├── requirements.txt              # Python dependencies
-├── environment.yml               # Conda environment
-└── setup.py                      # Package setup
+├── docs/
+│   ├── diffusion_v1_results.md
+│   └── simple_model_architecture_and_training.md
+│
+├── outputs/
+│   └── diffusion_v1/                         # report figures + metrics.json
+│
+├── environment.yml                            # mamba env spec
+└── setup.py
 ```
 
 ## Setup
 
 ```bash
-# Create environment with Python 3.12
-conda create -n hmforecast python=3.12
-conda activate hmforecast
-
-# Install PyTorch (choose based on your hardware)
-pip install light-the-torch
-
-# Install PyTorch with optimal hardware support (CPU/CUDA/MPS)
-ltt install torch torchvision
-
-# Install core dependencies via conda
-conda install -c conda-forge \
-    pytorch-lightning \
-    torchmetrics \
-    rasterio \
-    shapely \
-    pyproj \
-    scipy \
-    matplotlib \
-    seaborn \
-    pandas \
-    numpy \
-    scikit-learn
-
-# Install additional packages via pip
-pip install torchgeo einops wandb
+git checkout diffusion
+mamba env create -f environment.yml -n spatio-diffusion
+mamba activate spatio-diffusion
+pip install -e .
 ```
 
-**Notes**:
-- Python 3.12 is recommended for best compatibility
-- `light-the-torch` (ltt)  automatically detects your hardware and installs the appropriate PyTorch version
+The env pins:
+- Python 3.11
+- PyTorch ≥ 2.3 (with MPS on Apple Silicon, CUDA on Linux+nvidia)
+- Lightning ≥ 2.2, diffusers ≥ 0.27, transformers, torchgeo, rasterio, etc.
 
-### 2. Data Structure
+For CUDA hosts add `pytorch-cuda=12.1` (or the version matching your driver)
+to `environment.yml` before creating the env.
 
-Data should be organized in `data/raw/hm_global/`:
-
-**Dynamic variables** (time-varying, 1990-2020 at 5-year intervals):
-```
-HM_1990_AA_1000.tiff    # Target variable (Human Modification total)
-HM_1990_AG_1000.tiff    # Agriculture
-HM_1990_BU_1000.tiff    # Built-up areas
-HM_1990_gdp_1000.tiff   # GDP
-HM_1990_population_1000.tiff
-... (repeat for 1995, 2000, 2005, 2010, 2015, 2020 and all HM stressors)
-```
-
-**Static variables** (time-invariant):
-```
-hm_static_ele_1000.tiff          # Elevation
-hm_static_tas_1000.tiff          # Mean temperature
-hm_static_pr_1000.tiff           # Precipitation
-hm_static_iucn_strict_1000.tiff  # Protected areas
-...
-```
-
-### 3. W&B Setup (Optional but Recommended)
+### W&B (optional)
 
 ```bash
 wandb login
-# Or set WANDB_API_KEY environment variable
 ```
+
+Disable per-run with `--disable_wandb`.
+
+### Data layout
+
+Rasters live under `data/raw/hm_global/`. Some files were originally staged
+under `data/raw/hm_global/smal/`; the dataloader transparently resolves either
+location via `_resolve()` in `scripts/torchgeo_dataloader.py`. All rasters are
+on the same global grid (1 km, EPSG:4326).
 
 ## Usage
 
-### Training from Scratch
-
-#### Basic Training Run
+### Diffusion training
 
 ```bash
-python scripts/train_lightning.py \
+python scripts/train_diffusion.py \
   --max_epochs 50 \
-  --batch_size 8 \
-  --hidden_dim 64 \
-  --num_layers 2
+  --base_channels 128 \
+  --batch_size 4 \
+  --train_chips 256 \
+  --val_chips 32 \
+  --restrict_to_region config/region_to_predict_small.geojson \
+  --wandb_run_name v2-mac-50epoch-base128
 ```
 
-#### Full Training with All Options
-
-```bash
-python scripts/train_lightning.py \
-  --max_epochs 100 \
-  --train_chips 500 \
-  --val_chips 100 \
-  --batch_size 8 \
-  --hidden_dim 64 \
-  --num_layers 2 \
-  --num_workers 4 \
-  --ssim_weight 2.0 \
-  --laplacian_weight 1.0 \
-  --histogram_weight 0.67 \
-  --histogram_warmup_epochs 20 \
-  --use_location_encoder true \
-  --locenc_out_channels 8 \
-  --predict_after_training true \
-  --predict_region config/region_to_predict.geojson
-```
-
-#### Quick Development Run (Smoke Test)
-
-```bash
-python scripts/train_lightning.py \
-  --fast_dev_run \
-  --batch_size 2 \
-  --hidden_dim 16
-```
-
-### Key Training Arguments
+Common knobs:
 
 | Argument | Default | Description |
-|----------|---------|-------------|
-| `--max_epochs` | 100 | Number of training epochs |
-| `--train_chips` | 200 | Chips sampled per training epoch |
-| `--val_chips` | 40 | Chips sampled per validation epoch |
-| `--batch_size` | 8 | Batch size for training/validation |
-| `--hidden_dim` | 64 | ConvLSTM hidden dimension |
-| `--num_layers` | 2 | Number of ConvLSTM layers |
-| `--num_workers` | 0 | Data loader workers (0=single-threaded) |
-| `--ssim_weight` | 2.0 | Weight for SSIM loss |
-| `--laplacian_weight` | 1.0 | Weight for Laplacian pyramid loss |
-| `--histogram_weight` | 0.67 | Weight for histogram loss |
-| `--use_location_encoder` | true | Use learnable spatial position encoding |
-| `--predict_after_training` | true | Run prediction after training completes |
+|---|---|---|
+| `--max_epochs` | 5 | Training epochs |
+| `--chip_size` | 64 | Spatial chip size |
+| `--batch_size` | 16 | Mini-batch size |
+| `--base_channels` | 128 | U-Net base channels (spec target) |
+| `--channel_mults` | `[1, 2, 2, 4]` | Per-stage channel multipliers |
+| `--num_train_timesteps` | 1000 | Diffusion training timesteps |
+| `--num_inference_steps` | 30 | DDIM sampling steps at inference |
+| `--ensemble_n` | 16 | Samples per chip aggregated in prediction |
+| `--restrict_to_region` | `region_to_predict_small.geojson` | Region mask for chips |
+| `--precision` | `32-true` | Use `bf16-mixed` on Ampere+ CUDA |
 
-### Making Predictions with Existing Checkpoint
-
-#### Option 1: Load from W&B Artifact
+### Region prediction
 
 ```bash
-python scripts/train_lightning.py \
-  --checkpoint "model-xxxxxx:v0" \
-  --max_epochs 0 \
-  --predict_after_training true \
-  --predict_region config/region_to_predict.geojson \
-  --predict_stride 64 \
-  --predict_batch_size 16
+python scripts/predict_region_diffusion.py \
+  --checkpoint <path-to.ckpt> \
+  --predict_region config/region_to_predict_small.geojson \
+  --predict_stride 32 \
+  --ensemble_n 16 \
+  --num_inference_steps 30
 ```
 
-**How to find your W&B artifact name:**
-1. Go to your W&B project: https://wandb.ai/glennwithtwons/spatio-temporal-convlstm
-2. Click on a run
-3. Go to "Artifacts" tab
-4. Copy the artifact name (e.g., `model-xxxxxx:v0`)
+Outputs four GeoTIFFs to `data/predictions_diffusion/`:
 
-#### Option 2: Load from Local Checkpoint File
+```
+prediction_dhm_2020_median.tif   # ensemble median
+prediction_dhm_2020_q025.tif     # 2.5th percentile (lower band)
+prediction_dhm_2020_q975.tif     # 97.5th percentile (upper band)
+prediction_dhm_2020_std.tif      # ensemble std (uncertainty)
+```
+
+### Tile-level evaluation
 
 ```bash
-python scripts/train_lightning.py \
-  --checkpoint "checkpoints/best_model.ckpt" \
-  --max_epochs 0 \
-  --predict_after_training true \
-  --predict_region config/region_to_predict.geojson
+python scripts/evaluate_diffusion.py \
+  --checkpoint <path-to.ckpt> \
+  --wandb_run glennwithtwons/spatio-temporal-diffusion/<runid>
 ```
 
-#### Prediction Arguments
+Generates `outputs/diffusion_v1/{map_comparison.png, tile_metrics.png,
+samples_vs_observed.png, metrics.json}` and writes
+`docs/diffusion_v1_results.md`.
 
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `--predict_region` | None | Path to GeoJSON file defining prediction area |
-| `--predict_stride` | 64 | Stride between tiles for overlap blending |
-| `--predict_batch_size` | 16 | Tiles processed in parallel on GPU |
+## Architecture (diffusion v1)
 
-#### Prediction Output
+- **Backbone**: `diffusers.UNet2DModel`, 4 resolution stages, `base_channels=128`,
+  channel multipliers `[1, 2, 2, 4]`, self-attention at the lowest two stages,
+  ~74 M parameters.
+- **Conditioning** (49 channels concatenated to the noisy target every step):
+  3 timesteps × 11 dynamic vars (33) + 7 static vars + 8 LocationEncoder
+  channels + 1 explicit HM(t) reference channel.
+- **Objective**: v-prediction with cosine schedule
+  (`DDPMScheduler(prediction_type="v_prediction", beta_schedule="squaredcos_cap_v2")`).
+- **Sampler**: DDIM at inference, 30 steps, 16-sample ensemble per chip.
+- **Aggregation**: ensemble median (central), 2.5 % / 97.5 % quantiles
+  (bounds), std (uncertainty).
 
-For each horizon (5yr, 10yr, 15yr, 20yr), three GeoTIFF files are created:
+## Baseline (ConvLSTM)
 
-```
-data/predictions/REGION_NAME/
-├── prediction_2025_lower_blended.tif    # Lower 2.5% quantile
-├── prediction_2025_central_blended.tif  # Central estimate
-├── prediction_2025_upper_blended.tif    # Upper 97.5% quantile
-├── prediction_2030_lower_blended.tif
-├── prediction_2030_central_blended.tif
-├── prediction_2030_upper_blended.tif
-... (and so on for 2035, 2040)
-```
+The original ConvLSTM with 12 independent prediction heads (4 horizons × 3
+quantiles) lives under `baselines/convlstm/`. To run it:
 
-**Uncertainty mapping:**
-```python
-uncertainty = upper - lower  # Width of 95% confidence interval
-```
-
-### Experiment Tracking (W&B)
-
-All training runs are logged to: **https://wandb.ai/glennwithtwons/spatio-temporal-convlstm**
-
-**Logged metrics include:**
-- Per-horizon losses: `train/val_mae_5yr`, `train/val_ssim_loss_10yr`, etc.
-- Quantile losses: `train/val_pinball_lower_total`, `train/val_pinball_upper_total`
-- Coverage calibration: `val_coverage_total` (target: ~95%)
-- Visualizations: Multi-horizon predictions with uncertainty bounds
-
-**Disable W&B:**
 ```bash
-python scripts/train_lightning.py --disable_wandb
+python baselines/convlstm/scripts/train_lightning.py --max_epochs 50
 ```
+
+Baseline tests:
+
+```bash
+pytest baselines/convlstm/tests
+```
+
+The baseline is frozen — no further development is expected on it; it exists
+for the data-paper comparison.
 
 ## Data: Human Modification (HM)
 
-We forecast the Human Modification (HM) index, a spatially explicit measure of anthropogenic modification across landscapes.
+We forecast the Human Modification (HM) index, a spatially explicit measure of
+anthropogenic modification across landscapes.
 
-- **Source paper** (Nature Scientific Data):
-  - "Theobald, D. M., Oakleaf, J. R., Moncrieff, G., Voigt, M., Kiesecker, J., & Kennedy, C. M. (2025). Global extent and change in human modification of terrestrial ecosystems from 1990 to 2022. Scientific Data, 12(1), 606."
-  - paper available at https://www.nature.com/articles/s41597-025-04892-2
-  - data available at https://zenodo.org/records/16907328
+- **Source paper** (Nature Scientific Data): Theobald, D. M., Oakleaf, J. R.,
+  Moncrieff, G., Voigt, M., Kiesecker, J., & Kennedy, C. M. (2025). Global
+  extent and change in human modification of terrestrial ecosystems from 1990
+  to 2022. *Scientific Data*, 12(1), 606.
+  Paper: <https://www.nature.com/articles/s41597-025-04892-2>
+  Data: <https://zenodo.org/records/16907328>
 
-**Key characteristics:**
-- **Temporal cadence**: 5-year intervals (1990, 1995, ..., 2020)
-- **Model inputs**: 3 most recent HM timesteps + 11 dynamic covariates + 7 static variables
-- **Target variable**: AA (total Human Modification)
-- **Data range**: [0, 1]
-- **Coverage**: Near-global extent
-
-## Model Architecture
-
-### Independent Prediction Heads
-
-The model uses **12 separate neural network heads** (3 per horizon):
-
-```
-ConvLSTM → Shared representation
-           ↓
-    ┌──────┼──────┐
-    ↓      ↓      ↓
- Lower  Central Upper
-  Head    Head   Head
-    ↓      ↓      ↓
-  2.5%   Best   97.5%
-         Est.
-```
-
-**Central heads**: Full-size (hidden_dim → hidden_dim → 1), optimized for accuracy + spatial patterns  
-**Quantile heads**: Smaller (hidden_dim → hidden_dim/2 → 1), optimized only for uncertainty bounds
-
-### Loss Function
-
-```
-Central prediction receives:
-  MSE + 2.0×SSIM + 1.0×Laplacian + 0.67×Histogram
-
-Lower quantile receives:
-  Pinball loss (q=0.025)
-
-Upper quantile receives:
-  Pinball loss (q=0.975)
-```
-
-## Contributing
-
-Pull requests and issues are welcome. Please open an issue to discuss significant changes beforehand.
+**Available timesteps**: 1990, 1995, 2000, 2005, 2010, 2015, 2020.
+For the 20yr-horizon diffusion, the only valid input window in the available
+data is `(1990, 1995, 2000) → 2020` — the dataloader forces this when
+`target_mode="delta_20yr"`.
 
 ## Citation
-
-If you use this code, please cite the HM dataset:
 
 ```bibtex
 @article{theobald2025global,

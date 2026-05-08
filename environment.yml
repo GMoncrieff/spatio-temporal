@@ -1,0 +1,38 @@
+name: spatio-diffusion
+channels:
+  - pytorch
+  - conda-forge
+  - nvidia
+dependencies:
+  - python=3.11
+  - pip
+
+  - pytorch::pytorch>=2.3
+  - pytorch::torchvision
+
+  - conda-forge::rasterio
+  - conda-forge::shapely
+  - conda-forge::pyproj
+  - conda-forge::fiona
+  - conda-forge::gdal
+
+  - conda-forge::numpy
+  - conda-forge::scipy
+  - conda-forge::pandas
+  - conda-forge::matplotlib
+  - conda-forge::seaborn
+  - conda-forge::pyyaml
+  - conda-forge::pytest
+  - conda-forge::tqdm
+
+  - pip:
+      - lightning>=2.2
+      - diffusers>=0.27
+      - transformers>=4.40
+      - accelerate>=0.30
+      - torchgeo>=0.5
+      - wandb
+      - omegaconf
+      - hydra-core
+      - einops
+      - torchmetrics

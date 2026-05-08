@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from ..locationencoder import LocationEncoder
+from src.locationencoder import LocationEncoder
 from .convlstm import ConvLSTM
 
 class SpatioTemporalPredictor(nn.Module):

@@ -2,9 +2,14 @@
 Test histogram loss for pixel-level change distributions.
 """
 
+import sys
+from pathlib import Path
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(PROJECT_ROOT))
+
 import torch
 import numpy as np
-from src.models.histogram_loss import HistogramLoss, compute_histogram
+from baselines.convlstm.models.histogram_loss import HistogramLoss, compute_histogram
 
 
 def test_compute_histogram():
@@ -107,7 +112,7 @@ def test_class_balanced_weights():
 
 def test_warmup_epochs():
     """Test that histogram loss respects warmup epochs."""
-    from src.models.lightning_module import SpatioTemporalLightningModule
+    from baselines.convlstm.models.lightning_module import SpatioTemporalLightningModule
     
     model = SpatioTemporalLightningModule(
         hidden_dim=16,

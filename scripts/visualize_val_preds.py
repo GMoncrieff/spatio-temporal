@@ -5,7 +5,7 @@ import os
 import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent))
-from src.models.lightning_module import SpatioTemporalLightningModule
+from baselines.convlstm.models.lightning_module import SpatioTemporalLightningModule
 
 # Path to best checkpoint
 ckpt_path = os.path.join('models', 'checkpoints', 'lightning_logs', 'version_7', 'checkpoints', 'epoch=9-step=250.ckpt')

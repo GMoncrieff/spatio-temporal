@@ -1,15 +1,15 @@
 """
 Integration test for multi-horizon training loop.
 """
-import torch
 import sys
-import os
+from pathlib import Path
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
-# Add parent directory to path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-from scripts.torchgeo_dataloader import get_dataloader
-from src.models.lightning_module import SpatioTemporalLightningModule
+import torch
+from torchgeo_dataloader import get_dataloader
+from baselines.convlstm.models.lightning_module import SpatioTemporalLightningModule
 import pytorch_lightning as pl
 
 

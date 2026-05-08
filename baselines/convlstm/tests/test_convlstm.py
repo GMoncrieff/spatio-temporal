@@ -1,8 +1,9 @@
 import torch
 import sys
 from pathlib import Path
-sys.path.append(str(Path(__file__).parent.parent))
-from src.models.convlstm import ConvLSTM
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(PROJECT_ROOT))
+from baselines.convlstm.models.convlstm import ConvLSTM
 
 def test_convlstm_forward():
     # Dummy input: batch=2, timesteps=3, channels=1, height=128, width=128
