@@ -7,25 +7,6 @@
 - Aggregate-tile size: **16×16** pixels (10 km blocks).
 - Histogram bins (rarity-weighted, matches baseline `histogram_loss.py`):
   `[-1.0, -0.005, 0.005, 0.02, 0.1, 0.2, 0.4, 0.6, 1.0]`.
-- W&B run: [glennwithtwons/spatio-temporal-diffusion/pnbnwhjp](https://wandb.ai/glennwithtwons/spatio-temporal-diffusion/pnbnwhjp)
-
-## Model & checkpoint
-
-- Checkpoint: `/Users/glen.moncrieff/python/spatio_temporal/spatio-temporal-diffusion/pnbnwhjp/checkpoints/dhm-diffusion-epoch29-valloss0.0931.ckpt`
-- Stopping epoch: 29 (global step 1920)
-- Architecture: `ConditionalDiffusionUNet` (`diffusers.UNet2DModel`)
-  - sample_size = 64
-  - base_channels = 128
-  - channel_mults = [1, 2, 2, 4]
-  - attention_head_dim = 64, attention_at_low_two = True
-  - layers_per_block = 2
-  - cond_channels = 55 (3 timesteps × 11 dyn + 7 static + locenc + 1 hm_t)
-  - parameter count = **74.1 M**
-- Diffusion: `DDPMScheduler(prediction_type="v_prediction", beta_schedule="squaredcos_cap_v2")`
-  - num_train_timesteps = 1000
-  - inference sampler: DDIM at 30 steps
-- LocationEncoder: `('sphericalharmonics', 'siren')`, out_channels=8
-- Optimizer: `AdamW(lr=0.0001, weight_decay=0.01)`
 
 ## Results
 
@@ -58,20 +39,35 @@ ones where the model has to express genuine uncertainty.
 | `[ +0.400, +0.600]` | 19 | 0.000 |
 | `[ +0.600, +1.000]` | 0 | — |
 
+## Tail diagnostics
+
+These metrics directly answer "is the model under-predicting magnitude
+*somewhere in the field*?" — the user's stated success criterion. Methods follow
+WassDiff (IEEE TGRS 2025), ExtremeCast (AAAI 2024), and the Aich et al. (GMD
+2026) bias-correction work.
+
+### R95p (mass above 95th percentile of obs)
+
+- Threshold: 0.0623
+- Observed tail mass: 501.7283
+- Predicted tail mass: 0.0000
+- **Ratio (pred / obs):** **0.000** (<<1 = under-predicting tail; ~1 = calibrated; >1 = over)
+
+### Tail exceedance (deterministic + q975 ensemble support)
+
+| Threshold | n(obs>t) | n(pred>t) | POD | CSI | FAR | q975 soft-POD |
+|---|---|---|---|---|---|---|
+| +0.050 |     17,401 |      1,042 | 0.012 | 0.012 | 0.792 | 0.926 |
+| +0.100 |      4,564 |          0 | 0.000 | 0.000 | nan | 0.000 |
+| +0.200 |        544 |          0 | 0.000 | 0.000 | nan | 0.000 |
+| +0.400 |         19 |          0 | 0.000 | 0.000 | nan | 0.000 |
+
+![Q-Q max-of-field](../outputs/diffusion_v1/qq_max_of_field.png)
+
 ## Figures
 
 - Map comparison: ![](../outputs/diffusion_v1/map_comparison.png)
 - Tile-level summaries: ![](../outputs/diffusion_v1/tile_metrics.png)
-
-
-## Random samples vs. observed change
-
-5 randomly-drawn validation chips (rows). Column 1 = observed Δhm
-(2020 − 2000); columns 2–6 = independent draws from the trained diffusion
-model's conditional posterior. Sample variability captures the model's
-uncertainty about *where* and *how much* change occurs.
-
-![](../outputs/diffusion_v1/samples_vs_observed.png)
 
 ## Caveats / Notes
 

@@ -235,6 +235,158 @@ def per_bin_coverage(obs, q025, q975, valid, bin_edges):
     return out
 
 
+def per_tile_max(arr, valid, tile_size):
+    """Per non-overlapping tile, return the spatial max of valid pixels."""
+    H, W = arr.shape
+    Ht = (H // tile_size) * tile_size
+    Wt = (W // tile_size) * tile_size
+    a = np.where(valid, arr, np.nan)[:Ht, :Wt]
+    n_h, n_w = Ht // tile_size, Wt // tile_size
+    blocks = a.reshape(n_h, tile_size, n_w, tile_size)
+    counts = np.isfinite(blocks).sum(axis=(1, 3))
+    maxes = np.nanmax(blocks, axis=(1, 3))
+    return maxes, counts
+
+
+def qq_max_of_field(pred, obs, valid, tile_size, q=np.linspace(0.0, 1.0, 51)):
+    """Q-Q comparison of per-tile spatial max(Δhm).
+
+    The single most diagnostic metric for "magnitude-correct somewhere in the
+    field": for each tile take max(pred) and max(obs); compare their CDFs.
+    Slope < 1 in the upper-tail = systematic under-prediction of magnitude.
+    """
+    pred_max, c_p = per_tile_max(pred, valid, tile_size)
+    obs_max, c_o = per_tile_max(obs, valid, tile_size)
+    keep = (c_p > 0) & (c_o > 0) & np.isfinite(pred_max) & np.isfinite(obs_max)
+    if keep.sum() == 0:
+        return None
+    pred_q = np.quantile(pred_max[keep], q)
+    obs_q = np.quantile(obs_max[keep], q)
+    return {
+        "quantiles": q.tolist(),
+        "pred_q": pred_q.tolist(),
+        "obs_q": obs_q.tolist(),
+        "n_tiles": int(keep.sum()),
+        "pred_max_global": float(np.max(pred_max[keep])),
+        "obs_max_global": float(np.max(obs_max[keep])),
+    }
+
+
+def r95p_index(pred, obs, valid, percentile=95):
+    """R95p: ratio of total Δhm mass above the p-th percentile of observations.
+
+    >=1.0 means the model captures (or over-states) the upper-tail mass; <<1.0
+    means systematic under-prediction. Standard in the precipitation-extremes
+    literature (Aich et al. GMD 2026; FuXi-Extreme).
+    """
+    obs_pos = obs[valid & (obs > 0)]
+    if obs_pos.size < 32:
+        return None
+    p = float(np.percentile(obs_pos, percentile))
+    obs_mass = float(np.sum(np.maximum(obs[valid] - p, 0.0)))
+    pred_mass = float(np.sum(np.maximum(pred[valid] - p, 0.0)))
+    if obs_mass <= 0:
+        return None
+    return {
+        "percentile": percentile,
+        "threshold": p,
+        "obs_tail_mass": obs_mass,
+        "pred_tail_mass": pred_mass,
+        "ratio": pred_mass / obs_mass,
+    }
+
+
+def tail_exceedance_metrics(pred, obs, q975, valid, thresholds=(0.05, 0.1, 0.2, 0.4)):
+    """For each threshold t, report deterministic POD/FAR/CSI on (pred>t vs obs>t)
+    plus ensemble-exceedance support from q975.
+
+    POD = TP/(TP+FN), CSI = TP/(TP+FN+FP). q975-based "soft" exceedance reports
+    the fraction of pixels where the predicted upper bound at least crosses t —
+    a calibration check on the ensemble's tail width.
+    """
+    out = []
+    for t in thresholds:
+        obs_pos = (obs > t) & valid
+        pred_pos = (pred > t) & valid
+        tp = int((obs_pos & pred_pos).sum())
+        fn = int((obs_pos & ~pred_pos).sum())
+        fp = int((~obs_pos & pred_pos).sum())
+        n_obs = int(obs_pos.sum())
+        pod = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
+        csi = tp / (tp + fn + fp) if (tp + fn + fp) > 0 else float("nan")
+        far = fp / (tp + fp) if (tp + fp) > 0 else float("nan")
+        # Ensemble-tail support from q975 (model thinks P(X>t)>2.5%)
+        if q975 is not None:
+            q975_pos = (q975 > t) & valid
+            n_q975 = int(q975_pos.sum())
+            soft_pod = (
+                int((obs_pos & q975_pos).sum()) / n_obs if n_obs > 0 else float("nan")
+            )
+        else:
+            n_q975 = None
+            soft_pod = float("nan")
+        out.append({
+            "threshold": float(t),
+            "n_obs_exceed": n_obs,
+            "n_pred_exceed": int(pred_pos.sum()),
+            "n_q975_exceed": n_q975,
+            "POD": pod,
+            "CSI": csi,
+            "FAR": far,
+            "q975_soft_POD": soft_pod,
+        })
+    return out
+
+
+def plot_qq_max_of_field(qq, out_path):
+    """Diagonal Q-Q of per-tile max(Δhm). Blue line = perfect; red = our model."""
+    if qq is None:
+        return
+    pred_q = np.asarray(qq["pred_q"])
+    obs_q = np.asarray(qq["obs_q"])
+    fig, ax = plt.subplots(figsize=(5.5, 5.5), constrained_layout=True)
+    lim_lo = float(min(pred_q.min(), obs_q.min()))
+    lim_hi = float(max(pred_q.max(), obs_q.max()))
+    ax.plot([lim_lo, lim_hi], [lim_lo, lim_hi], "b--", linewidth=1, label="y = x")
+    ax.plot(obs_q, pred_q, "r-o", markersize=3, linewidth=1.2, label="pred vs obs")
+    ax.set_xlabel("Observed per-tile max(Δhm)")
+    ax.set_ylabel("Predicted per-tile max(Δhm)")
+    ax.set_title("Q-Q: per-tile spatial maximum")
+    ax.legend(loc="lower right")
+    ax.grid(True, alpha=0.3)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _render_tail_exceedance_table(rows):
+    if not rows:
+        return ""
+    header = ("| Threshold | n(obs>t) | n(pred>t) | POD | CSI | FAR | q975 soft-POD |\n"
+              "|---|---|---|---|---|---|---|\n")
+    body = []
+    for r in rows:
+        body.append(
+            f"| {r['threshold']:>+.3f} | {r['n_obs_exceed']:>10,d} | "
+            f"{r['n_pred_exceed']:>10,d} | "
+            f"{r['POD']:.3f} | {r['CSI']:.3f} | {r['FAR']:.3f} | "
+            f"{r['q975_soft_POD']:.3f} |"
+        )
+    return "### Tail exceedance (deterministic + q975 ensemble support)\n\n" + header + "\n".join(body) + "\n"
+
+
+def _render_r95p(r95p):
+    if r95p is None:
+        return ""
+    return (
+        f"### R95p (mass above {r95p['percentile']}th percentile of obs)\n\n"
+        f"- Threshold: {r95p['threshold']:.4f}\n"
+        f"- Observed tail mass: {r95p['obs_tail_mass']:.4f}\n"
+        f"- Predicted tail mass: {r95p['pred_tail_mass']:.4f}\n"
+        f"- **Ratio (pred / obs):** **{r95p['ratio']:.3f}** "
+        f"(<<1 = under-predicting tail; ~1 = calibrated; >1 = over)\n"
+    )
+
+
 def model_summary_from_checkpoint(checkpoint_path):
     """Load a checkpoint and pull a model+training summary dict (no torch needed for parts)."""
     import torch
@@ -381,7 +533,7 @@ def _render_bin_coverage_table(per_bin):
 
 
 def write_report(metrics, args, report_path, panel_path, summary_path,
-                 model_info=None, sample_grid_path=None):
+                 model_info=None, sample_grid_path=None, qq_path=None):
     rel = lambda p: os.path.relpath(p, os.path.dirname(report_path))
 
     model_section = ""
@@ -463,6 +615,17 @@ ones where the model has to express genuine uncertainty.
 | Δhm bin | n pixels | Coverage |
 |---|---:|---:|
 {_render_bin_coverage_table(metrics.get('per_bin_coverage'))}
+
+## Tail diagnostics
+
+These metrics directly answer "is the model under-predicting magnitude
+*somewhere in the field*?" — the user's stated success criterion. Methods follow
+WassDiff (IEEE TGRS 2025), ExtremeCast (AAAI 2024), and the Aich et al. (GMD
+2026) bias-correction work.
+
+{_render_r95p(metrics.get('r95p'))}
+{_render_tail_exceedance_table(metrics.get('tail_exceedance'))}
+{f"![Q-Q max-of-field]({rel(qq_path)})" if qq_path is not None else ""}
 
 ## Figures
 
@@ -548,6 +711,14 @@ def main():
         cov_valid = valid & np.isfinite(q025) & np.isfinite(q975)
         cov = coverage_rate(obs, q025, q975, cov_valid)
         bin_cov = per_bin_coverage(obs, q025, q975, cov_valid, HIST_BIN_EDGES)
+    else:
+        q975 = None
+
+    qq_max = qq_max_of_field(pred, obs, valid, args.tile_size)
+    r95p = r95p_index(pred, obs, valid, percentile=95)
+    tail_exceed = tail_exceedance_metrics(
+        pred, obs, q975, valid, thresholds=(0.05, 0.1, 0.2, 0.4)
+    )
 
     metrics = dict(
         n_tiles_total=n_tiles_total,
@@ -560,6 +731,9 @@ def main():
         pearson_r=pearson_r,
         coverage_rate=cov,
         per_bin_coverage=bin_cov,
+        qq_max_of_field=qq_max,
+        r95p=r95p,
+        tail_exceedance=tail_exceed,
     )
     print("Metrics:")
     for k, v in metrics.items():
@@ -570,8 +744,23 @@ def main():
             for entry in v:
                 low, high = entry["bin"]
                 cov_v = entry["coverage"]
-                cov_s = f"{cov_v:.3f}" if cov_v == cov_v else "nan"  # nan check
+                cov_s = f"{cov_v:.3f}" if cov_v == cov_v else "nan"
                 print(f"    [{low:>+7.3f}, {high:>+6.3f}]  n={entry['n']:>10,d}  coverage={cov_s}")
+        elif k == "qq_max_of_field":
+            if v is None:
+                continue
+            print(f"  qq_max_of_field: pred_max_global={v['pred_max_global']:.4f}  "
+                  f"obs_max_global={v['obs_max_global']:.4f}  n_tiles={v['n_tiles']}")
+        elif k == "r95p":
+            if v is None:
+                continue
+            print(f"  r95p: threshold={v['threshold']:.4f}  ratio(pred/obs)={v['ratio']:.3f}")
+        elif k == "tail_exceedance":
+            print("  tail_exceedance:")
+            for r in v:
+                print(f"    t>{r['threshold']:>+.3f}  n_obs={r['n_obs_exceed']:>10,d}  "
+                      f"POD={r['POD']:.3f}  CSI={r['CSI']:.3f}  "
+                      f"q975-soft-POD={r['q975_soft_POD']:.3f}")
         else:
             print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
 
@@ -587,6 +776,11 @@ def main():
     metric_summary_plots(tile_mae, tile_xinter, counts, summary_path)
     print(f"Wrote: {panel_path}")
     print(f"Wrote: {summary_path}")
+
+    qq_path = out_dir / "qq_max_of_field.png"
+    plot_qq_max_of_field(qq_max, qq_path)
+    if qq_max is not None:
+        print(f"Wrote: {qq_path}")
 
     sample_grid_path = None
     model_info = None
@@ -607,7 +801,8 @@ def main():
             sample_grid_path = None
 
     write_report(metrics, args, args.report, panel_path, summary_path,
-                 model_info=model_info, sample_grid_path=sample_grid_path)
+                 model_info=model_info, sample_grid_path=sample_grid_path,
+                 qq_path=qq_path if qq_max is not None else None)
     print(f"Wrote report: {args.report}")
 
     metrics_json = out_dir / "metrics.json"
