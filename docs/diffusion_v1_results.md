@@ -7,11 +7,11 @@
 - Aggregate-tile size: **16×16** pixels (10 km blocks).
 - Histogram bins (rarity-weighted, matches baseline `histogram_loss.py`):
   `[-1.0, -0.005, 0.005, 0.02, 0.1, 0.2, 0.4, 0.6, 1.0]`.
-- W&B run: [glennwithtwons/spatio-temporal-diffusion/ry0po5mo](https://wandb.ai/glennwithtwons/spatio-temporal-diffusion/ry0po5mo)
+- W&B run: [glennwithtwons/spatio-temporal-diffusion/ebcdx6ax](https://wandb.ai/glennwithtwons/spatio-temporal-diffusion/ebcdx6ax)
 
 ## Model & checkpoint
 
-- Checkpoint: `/Users/glen.moncrieff/python/spatio_temporal/spatio-temporal-diffusion/ry0po5mo/checkpoints/dhm-diffusion-epoch33-valloss0.1682.ckpt`
+- Checkpoint: `/Users/glen.moncrieff/python/spatio_temporal/spatio-temporal-diffusion/ebcdx6ax/checkpoints/dhm-diffusion-epoch33-valloss0.1684.ckpt`
 - Stopping epoch: 33 (global step 2176)
 - Architecture: `ConditionalDiffusionUNet` (`diffusers.UNet2DModel`)
   - sample_size = 64
@@ -19,7 +19,7 @@
   - channel_mults = [1, 2, 2, 4]
   - attention_head_dim = 64, attention_at_low_two = True
   - layers_per_block = 2
-  - cond_channels = 49 (3 timesteps × 11 dyn + 7 static + locenc + 1 hm_t)
+  - cond_channels = 55 (3 timesteps × 11 dyn + 7 static + locenc + 1 hm_t)
   - parameter count = **74.1 M**
 - Diffusion: `DDPMScheduler(prediction_type="v_prediction", beta_schedule="squaredcos_cap_v2")`
   - num_train_timesteps = 1000
@@ -32,13 +32,13 @@
 | Metric | Value |
 |---|---|
 | Tiles with valid coverage | 2,003 of 7,150 |
-| Tile-mean MAE (median) | **0.0021** |
-| Tile-mean MAE (mean) | 0.0056 |
-| Tile-mean MAE (95th %ile) | 0.0222 |
-| Histogram intersection (median) | **0.850** |
-| Histogram intersection (mean) | 0.785 |
-| Pearson r (predicted vs. observed tile-mean Δhm) | 0.489 |
-| Coverage rate (q025 ≤ obs ≤ q975) | 0.791 (target ≈ 0.95) |
+| Tile-mean MAE (median) | **0.0019** |
+| Tile-mean MAE (mean) | 0.0055 |
+| Tile-mean MAE (95th %ile) | 0.0224 |
+| Histogram intersection (median) | **0.862** |
+| Histogram intersection (mean) | 0.789 |
+| Pearson r (predicted vs. observed tile-mean Δhm) | 0.517 |
+| Coverage rate (q025 ≤ obs ≤ q975) | 0.799 (target ≈ 0.95) |
 
 ## Figures
 

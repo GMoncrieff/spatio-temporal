@@ -91,7 +91,7 @@ def quick_stats(stat_samples=512, chip_size=64):
     ds = HumanFootprintChipDataset(
         hm_files, component_files, static_files,
         chip_size=chip_size, stat_samples=stat_samples,
-        target_mode="delta_20yr",  # match training mode (extends hm_vars with IDW)
+        target_mode="delta_20yr",  # match training mode (extends hm_vars with distance vars)
     )
     return dict(
         hm_mean=float(ds.hm_mean), hm_std=float(ds.hm_std),
@@ -134,7 +134,7 @@ def main():
     hm_mean, hm_std = stats["hm_mean"], stats["hm_std"]
     comp_means, comp_stds = stats["comp_means"], stats["comp_stds"]
     static_means, static_stds = stats["static_means"], stats["static_stds"]
-    # The dataset extends hm_vars with idw15/idw51 when delta_20yr; use that list
+    # The dataset extends hm_vars with dist10/dist40 when delta_20yr; use that list
     # both for normalization keys AND to know which raster files to open.
     hm_vars_used = stats["hm_vars"]
     comp_files_used = stats["comp_files"]
@@ -179,7 +179,7 @@ def main():
 
     # Open all rasters
     hm_srcs = [rasterio.open(p) for p in hm_files]
-    # Use the extended component file list from the dataset (includes IDW vars).
+    # Use the extended component file list from the dataset (includes distance vars).
     comp_srcs = {y: [rasterio.open(p) for p in comp_files_used[y]] for y in years}
     stat_srcs = [rasterio.open(p) for p in static_files]
     nan_to_zero_static = {0, 4, 5, 6}
@@ -235,7 +235,7 @@ def main():
                 channels = []
                 arr_hm = hm_srcs[t_idx].read(1, window=win, masked=True).filled(np.nan)
                 channels.append((arr_hm - hm_mean) / hm_std)
-                # Components (originals + precomputed IDW vars when delta_20yr)
+                # Components (originals + precomputed distance vars when delta_20yr)
                 for var_idx, (var_name, src) in enumerate(zip(hm_vars_used, comp_srcs[y])):
                     carr = src.read(1, window=win, masked=True).filled(np.nan)
                     carr = np.nan_to_num(carr, nan=0.0)

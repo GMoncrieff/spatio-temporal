@@ -45,35 +45,9 @@ import numpy as np
 import rasterio
 
 
-def _make_idw_kernels(sizes=(15, 51), decay=1.0):
-    """Build inverse-distance weighting kernels w(d) = 1 / (d^decay + ε).
-
-    HM is continuous in [0, 1] so a binary "distance to feature" doesn't
-    apply. Instead we treat each pixel's HM value as the *intensity* of
-    modification at that location and ask, for every target pixel, "how
-    much modification surrounds you, weighted by 1/distance?". Convolving
-    HM with these kernels gives a per-pixel neighborhood-IDW signal that
-    captures proximity to roads / urban / infrastructure (which are the
-    dominant contributors to HM_AA).
-
-    Two scales by default: a "near" kernel (radius 15 ≈ 15 km at 1 km/px
-    grid) for immediate-neighborhood pressure, and a "far" kernel
-    (radius 51) for regional context.
-    """
-    kernels = []
-    for size in sizes:
-        half = int(size)
-        full = 2 * half + 1
-        y, x = np.ogrid[-half:half + 1, -half:half + 1]
-        d = np.sqrt(x * x + y * y).astype(np.float32)
-        eps = 1e-6
-        w = 1.0 / (d ** decay + eps)
-        w[half, half] = 0.0  # exclude self
-        s = w.sum()
-        if s > 0:
-            w = w / s
-        kernels.append(w)
-    return kernels
+def _distance_label(threshold: float) -> str:
+    """Format a threshold like 0.10 → 'dist10', 0.40 → 'dist40'."""
+    return f"dist{int(round(threshold * 100)):02d}"
 
 
 class HumanFootprintChipDataset(torch.utils.data.Dataset):
@@ -111,10 +85,8 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
         target_mode="absolute_4horizons",
         restrict_to_region=None,
         dhm_stats_cache=None,
-        add_idw=None,
-        idw_kernel_radii=(15, 51),
-        idw_decay=1.0,
-        idw_stats_cache=None,
+        add_distance=None,
+        distance_thresholds=(0.1, 0.4),
     ):
         self.hm_files = hm_files
         self.component_files = component_files
@@ -132,16 +104,17 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
         self.restrict_to_region = restrict_to_region
         self.dhm_stats_cache = dhm_stats_cache
 
-        # IDW spatial-context channels: defaults on for delta_20yr, off otherwise.
-        # IDW rasters must be precomputed via scripts/preprocess_idw.py and live
-        # alongside the HM_AA / component rasters.
-        if add_idw is None:
-            add_idw = (target_mode == "delta_20yr")
-        self.add_idw = bool(add_idw)
-        self.idw_kernel_radii = tuple(int(r) for r in idw_kernel_radii) if self.add_idw else ()
-        self.idw_decay = float(idw_decay)  # tracked for cache compatibility only
-        self.idw_stats_cache = idw_stats_cache  # unused under precompute path
-        self.n_idw_channels = len(self.idw_kernel_radii)
+        # Distance-to-HM-threshold channels: defaults on for delta_20yr, off otherwise.
+        # Distance rasters (e.g. HM_2000_dist10_1000.tiff, HM_2000_dist40_1000.tiff)
+        # must be precomputed via scripts/preprocess_distance.py and live alongside
+        # the HM_AA / component rasters.
+        if add_distance is None:
+            add_distance = (target_mode == "delta_20yr")
+        self.add_distance = bool(add_distance)
+        self.distance_thresholds = (
+            tuple(float(t) for t in distance_thresholds) if self.add_distance else ()
+        )
+        self.n_distance_channels = len(self.distance_thresholds)
 
         if target_mode == "delta_20yr":
             if list(end_year_options) != [2000] or use_temporal_sampling \
@@ -167,12 +140,15 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
         self.include_components = bool(include_components)
         self._hm_files = list(hm_files)
         self._static_files = list(static_files if static_channels is None else static_files[:int(static_channels)])
-        # Effective component variable list (extended with precomputed IDW vars
-        # when add_idw=True). The IDW rasters get the same per-variable
-        # normalization treatment as the original HM components.
+        # Effective component variable list (extended with precomputed
+        # distance-to-HM-threshold vars when add_distance=True). Those distance
+        # rasters get the same per-variable normalization treatment as the
+        # original HM components.
         self.hm_vars = list(HM_VARS)
-        if self.add_idw and self.idw_kernel_radii:
-            self.hm_vars = self.hm_vars + [f"idw{r}" for r in self.idw_kernel_radii]
+        if self.add_distance and self.distance_thresholds:
+            self.hm_vars = self.hm_vars + [
+                _distance_label(t) for t in self.distance_thresholds
+            ]
         if self.include_components:
             self._comp_files = {
                 y: [_resolve(f"HM_{y}_{v}_1000.tiff") for v in self.hm_vars]
@@ -250,8 +226,8 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
         self.elev_std = self.static_stds[0] if self.static_stds else 1.0
         
         # Component stats (per variable) - critical for GDP/population which have different scales.
-        # Note: self.hm_vars may include precomputed IDW vars (idw15, idw51) when add_idw=True;
-        # those go through the same per-variable normalization pipeline.
+        # Note: self.hm_vars may include precomputed distance vars (dist10, dist40) when
+        # add_distance=True; those go through the same per-variable normalization pipeline.
         self.comp_means = {}
         self.comp_stds = {}
         if self.include_components:
@@ -362,8 +338,8 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
         else:
             self.chip_positions = None
 
-        # C_comp already includes IDW vars when add_idw is True (they're added
-        # to self.hm_vars and self._comp_files above).
+        # C_comp already includes distance vars when add_distance is True (they're
+        # added to self.hm_vars and self._comp_files above).
         self.C_comp = len(self._comp_files[years[0]]) if self.include_components else 0
         self.C_dyn = 1 + self.C_comp
         self.C_static = len(self._static_files)
@@ -512,7 +488,7 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
                 # Data is already in [0, 1] range
                 arr_hm = (arr_hm - self.hm_mean) / self.hm_std
                 channels.append(arr_hm)
-                # HM covariates (originals + precomputed IDW vars when add_idw)
+                # HM covariates (originals + precomputed distance vars when add_distance)
                 if self.include_components and self._comp_srcs.get(year, []):
                     for var_idx, src in enumerate(self._comp_srcs[year]):
                         carr = src.read(1, window=rasterio.windows.Window(j, i, self.chip_size, self.chip_size), masked=True).filled(np.nan)
@@ -663,10 +639,8 @@ def get_dataloader(
     target_mode="absolute_4horizons",
     restrict_to_region=None,
     dhm_stats_cache=None,
-    add_idw=None,
-    idw_kernel_radii=(15, 51),
-    idw_decay=1.0,
-    idw_stats_cache=None,
+    add_distance=None,
+    distance_thresholds=(0.1, 0.4),
 ):
     """
     Create a DataLoader for the Human Footprint dataset.
@@ -679,11 +653,10 @@ def get_dataloader(
             overlaps the rasterized region are kept.
         dhm_stats_cache: Optional path to cache (mean, std) of Δhm; ignored unless
             target_mode == "delta_20yr".
-        add_idw: Whether to add IDW(HM) channels per timestep (default: True for
-            delta_20yr, False otherwise).
-        idw_kernel_radii: Per-channel kernel radii (pixels). Default (15, 51).
-        idw_decay: IDW kernel decay exponent. Default 1.0 (1/d weighting).
-        idw_stats_cache: Optional JSON path to cache per-kernel mean/std.
+        add_distance: Whether to read precomputed distance-to-HM-threshold rasters
+            as extra component channels (default: True for delta_20yr, False otherwise).
+            Rasters must be precomputed via scripts/preprocess_distance.py.
+        distance_thresholds: Per-channel HM thresholds. Default (0.1, 0.4).
     """
     ds = HumanFootprintChipDataset(
         hm_files,
@@ -708,10 +681,8 @@ def get_dataloader(
         target_mode=target_mode,
         restrict_to_region=restrict_to_region,
         dhm_stats_cache=dhm_stats_cache,
-        add_idw=add_idw,
-        idw_kernel_radii=idw_kernel_radii,
-        idw_decay=idw_decay,
-        idw_stats_cache=idw_stats_cache,
+        add_distance=add_distance,
+        distance_thresholds=distance_thresholds,
     )
     return DataLoader(
         ds,
