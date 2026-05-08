@@ -69,6 +69,7 @@ class DiffusionLightningModule(pl.LightningModule):
         dhm_mean: float = 0.0,
         dhm_std: float = 1.0,
         cfg_dropout_prob: float = 0.0,
+        min_snr_gamma: float = 0.0,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -89,6 +90,7 @@ class DiffusionLightningModule(pl.LightningModule):
         self.dhm_mean = float(dhm_mean)
         self.dhm_std = float(dhm_std)
         self.cfg_dropout_prob = float(cfg_dropout_prob)
+        self.min_snr_gamma = float(min_snr_gamma)
 
         loc = _maybe_build_location_encoder(location_encoder_kwargs)
         if loc is None:
@@ -159,26 +161,46 @@ class DiffusionLightningModule(pl.LightningModule):
             batch["hm_t_normalized"],
         )
 
-    def _v_loss(self, v_pred, v_target, valid, target_dhm):
-        """Per-pixel-reweighted v-prediction MSE.
+    def _snr_weights(self, t):
+        """Min-SNR-γ per-timestep weight for v-prediction.
 
-        With pixel_weight_alpha > 0, each pixel's MSE contribution is scaled
-        by (|target_dhm|^alpha + eps), normalised so the average weight over
-        valid pixels is 1. This concentrates gradient on the rare large-Δhm
-        pixels that the uniform MSE drowns out.
+        Hang et al. 2023 — for v-prediction the loss should be weighted by
+        min(γ, SNR(t)) / (1 + SNR(t)) so high-SNR (low-noise) steps get
+        relatively more gradient. Without this the v-loss is roughly uniform
+        across t, which under-weights the low-noise regime where rare
+        high-magnitude features actually live.
+        """
+        if self.min_snr_gamma <= 0:
+            return None
+        alphas_cumprod = self.train_scheduler.alphas_cumprod.to(t.device)[t]
+        snr = alphas_cumprod / (1.0 - alphas_cumprod).clamp(min=1e-8)
+        w = torch.minimum(snr, torch.full_like(snr, self.min_snr_gamma)) / (1.0 + snr)
+        return w.view(-1, 1, 1, 1)
+
+    def _v_loss(self, v_pred, v_target, valid, target_dhm, t):
+        """Per-pixel + per-timestep weighted v-prediction MSE.
+
+        - pixel_weight_alpha > 0 scales each pixel's MSE by (|target_dhm|^α + ε),
+          normalised so the average pixel weight on valid pixels is 1.
+        - min_snr_gamma > 0 applies Hang-2023 min-SNR-γ per-timestep weighting
+          (γ ≈ 5 is standard for v-prediction).
         """
         valid_f = valid.float()
         sq = (v_pred - v_target).pow(2)
-        if self.pixel_weight_alpha <= 0:
-            denom = valid_f.sum().clamp(min=1.0)
-            return (sq * valid_f).sum() / denom
-        w = target_dhm.abs().pow(self.pixel_weight_alpha) + self.pixel_weight_eps
-        # Normalise per-batch so the *mean* weight on valid pixels is 1.
-        w_sum = (w * valid_f).sum()
-        v_sum = valid_f.sum().clamp(min=1.0)
-        w_norm = w * (v_sum / w_sum.clamp(min=1e-8))
+        # Pixel weight (1 if disabled).
+        if self.pixel_weight_alpha > 0:
+            w_pix = target_dhm.abs().pow(self.pixel_weight_alpha) + self.pixel_weight_eps
+            w_sum = (w_pix * valid_f).sum()
+            v_sum = valid_f.sum().clamp(min=1.0)
+            w_pix = w_pix * (v_sum / w_sum.clamp(min=1e-8))
+        else:
+            w_pix = torch.ones_like(sq)
+        # SNR weight (1 if disabled). Per-batch-element [B, 1, 1, 1].
+        snr_w = self._snr_weights(t)
+        if snr_w is not None:
+            sq = sq * snr_w
         denom = valid_f.sum().clamp(min=1.0)
-        return (sq * w_norm * valid_f).sum() / denom
+        return (sq * w_pix * valid_f).sum() / denom
 
     def _x0_pred_from_v(self, noisy, v_pred, t):
         """Recover predicted clean x_0 from v_pred under v-prediction parametrisation."""
@@ -239,7 +261,7 @@ class DiffusionLightningModule(pl.LightningModule):
         v_target = self.train_scheduler.get_velocity(x_0, noise, t)
         v_pred = self.unet(noisy, cond, t)
 
-        v_loss = self._v_loss(v_pred, v_target, valid, x_0)
+        v_loss = self._v_loss(v_pred, v_target, valid, x_0, t)
 
         if self.pattern_loss_weight > 0:
             x0_pred = self._x0_pred_from_v(noisy, v_pred, t)

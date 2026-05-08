@@ -92,6 +92,9 @@ def parse_args():
     p.add_argument("--cfg_dropout_prob", type=float, default=0.0,
                    help="Probability of dropping conditioning during training (CFG). "
                         "0 = off; 0.1 standard. Enables classifier-free guidance at sampling.")
+    p.add_argument("--min_snr_gamma", type=float, default=0.0,
+                   help="Hang-2023 min-SNR-γ weighting on v-loss (0=off, 5 standard "
+                        "for v-prediction). Upweights low-noise / high-SNR steps.")
 
     # Location encoder
     p.add_argument("--use_location_encoder", action="store_true", default=True)
@@ -200,6 +203,7 @@ def main():
         dhm_mean=float(train_ds.dhm_mean),
         dhm_std=float(train_ds.dhm_std),
         cfg_dropout_prob=args.cfg_dropout_prob,
+        min_snr_gamma=args.min_snr_gamma,
     )
     n_params = sum(p.numel() for p in module.parameters())
     print(f"  module param count: {n_params/1e6:.1f}M")
