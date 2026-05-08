@@ -89,6 +89,9 @@ def parse_args():
                    help="Average-pool kernel sizes for tile-pattern matching.")
     p.add_argument("--pattern_temperature", type=float, default=0.02,
                    help="Sigmoid temperature for soft binarisation.")
+    p.add_argument("--cfg_dropout_prob", type=float, default=0.0,
+                   help="Probability of dropping conditioning during training (CFG). "
+                        "0 = off; 0.1 standard. Enables classifier-free guidance at sampling.")
 
     # Location encoder
     p.add_argument("--use_location_encoder", action="store_true", default=True)
@@ -196,6 +199,7 @@ def main():
         pattern_temperature=args.pattern_temperature,
         dhm_mean=float(train_ds.dhm_mean),
         dhm_std=float(train_ds.dhm_std),
+        cfg_dropout_prob=args.cfg_dropout_prob,
     )
     n_params = sum(p.numel() for p in module.parameters())
     print(f"  module param count: {n_params/1e6:.1f}M")

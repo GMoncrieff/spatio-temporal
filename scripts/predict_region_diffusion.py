@@ -51,6 +51,10 @@ def parse_args():
                         "to ensemble_n samples internally.")
     p.add_argument("--ensemble_n", type=int, default=16)
     p.add_argument("--num_inference_steps", type=int, default=30)
+    p.add_argument("--guidance_scale", type=float, default=1.0,
+                   help="CFG scale: 1=no guidance (use cond only); >1 amplifies the "
+                        "conditional. Only meaningful if the model was trained with "
+                        "cfg_dropout_prob > 0.")
     p.add_argument("--tile_size", type=int, default=64)
     p.add_argument("--dhm_stats_cache",
                    default="data/raw/hm_global/dhm_stats_20yr.json")
@@ -303,6 +307,7 @@ def main():
             samples = module.sample(
                 cond, n_samples=args.ensemble_n,
                 num_inference_steps=args.num_inference_steps,
+                guidance_scale=args.guidance_scale,
             )  # [N, B, 1, H, W]
 
         # Aggregate per tile

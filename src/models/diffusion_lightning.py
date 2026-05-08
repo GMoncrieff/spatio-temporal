@@ -68,6 +68,7 @@ class DiffusionLightningModule(pl.LightningModule):
         pattern_temperature: float = 0.02,
         dhm_mean: float = 0.0,
         dhm_std: float = 1.0,
+        cfg_dropout_prob: float = 0.0,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -87,6 +88,7 @@ class DiffusionLightningModule(pl.LightningModule):
         self.pattern_temperature = float(pattern_temperature)
         self.dhm_mean = float(dhm_mean)
         self.dhm_std = float(dhm_std)
+        self.cfg_dropout_prob = float(cfg_dropout_prob)
 
         loc = _maybe_build_location_encoder(location_encoder_kwargs)
         if loc is None:
@@ -224,6 +226,11 @@ class DiffusionLightningModule(pl.LightningModule):
         x_0 = batch["target_dhm"]                  # [B, 1, H, W]
         valid = batch["valid_mask"].unsqueeze(1)   # [B, 1, H, W]
         B = x_0.shape[0]
+        # CFG: occasionally drop conditioning so the model also learns the
+        # unconditional score. At sampling we then blend cond + uncond.
+        if self.training and self.cfg_dropout_prob > 0:
+            keep = (torch.rand(B, device=cond.device) > self.cfg_dropout_prob).float()
+            cond = cond * keep.view(-1, 1, 1, 1)
         t = torch.randint(
             0, self.num_train_timesteps, (B,), device=x_0.device, dtype=torch.long
         )
@@ -320,6 +327,7 @@ class DiffusionLightningModule(pl.LightningModule):
         num_inference_steps: Optional[int] = None,
         generator: Optional[torch.Generator] = None,
         use_ema: Optional[bool] = None,
+        guidance_scale: float = 1.0,
     ) -> torch.Tensor:
         """Run DDIM sampling. Returns [n_samples, B, 1, H, W].
 
@@ -337,13 +345,20 @@ class DiffusionLightningModule(pl.LightningModule):
         try:
             B, C_cond, H, W = conditioning.shape
             cond_tiled = conditioning.repeat_interleave(n_samples, dim=0)  # [N*B, ...]
+            do_cfg = guidance_scale != 1.0
+            zero_cond = torch.zeros_like(cond_tiled) if do_cfg else None
             x = torch.randn(
                 n_samples * B, 1, H, W, device=conditioning.device,
                 dtype=conditioning.dtype, generator=generator,
             )
             for t in scheduler.timesteps:
                 t_batch = t.expand(x.shape[0]).to(x.device)
-                v_pred = self.unet(x, cond_tiled, t_batch)
+                if do_cfg:
+                    v_cond = self.unet(x, cond_tiled, t_batch)
+                    v_uncond = self.unet(x, zero_cond, t_batch)
+                    v_pred = v_uncond + guidance_scale * (v_cond - v_uncond)
+                else:
+                    v_pred = self.unet(x, cond_tiled, t_batch)
                 x = scheduler.step(v_pred, t, x).prev_sample
             return x.view(n_samples, B, 1, H, W)
         finally:
