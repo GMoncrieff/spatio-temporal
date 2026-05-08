@@ -298,20 +298,19 @@ def sample_at_sites(args, n_sites, n_samples, num_inference_steps):
     return sites
 
 
-def plot_sample_grid(sites, out_path):
-    """N rows (sites) × (1 + n_samples) cols (observed + samples)."""
+def plot_sample_grid(sites, out_path, vmin=-0.1, vmax=0.4):
+    """N rows (sites) × (1 + n_samples) cols (observed + samples).
+
+    Color scale is fixed across all panels to make sample-to-sample and
+    site-to-site comparisons honest. Defaults span the meaningful Δhm range:
+    a small loss of modification on the negative side, a larger gain on the
+    positive side (most change in this dataset is positive).
+    """
     n_sites = len(sites)
     n_samples = sites[0]["samples"].shape[0]
 
     masked_obs = [np.where(s["valid_mask"], s["observed"], np.nan) for s in sites]
     masked_samp = [np.where(s["valid_mask"][None], s["samples"], np.nan) for s in sites]
-    pile = np.concatenate([a[np.isfinite(a)] for a in masked_obs] +
-                          [a[np.isfinite(a)] for a in masked_samp])
-    if pile.size == 0:
-        vmin, vmax = -0.05, 0.05
-    else:
-        vmax = float(max(abs(np.percentile(pile, 1)), abs(np.percentile(pile, 99))))
-        vmin = -vmax
 
     fig, axes = plt.subplots(
         n_sites, n_samples + 1,
