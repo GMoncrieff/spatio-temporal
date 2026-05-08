@@ -87,6 +87,8 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
         dhm_stats_cache=None,
         add_distance=None,
         distance_thresholds=(0.1, 0.4),
+        weighted_sampling=False,
+        weight_alpha=1.0,
     ):
         self.hm_files = hm_files
         self.component_files = component_files
@@ -103,6 +105,9 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
         self.target_mode = target_mode
         self.restrict_to_region = restrict_to_region
         self.dhm_stats_cache = dhm_stats_cache
+        self.weighted_sampling = bool(weighted_sampling) and target_mode == "delta_20yr"
+        self.weight_alpha = float(weight_alpha)
+        self._chip_weights = None  # populated lazily after valid_split_positions is known
 
         # Distance-to-HM-threshold channels: defaults on for delta_20yr, off otherwise.
         # Distance rasters (e.g. HM_2000_dist10_1000.tiff, HM_2000_dist40_1000.tiff)
@@ -342,6 +347,10 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
         # added to self.hm_vars and self._comp_files above).
         self.C_comp = len(self._comp_files[years[0]]) if self.include_components else 0
         self.C_dyn = 1 + self.C_comp
+
+        # Per-chip importance weights for weighted sampling (delta_20yr only).
+        if self.weighted_sampling and self.valid_split_positions:
+            self._chip_weights = self._compute_chip_weights()
         self.C_static = len(self._static_files)
 
     def _compute_dhm_stats(self, rng, stat_samples):
@@ -390,6 +399,41 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
                 print(f"Cached Δhm stats to {self.dhm_stats_cache}")
             except Exception as e:
                 print(f"Failed to write Δhm stats cache: {e}")
+
+    def _compute_chip_weights(self):
+        """Per-chip sampling weights ∝ (max |Δhm| in chip)^α.
+
+        Sampling proportional to max |Δhm| concentrates training compute on the
+        small minority of chips that contain rare-but-important high-change
+        pixels — directly addresses poor coverage in upper Δhm bins. α controls
+        sharpness: α=1 ⇒ proportional, α=0 ⇒ uniform.
+        """
+        idx_2000 = self.year_to_idx[2000]
+        idx_2020 = self.year_to_idx[2020]
+        n = len(self.valid_split_positions)
+        weights = np.zeros(n, dtype=np.float64)
+        print(f"Computing weighted-sampling chip weights over {n} valid positions "
+              f"(α={self.weight_alpha})...")
+        with rasterio.open(self._hm_files[idx_2000]) as s00, \
+             rasterio.open(self._hm_files[idx_2020]) as s20:
+            for k, (i, j) in enumerate(self.valid_split_positions):
+                window = rasterio.windows.Window(j, i, self.chip_size, self.chip_size)
+                arr00 = s00.read(1, window=window, masked=True).filled(np.nan)
+                arr20 = s20.read(1, window=window, masked=True).filled(np.nan)
+                dhm = np.abs(arr20 - arr00)
+                if not np.isfinite(dhm).any():
+                    weights[k] = 0.0
+                else:
+                    weights[k] = float(np.nanmax(dhm))
+        eps = 1e-3  # so all-zero chips still get a tiny non-zero weight
+        weights = (weights + eps) ** self.weight_alpha
+        weights = weights / weights.sum()
+        # Diagnostic: how concentrated is the sampling?
+        sorted_w = np.sort(weights)[::-1]
+        top10pct = sorted_w[: max(1, n // 10)].sum()
+        print(f"  top 10% of chips will draw {100 * top10pct:.1f}% of sampling probability "
+              f"(uniform = 10%)")
+        return weights
 
     def _rasterize_region_to_mask(self, geojson_path):
         """Rasterize a GeoJSON region into a boolean mask in the dataset's reference grid."""
@@ -464,8 +508,14 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
                 
                 # If using splits, sample from pre-computed valid positions
                 if self.valid_split_positions is not None:
-                    # Randomly select a valid chip position
-                    pos_idx = np.random.randint(0, len(self.valid_split_positions))
+                    # Sample by chip weight if available, else uniform
+                    if self._chip_weights is not None:
+                        pos_idx = int(np.random.choice(
+                            len(self.valid_split_positions),
+                            p=self._chip_weights,
+                        ))
+                    else:
+                        pos_idx = np.random.randint(0, len(self.valid_split_positions))
                     i, j = self.valid_split_positions[pos_idx]
                     # Add small random offset within chip for diversity
                     offset = min(32, self.chip_size // 4)
@@ -641,6 +691,8 @@ def get_dataloader(
     dhm_stats_cache=None,
     add_distance=None,
     distance_thresholds=(0.1, 0.4),
+    weighted_sampling=False,
+    weight_alpha=1.0,
 ):
     """
     Create a DataLoader for the Human Footprint dataset.
@@ -683,6 +735,8 @@ def get_dataloader(
         dhm_stats_cache=dhm_stats_cache,
         add_distance=add_distance,
         distance_thresholds=distance_thresholds,
+        weighted_sampling=weighted_sampling,
+        weight_alpha=weight_alpha,
     )
     return DataLoader(
         ds,

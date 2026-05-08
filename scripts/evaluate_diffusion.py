@@ -205,6 +205,36 @@ def coverage_rate(obs, q025, q975, valid):
     return float(in_band.sum() / valid.sum())
 
 
+def per_bin_coverage(obs, q025, q975, valid, bin_edges):
+    """Stratify coverage by Δhm magnitude bin.
+
+    For each bin [low, high), report:
+      - n: number of valid pixels whose observed Δhm falls in the bin,
+      - coverage: fraction of those pixels where q025 ≤ obs ≤ q975.
+
+    Pixels in the highest bin use closed-on-the-right semantics so the
+    end of the schedule (e.g. Δhm == 1.0) is not dropped.
+    """
+    in_band = (obs >= q025) & (obs <= q975)
+    out = []
+    n_bins = len(bin_edges) - 1
+    for i in range(n_bins):
+        low = float(bin_edges[i])
+        high = float(bin_edges[i + 1])
+        if i < n_bins - 1:
+            in_bin = (obs >= low) & (obs < high)
+        else:
+            in_bin = (obs >= low) & (obs <= high)
+        bin_mask = valid & in_bin
+        n = int(bin_mask.sum())
+        if n == 0:
+            cov = float("nan")
+        else:
+            cov = float((in_band & bin_mask).sum() / n)
+        out.append({"bin": [low, high], "n": n, "coverage": cov})
+    return out
+
+
 def model_summary_from_checkpoint(checkpoint_path):
     """Load a checkpoint and pull a model+training summary dict (no torch needed for parts)."""
     import torch
@@ -337,6 +367,19 @@ def plot_sample_grid(sites, out_path, vmin=-0.1, vmax=0.4):
     plt.close(fig)
 
 
+def _render_bin_coverage_table(per_bin):
+    if not per_bin:
+        return "| (no q025/q975 rasters present) | | |"
+    rows = []
+    for entry in per_bin:
+        low, high = entry["bin"]
+        n = entry["n"]
+        cov = entry["coverage"]
+        cov_s = f"{cov:.3f}" if cov == cov else "—"
+        rows.append(f"| `[{low:>+7.3f}, {high:>+6.3f}]` | {n:,} | {cov_s} |")
+    return "\n".join(rows)
+
+
 def write_report(metrics, args, report_path, panel_path, summary_path,
                  model_info=None, sample_grid_path=None):
     rel = lambda p: os.path.relpath(p, os.path.dirname(report_path))
@@ -408,7 +451,18 @@ uncertainty about *where* and *how much* change occurs.
 | Histogram intersection (median) | **{metrics['xinter_median']:.3f}** |
 | Histogram intersection (mean) | {metrics['xinter_mean']:.3f} |
 | Pearson r (predicted vs. observed tile-mean Δhm) | {metrics['pearson_r']:.3f} |
-| Coverage rate (q025 ≤ obs ≤ q975) | {metrics.get('coverage_rate', float('nan')):.3f} (target ≈ 0.95) |
+| Coverage rate (q025 ≤ obs ≤ q975), all bins | {metrics.get('coverage_rate', float('nan')):.3f} (target ≈ 0.95) |
+
+### Coverage stratified by Δhm change bin
+
+How often the observed Δhm falls inside the predicted (q025, q975) band, broken
+out by magnitude bin. The overall coverage number is dominated by the no-change
+bin, where most pixels live; the harder-to-cover bins are the rare large-change
+ones where the model has to express genuine uncertainty.
+
+| Δhm bin | n pixels | Coverage |
+|---|---:|---:|
+{_render_bin_coverage_table(metrics.get('per_bin_coverage'))}
 
 ## Figures
 
@@ -485,6 +539,7 @@ def main():
     q025_path = os.path.join(args.pred_dir, "prediction_dhm_2020_q025.tif")
     q975_path = os.path.join(args.pred_dir, "prediction_dhm_2020_q975.tif")
     cov = float("nan")
+    bin_cov = None
     if os.path.exists(q025_path) and os.path.exists(q975_path):
         with rasterio.open(q025_path) as r:
             q025 = r.read(1)
@@ -492,6 +547,7 @@ def main():
             q975 = r.read(1)
         cov_valid = valid & np.isfinite(q025) & np.isfinite(q975)
         cov = coverage_rate(obs, q025, q975, cov_valid)
+        bin_cov = per_bin_coverage(obs, q025, q975, cov_valid, HIST_BIN_EDGES)
 
     metrics = dict(
         n_tiles_total=n_tiles_total,
@@ -503,10 +559,21 @@ def main():
         xinter_mean=float(np.mean(xinter_flat)),
         pearson_r=pearson_r,
         coverage_rate=cov,
+        per_bin_coverage=bin_cov,
     )
     print("Metrics:")
     for k, v in metrics.items():
-        print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
+        if k == "per_bin_coverage":
+            if v is None:
+                continue
+            print("  per_bin_coverage:")
+            for entry in v:
+                low, high = entry["bin"]
+                cov_v = entry["coverage"]
+                cov_s = f"{cov_v:.3f}" if cov_v == cov_v else "nan"  # nan check
+                print(f"    [{low:>+7.3f}, {high:>+6.3f}]  n={entry['n']:>10,d}  coverage={cov_s}")
+        else:
+            print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

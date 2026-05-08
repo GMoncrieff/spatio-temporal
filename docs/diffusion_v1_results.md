@@ -7,11 +7,11 @@
 - Aggregate-tile size: **16×16** pixels (10 km blocks).
 - Histogram bins (rarity-weighted, matches baseline `histogram_loss.py`):
   `[-1.0, -0.005, 0.005, 0.02, 0.1, 0.2, 0.4, 0.6, 1.0]`.
-- W&B run: [glennwithtwons/spatio-temporal-diffusion/ebcdx6ax](https://wandb.ai/glennwithtwons/spatio-temporal-diffusion/ebcdx6ax)
+- W&B run: [glennwithtwons/spatio-temporal-diffusion/fpbrzkno](https://wandb.ai/glennwithtwons/spatio-temporal-diffusion/fpbrzkno)
 
 ## Model & checkpoint
 
-- Checkpoint: `/Users/glen.moncrieff/python/spatio_temporal/spatio-temporal-diffusion/ebcdx6ax/checkpoints/dhm-diffusion-epoch33-valloss0.1684.ckpt`
+- Checkpoint: `/Users/glen.moncrieff/python/spatio_temporal/spatio-temporal-diffusion/fpbrzkno/checkpoints/dhm-diffusion-epoch33-valloss0.1414.ckpt`
 - Stopping epoch: 33 (global step 2176)
 - Architecture: `ConditionalDiffusionUNet` (`diffusers.UNet2DModel`)
   - sample_size = 64
@@ -23,7 +23,7 @@
   - parameter count = **74.1 M**
 - Diffusion: `DDPMScheduler(prediction_type="v_prediction", beta_schedule="squaredcos_cap_v2")`
   - num_train_timesteps = 1000
-  - inference sampler: DDIM at 12 steps
+  - inference sampler: DDIM at 30 steps
 - LocationEncoder: `('sphericalharmonics', 'siren')`, out_channels=8
 - Optimizer: `AdamW(lr=0.0001, weight_decay=0.01)`
 
@@ -32,13 +32,31 @@
 | Metric | Value |
 |---|---|
 | Tiles with valid coverage | 2,003 of 7,150 |
-| Tile-mean MAE (median) | **0.0019** |
-| Tile-mean MAE (mean) | 0.0055 |
-| Tile-mean MAE (95th %ile) | 0.0224 |
-| Histogram intersection (median) | **0.862** |
-| Histogram intersection (mean) | 0.789 |
-| Pearson r (predicted vs. observed tile-mean Δhm) | 0.517 |
-| Coverage rate (q025 ≤ obs ≤ q975) | 0.799 (target ≈ 0.95) |
+| Tile-mean MAE (median) | **0.0016** |
+| Tile-mean MAE (mean) | 0.0052 |
+| Tile-mean MAE (95th %ile) | 0.0208 |
+| Histogram intersection (median) | **0.883** |
+| Histogram intersection (mean) | 0.810 |
+| Pearson r (predicted vs. observed tile-mean Δhm) | 0.559 |
+| Coverage rate (q025 ≤ obs ≤ q975), all bins | 0.888 (target ≈ 0.95) |
+
+### Coverage stratified by Δhm change bin
+
+How often the observed Δhm falls inside the predicted (q025, q975) band, broken
+out by magnitude bin. The overall coverage number is dominated by the no-change
+bin, where most pixels live; the harder-to-cover bins are the rare large-change
+ones where the model has to express genuine uncertainty.
+
+| Δhm bin | n pixels | Coverage |
+|---|---:|---:|
+| `[ -1.000, -0.005]` | 26,031 | 0.431 |
+| `[ -0.005, +0.005]` | 345,050 | 0.965 |
+| `[ +0.005, +0.020]` | 51,561 | 0.899 |
+| `[ +0.020, +0.100]` | 40,825 | 0.617 |
+| `[ +0.100, +0.200]` | 4,020 | 0.000 |
+| `[ +0.200, +0.400]` | 525 | 0.000 |
+| `[ +0.400, +0.600]` | 19 | 0.000 |
+| `[ +0.600, +1.000]` | 0 | — |
 
 ## Figures
 

@@ -70,6 +70,13 @@ def parse_args():
     p.add_argument("--num_train_timesteps", type=int, default=1000)
     p.add_argument("--num_inference_steps", type=int, default=30)
     p.add_argument("--ensemble_n", type=int, default=16)
+    p.add_argument("--use_ema", action="store_true", default=False,
+                   help="Track exponential-moving-average UNet weights and use them at sampling.")
+    p.add_argument("--ema_decay", type=float, default=0.999)
+    p.add_argument("--weighted_sampling", action="store_true", default=False,
+                   help="Sample chips proportional to (max |Δhm|)^alpha to oversample "
+                        "rare high-change cases.")
+    p.add_argument("--weight_alpha", type=float, default=1.0)
 
     # Location encoder
     p.add_argument("--use_location_encoder", action="store_true", default=True)
@@ -107,8 +114,12 @@ def make_loaders(args):
         chips_per_epoch=args.train_chips,
         mode="random",
         split_value=1,
+        weighted_sampling=args.weighted_sampling,
+        weight_alpha=args.weight_alpha,
         **common,
     )
+    # Val loader is uniform: we want val/loss to reflect the natural chip
+    # distribution, not the importance-weighted training distribution.
     val_loader = get_dataloader(
         batch_size=args.batch_size,
         chips_per_epoch=args.val_chips,
@@ -162,6 +173,8 @@ def main():
         num_inference_steps=args.num_inference_steps,
         ensemble_n=args.ensemble_n,
         location_encoder_kwargs=locenc_kwargs,
+        use_ema=args.use_ema,
+        ema_decay=args.ema_decay,
     )
     n_params = sum(p.numel() for p in module.parameters())
     print(f"  module param count: {n_params/1e6:.1f}M")

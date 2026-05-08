@@ -58,6 +58,8 @@ class DiffusionLightningModule(pl.LightningModule):
         num_inference_steps: int = 30,
         ensemble_n: int = 16,
         location_encoder_kwargs: Optional[Mapping[str, Any]] = None,
+        use_ema: bool = False,
+        ema_decay: float = 0.999,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -67,6 +69,8 @@ class DiffusionLightningModule(pl.LightningModule):
         self.num_train_timesteps = num_train_timesteps
         self.num_inference_steps = num_inference_steps
         self.ensemble_n = ensemble_n
+        self.use_ema = bool(use_ema)
+        self.ema_decay = float(ema_decay)
 
         loc = _maybe_build_location_encoder(location_encoder_kwargs)
         if loc is None:
@@ -90,6 +94,18 @@ class DiffusionLightningModule(pl.LightningModule):
             prediction_type="v_prediction",
             beta_schedule="squaredcos_cap_v2",
         )
+
+        # EMA state — tracked manually as a dict of detached tensors so it
+        # round-trips through Lightning's checkpoint without needing to be
+        # an nn.Module submodule (which would double the param count in
+        # the trainer summary).
+        self._ema_state: Optional[dict] = None
+        if self.use_ema:
+            self._ema_state = {
+                name: p.detach().clone()
+                for name, p in self.unet.named_parameters()
+                if p.requires_grad
+            }
 
     def assemble_conditioning(
         self,
@@ -157,6 +173,65 @@ class DiffusionLightningModule(pl.LightningModule):
         with torch.no_grad():
             return self._denoising_step(batch, "val")
 
+    # --- EMA helpers ---
+
+    def _ema_to_device(self, device):
+        if self._ema_state is None:
+            return
+        for name, t in self._ema_state.items():
+            if t.device != device:
+                self._ema_state[name] = t.to(device)
+
+    def on_train_start(self):
+        self._ema_to_device(self.device)
+
+    def on_train_batch_end(self, *_args, **_kwargs):
+        if self._ema_state is None:
+            return
+        d = self.ema_decay
+        with torch.no_grad():
+            for name, p in self.unet.named_parameters():
+                if not p.requires_grad:
+                    continue
+                ema = self._ema_state[name]
+                if ema.device != p.device:
+                    ema = ema.to(p.device)
+                    self._ema_state[name] = ema
+                ema.mul_(d).add_(p.detach(), alpha=1.0 - d)
+
+    def on_save_checkpoint(self, ckpt):
+        if self._ema_state is not None:
+            ckpt["ema_state"] = {k: v.detach().cpu() for k, v in self._ema_state.items()}
+
+    def on_load_checkpoint(self, ckpt):
+        if self.use_ema and "ema_state" in ckpt:
+            self._ema_state = {k: v.clone() for k, v in ckpt["ema_state"].items()}
+
+    def _swap_to_ema(self):
+        """Backup current unet weights and load EMA into the unet. Returns the backup."""
+        if self._ema_state is None:
+            return None
+        backup = {}
+        with torch.no_grad():
+            for name, p in self.unet.named_parameters():
+                if not p.requires_grad:
+                    continue
+                backup[name] = p.detach().clone()
+                ema = self._ema_state[name]
+                if ema.device != p.device:
+                    ema = ema.to(p.device)
+                p.data.copy_(ema)
+        return backup
+
+    def _restore_from_backup(self, backup):
+        if backup is None:
+            return
+        with torch.no_grad():
+            for name, p in self.unet.named_parameters():
+                if not p.requires_grad or name not in backup:
+                    continue
+                p.data.copy_(backup[name])
+
     @torch.no_grad()
     def sample(
         self,
@@ -164,23 +239,35 @@ class DiffusionLightningModule(pl.LightningModule):
         n_samples: int = 1,
         num_inference_steps: Optional[int] = None,
         generator: Optional[torch.Generator] = None,
+        use_ema: Optional[bool] = None,
     ) -> torch.Tensor:
-        """Run DDIM sampling. Returns [n_samples, B, 1, H, W]."""
+        """Run DDIM sampling. Returns [n_samples, B, 1, H, W].
+
+        If `use_ema` is True (or None and self.use_ema is True), swap to EMA
+        weights for sampling, then restore the live training weights.
+        """
         steps = num_inference_steps or self.num_inference_steps
         scheduler = DDIMScheduler.from_config(self.train_scheduler.config)
         scheduler.set_timesteps(steps, device=conditioning.device)
 
-        B, C_cond, H, W = conditioning.shape
-        cond_tiled = conditioning.repeat_interleave(n_samples, dim=0)  # [N*B, ...]
-        x = torch.randn(
-            n_samples * B, 1, H, W, device=conditioning.device,
-            dtype=conditioning.dtype, generator=generator,
-        )
-        for t in scheduler.timesteps:
-            t_batch = t.expand(x.shape[0]).to(x.device)
-            v_pred = self.unet(x, cond_tiled, t_batch)
-            x = scheduler.step(v_pred, t, x).prev_sample
-        return x.view(n_samples, B, 1, H, W)
+        if use_ema is None:
+            use_ema = self.use_ema and self._ema_state is not None
+        backup = self._swap_to_ema() if use_ema else None
+
+        try:
+            B, C_cond, H, W = conditioning.shape
+            cond_tiled = conditioning.repeat_interleave(n_samples, dim=0)  # [N*B, ...]
+            x = torch.randn(
+                n_samples * B, 1, H, W, device=conditioning.device,
+                dtype=conditioning.dtype, generator=generator,
+            )
+            for t in scheduler.timesteps:
+                t_batch = t.expand(x.shape[0]).to(x.device)
+                v_pred = self.unet(x, cond_tiled, t_batch)
+                x = scheduler.step(v_pred, t, x).prev_sample
+            return x.view(n_samples, B, 1, H, W)
+        finally:
+            self._restore_from_backup(backup)
 
     def configure_optimizers(self):
         try:
