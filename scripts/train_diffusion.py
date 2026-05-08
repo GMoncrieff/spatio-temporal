@@ -77,6 +77,18 @@ def parse_args():
                    help="Sample chips proportional to (max |Δhm|)^alpha to oversample "
                         "rare high-change cases.")
     p.add_argument("--weight_alpha", type=float, default=1.0)
+    p.add_argument("--pixel_weight_alpha", type=float, default=0.0,
+                   help="Per-pixel reweighting on v-prediction MSE: weight ∝ (|Δhm|^α + ε). "
+                        "0 = uniform; 1 = linear in |Δhm|. Concentrates gradient on rare pixels.")
+    p.add_argument("--pixel_weight_eps", type=float, default=0.05)
+    p.add_argument("--pattern_loss_weight", type=float, default=0.0,
+                   help="Weight for the multi-scale binary-pattern matching loss. 0 = off.")
+    p.add_argument("--pattern_thresholds", type=float, nargs="+", default=[0.05, 0.4],
+                   help="Thresholds (raw Δhm space) for soft-binarising in the pattern loss.")
+    p.add_argument("--pattern_scales", type=int, nargs="+", default=[8, 16],
+                   help="Average-pool kernel sizes for tile-pattern matching.")
+    p.add_argument("--pattern_temperature", type=float, default=0.02,
+                   help="Sigmoid temperature for soft binarisation.")
 
     # Location encoder
     p.add_argument("--use_location_encoder", action="store_true", default=True)
@@ -161,6 +173,7 @@ def main():
                          optimizer=dict(lr=1e-4, wd=1e-3)),
         )
 
+    train_ds = train_loader.dataset
     module = DiffusionLightningModule(
         cond_channels=cond_channels,
         sample_size=args.chip_size,
@@ -175,6 +188,14 @@ def main():
         location_encoder_kwargs=locenc_kwargs,
         use_ema=args.use_ema,
         ema_decay=args.ema_decay,
+        pixel_weight_alpha=args.pixel_weight_alpha,
+        pixel_weight_eps=args.pixel_weight_eps,
+        pattern_loss_weight=args.pattern_loss_weight,
+        pattern_thresholds=tuple(args.pattern_thresholds),
+        pattern_scales=tuple(args.pattern_scales),
+        pattern_temperature=args.pattern_temperature,
+        dhm_mean=float(train_ds.dhm_mean),
+        dhm_std=float(train_ds.dhm_std),
     )
     n_params = sum(p.numel() for p in module.parameters())
     print(f"  module param count: {n_params/1e6:.1f}M")

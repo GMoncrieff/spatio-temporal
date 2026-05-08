@@ -60,6 +60,14 @@ class DiffusionLightningModule(pl.LightningModule):
         location_encoder_kwargs: Optional[Mapping[str, Any]] = None,
         use_ema: bool = False,
         ema_decay: float = 0.999,
+        pixel_weight_alpha: float = 0.0,
+        pixel_weight_eps: float = 0.05,
+        pattern_loss_weight: float = 0.0,
+        pattern_thresholds: Sequence[float] = (0.05, 0.4),
+        pattern_scales: Sequence[int] = (8, 16),
+        pattern_temperature: float = 0.02,
+        dhm_mean: float = 0.0,
+        dhm_std: float = 1.0,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -71,6 +79,14 @@ class DiffusionLightningModule(pl.LightningModule):
         self.ensemble_n = ensemble_n
         self.use_ema = bool(use_ema)
         self.ema_decay = float(ema_decay)
+        self.pixel_weight_alpha = float(pixel_weight_alpha)
+        self.pixel_weight_eps = float(pixel_weight_eps)
+        self.pattern_loss_weight = float(pattern_loss_weight)
+        self.pattern_thresholds = tuple(float(t) for t in pattern_thresholds)
+        self.pattern_scales = tuple(int(s) for s in pattern_scales)
+        self.pattern_temperature = float(pattern_temperature)
+        self.dhm_mean = float(dhm_mean)
+        self.dhm_std = float(dhm_std)
 
         loc = _maybe_build_location_encoder(location_encoder_kwargs)
         if loc is None:
@@ -141,6 +157,64 @@ class DiffusionLightningModule(pl.LightningModule):
             batch["hm_t_normalized"],
         )
 
+    def _v_loss(self, v_pred, v_target, valid, target_dhm):
+        """Per-pixel-reweighted v-prediction MSE.
+
+        With pixel_weight_alpha > 0, each pixel's MSE contribution is scaled
+        by (|target_dhm|^alpha + eps), normalised so the average weight over
+        valid pixels is 1. This concentrates gradient on the rare large-Δhm
+        pixels that the uniform MSE drowns out.
+        """
+        valid_f = valid.float()
+        sq = (v_pred - v_target).pow(2)
+        if self.pixel_weight_alpha <= 0:
+            denom = valid_f.sum().clamp(min=1.0)
+            return (sq * valid_f).sum() / denom
+        w = target_dhm.abs().pow(self.pixel_weight_alpha) + self.pixel_weight_eps
+        # Normalise per-batch so the *mean* weight on valid pixels is 1.
+        w_sum = (w * valid_f).sum()
+        v_sum = valid_f.sum().clamp(min=1.0)
+        w_norm = w * (v_sum / w_sum.clamp(min=1e-8))
+        denom = valid_f.sum().clamp(min=1.0)
+        return (sq * w_norm * valid_f).sum() / denom
+
+    def _x0_pred_from_v(self, noisy, v_pred, t):
+        """Recover predicted clean x_0 from v_pred under v-prediction parametrisation."""
+        alphas = self.train_scheduler.alphas_cumprod.to(t.device)[t]  # [B]
+        alpha_sqrt = alphas.sqrt().view(-1, 1, 1, 1)
+        sigma_sqrt = (1.0 - alphas).clamp(min=0).sqrt().view(-1, 1, 1, 1)
+        return alpha_sqrt * noisy - sigma_sqrt * v_pred
+
+    def _pattern_loss(self, x0_pred, target_dhm, valid):
+        """Multi-scale binary-pattern matching loss.
+
+        Soft-binarises predicted/observed Δhm at each threshold (in raw units),
+        then compares average-pooled binary maps at multiple scales. Pooling
+        makes this insensitive to pixel-level alignment; the model has to put
+        the right *amount* of high-change in roughly the right *places* within
+        each tile.
+        """
+        if self.pattern_loss_weight <= 0 or not self.pattern_thresholds:
+            return torch.zeros((), device=x0_pred.device)
+        # Denormalise to raw Δhm space so thresholds are meaningful.
+        x0_raw = x0_pred * self.dhm_std + self.dhm_mean
+        target_raw = target_dhm * self.dhm_std + self.dhm_mean
+        valid_f = valid.float()
+        terms = []
+        for T in self.pattern_thresholds:
+            soft = torch.sigmoid((x0_raw - T) / self.pattern_temperature) * valid_f
+            hard = (target_raw > T).float() * valid_f
+            for s in self.pattern_scales:
+                # Skip scales that don't fit
+                if soft.shape[-1] < s or soft.shape[-2] < s:
+                    continue
+                p = F.avg_pool2d(soft, s, s)
+                o = F.avg_pool2d(hard, s, s)
+                terms.append(F.mse_loss(p, o))
+        if not terms:
+            return torch.zeros((), device=x0_pred.device)
+        return torch.stack(terms).mean()
+
     def _denoising_step(
         self,
         batch: Mapping[str, Any],
@@ -158,13 +232,19 @@ class DiffusionLightningModule(pl.LightningModule):
         v_target = self.train_scheduler.get_velocity(x_0, noise, t)
         v_pred = self.unet(noisy, cond, t)
 
-        if valid.any():
-            loss = F.mse_loss(v_pred[valid.expand_as(v_pred)], v_target[valid.expand_as(v_target)])
-        else:
-            loss = F.mse_loss(v_pred, v_target)
+        v_loss = self._v_loss(v_pred, v_target, valid, x_0)
 
-        self.log(f"{log_prefix}/loss", loss, prog_bar=True, on_step=True, on_epoch=True)
-        return loss
+        if self.pattern_loss_weight > 0:
+            x0_pred = self._x0_pred_from_v(noisy, v_pred, t)
+            p_loss = self._pattern_loss(x0_pred, x_0, valid)
+            total_loss = v_loss + self.pattern_loss_weight * p_loss
+            self.log(f"{log_prefix}/v_loss", v_loss, on_step=True, on_epoch=True)
+            self.log(f"{log_prefix}/pattern_loss", p_loss, on_step=True, on_epoch=True)
+        else:
+            total_loss = v_loss
+
+        self.log(f"{log_prefix}/loss", total_loss, prog_bar=True, on_step=True, on_epoch=True)
+        return total_loss
 
     def training_step(self, batch, batch_idx):
         return self._denoising_step(batch, "train")
