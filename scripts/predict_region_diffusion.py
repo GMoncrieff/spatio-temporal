@@ -63,6 +63,11 @@ def parse_args():
                    help="Optional path to a JSON dump of the training "
                         "dataset's hm_mean/hm_std/comp_*/static_* stats. "
                         "If unset, recompute fresh stats from a quick sample.")
+    p.add_argument("--m_target", type=float, default=None,
+                   help="Inference value for the FIDE-style block-maxima "
+                        "conditioning channel (raw |Δhm| units). Only used if "
+                        "the checkpoint's use_magnitude_cond is True. Typical "
+                        "choices: training-set 99th percentile of max|Δhm| (≈0.5).")
     return p.parse_args()
 
 
@@ -298,7 +303,14 @@ def main():
         bhm_t_t = torch.from_numpy(np.stack(bhm_t)).to(device)
 
         with torch.no_grad():
-            cond = module.assemble_conditioning(bdyn_t, bstat_t, bll_t, bhm_t_t)
+            m_scalar = None
+            if getattr(module, "use_magnitude_cond", False):
+                m_val = float(args.m_target) if args.m_target is not None else 0.0
+                m_scalar = torch.full(
+                    (bdyn_t.shape[0],), m_val, device=device, dtype=torch.float32,
+                )
+            cond = module.assemble_conditioning(bdyn_t, bstat_t, bll_t, bhm_t_t,
+                                                m_scalar=m_scalar)
             samples = module.sample(
                 cond, n_samples=args.ensemble_n,
                 num_inference_steps=args.num_inference_steps,

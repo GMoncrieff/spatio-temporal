@@ -668,6 +668,16 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
                     ).float()
                     sample["valid_mask"] = torch.from_numpy(valid_mask)
                     sample["target_year"] = 2020
+                    # Per-chip block maximum of |raw Δhm| over valid pixels.
+                    # Used by FIDE-style magnitude conditioning. Reported in
+                    # *raw* Δhm units (the user's interpretable scale); module
+                    # normalises by m_norm_scale before injection.
+                    valid_dhm = dhm_raw[valid_mask] if valid_mask.any() else dhm_raw
+                    finite_dhm = valid_dhm[np.isfinite(valid_dhm)]
+                    sample["target_max_dhm"] = torch.tensor(
+                        float(np.abs(finite_dhm).max()) if finite_dhm.size > 0 else 0.0,
+                        dtype=torch.float32,
+                    )
                     return sample
                 continue
 
@@ -704,6 +714,7 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
             ).float()
             sample["valid_mask"] = torch.from_numpy(valid_mask)
             sample["target_year"] = 2020
+            sample["target_max_dhm"] = torch.tensor(0.0, dtype=torch.float32)
         else:
             sample.update(targets)
         return sample

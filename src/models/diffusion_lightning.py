@@ -72,6 +72,12 @@ class DiffusionLightningModule(pl.LightningModule):
         min_snr_gamma: float = 0.0,
         dhm_transform: str = "none",
         dhm_log_scale: float = 0.05,
+        exloss_lambda: float = 0.0,
+        wasserstein_loss_weight: float = 0.0,
+        wasserstein_n_quantiles: int = 256,
+        use_magnitude_cond: bool = False,
+        m_dropout_prob: float = 0.0,
+        m_norm_scale: float = 0.5,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -99,6 +105,12 @@ class DiffusionLightningModule(pl.LightningModule):
             )
         self.dhm_transform = str(dhm_transform)
         self.dhm_log_scale = float(dhm_log_scale)
+        self.exloss_lambda = float(exloss_lambda)
+        self.wasserstein_loss_weight = float(wasserstein_loss_weight)
+        self.wasserstein_n_quantiles = int(wasserstein_n_quantiles)
+        self.use_magnitude_cond = bool(use_magnitude_cond)
+        self.m_dropout_prob = float(m_dropout_prob)
+        self.m_norm_scale = float(m_norm_scale)
 
         loc = _maybe_build_location_encoder(location_encoder_kwargs)
         if loc is None:
@@ -141,8 +153,15 @@ class DiffusionLightningModule(pl.LightningModule):
         input_static: torch.Tensor,    # [B, C_static, H, W]
         lonlat: Optional[torch.Tensor],   # [B, H, W, 2]
         hm_t_normalized: torch.Tensor, # [B, 1, H, W]
+        m_scalar: Optional[torch.Tensor] = None,   # [B] raw |Δhm| scalar; only used if use_magnitude_cond
     ) -> torch.Tensor:
         """Concatenate all conditioning channels into [B, C_cond, H, W].
+
+        When use_magnitude_cond is True, an extra channel encoding the per-chip
+        max|Δhm| (FIDE-style block-maxima conditioning) is appended after
+        normalisation by m_norm_scale. m_scalar=None ⇒ the channel is filled with
+        zeros (the "null" / unknown M sentinel used during dropout/inference
+        without explicit M).
 
         Replaces non-finite values (NaN/±Inf) with 0 — chips that overlap
         ocean/no-data carry NaNs in HM and a few static channels; convs would
@@ -158,15 +177,35 @@ class DiffusionLightningModule(pl.LightningModule):
             loc_grid = loc.reshape(B, H, W, self.locenc_out_channels).permute(0, 3, 1, 2).contiguous()
             parts.append(loc_grid)
         parts.append(hm_t_normalized)
+        if self.use_magnitude_cond:
+            if m_scalar is None:
+                m_chan = torch.zeros((B, 1, H, W), device=input_dynamic.device, dtype=input_dynamic.dtype)
+            else:
+                m_norm = (m_scalar.float() / max(self.m_norm_scale, 1e-8)).view(B, 1, 1, 1)
+                m_chan = m_norm.expand(B, 1, H, W).to(input_dynamic.dtype)
+            parts.append(m_chan)
         cond = torch.cat(parts, dim=1)
         return torch.nan_to_num(cond, nan=0.0, posinf=0.0, neginf=0.0)
 
-    def _build_conditioning_from_batch(self, batch: Mapping[str, Any]) -> torch.Tensor:
+    def _build_conditioning_from_batch(
+        self, batch: Mapping[str, Any], drop_m: bool = False,
+    ) -> torch.Tensor:
+        m = None
+        if self.use_magnitude_cond and "target_max_dhm" in batch:
+            m = batch["target_max_dhm"]
+            if drop_m and self.training and self.m_dropout_prob > 0:
+                # FIDE-style: drop the magnitude scalar (replace with null) for a
+                # subset of the batch so the model also learns the m-unconditional
+                # distribution. Spatial conditioning is *not* dropped.
+                B = m.shape[0]
+                keep = (torch.rand(B, device=m.device) > self.m_dropout_prob)
+                m = torch.where(keep, m, torch.zeros_like(m))
         return self.assemble_conditioning(
             batch["input_dynamic"],
             batch["input_static"],
             batch.get("lonlat"),
             batch["hm_t_normalized"],
+            m_scalar=m,
         )
 
     def _snr_weights(self, t):
@@ -190,13 +229,29 @@ class DiffusionLightningModule(pl.LightningModule):
 
         - pixel_weight_alpha > 0 scales each pixel's MSE by (|target_dhm|^α + ε),
           normalised so the average pixel weight on valid pixels is 1.
+        - exloss_lambda > 0 (Tier 2B / ExtremeCast Gong 2024) replaces the
+          symmetric pixel weight with an asymmetric one that penalises *under-
+          predictions* of large |target_dhm| more than over-predictions. Under
+          v-prediction parametrisation, "x_pred under-predicts magnitude" iff
+          (v_pred - v_target) * sign(target_dhm) > 0 (since x_pred and v_pred
+          are negatively related at fixed t). When both are set, exloss_lambda
+          takes precedence.
         - min_snr_gamma > 0 applies Hang-2023 min-SNR-γ per-timestep weighting
           (γ ≈ 5 is standard for v-prediction).
         """
         valid_f = valid.float()
-        sq = (v_pred - v_target).pow(2)
-        # Pixel weight (1 if disabled).
-        if self.pixel_weight_alpha > 0:
+        err = v_pred - v_target
+        sq = err.pow(2)
+        if self.exloss_lambda > 0:
+            # Asymmetric scaling on under-predictions of magnitude.
+            under = ((err * torch.sign(target_dhm)) > 0).float()
+            w_pix = 1.0 + self.exloss_lambda * target_dhm.abs() * under
+            # Renormalise so average pixel weight on valid pixels is 1, keeping
+            # loss scale comparable to the unweighted case.
+            w_sum = (w_pix * valid_f).sum()
+            v_sum = valid_f.sum().clamp(min=1.0)
+            w_pix = w_pix * (v_sum / w_sum.clamp(min=1e-8))
+        elif self.pixel_weight_alpha > 0:
             w_pix = target_dhm.abs().pow(self.pixel_weight_alpha) + self.pixel_weight_eps
             w_sum = (w_pix * valid_f).sum()
             v_sum = valid_f.sum().clamp(min=1.0)
@@ -209,6 +264,33 @@ class DiffusionLightningModule(pl.LightningModule):
             sq = sq * snr_w
         denom = valid_f.sum().clamp(min=1.0)
         return (sq * w_pix * valid_f).sum() / denom
+
+    def _marginal_wasserstein_loss(self, x0_pred, target_dhm, valid):
+        """Sliced 1D Wasserstein on the marginal pixel-value histogram (Tier 2C).
+
+        Forces the predicted Δhm distribution (over all valid pixels in the
+        batch) to match the target distribution. Per-pixel order-free — only
+        the histogram shape is constrained — which directly addresses the
+        observed mode-collapse to the conditional mean: even if the model
+        cannot place high-magnitude pixels at the right *locations*, the
+        Wasserstein loss demands they appear *somewhere*.
+        """
+        if self.wasserstein_loss_weight <= 0:
+            return torch.zeros((), device=x0_pred.device)
+        v = valid.bool() if valid.dtype != torch.bool else valid
+        a = x0_pred[v]
+        b = target_dhm[v]
+        n = min(a.numel(), b.numel())
+        if n < 64:
+            return torch.zeros((), device=x0_pred.device)
+        a_sorted, _ = torch.sort(a)
+        b_sorted, _ = torch.sort(b)
+        # Sample the same N quantiles from each via index linspace.
+        N = min(self.wasserstein_n_quantiles, n)
+        idx = torch.linspace(0, n - 1, N, device=a_sorted.device).long()
+        a_q = a_sorted[idx]
+        b_q = b_sorted[idx]
+        return (a_q - b_q).abs().mean()
 
     def _x0_pred_from_v(self, noisy, v_pred, t):
         """Recover predicted clean x_0 from v_pred under v-prediction parametrisation."""
@@ -265,12 +347,13 @@ class DiffusionLightningModule(pl.LightningModule):
         batch: Mapping[str, Any],
         log_prefix: str,
     ) -> torch.Tensor:
-        cond = self._build_conditioning_from_batch(batch)
+        cond = self._build_conditioning_from_batch(batch, drop_m=True)
         x_0 = batch["target_dhm"]                  # [B, 1, H, W]
         valid = batch["valid_mask"].unsqueeze(1)   # [B, 1, H, W]
         B = x_0.shape[0]
-        # CFG: occasionally drop conditioning so the model also learns the
-        # unconditional score. At sampling we then blend cond + uncond.
+        # CFG: occasionally drop the *whole* spatial conditioning so the model
+        # also learns the unconditional score (independent of magnitude
+        # dropout, which lives in _build_conditioning_from_batch).
         if self.training and self.cfg_dropout_prob > 0:
             keep = (torch.rand(B, device=cond.device) > self.cfg_dropout_prob).float()
             cond = cond * keep.view(-1, 1, 1, 1)
@@ -283,15 +366,21 @@ class DiffusionLightningModule(pl.LightningModule):
         v_pred = self.unet(noisy, cond, t)
 
         v_loss = self._v_loss(v_pred, v_target, valid, x_0, t)
+        total_loss = v_loss
+        self.log(f"{log_prefix}/v_loss", v_loss, on_step=True, on_epoch=True)
+
+        need_x0 = self.pattern_loss_weight > 0 or self.wasserstein_loss_weight > 0
+        x0_pred = self._x0_pred_from_v(noisy, v_pred, t) if need_x0 else None
 
         if self.pattern_loss_weight > 0:
-            x0_pred = self._x0_pred_from_v(noisy, v_pred, t)
             p_loss = self._pattern_loss(x0_pred, x_0, valid)
-            total_loss = v_loss + self.pattern_loss_weight * p_loss
-            self.log(f"{log_prefix}/v_loss", v_loss, on_step=True, on_epoch=True)
+            total_loss = total_loss + self.pattern_loss_weight * p_loss
             self.log(f"{log_prefix}/pattern_loss", p_loss, on_step=True, on_epoch=True)
-        else:
-            total_loss = v_loss
+
+        if self.wasserstein_loss_weight > 0:
+            w_loss = self._marginal_wasserstein_loss(x0_pred, x_0, valid)
+            total_loss = total_loss + self.wasserstein_loss_weight * w_loss
+            self.log(f"{log_prefix}/wasserstein_loss", w_loss, on_step=True, on_epoch=True)
 
         self.log(f"{log_prefix}/loss", total_loss, prog_bar=True, on_step=True, on_epoch=True)
         return total_loss

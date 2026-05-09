@@ -7,19 +7,19 @@
 - Aggregate-tile size: **16×16** pixels (10 km blocks).
 - Histogram bins (rarity-weighted, matches baseline `histogram_loss.py`):
   `[-1.0, -0.005, 0.005, 0.02, 0.1, 0.2, 0.4, 0.6, 1.0]`.
-- W&B run: [glennwithtwons/spatio-temporal-diffusion/vsqjke5c](https://wandb.ai/glennwithtwons/spatio-temporal-diffusion/vsqjke5c)
+- W&B run: [glennwithtwons/spatio-temporal-diffusion/48cotpid](https://wandb.ai/glennwithtwons/spatio-temporal-diffusion/48cotpid)
 
 ## Model & checkpoint
 
-- Checkpoint: `spatio-temporal-diffusion/vsqjke5c/checkpoints/dhm-diffusion-epoch29-valloss0.1968.ckpt`
-- Stopping epoch: 29 (global step 480)
+- Checkpoint: `spatio-temporal-diffusion/48cotpid/checkpoints/dhm-diffusion-epoch12-valloss0.0828.ckpt`
+- Stopping epoch: 12 (global step 208)
 - Architecture: `ConditionalDiffusionUNet` (`diffusers.UNet2DModel`)
   - sample_size = 64
   - base_channels = 128
   - channel_mults = [1, 2, 2, 4]
   - attention_head_dim = 64, attention_at_low_two = True
   - layers_per_block = 2
-  - cond_channels = 55 (3 timesteps × 11 dyn + 7 static + locenc + 1 hm_t)
+  - cond_channels = 56 (3 timesteps × 11 dyn + 7 static + locenc + 1 hm_t)
   - parameter count = **74.1 M**
 - Diffusion: `DDPMScheduler(prediction_type="v_prediction", beta_schedule="squaredcos_cap_v2")`
   - num_train_timesteps = 1000
@@ -32,13 +32,13 @@
 | Metric | Value |
 |---|---|
 | Tiles with valid coverage | 4,394 of 7,150 |
-| Tile-mean MAE (median) | **0.0025** |
-| Tile-mean MAE (mean) | 0.0068 |
-| Tile-mean MAE (95th %ile) | 0.0294 |
-| Histogram intersection (median) | **0.846** |
-| Histogram intersection (mean) | 0.769 |
-| Pearson r (predicted vs. observed tile-mean Δhm) | 0.531 |
-| Coverage rate (q025 ≤ obs ≤ q975), all bins | 0.765 (target ≈ 0.95) |
+| Tile-mean MAE (median) | **0.0050** |
+| Tile-mean MAE (mean) | 0.0085 |
+| Tile-mean MAE (95th %ile) | 0.0297 |
+| Histogram intersection (median) | **0.438** |
+| Histogram intersection (mean) | 0.485 |
+| Pearson r (predicted vs. observed tile-mean Δhm) | 0.378 |
+| Coverage rate (q025 ≤ obs ≤ q975), all bins | 0.949 (target ≈ 0.95) |
 
 ### Coverage stratified by Δhm change bin
 
@@ -49,10 +49,10 @@ ones where the model has to express genuine uncertainty.
 
 | Δhm bin | n pixels | Coverage |
 |---|---:|---:|
-| `[ -1.000, -0.005]` | 56,357 | 0.000 |
-| `[ -0.005, +0.005]` | 742,163 | 0.965 |
-| `[ +0.005, +0.020]` | 116,330 | 0.576 |
-| `[ +0.020, +0.100]` | 97,708 | 0.000 |
+| `[ -1.000, -0.005]` | 56,357 | 0.814 |
+| `[ -0.005, +0.005]` | 742,163 | 1.000 |
+| `[ +0.005, +0.020]` | 116,330 | 0.998 |
+| `[ +0.020, +0.100]` | 97,708 | 0.699 |
 | `[ +0.100, +0.200]` | 10,296 | 0.000 |
 | `[ +0.200, +0.400]` | 1,614 | 0.000 |
 | `[ +0.400, +0.600]` | 120 | 0.000 |
@@ -76,7 +76,7 @@ WassDiff (IEEE TGRS 2025), ExtremeCast (AAAI 2024), and the Aich et al. (GMD
 
 | Threshold | n(obs>t) | n(pred>t) | POD | CSI | FAR | q975 soft-POD |
 |---|---|---|---|---|---|---|
-| +0.050 |     42,889 |          0 | 0.000 | 0.000 | nan | 0.000 |
+| +0.050 |     42,889 |        571 | 0.002 | 0.002 | 0.816 | 0.782 |
 | +0.100 |     12,037 |          0 | 0.000 | 0.000 | nan | 0.000 |
 | +0.200 |      1,741 |          0 | 0.000 | 0.000 | nan | 0.000 |
 | +0.400 |        127 |          0 | 0.000 | 0.000 | nan | 0.000 |

@@ -102,6 +102,24 @@ def parse_args():
     p.add_argument("--dhm_log_scale", type=float, default=0.05,
                    help="Knee scale for signed_log1p: transform(x) = sign(x) * "
                         "log1p(|x|/scale). Smaller = more tail stretch.")
+    p.add_argument("--exloss_lambda", type=float, default=0.0,
+                   help="Tier 2B asymmetric Exloss (Gong 2024). 0=off; ~1 standard. "
+                        "Replaces pixel_weight_alpha when >0; under-predictions of "
+                        "high-magnitude pixels are penalised more than over.")
+    p.add_argument("--wasserstein_loss_weight", type=float, default=0.0,
+                   help="Tier 2C marginal Wasserstein regulariser (WassDiff). "
+                        "0=off; ~0.05 standard. Forces the predicted pixel-value "
+                        "histogram to match the target distribution.")
+    p.add_argument("--use_magnitude_cond", action="store_true", default=False,
+                   help="Tier 2A FIDE-style block-maxima conditioning. Adds a "
+                        "per-chip max|Δhm| scalar as an extra conditioning channel.")
+    p.add_argument("--m_dropout_prob", type=float, default=0.1,
+                   help="Probability of dropping the magnitude scalar to null "
+                        "during training (so the model also learns the m-uncond "
+                        "distribution). Standard 0.1.")
+    p.add_argument("--m_norm_scale", type=float, default=0.5,
+                   help="Divisor used to normalise raw |Δhm| max into the "
+                        "magnitude conditioning channel. ~max realistic |Δhm|.")
 
     # Location encoder
     p.add_argument("--use_location_encoder", action="store_true", default=True)
@@ -158,12 +176,14 @@ def make_loaders(args):
 
 
 def compute_cond_channels(sample_batch, args):
-    """Total conditioning channels = T*C_dyn + C_static + locenc_out + 1 (hm_t)."""
+    """Total conditioning channels = T*C_dyn + C_static + locenc_out + 1 (hm_t)
+    + 1 (block-maxima M) when use_magnitude_cond is on."""
     T = sample_batch["input_dynamic"].shape[1]
     C_dyn = sample_batch["input_dynamic"].shape[2]
     C_static = sample_batch["input_static"].shape[1]
     locenc = args.locenc_out_channels if args.use_location_encoder else 0
-    return T * C_dyn + C_static + locenc + 1  # +1 for hm_t_normalized
+    extra = 1 if args.use_magnitude_cond else 0
+    return T * C_dyn + C_static + locenc + 1 + extra
 
 
 def main():
@@ -215,6 +235,11 @@ def main():
         min_snr_gamma=args.min_snr_gamma,
         dhm_transform=args.dhm_transform,
         dhm_log_scale=args.dhm_log_scale,
+        exloss_lambda=args.exloss_lambda,
+        wasserstein_loss_weight=args.wasserstein_loss_weight,
+        use_magnitude_cond=args.use_magnitude_cond,
+        m_dropout_prob=args.m_dropout_prob,
+        m_norm_scale=args.m_norm_scale,
     )
     n_params = sum(p.numel() for p in module.parameters())
     print(f"  module param count: {n_params/1e6:.1f}M")
