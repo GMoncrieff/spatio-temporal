@@ -95,6 +95,13 @@ def parse_args():
     p.add_argument("--min_snr_gamma", type=float, default=0.0,
                    help="Hang-2023 min-SNR-γ weighting on v-loss (0=off, 5 standard "
                         "for v-prediction). Upweights low-noise / high-SNR steps.")
+    p.add_argument("--dhm_transform", choices=("none", "signed_log1p"), default="none",
+                   help="Forward Δhm transform before z-score normalisation. "
+                        "'signed_log1p' compresses bulk and stretches the heavy tail "
+                        "so diffusion can resolve high-magnitude change events.")
+    p.add_argument("--dhm_log_scale", type=float, default=0.05,
+                   help="Knee scale for signed_log1p: transform(x) = sign(x) * "
+                        "log1p(|x|/scale). Smaller = more tail stretch.")
 
     # Location encoder
     p.add_argument("--use_location_encoder", action="store_true", default=True)
@@ -126,6 +133,8 @@ def make_loaders(args):
         stat_samples=args.stat_samples,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
+        dhm_transform=args.dhm_transform,
+        dhm_log_scale=args.dhm_log_scale,
     )
     train_loader = get_dataloader(
         batch_size=args.batch_size,
@@ -204,6 +213,8 @@ def main():
         dhm_std=float(train_ds.dhm_std),
         cfg_dropout_prob=args.cfg_dropout_prob,
         min_snr_gamma=args.min_snr_gamma,
+        dhm_transform=args.dhm_transform,
+        dhm_log_scale=args.dhm_log_scale,
     )
     n_params = sum(p.numel() for p in module.parameters())
     print(f"  module param count: {n_params/1e6:.1f}M")

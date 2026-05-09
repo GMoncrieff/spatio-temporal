@@ -70,6 +70,8 @@ class DiffusionLightningModule(pl.LightningModule):
         dhm_std: float = 1.0,
         cfg_dropout_prob: float = 0.0,
         min_snr_gamma: float = 0.0,
+        dhm_transform: str = "none",
+        dhm_log_scale: float = 0.05,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -91,6 +93,12 @@ class DiffusionLightningModule(pl.LightningModule):
         self.dhm_std = float(dhm_std)
         self.cfg_dropout_prob = float(cfg_dropout_prob)
         self.min_snr_gamma = float(min_snr_gamma)
+        if dhm_transform not in ("none", "signed_log1p"):
+            raise ValueError(
+                f"dhm_transform must be 'none' or 'signed_log1p', got {dhm_transform!r}"
+            )
+        self.dhm_transform = str(dhm_transform)
+        self.dhm_log_scale = float(dhm_log_scale)
 
         loc = _maybe_build_location_encoder(location_encoder_kwargs)
         if loc is None:
@@ -209,6 +217,18 @@ class DiffusionLightningModule(pl.LightningModule):
         sigma_sqrt = (1.0 - alphas).clamp(min=0).sqrt().view(-1, 1, 1, 1)
         return alpha_sqrt * noisy - sigma_sqrt * v_pred
 
+    def denormalize(self, x_norm: torch.Tensor) -> torch.Tensor:
+        """Convert model-space (normalised, possibly transformed) Δhm back to raw Δhm units.
+
+        Inverts (1) z-score by self.dhm_mean/dhm_std and (2) the forward target
+        transform applied in the dataloader (e.g. signed_log1p). Mirrors
+        HumanFootprintChipDataset._apply_dhm_transform exactly.
+        """
+        x_t = x_norm * self.dhm_std + self.dhm_mean
+        if self.dhm_transform == "signed_log1p":
+            return torch.sign(x_t) * (torch.expm1(torch.abs(x_t)) * self.dhm_log_scale)
+        return x_t
+
     def _pattern_loss(self, x0_pred, target_dhm, valid):
         """Multi-scale binary-pattern matching loss.
 
@@ -220,9 +240,10 @@ class DiffusionLightningModule(pl.LightningModule):
         """
         if self.pattern_loss_weight <= 0 or not self.pattern_thresholds:
             return torch.zeros((), device=x0_pred.device)
-        # Denormalise to raw Δhm space so thresholds are meaningful.
-        x0_raw = x0_pred * self.dhm_std + self.dhm_mean
-        target_raw = target_dhm * self.dhm_std + self.dhm_mean
+        # Inverse-transform back to raw Δhm space so thresholds (0.05, 0.4) are
+        # interpretable as actual change magnitudes.
+        x0_raw = self.denormalize(x0_pred)
+        target_raw = self.denormalize(target_dhm)
         valid_f = valid.float()
         terms = []
         for T in self.pattern_thresholds:

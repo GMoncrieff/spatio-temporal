@@ -89,6 +89,8 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
         distance_thresholds=(0.1, 0.4),
         weighted_sampling=False,
         weight_alpha=1.0,
+        dhm_transform="none",
+        dhm_log_scale=0.05,
     ):
         self.hm_files = hm_files
         self.component_files = component_files
@@ -104,6 +106,12 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
             )
         self.target_mode = target_mode
         self.restrict_to_region = restrict_to_region
+        if dhm_transform not in ("none", "signed_log1p"):
+            raise ValueError(
+                f"dhm_transform must be 'none' or 'signed_log1p', got {dhm_transform!r}"
+            )
+        self.dhm_transform = str(dhm_transform)
+        self.dhm_log_scale = float(dhm_log_scale)
         self.dhm_stats_cache = dhm_stats_cache
         self.weighted_sampling = bool(weighted_sampling) and target_mode == "delta_20yr"
         self.weight_alpha = float(weight_alpha)
@@ -353,15 +361,40 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
             self._chip_weights = self._compute_chip_weights()
         self.C_static = len(self._static_files)
 
+    def _apply_dhm_transform(self, x):
+        """Forward Δhm transform applied BEFORE z-score normalization.
+
+        Heavy-tailed Δhm distributions get crushed into the noise budget by a
+        plain z-score; signed_log1p compresses bulk and stretches the tail so
+        the diffusion forward process can resolve extreme magnitudes.
+        Inverse must mirror this exactly in the diffusion module's sample().
+        """
+        if self.dhm_transform == "signed_log1p":
+            s = self.dhm_log_scale
+            return np.sign(x) * np.log1p(np.abs(x) / s)
+        return x
+
+    def _dhm_cache_path(self):
+        """Cache key includes transform name + scale so different transforms
+        don't share statistics."""
+        if not self.dhm_stats_cache:
+            return None
+        if self.dhm_transform == "none":
+            return self.dhm_stats_cache
+        base, ext = os.path.splitext(self.dhm_stats_cache)
+        suffix = f"_{self.dhm_transform}_s{self.dhm_log_scale:g}"
+        return f"{base}{suffix}{ext}"
+
     def _compute_dhm_stats(self, rng, stat_samples):
         """Compute or load Δhm = HM(2020) - HM(2000) normalization stats."""
-        if self.dhm_stats_cache and os.path.exists(self.dhm_stats_cache):
+        cache_path = self._dhm_cache_path()
+        if cache_path and os.path.exists(cache_path):
             try:
-                with open(self.dhm_stats_cache, "r") as f:
+                with open(cache_path, "r") as f:
                     stats = json.load(f)
                 self.dhm_mean = float(stats["dhm_mean"])
                 self.dhm_std = float(stats["dhm_std"])
-                print(f"Loaded Δhm stats from {self.dhm_stats_cache}: mean={self.dhm_mean:.6e} std={self.dhm_std:.6e}")
+                print(f"Loaded Δhm stats from {cache_path}: mean={self.dhm_mean:.6e} std={self.dhm_std:.6e}")
                 return
             except Exception as e:
                 print(f"Failed to load Δhm stats cache ({e}); recomputing")
@@ -386,17 +419,27 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
                 arr20 = s20.read(1, window=window, masked=True).filled(np.nan)
                 samples.append(arr20 - arr00)
         arr = np.stack(samples, axis=0)
-        self.dhm_mean = float(np.nanmean(arr))
-        self.dhm_std = float(np.nanstd(arr) + 1e-8)
-        print(f"Computed Δhm stats: mean={self.dhm_mean:.6e} std={self.dhm_std:.6e}")
-        if self.dhm_stats_cache:
+        # Apply forward transform BEFORE computing mean/std so the z-score
+        # below targets the post-transform distribution.
+        arr_t = self._apply_dhm_transform(arr)
+        self.dhm_mean = float(np.nanmean(arr_t))
+        self.dhm_std = float(np.nanstd(arr_t) + 1e-8)
+        print(f"Computed Δhm stats (transform={self.dhm_transform}, scale={self.dhm_log_scale}): "
+              f"mean={self.dhm_mean:.6e} std={self.dhm_std:.6e}")
+        cache_path = self._dhm_cache_path()
+        if cache_path:
             try:
-                cache_dir = os.path.dirname(self.dhm_stats_cache)
+                cache_dir = os.path.dirname(cache_path)
                 if cache_dir:
                     os.makedirs(cache_dir, exist_ok=True)
-                with open(self.dhm_stats_cache, "w") as f:
-                    json.dump({"dhm_mean": self.dhm_mean, "dhm_std": self.dhm_std}, f)
-                print(f"Cached Δhm stats to {self.dhm_stats_cache}")
+                with open(cache_path, "w") as f:
+                    json.dump({
+                        "dhm_mean": self.dhm_mean,
+                        "dhm_std": self.dhm_std,
+                        "dhm_transform": self.dhm_transform,
+                        "dhm_log_scale": self.dhm_log_scale,
+                    }, f)
+                print(f"Cached Δhm stats to {cache_path}")
             except Exception as e:
                 print(f"Failed to write Δhm stats cache: {e}")
 
@@ -601,7 +644,8 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
                     masked=True,
                 ).filled(np.nan)
                 dhm_raw = arr_2020 - arr_2000
-                target_dhm = (dhm_raw - self.dhm_mean) / self.dhm_std
+                dhm_transformed = self._apply_dhm_transform(dhm_raw)
+                target_dhm = (dhm_transformed - self.dhm_mean) / self.dhm_std
 
                 target_finite = np.isfinite(target_dhm)
                 dyn_finite = np.isfinite(input_dynamic).all(axis=(0, 1))
@@ -693,6 +737,8 @@ def get_dataloader(
     distance_thresholds=(0.1, 0.4),
     weighted_sampling=False,
     weight_alpha=1.0,
+    dhm_transform="none",
+    dhm_log_scale=0.05,
 ):
     """
     Create a DataLoader for the Human Footprint dataset.
@@ -737,6 +783,8 @@ def get_dataloader(
         distance_thresholds=distance_thresholds,
         weighted_sampling=weighted_sampling,
         weight_alpha=weight_alpha,
+        dhm_transform=dhm_transform,
+        dhm_log_scale=dhm_log_scale,
     )
     return DataLoader(
         ds,

@@ -7,19 +7,38 @@
 - Aggregate-tile size: **16×16** pixels (10 km blocks).
 - Histogram bins (rarity-weighted, matches baseline `histogram_loss.py`):
   `[-1.0, -0.005, 0.005, 0.02, 0.1, 0.2, 0.4, 0.6, 1.0]`.
+- W&B run: [glennwithtwons/spatio-temporal-diffusion/zfm5r53r](https://wandb.ai/glennwithtwons/spatio-temporal-diffusion/zfm5r53r)
+
+## Model & checkpoint
+
+- Checkpoint: `spatio-temporal-diffusion/zfm5r53r/checkpoints/dhm-diffusion-epoch29-valloss0.2250.ckpt`
+- Stopping epoch: 29 (global step 480)
+- Architecture: `ConditionalDiffusionUNet` (`diffusers.UNet2DModel`)
+  - sample_size = 64
+  - base_channels = 128
+  - channel_mults = [1, 2, 2, 4]
+  - attention_head_dim = 64, attention_at_low_two = True
+  - layers_per_block = 2
+  - cond_channels = 55 (3 timesteps × 11 dyn + 7 static + locenc + 1 hm_t)
+  - parameter count = **74.1 M**
+- Diffusion: `DDPMScheduler(prediction_type="v_prediction", beta_schedule="squaredcos_cap_v2")`
+  - num_train_timesteps = 1000
+  - inference sampler: DDIM at 12 steps
+- LocationEncoder: `('sphericalharmonics', 'siren')`, out_channels=8
+- Optimizer: `AdamW(lr=0.0001, weight_decay=0.01)`
 
 ## Results
 
 | Metric | Value |
 |---|---|
-| Tiles with valid coverage | 2,003 of 7,150 |
-| Tile-mean MAE (median) | **0.0034** |
-| Tile-mean MAE (mean) | 0.0066 |
-| Tile-mean MAE (95th %ile) | 0.0220 |
-| Histogram intersection (median) | **0.859** |
-| Histogram intersection (mean) | 0.793 |
-| Pearson r (predicted vs. observed tile-mean Δhm) | 0.561 |
-| Coverage rate (q025 ≤ obs ≤ q975), all bins | 0.942 (target ≈ 0.95) |
+| Tiles with valid coverage | 4,394 of 7,150 |
+| Tile-mean MAE (median) | **0.0049** |
+| Tile-mean MAE (mean) | 0.0076 |
+| Tile-mean MAE (95th %ile) | 0.0236 |
+| Histogram intersection (median) | **0.548** |
+| Histogram intersection (mean) | 0.541 |
+| Pearson r (predicted vs. observed tile-mean Δhm) | 0.547 |
+| Coverage rate (q025 ≤ obs ≤ q975), all bins | 0.855 (target ≈ 0.95) |
 
 ### Coverage stratified by Δhm change bin
 
@@ -30,14 +49,14 @@ ones where the model has to express genuine uncertainty.
 
 | Δhm bin | n pixels | Coverage |
 |---|---:|---:|
-| `[ -1.000, -0.005]` | 26,031 | 0.706 |
-| `[ -0.005, +0.005]` | 345,050 | 0.993 |
-| `[ +0.005, +0.020]` | 51,561 | 0.979 |
-| `[ +0.020, +0.100]` | 40,825 | 0.726 |
-| `[ +0.100, +0.200]` | 4,020 | 0.000 |
-| `[ +0.200, +0.400]` | 525 | 0.000 |
-| `[ +0.400, +0.600]` | 19 | 0.000 |
-| `[ +0.600, +1.000]` | 0 | — |
+| `[ -1.000, -0.005]` | 56,357 | 0.297 |
+| `[ -0.005, +0.005]` | 742,163 | 0.990 |
+| `[ +0.005, +0.020]` | 116,330 | 0.996 |
+| `[ +0.020, +0.100]` | 97,708 | 0.090 |
+| `[ +0.100, +0.200]` | 10,296 | 0.000 |
+| `[ +0.200, +0.400]` | 1,614 | 0.000 |
+| `[ +0.400, +0.600]` | 120 | 0.000 |
+| `[ +0.600, +1.000]` | 7 | 0.000 |
 
 ## Tail diagnostics
 
@@ -48,8 +67,8 @@ WassDiff (IEEE TGRS 2025), ExtremeCast (AAAI 2024), and the Aich et al. (GMD
 
 ### R95p (mass above 95th percentile of obs)
 
-- Threshold: 0.0623
-- Observed tail mass: 501.7283
+- Threshold: 0.0667
+- Observed tail mass: 1245.5662
 - Predicted tail mass: 0.0000
 - **Ratio (pred / obs):** **0.000** (<<1 = under-predicting tail; ~1 = calibrated; >1 = over)
 
@@ -57,10 +76,10 @@ WassDiff (IEEE TGRS 2025), ExtremeCast (AAAI 2024), and the Aich et al. (GMD
 
 | Threshold | n(obs>t) | n(pred>t) | POD | CSI | FAR | q975 soft-POD |
 |---|---|---|---|---|---|---|
-| +0.050 |     17,401 |      1,042 | 0.012 | 0.012 | 0.792 | 0.926 |
-| +0.100 |      4,564 |          0 | 0.000 | 0.000 | nan | 0.000 |
-| +0.200 |        544 |          0 | 0.000 | 0.000 | nan | 0.000 |
-| +0.400 |         19 |          0 | 0.000 | 0.000 | nan | 0.000 |
+| +0.050 |     42,889 |          0 | 0.000 | 0.000 | nan | 0.000 |
+| +0.100 |     12,037 |          0 | 0.000 | 0.000 | nan | 0.000 |
+| +0.200 |      1,741 |          0 | 0.000 | 0.000 | nan | 0.000 |
+| +0.400 |        127 |          0 | 0.000 | 0.000 | nan | 0.000 |
 
 ![Q-Q max-of-field](../outputs/diffusion_v1/qq_max_of_field.png)
 
@@ -68,6 +87,16 @@ WassDiff (IEEE TGRS 2025), ExtremeCast (AAAI 2024), and the Aich et al. (GMD
 
 - Map comparison: ![](../outputs/diffusion_v1/map_comparison.png)
 - Tile-level summaries: ![](../outputs/diffusion_v1/tile_metrics.png)
+
+
+## Random samples vs. observed change
+
+5 randomly-drawn validation chips (rows). Column 1 = observed Δhm
+(2020 − 2000); columns 2–6 = independent draws from the trained diffusion
+model's conditional posterior. Sample variability captures the model's
+uncertainty about *where* and *how much* change occurs.
+
+![](../outputs/diffusion_v1/samples_vs_observed.png)
 
 ## Caveats / Notes
 

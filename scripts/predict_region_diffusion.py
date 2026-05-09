@@ -122,17 +122,12 @@ def main():
     module = DiffusionLightningModule.load_from_checkpoint(args.checkpoint, map_location=device)
     module.train(False)
 
-    # Δhm stats (same cache the training script wrote)
-    if not os.path.exists(args.dhm_stats_cache):
-        raise FileNotFoundError(
-            f"Δhm stats cache not found at {args.dhm_stats_cache}; "
-            f"train_diffusion.py writes it on first run."
-        )
-    with open(args.dhm_stats_cache) as f:
-        dhm_stats = json.load(f)
-    dhm_mean = float(dhm_stats["dhm_mean"])
-    dhm_std = float(dhm_stats["dhm_std"])
-    print(f"Δhm stats: mean={dhm_mean:.6e} std={dhm_std:.6e}")
+    # Δhm stats are baked into the checkpoint hyperparameters (and so is the
+    # forward transform spec, e.g. dhm_transform="signed_log1p", dhm_log_scale).
+    # module.denormalize() inverts both, so we just need to print for visibility.
+    print(f"Δhm stats from checkpoint: mean={module.dhm_mean:.6e} std={module.dhm_std:.6e} "
+          f"transform={getattr(module, 'dhm_transform', 'none')} "
+          f"log_scale={getattr(module, 'dhm_log_scale', float('nan'))}")
 
     stats = quick_stats(stat_samples=512, chip_size=args.tile_size)
     hm_mean, hm_std = stats["hm_mean"], stats["hm_std"]
@@ -308,10 +303,13 @@ def main():
                 cond, n_samples=args.ensemble_n,
                 num_inference_steps=args.num_inference_steps,
                 guidance_scale=args.guidance_scale,
-            )  # [N, B, 1, H, W]
+            )  # [N, B, 1, H, W] in normalised (and possibly transformed) model space.
+            # module.denormalize handles z-score AND inverse target transform (e.g.
+            # signed_log1p) so callers always work in raw Δhm units.
+            samples_raw = module.denormalize(samples.float())
 
         # Aggregate per tile
-        samples_dhm = samples.float().cpu().numpy() * dhm_std + dhm_mean
+        samples_dhm = samples_raw.cpu().numpy()
         # samples_dhm: [N, B, 1, H, W]
         med = np.median(samples_dhm, axis=0)[:, 0]              # [B, H, W]
         q025 = np.quantile(samples_dhm, 0.025, axis=0)[:, 0]
