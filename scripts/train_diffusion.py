@@ -136,6 +136,21 @@ def parse_args():
                         "0=off; 0.5–1.0 typical.")
     p.add_argument("--tile_mean_scales", type=int, nargs="+", default=[8, 16],
                    help="Average-pool scales for tile-mean loss. e.g. 8 16 32.")
+    p.add_argument("--hist_loss_weight", type=float, default=0.0,
+                   help="Per-tile soft-histogram intersection loss — direct "
+                        "training-time mirror of the eval `xinter_median` "
+                        "metric. 0=off; 1.0–2.0 typical when targeting tile-"
+                        "level histogram agreement.")
+    p.add_argument("--hist_bin_edges", type=float, nargs="+",
+                   default=[-1.0, -0.005, 0.005, 0.02, 0.1, 0.2, 0.4, 0.6, 1.0],
+                   help="Bin edges used by the histogram loss. Defaults match "
+                        "scripts/evaluate_diffusion.HIST_BIN_EDGES.")
+    p.add_argument("--hist_scales", type=int, nargs="+", default=[16, 32],
+                   help="Avg-pool scales for the histogram loss (per-tile sizes).")
+    p.add_argument("--hist_temperature", type=float, default=0.01,
+                   help="Sigmoid temperature for soft binning. Smaller = sharper "
+                        "binning (closer to the discrete eval metric) but harder "
+                        "gradient.")
 
     # Location encoder
     p.add_argument("--use_location_encoder", action="store_true", default=True)
@@ -261,6 +276,10 @@ def main():
         mean_loss_weight=args.mean_loss_weight,
         tile_mean_loss_weight=args.tile_mean_loss_weight,
         tile_mean_scales=tuple(args.tile_mean_scales),
+        hist_loss_weight=args.hist_loss_weight,
+        hist_bin_edges=tuple(args.hist_bin_edges),
+        hist_scales=tuple(args.hist_scales),
+        hist_temperature=args.hist_temperature,
     )
     n_params = sum(p.numel() for p in module.parameters())
     print(f"  module param count: {n_params/1e6:.1f}M")

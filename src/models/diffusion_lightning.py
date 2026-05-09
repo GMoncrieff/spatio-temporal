@@ -108,6 +108,10 @@ class DiffusionLightningModule(pl.LightningModule):
         mean_loss_weight: float = 1.0,
         tile_mean_loss_weight: float = 0.0,
         tile_mean_scales: Sequence[int] = (8, 16),
+        hist_loss_weight: float = 0.0,
+        hist_bin_edges: Sequence[float] = (-1.0, -0.005, 0.005, 0.02, 0.1, 0.2, 0.4, 0.6, 1.0),
+        hist_scales: Sequence[int] = (16, 32),
+        hist_temperature: float = 0.01,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -145,6 +149,13 @@ class DiffusionLightningModule(pl.LightningModule):
         self.mean_loss_weight = float(mean_loss_weight)
         self.tile_mean_loss_weight = float(tile_mean_loss_weight)
         self.tile_mean_scales = tuple(int(s) for s in tile_mean_scales)
+        self.hist_loss_weight = float(hist_loss_weight)
+        self.register_buffer(
+            "hist_bin_edges",
+            torch.tensor(list(hist_bin_edges), dtype=torch.float32),
+        )
+        self.hist_scales = tuple(int(s) for s in hist_scales)
+        self.hist_temperature = float(hist_temperature)
 
         loc = _maybe_build_location_encoder(location_encoder_kwargs)
         if loc is None:
@@ -304,6 +315,45 @@ class DiffusionLightningModule(pl.LightningModule):
         denom = valid_f.sum().clamp(min=1.0)
         return (sq * w_pix * valid_f).sum() / denom
 
+    def _per_tile_hist_loss(self, x0_pred, target_dhm, valid):
+        """Per-tile histogram-intersection loss — directly mirrors `xinter` in
+        `scripts/evaluate_diffusion.py`.
+
+        For each evaluation bin [edge_i, edge_{i+1}), each pixel gets a soft
+        membership via sigmoid differences; per-tile histograms are obtained
+        by avg_pool2d at multiple scales; pred and target tile-histograms are
+        normalised so they sum to 1 per tile; loss = 1 − Σ_bin min(p, q),
+        averaged over tiles and scales. Targets the user-stated 'tile-level
+        histogram agreement' criterion directly.
+        """
+        if self.hist_loss_weight <= 0 or len(self.hist_bin_edges) < 2:
+            return torch.zeros((), device=x0_pred.device)
+        edges = self.hist_bin_edges.to(x0_pred.device)
+        T = self.hist_temperature
+        valid_f = valid.float()
+        # Per-pixel soft bin membership: [B, n_bins, H, W]
+        # bin_i membership = sigmoid((x − edge_i)/T) − sigmoid((x − edge_{i+1})/T)
+        sig_pred = torch.sigmoid((x0_pred - edges.view(1, -1, 1, 1)) / T)
+        sig_targ = torch.sigmoid((target_dhm - edges.view(1, -1, 1, 1)) / T)
+        # bin counts: difference of consecutive sigmoid responses
+        h_pred = (sig_pred[:, :-1] - sig_pred[:, 1:]) * valid_f  # [B, n_bins, H, W]
+        h_targ = (sig_targ[:, :-1] - sig_targ[:, 1:]) * valid_f
+        terms = []
+        for s in self.hist_scales:
+            if x0_pred.shape[-1] < s or x0_pred.shape[-2] < s:
+                continue
+            # Per-tile sums (proportional to histogram counts)
+            cp = F.avg_pool2d(h_pred, s, s)  # [B, n_bins, H/s, W/s]
+            ct = F.avg_pool2d(h_targ, s, s)
+            # Normalise per tile so the histogram sums to 1
+            cp = cp / (cp.sum(dim=1, keepdim=True) + 1e-6)
+            ct = ct / (ct.sum(dim=1, keepdim=True) + 1e-6)
+            inter = torch.minimum(cp, ct).sum(dim=1)  # [B, H/s, W/s]
+            terms.append((1.0 - inter).mean())
+        if not terms:
+            return torch.zeros((), device=x0_pred.device)
+        return torch.stack(terms).mean()
+
     def _tile_mean_loss(self, x0_pred, target_dhm, valid):
         """Multi-scale tile-mean MSE: ‖avg_pool(pred) − avg_pool(target)‖².
 
@@ -457,7 +507,8 @@ class DiffusionLightningModule(pl.LightningModule):
 
         need_x0 = (self.pattern_loss_weight > 0
                    or self.wasserstein_loss_weight > 0
-                   or self.tile_mean_loss_weight > 0)
+                   or self.tile_mean_loss_weight > 0
+                   or self.hist_loss_weight > 0)
         x0_pred = self._x0_pred_from_v(noisy, v_pred, t) if need_x0 else None
         # Pattern / Wasserstein losses must operate in *target space* (not
         # residual space) so their thresholds and histograms correspond to
@@ -484,6 +535,11 @@ class DiffusionLightningModule(pl.LightningModule):
             tm_loss = self._tile_mean_loss(x0_pred_full, target_for_loss, valid)
             total_loss = total_loss + self.tile_mean_loss_weight * tm_loss
             self.log(f"{log_prefix}/tile_mean_loss", tm_loss, on_step=True, on_epoch=True)
+
+        if self.hist_loss_weight > 0:
+            h_loss = self._per_tile_hist_loss(x0_pred_full, target_for_loss, valid)
+            total_loss = total_loss + self.hist_loss_weight * h_loss
+            self.log(f"{log_prefix}/hist_loss", h_loss, on_step=True, on_epoch=True)
 
         self.log(f"{log_prefix}/loss", total_loss, prog_bar=True, on_step=True, on_epoch=True)
         return total_loss
