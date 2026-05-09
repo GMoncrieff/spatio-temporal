@@ -22,6 +22,31 @@ from diffusers import DDPMScheduler, DDIMScheduler
 from .diffusion_unet import ConditionalDiffusionUNet
 
 
+class CorrDiffMeanHead(nn.Module):
+    """Small deterministic conv stack that predicts the conditional-mean Δhm μ
+    from the same conditioning the diffusion U-Net sees.
+
+    Trained jointly with an MSE loss on (μ, target_dhm). The diffusion model
+    learns the residual r = target − μ.detach(), so its entropy budget is no
+    longer spent re-modelling the conditional mean — that frees variance for
+    rare-event sampling, which is the v8/v12 bottleneck.
+    """
+    def __init__(self, in_channels: int, hidden: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, hidden, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(hidden, hidden, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(hidden, hidden, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(hidden, 1, 1),
+        )
+
+    def forward(self, cond):
+        return self.net(cond)
+
+
 def _maybe_build_location_encoder(
     locenc_kwargs: Optional[Mapping[str, Any]],
 ):
@@ -78,6 +103,9 @@ class DiffusionLightningModule(pl.LightningModule):
         use_magnitude_cond: bool = False,
         m_dropout_prob: float = 0.0,
         m_norm_scale: float = 0.5,
+        use_mean_head: bool = False,
+        mean_head_hidden: int = 64,
+        mean_loss_weight: float = 1.0,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -111,6 +139,8 @@ class DiffusionLightningModule(pl.LightningModule):
         self.use_magnitude_cond = bool(use_magnitude_cond)
         self.m_dropout_prob = float(m_dropout_prob)
         self.m_norm_scale = float(m_norm_scale)
+        self.use_mean_head = bool(use_mean_head)
+        self.mean_loss_weight = float(mean_loss_weight)
 
         loc = _maybe_build_location_encoder(location_encoder_kwargs)
         if loc is None:
@@ -128,6 +158,11 @@ class DiffusionLightningModule(pl.LightningModule):
             layers_per_block=layers_per_block,
             attention_head_dim=attention_head_dim,
         )
+
+        if self.use_mean_head:
+            self.mean_head = CorrDiffMeanHead(cond_channels, hidden=int(mean_head_hidden))
+        else:
+            self.mean_head = None
 
         self.train_scheduler = DDPMScheduler(
             num_train_timesteps=num_train_timesteps,
@@ -348,15 +383,32 @@ class DiffusionLightningModule(pl.LightningModule):
         log_prefix: str,
     ) -> torch.Tensor:
         cond = self._build_conditioning_from_batch(batch, drop_m=True)
-        x_0 = batch["target_dhm"]                  # [B, 1, H, W]
+        target = batch["target_dhm"]               # [B, 1, H, W]
         valid = batch["valid_mask"].unsqueeze(1)   # [B, 1, H, W]
-        B = x_0.shape[0]
+        B = target.shape[0]
         # CFG: occasionally drop the *whole* spatial conditioning so the model
         # also learns the unconditional score (independent of magnitude
         # dropout, which lives in _build_conditioning_from_batch).
         if self.training and self.cfg_dropout_prob > 0:
             keep = (torch.rand(B, device=cond.device) > self.cfg_dropout_prob).float()
             cond = cond * keep.view(-1, 1, 1, 1)
+
+        # CorrDiff residual decomposition (Tier 3A): if a deterministic mean
+        # head is enabled, train it with MSE on (μ, target) and have the
+        # diffusion learn the residual r = target − μ.detach() instead of the
+        # full target. Frees the diffusion's stochastic capacity from
+        # re-modelling the conditional mean.
+        mean_loss_term = None
+        if self.use_mean_head and self.mean_head is not None:
+            mu = self.mean_head(cond)                # [B, 1, H, W]
+            valid_f = valid.float()
+            denom = valid_f.sum().clamp(min=1.0)
+            mean_loss_term = ((mu - target).pow(2) * valid_f).sum() / denom
+            x_0 = target - mu.detach()
+        else:
+            mu = None
+            x_0 = target
+
         t = torch.randint(
             0, self.num_train_timesteps, (B,), device=x_0.device, dtype=torch.long
         )
@@ -368,17 +420,30 @@ class DiffusionLightningModule(pl.LightningModule):
         v_loss = self._v_loss(v_pred, v_target, valid, x_0, t)
         total_loss = v_loss
         self.log(f"{log_prefix}/v_loss", v_loss, on_step=True, on_epoch=True)
+        if mean_loss_term is not None:
+            total_loss = total_loss + self.mean_loss_weight * mean_loss_term
+            self.log(f"{log_prefix}/mean_loss", mean_loss_term, on_step=True, on_epoch=True)
 
         need_x0 = self.pattern_loss_weight > 0 or self.wasserstein_loss_weight > 0
         x0_pred = self._x0_pred_from_v(noisy, v_pred, t) if need_x0 else None
+        # Pattern / Wasserstein losses must operate in *target space* (not
+        # residual space) so their thresholds and histograms correspond to
+        # actual Δhm magnitudes. With the mean head on, x_0 is the residual,
+        # so we add μ.detach() back to recover the full prediction & target.
+        if x0_pred is not None and mu is not None:
+            x0_pred_full = x0_pred + mu.detach()
+            target_for_loss = target
+        else:
+            x0_pred_full = x0_pred
+            target_for_loss = x_0
 
         if self.pattern_loss_weight > 0:
-            p_loss = self._pattern_loss(x0_pred, x_0, valid)
+            p_loss = self._pattern_loss(x0_pred_full, target_for_loss, valid)
             total_loss = total_loss + self.pattern_loss_weight * p_loss
             self.log(f"{log_prefix}/pattern_loss", p_loss, on_step=True, on_epoch=True)
 
         if self.wasserstein_loss_weight > 0:
-            w_loss = self._marginal_wasserstein_loss(x0_pred, x_0, valid)
+            w_loss = self._marginal_wasserstein_loss(x0_pred_full, target_for_loss, valid)
             total_loss = total_loss + self.wasserstein_loss_weight * w_loss
             self.log(f"{log_prefix}/wasserstein_loss", w_loss, on_step=True, on_epoch=True)
 
@@ -492,7 +557,13 @@ class DiffusionLightningModule(pl.LightningModule):
                 else:
                     v_pred = self.unet(x, cond_tiled, t_batch)
                 x = scheduler.step(v_pred, t, x).prev_sample
-            return x.view(n_samples, B, 1, H, W)
+            samples = x.view(n_samples, B, 1, H, W)
+            # CorrDiff: outputs are residuals; add μ to recover full prediction
+            if self.use_mean_head and self.mean_head is not None:
+                with torch.no_grad():
+                    mu = self.mean_head(conditioning)             # [B, 1, H, W]
+                samples = samples + mu.unsqueeze(0)               # broadcast over N
+            return samples
         finally:
             self._restore_from_backup(backup)
 

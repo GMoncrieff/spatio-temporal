@@ -120,6 +120,15 @@ def parse_args():
     p.add_argument("--m_norm_scale", type=float, default=0.5,
                    help="Divisor used to normalise raw |Δhm| max into the "
                         "magnitude conditioning channel. ~max realistic |Δhm|.")
+    p.add_argument("--use_mean_head", action="store_true", default=False,
+                   help="Tier 3A: enable a small deterministic conv head that "
+                        "predicts the conditional-mean Δhm (CorrDiff). The "
+                        "diffusion U-Net then learns only the residual, freeing "
+                        "its stochastic capacity for rare events.")
+    p.add_argument("--mean_head_hidden", type=int, default=64,
+                   help="Hidden channel width for the CorrDiff mean head.")
+    p.add_argument("--mean_loss_weight", type=float, default=1.0,
+                   help="Multiplier on the mean head's MSE loss term.")
 
     # Location encoder
     p.add_argument("--use_location_encoder", action="store_true", default=True)
@@ -240,6 +249,9 @@ def main():
         use_magnitude_cond=args.use_magnitude_cond,
         m_dropout_prob=args.m_dropout_prob,
         m_norm_scale=args.m_norm_scale,
+        use_mean_head=args.use_mean_head,
+        mean_head_hidden=args.mean_head_hidden,
+        mean_loss_weight=args.mean_loss_weight,
     )
     n_params = sum(p.numel() for p in module.parameters())
     print(f"  module param count: {n_params/1e6:.1f}M")
