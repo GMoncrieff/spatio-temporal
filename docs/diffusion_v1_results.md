@@ -7,11 +7,11 @@
 - Aggregate-tile size: **16×16** pixels (10 km blocks).
 - Histogram bins (rarity-weighted, matches baseline `histogram_loss.py`):
   `[-1.0, -0.005, 0.005, 0.02, 0.1, 0.2, 0.4, 0.6, 1.0]`.
-- W&B run: [glennwithtwons/spatio-temporal-diffusion/zfm5r53r](https://wandb.ai/glennwithtwons/spatio-temporal-diffusion/zfm5r53r)
+- W&B run: [glennwithtwons/spatio-temporal-diffusion/vsqjke5c](https://wandb.ai/glennwithtwons/spatio-temporal-diffusion/vsqjke5c)
 
 ## Model & checkpoint
 
-- Checkpoint: `spatio-temporal-diffusion/zfm5r53r/checkpoints/dhm-diffusion-epoch29-valloss0.2250.ckpt`
+- Checkpoint: `spatio-temporal-diffusion/vsqjke5c/checkpoints/dhm-diffusion-epoch29-valloss0.1968.ckpt`
 - Stopping epoch: 29 (global step 480)
 - Architecture: `ConditionalDiffusionUNet` (`diffusers.UNet2DModel`)
   - sample_size = 64
@@ -32,13 +32,13 @@
 | Metric | Value |
 |---|---|
 | Tiles with valid coverage | 4,394 of 7,150 |
-| Tile-mean MAE (median) | **0.0049** |
-| Tile-mean MAE (mean) | 0.0076 |
-| Tile-mean MAE (95th %ile) | 0.0236 |
-| Histogram intersection (median) | **0.548** |
-| Histogram intersection (mean) | 0.541 |
-| Pearson r (predicted vs. observed tile-mean Δhm) | 0.547 |
-| Coverage rate (q025 ≤ obs ≤ q975), all bins | 0.855 (target ≈ 0.95) |
+| Tile-mean MAE (median) | **0.0025** |
+| Tile-mean MAE (mean) | 0.0068 |
+| Tile-mean MAE (95th %ile) | 0.0294 |
+| Histogram intersection (median) | **0.846** |
+| Histogram intersection (mean) | 0.769 |
+| Pearson r (predicted vs. observed tile-mean Δhm) | 0.531 |
+| Coverage rate (q025 ≤ obs ≤ q975), all bins | 0.765 (target ≈ 0.95) |
 
 ### Coverage stratified by Δhm change bin
 
@@ -49,10 +49,10 @@ ones where the model has to express genuine uncertainty.
 
 | Δhm bin | n pixels | Coverage |
 |---|---:|---:|
-| `[ -1.000, -0.005]` | 56,357 | 0.297 |
-| `[ -0.005, +0.005]` | 742,163 | 0.990 |
-| `[ +0.005, +0.020]` | 116,330 | 0.996 |
-| `[ +0.020, +0.100]` | 97,708 | 0.090 |
+| `[ -1.000, -0.005]` | 56,357 | 0.000 |
+| `[ -0.005, +0.005]` | 742,163 | 0.965 |
+| `[ +0.005, +0.020]` | 116,330 | 0.576 |
+| `[ +0.020, +0.100]` | 97,708 | 0.000 |
 | `[ +0.100, +0.200]` | 10,296 | 0.000 |
 | `[ +0.200, +0.400]` | 1,614 | 0.000 |
 | `[ +0.400, +0.600]` | 120 | 0.000 |
