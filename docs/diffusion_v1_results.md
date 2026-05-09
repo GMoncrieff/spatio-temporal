@@ -32,13 +32,13 @@
 | Metric | Value |
 |---|---|
 | Tiles with valid coverage | 4,394 of 7,150 |
-| Tile-mean MAE (median) | **0.0067** |
-| Tile-mean MAE (mean) | 0.0087 |
-| Tile-mean MAE (95th %ile) | 0.0230 |
-| Histogram intersection (median) | **0.430** |
-| Histogram intersection (mean) | 0.484 |
-| Pearson r (predicted vs. observed tile-mean Δhm) | 0.677 |
-| Coverage rate (q025 ≤ obs ≤ q975), all bins | 0.953 (target ≈ 0.95) |
+| Tile-mean MAE (median) | **0.0042** |
+| Tile-mean MAE (mean) | 0.0066 |
+| Tile-mean MAE (95th %ile) | 0.0210 |
+| Histogram intersection (median) | **0.521** |
+| Histogram intersection (mean) | 0.548 |
+| Pearson r (predicted vs. observed tile-mean Δhm) | 0.676 |
+| Coverage rate (q025 ≤ obs ≤ q975), all bins | 0.959 (target ≈ 0.95) |
 
 ### Coverage stratified by Δhm change bin
 
@@ -49,11 +49,11 @@ ones where the model has to express genuine uncertainty.
 
 | Δhm bin | n pixels | Coverage |
 |---|---:|---:|
-| `[ -1.000, -0.005]` | 56,357 | 0.817 |
-| `[ -0.005, +0.005]` | 742,163 | 0.997 |
-| `[ +0.005, +0.020]` | 116,330 | 0.984 |
-| `[ +0.020, +0.100]` | 97,708 | 0.767 |
-| `[ +0.100, +0.200]` | 10,296 | 0.072 |
+| `[ -1.000, -0.005]` | 56,357 | 0.812 |
+| `[ -0.005, +0.005]` | 742,163 | 0.998 |
+| `[ +0.005, +0.020]` | 116,330 | 0.986 |
+| `[ +0.020, +0.100]` | 97,708 | 0.818 |
+| `[ +0.100, +0.200]` | 10,296 | 0.085 |
 | `[ +0.200, +0.400]` | 1,614 | 0.002 |
 | `[ +0.400, +0.600]` | 120 | 0.000 |
 | `[ +0.600, +1.000]` | 7 | 0.000 |
@@ -69,16 +69,16 @@ WassDiff (IEEE TGRS 2025), ExtremeCast (AAAI 2024), and the Aich et al. (GMD
 
 - Threshold: 0.0667
 - Observed tail mass: 1245.5662
-- Predicted tail mass: 115.3724
-- **Ratio (pred / obs):** **0.093** (<<1 = under-predicting tail; ~1 = calibrated; >1 = over)
+- Predicted tail mass: 123.9677
+- **Ratio (pred / obs):** **0.100** (<<1 = under-predicting tail; ~1 = calibrated; >1 = over)
 
 ### Tail exceedance (deterministic + q975 ensemble support)
 
 | Threshold | n(obs>t) | n(pred>t) | POD | CSI | FAR | q975 soft-POD |
 |---|---|---|---|---|---|---|
-| +0.050 |     42,889 |     14,961 | 0.152 | 0.127 | 0.564 | 0.752 |
-| +0.100 |     12,037 |        977 | 0.029 | 0.028 | 0.642 | 0.171 |
-| +0.200 |      1,741 |          4 | 0.002 | 0.002 | 0.000 | 0.011 |
+| +0.050 |     42,889 |     16,241 | 0.165 | 0.136 | 0.565 | 0.860 |
+| +0.100 |     12,037 |      1,048 | 0.034 | 0.032 | 0.609 | 0.194 |
+| +0.200 |      1,741 |          5 | 0.003 | 0.003 | 0.000 | 0.010 |
 | +0.400 |        127 |          0 | 0.000 | 0.000 | nan | 0.000 |
 
 ![Q-Q max-of-field](../outputs/diffusion_v1/qq_max_of_field.png)
