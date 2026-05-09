@@ -106,6 +106,8 @@ class DiffusionLightningModule(pl.LightningModule):
         use_mean_head: bool = False,
         mean_head_hidden: int = 64,
         mean_loss_weight: float = 1.0,
+        tile_mean_loss_weight: float = 0.0,
+        tile_mean_scales: Sequence[int] = (8, 16),
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -141,6 +143,8 @@ class DiffusionLightningModule(pl.LightningModule):
         self.m_norm_scale = float(m_norm_scale)
         self.use_mean_head = bool(use_mean_head)
         self.mean_loss_weight = float(mean_loss_weight)
+        self.tile_mean_loss_weight = float(tile_mean_loss_weight)
+        self.tile_mean_scales = tuple(int(s) for s in tile_mean_scales)
 
         loc = _maybe_build_location_encoder(location_encoder_kwargs)
         if loc is None:
@@ -300,6 +304,33 @@ class DiffusionLightningModule(pl.LightningModule):
         denom = valid_f.sum().clamp(min=1.0)
         return (sq * w_pix * valid_f).sum() / denom
 
+    def _tile_mean_loss(self, x0_pred, target_dhm, valid):
+        """Multi-scale tile-mean MSE: ‖avg_pool(pred) − avg_pool(target)‖².
+
+        Targets the *amount* of change at the tile level (per-tile aggregate
+        magnitude) — directly aligned with the user's stated success metric
+        (pixel coverage + tile-level amount, not pixel-precise matching).
+        Pooling makes this insensitive to which pixel within a tile carries
+        the change.
+        """
+        if self.tile_mean_loss_weight <= 0 or not self.tile_mean_scales:
+            return torch.zeros((), device=x0_pred.device)
+        valid_f = valid.float()
+        # Mask both fields, average only over valid pixels per tile.
+        terms = []
+        for s in self.tile_mean_scales:
+            if x0_pred.shape[-1] < s or x0_pred.shape[-2] < s:
+                continue
+            p_sum = F.avg_pool2d(x0_pred * valid_f, s, s)
+            t_sum = F.avg_pool2d(target_dhm * valid_f, s, s)
+            v_sum = F.avg_pool2d(valid_f, s, s).clamp(min=1e-3)
+            p_mean = p_sum / v_sum
+            t_mean = t_sum / v_sum
+            terms.append((p_mean - t_mean).pow(2).mean())
+        if not terms:
+            return torch.zeros((), device=x0_pred.device)
+        return torch.stack(terms).mean()
+
     def _marginal_wasserstein_loss(self, x0_pred, target_dhm, valid):
         """Sliced 1D Wasserstein on the marginal pixel-value histogram (Tier 2C).
 
@@ -424,7 +455,9 @@ class DiffusionLightningModule(pl.LightningModule):
             total_loss = total_loss + self.mean_loss_weight * mean_loss_term
             self.log(f"{log_prefix}/mean_loss", mean_loss_term, on_step=True, on_epoch=True)
 
-        need_x0 = self.pattern_loss_weight > 0 or self.wasserstein_loss_weight > 0
+        need_x0 = (self.pattern_loss_weight > 0
+                   or self.wasserstein_loss_weight > 0
+                   or self.tile_mean_loss_weight > 0)
         x0_pred = self._x0_pred_from_v(noisy, v_pred, t) if need_x0 else None
         # Pattern / Wasserstein losses must operate in *target space* (not
         # residual space) so their thresholds and histograms correspond to
@@ -446,6 +479,11 @@ class DiffusionLightningModule(pl.LightningModule):
             w_loss = self._marginal_wasserstein_loss(x0_pred_full, target_for_loss, valid)
             total_loss = total_loss + self.wasserstein_loss_weight * w_loss
             self.log(f"{log_prefix}/wasserstein_loss", w_loss, on_step=True, on_epoch=True)
+
+        if self.tile_mean_loss_weight > 0:
+            tm_loss = self._tile_mean_loss(x0_pred_full, target_for_loss, valid)
+            total_loss = total_loss + self.tile_mean_loss_weight * tm_loss
+            self.log(f"{log_prefix}/tile_mean_loss", tm_loss, on_step=True, on_epoch=True)
 
         self.log(f"{log_prefix}/loss", total_loss, prog_bar=True, on_step=True, on_epoch=True)
         return total_loss

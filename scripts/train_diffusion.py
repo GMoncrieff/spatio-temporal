@@ -129,6 +129,13 @@ def parse_args():
                    help="Hidden channel width for the CorrDiff mean head.")
     p.add_argument("--mean_loss_weight", type=float, default=1.0,
                    help="Multiplier on the mean head's MSE loss term.")
+    p.add_argument("--tile_mean_loss_weight", type=float, default=0.0,
+                   help="Multi-scale tile-mean MSE on full predicted x0 vs "
+                        "target. Targets per-tile aggregate magnitude (the "
+                        "user's tile-level 'amount of change' criterion). "
+                        "0=off; 0.5–1.0 typical.")
+    p.add_argument("--tile_mean_scales", type=int, nargs="+", default=[8, 16],
+                   help="Average-pool scales for tile-mean loss. e.g. 8 16 32.")
 
     # Location encoder
     p.add_argument("--use_location_encoder", action="store_true", default=True)
@@ -252,6 +259,8 @@ def main():
         use_mean_head=args.use_mean_head,
         mean_head_hidden=args.mean_head_hidden,
         mean_loss_weight=args.mean_loss_weight,
+        tile_mean_loss_weight=args.tile_mean_loss_weight,
+        tile_mean_scales=tuple(args.tile_mean_scales),
     )
     n_params = sum(p.numel() for p in module.parameters())
     print(f"  module param count: {n_params/1e6:.1f}M")
