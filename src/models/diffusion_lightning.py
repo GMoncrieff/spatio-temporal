@@ -106,6 +106,8 @@ class DiffusionLightningModule(pl.LightningModule):
         use_mean_head: bool = False,
         mean_head_hidden: int = 64,
         mean_loss_weight: float = 1.0,
+        mean_head_pixel_weight_alpha: float = 0.0,
+        mean_head_pixel_weight_eps: float = 0.01,
         tile_mean_loss_weight: float = 0.0,
         tile_mean_scales: Sequence[int] = (8, 16),
         hist_loss_weight: float = 0.0,
@@ -149,6 +151,8 @@ class DiffusionLightningModule(pl.LightningModule):
         self.m_norm_scale = float(m_norm_scale)
         self.use_mean_head = bool(use_mean_head)
         self.mean_loss_weight = float(mean_loss_weight)
+        self.mean_head_pixel_weight_alpha = float(mean_head_pixel_weight_alpha)
+        self.mean_head_pixel_weight_eps = float(mean_head_pixel_weight_eps)
         self.tile_mean_loss_weight = float(tile_mean_loss_weight)
         self.tile_mean_scales = tuple(int(s) for s in tile_mean_scales)
         self.hist_loss_weight = float(hist_loss_weight)
@@ -517,8 +521,21 @@ class DiffusionLightningModule(pl.LightningModule):
         if self.use_mean_head and self.mean_head is not None:
             mu = self.mean_head(cond)                # [B, 1, H, W]
             valid_f = valid.float()
-            denom = valid_f.sum().clamp(min=1.0)
-            mean_loss_term = ((mu - target).pow(2) * valid_f).sum() / denom
+            sq = (mu - target).pow(2)
+            if self.mean_head_pixel_weight_alpha > 0:
+                # Up-weight rare high-magnitude pixels so the mean head learns
+                # to predict their actual values rather than being averaged out
+                # by the dominant near-zero bulk. Re-normalised so average pixel
+                # weight = 1, preserving loss scale.
+                w = target.abs().pow(self.mean_head_pixel_weight_alpha) \
+                    + self.mean_head_pixel_weight_eps
+                w_sum = (w * valid_f).sum()
+                v_sum = valid_f.sum().clamp(min=1.0)
+                w = w * (v_sum / w_sum.clamp(min=1e-8))
+                mean_loss_term = (sq * w * valid_f).sum() / v_sum
+            else:
+                denom = valid_f.sum().clamp(min=1.0)
+                mean_loss_term = (sq * valid_f).sum() / denom
             x_0 = target - mu.detach()
         else:
             mu = None

@@ -129,6 +129,15 @@ def parse_args():
                    help="Hidden channel width for the CorrDiff mean head.")
     p.add_argument("--mean_loss_weight", type=float, default=1.0,
                    help="Multiplier on the mean head's MSE loss term.")
+    p.add_argument("--mean_head_pixel_weight_alpha", type=float, default=0.0,
+                   help="Per-pixel weight on the mean head MSE: weight ∝ "
+                        "(|target|^α + ε). 0=uniform; 1=linear; 2=quadratic. "
+                        "Concentrates the mean head's capacity on rare high-"
+                        "magnitude pixels (essential for non-trivial median "
+                        "prediction at hotspots).")
+    p.add_argument("--mean_head_pixel_weight_eps", type=float, default=0.01,
+                   help="Floor for the pixel weight so near-zero pixels still "
+                        "contribute. Smaller = more aggressive concentration.")
     p.add_argument("--tile_mean_loss_weight", type=float, default=0.0,
                    help="Multi-scale tile-mean MSE on full predicted x0 vs "
                         "target. Targets per-tile aggregate magnitude (the "
@@ -283,6 +292,8 @@ def main():
         use_mean_head=args.use_mean_head,
         mean_head_hidden=args.mean_head_hidden,
         mean_loss_weight=args.mean_loss_weight,
+        mean_head_pixel_weight_alpha=args.mean_head_pixel_weight_alpha,
+        mean_head_pixel_weight_eps=args.mean_head_pixel_weight_eps,
         tile_mean_loss_weight=args.tile_mean_loss_weight,
         tile_mean_scales=tuple(args.tile_mean_scales),
         hist_loss_weight=args.hist_loss_weight,
