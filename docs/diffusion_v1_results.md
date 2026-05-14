@@ -25,22 +25,26 @@ Pixel-precise magnitude matching is *not* a goal.
 | v14 | 0.072 | 0.430 | 0.677 | 0.0067 | 0.953 | 0.221 | + tile-aware loss redesign |
 | v15 | 0.085 | 0.521 | 0.677 | 0.0042 | 0.959 | 0.214 | + 2× ensemble at inference (n=32) |
 | v17 | 0.086 | 0.399 | 0.699 | 0.0097 | 0.958 | 0.206 | + per-tile hist_loss=1.0 — regression |
-| **v18** | **0.087** | **0.529** | 0.681 | 0.0043 | **0.959** | 0.215 | **gentler hist_loss=0.3 — best on user targets** |
+| v18 | 0.087 | 0.529 | 0.681 | 0.0043 | 0.959 | 0.215 | gentler hist_loss=0.3 |
+| v19 | 0.087 | 0.481 | 0.693 | 0.0072 | 0.956 | 0.222 | + TV(masked) — tail preserved, neg-bias worsened |
+| **v20** | 0.083 | **0.604** | **0.738** | **0.0034** | 0.958 | **0.356** | **+ strong chip-mean anchor — best across-the-board** |
 
-v18 is the operational best for the user's stated criteria; v13 was the
-architectural breakthrough that unlocked the rest. Bins ≥ 0.2 remain near
-0% coverage across all runs — those events (1614 + 120 + 7 pixels in the
-small region) need either focal-cropping training data or a wider U-Net.
+v20 is the operational best for the user's stated criteria; v13 was the
+architectural breakthrough that unlocked the rest. Bin > 0.2 coverage
+finally lifted off zero (v18→v20: 0.002 → 0.007) and pred_max reached
+0.356 (vs obs max 0.656). Larger events (> 0.4) still 0% coverage —
+n=127 pixels region-wide; likely needs focal-cropped training data.
 
-### Production-ready recipe (v18)
+### Production-ready recipe (v20)
 
 Training:
 ```
 --use_ema --weighted_sampling --weight_alpha 1
 --pattern_loss_weight 0.3 --pattern_scales 8 16 32
---tile_mean_loss_weight 0.5 --tile_mean_scales 8 16 32
+--tile_mean_loss_weight 5.0 --tile_mean_scales 8 16 32 64   # 10x stronger + per-chip
 --wasserstein_loss_weight 0.2
 --hist_loss_weight 0.3 --hist_temperature 0.05 --hist_scales 16 32
+--tv_loss_weight 1.0 --tv_loss_target_floor 0.05           # smooth where |target|<=0.05
 --min_snr_gamma 5
 --use_magnitude_cond --m_dropout_prob 0.3 --m_norm_scale 0.5
 --use_mean_head --mean_head_hidden 128 --mean_loss_weight 1.0
@@ -50,6 +54,11 @@ Inference:
 ```
 --ensemble_n 32 --m_target 0.7 --predict_stride 64
 ```
+
+Performance note: predict_region_diffusion.py now calls
+`torch.mps.empty_cache()` between batches and explicitly deletes
+intermediate GPU tensors. Without that, MPS memory accumulates across
+batches and the predict run slows from ~40 min to 2-3 h.
 
 ## Model & checkpoint
 
