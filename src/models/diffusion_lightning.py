@@ -112,6 +112,8 @@ class DiffusionLightningModule(pl.LightningModule):
         hist_bin_edges: Sequence[float] = (-1.0, -0.005, 0.005, 0.02, 0.1, 0.2, 0.4, 0.6, 1.0),
         hist_scales: Sequence[int] = (16, 32),
         hist_temperature: float = 0.01,
+        tv_loss_weight: float = 0.0,
+        tv_loss_target_floor: float = 0.05,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -156,6 +158,8 @@ class DiffusionLightningModule(pl.LightningModule):
         )
         self.hist_scales = tuple(int(s) for s in hist_scales)
         self.hist_temperature = float(hist_temperature)
+        self.tv_loss_weight = float(tv_loss_weight)
+        self.tv_loss_target_floor = float(tv_loss_target_floor)
 
         loc = _maybe_build_location_encoder(location_encoder_kwargs)
         if loc is None:
@@ -314,6 +318,36 @@ class DiffusionLightningModule(pl.LightningModule):
             sq = sq * snr_w
         denom = valid_f.sum().clamp(min=1.0)
         return (sq * w_pix * valid_f).sum() / denom
+
+    def _tv_loss(self, x0_pred, target_dhm, valid):
+        """Total Variation loss on predicted Δhm — addresses sample noisiness.
+
+        Each diffusion sample has uniform ~0.028 per-pixel noise around the
+        median, which makes individual samples look granular even where the
+        truth is smooth (most pixels = 0). Penalising ‖∇x_pred‖ teaches the
+        U-Net to produce spatially smooth outputs at all noise levels.
+
+        To preserve the model's ability to produce *large positives* on the
+        rare event tiles, we mask the TV penalty out wherever |target| exceeds
+        `tv_loss_target_floor`: smoothness is only required in low-magnitude
+        regions where the truth is genuinely flat.
+        """
+        if self.tv_loss_weight <= 0:
+            return torch.zeros((), device=x0_pred.device)
+        # |target| ≤ floor → smoothness applies; |target| > floor → free.
+        floor = self.tv_loss_target_floor
+        smooth_mask = (target_dhm.abs() <= floor).float()
+        valid_f = valid.float()
+        # Edge-mask: only penalise gradients where BOTH endpoints are smooth-and-valid.
+        # mask for vertical edges (dx) — between rows i and i+1
+        m_dx = smooth_mask[..., :-1, :] * smooth_mask[..., 1:, :] * \
+               valid_f[..., :-1, :] * valid_f[..., 1:, :]
+        m_dy = smooth_mask[..., :, :-1] * smooth_mask[..., :, 1:] * \
+               valid_f[..., :, :-1] * valid_f[..., :, 1:]
+        dx = (x0_pred[..., 1:, :] - x0_pred[..., :-1, :]).abs()
+        dy = (x0_pred[..., :, 1:] - x0_pred[..., :, :-1]).abs()
+        denom = (m_dx.sum() + m_dy.sum()).clamp(min=1.0)
+        return ((dx * m_dx).sum() + (dy * m_dy).sum()) / denom
 
     def _per_tile_hist_loss(self, x0_pred, target_dhm, valid):
         """Per-tile histogram-intersection loss — directly mirrors `xinter` in
@@ -508,7 +542,8 @@ class DiffusionLightningModule(pl.LightningModule):
         need_x0 = (self.pattern_loss_weight > 0
                    or self.wasserstein_loss_weight > 0
                    or self.tile_mean_loss_weight > 0
-                   or self.hist_loss_weight > 0)
+                   or self.hist_loss_weight > 0
+                   or self.tv_loss_weight > 0)
         x0_pred = self._x0_pred_from_v(noisy, v_pred, t) if need_x0 else None
         # Pattern / Wasserstein losses must operate in *target space* (not
         # residual space) so their thresholds and histograms correspond to
@@ -540,6 +575,11 @@ class DiffusionLightningModule(pl.LightningModule):
             h_loss = self._per_tile_hist_loss(x0_pred_full, target_for_loss, valid)
             total_loss = total_loss + self.hist_loss_weight * h_loss
             self.log(f"{log_prefix}/hist_loss", h_loss, on_step=True, on_epoch=True)
+
+        if self.tv_loss_weight > 0:
+            tv = self._tv_loss(x0_pred_full, target_for_loss, valid)
+            total_loss = total_loss + self.tv_loss_weight * tv
+            self.log(f"{log_prefix}/tv_loss", tv, on_step=True, on_epoch=True)
 
         self.log(f"{log_prefix}/loss", total_loss, prog_bar=True, on_step=True, on_epoch=True)
         return total_loss

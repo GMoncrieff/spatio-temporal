@@ -151,6 +151,15 @@ def parse_args():
                    help="Sigmoid temperature for soft binning. Smaller = sharper "
                         "binning (closer to the discrete eval metric) but harder "
                         "gradient.")
+    p.add_argument("--tv_loss_weight", type=float, default=0.0,
+                   help="Total Variation loss on x0_pred. Smooths individual "
+                        "diffusion samples in regions where |target| is small "
+                        "(see --tv_loss_target_floor). 0=off; 0.5–2.0 typical.")
+    p.add_argument("--tv_loss_target_floor", type=float, default=0.05,
+                   help="TV penalty is masked OUT wherever |target| > this "
+                        "threshold, so the model can still produce sharp "
+                        "high-magnitude features. 0.05 means smoothness "
+                        "applies only where true Δhm is in [-0.05, +0.05].")
 
     # Location encoder
     p.add_argument("--use_location_encoder", action="store_true", default=True)
@@ -280,6 +289,8 @@ def main():
         hist_bin_edges=tuple(args.hist_bin_edges),
         hist_scales=tuple(args.hist_scales),
         hist_temperature=args.hist_temperature,
+        tv_loss_weight=args.tv_loss_weight,
+        tv_loss_target_floor=args.tv_loss_target_floor,
     )
     n_params = sum(p.numel() for p in module.parameters())
     print(f"  module param count: {n_params/1e6:.1f}M")
