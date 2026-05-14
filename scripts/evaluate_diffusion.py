@@ -598,44 +598,67 @@ User targets (re-stated): improve **per-bin pixel coverage** (especially
 bins > 0.05) and **tile-level histogram intersection** (`xinter_median`).
 Pixel-precise magnitude matching is *not* a goal.
 
-| Run | bin > 0.1 cov | xinter | Pearson r | MAE med | cov rate | pred_max | Notes |
-|---|---|---|---|---|---|---|---|
-| v8 baseline | 0.000 | 0.860 | 0.561 | 0.0034 | 0.942 | 0.056 | EMA + weighted + min-SNR (stride 32 eval) |
-| v10 / v11 | 0.000 | 0.55 / 0.85 | 0.55 | varies | varies | 0.022 / 0.011 | signed-log target — regression |
-| v12 | 0.000 | 0.438 | 0.378 | 0.0050 | 0.949 | 0.056 | 2A+2B+2C — flat on tail |
-| **v13** | **0.069** | 0.400 | 0.665 | 0.0074 | 0.954 | **0.208** | **CorrDiff residual — tail wall breaks** |
-| v14 | 0.072 | 0.430 | 0.677 | 0.0067 | 0.953 | 0.221 | + tile-aware loss redesign |
-| v15 | 0.085 | 0.521 | 0.677 | 0.0042 | 0.959 | 0.214 | + 2× ensemble at inference (n=32) |
-| v17 | 0.086 | 0.399 | 0.699 | 0.0097 | 0.958 | 0.206 | + per-tile hist_loss=1.0 — regression |
-| v18 | 0.087 | 0.529 | 0.681 | 0.0043 | 0.959 | 0.215 | gentler hist_loss=0.3 |
-| v19 | 0.087 | 0.481 | 0.693 | 0.0072 | 0.956 | 0.222 | + TV(masked) — tail preserved, neg-bias worsened |
-| **v20** | 0.083 | **0.604** | **0.738** | **0.0034** | 0.958 | **0.356** | **+ strong chip-mean anchor — best across-the-board** |
+| Run | bin > 0.1 cov | bin > 0.2 cov | xinter | Pearson r | MAE med | cov rate | pred_max | Notes |
+|---|---|---|---|---|---|---|---|---|
+| v8 baseline | 0.000 | 0.000 | 0.860 | 0.561 | 0.0034 | 0.942 | 0.056 | EMA + weighted + min-SNR (stride 32 eval) |
+| v10/v11 | 0.000 | 0.000 | 0.55/0.85 | 0.55 | varies | varies | 0.022/0.011 | signed-log target — regression |
+| v12 | 0.000 | 0.000 | 0.438 | 0.378 | 0.0050 | 0.949 | 0.056 | 2A+2B+2C — flat on tail |
+| **v13** | **0.069** | 0.000 | 0.400 | 0.665 | 0.0074 | 0.954 | **0.208** | **CorrDiff residual — tail wall breaks** |
+| v14 | 0.072 | 0.000 | 0.430 | 0.677 | 0.0067 | 0.953 | 0.221 | + tile-aware loss redesign |
+| v15 | 0.085 | 0.002 | 0.521 | 0.677 | 0.0042 | 0.959 | 0.214 | + 2× ensemble at inference (n=32) |
+| v17 | 0.086 | 0.001 | 0.399 | 0.699 | 0.0097 | 0.958 | 0.206 | + per-tile hist_loss=1.0 — regression |
+| v18 | 0.087 | 0.002 | 0.529 | 0.681 | 0.0043 | 0.959 | 0.215 | gentler hist_loss=0.3 |
+| v19 | 0.087 | 0.002 | 0.481 | 0.693 | 0.0072 | 0.956 | 0.222 | + TV(masked) — tail preserved, neg-bias worsened |
+| **v20** | 0.083 | 0.007 | **0.604** | **0.738** | **0.0034** | 0.958 | 0.356 | **+ strong chip-mean anchor — best balanced** |
+| v21 | 0.394 | 0.039 | 0.133 | 0.606 | 0.0299 | 0.483 | 0.505 | + α=1.0 pixel-weighted mean head — tail breaks, bulk breaks |
+| v22 | 0.135 | 0.005 | 0.471 | 0.687 | 0.0051 | 0.952 | 0.256 | α=0.3 — mediocre middle |
+| v23 | **0.441** | 0.037 | 0.175 | 0.622 | 0.0279 | 0.485 | 0.413 | α=1.0 + 3× bulk anchors — best bin>0.1 cov |
+| v24 | 0.247 | 0.042 | 0.343 | 0.534 | 0.0129 | 0.718 | 0.389 | mw=0.3 — best balance bin>0.2 |
+| **v25** | 0.239 | **0.048** | 0.246 | 0.412 | 0.0209 | 0.543 | 0.411 | **mw=0.1 — best upper-tail; first q975→0.4** |
 
-v20 is the operational best for the user's stated criteria; v13 was the
-architectural breakthrough that unlocked the rest. Bin > 0.2 coverage
-finally lifted off zero (v18→v20: 0.002 → 0.007) and pred_max reached
-0.356 (vs obs max 0.656). Larger events (> 0.4) still 0% coverage —
-n=127 pixels region-wide; likely needs focal-cropped training data.
+v13 was the architectural breakthrough (CorrDiff residual). v20 is
+the best **balanced** result. v24 is the best **bin>0.2 / balance**.
+v25 has the **best upper-tail** including first non-zero q975 reach
+to 0.4. Choice depends on which trade-off you want.
 
-### Production-ready recipe (v20)
+### Production recipes
 
+**v20 — bulk-balanced** (best xinter, MAE, coverage rate, Pearson):
+```
 Training:
-```
---use_ema --weighted_sampling --weight_alpha 1
---pattern_loss_weight 0.3 --pattern_scales 8 16 32
---tile_mean_loss_weight 5.0 --tile_mean_scales 8 16 32 64   # 10x stronger + per-chip
---wasserstein_loss_weight 0.2
---hist_loss_weight 0.3 --hist_temperature 0.05 --hist_scales 16 32
---tv_loss_weight 1.0 --tv_loss_target_floor 0.05           # smooth where |target|<=0.05
---min_snr_gamma 5
---use_magnitude_cond --m_dropout_prob 0.3 --m_norm_scale 0.5
---use_mean_head --mean_head_hidden 128 --mean_loss_weight 1.0
+  --use_ema --weighted_sampling --weight_alpha 1
+  --pattern_loss_weight 0.3 --pattern_scales 8 16 32
+  --tile_mean_loss_weight 5.0 --tile_mean_scales 8 16 32 64
+  --wasserstein_loss_weight 0.2
+  --hist_loss_weight 0.3 --hist_temperature 0.05 --hist_scales 16 32
+  --tv_loss_weight 1.0 --tv_loss_target_floor 0.05
+  --min_snr_gamma 5
+  --use_magnitude_cond --m_dropout_prob 0.3 --m_norm_scale 0.5
+  --use_mean_head --mean_head_hidden 128 --mean_loss_weight 1.0
+Inference:
+  --ensemble_n 32 --m_target 0.7 --predict_stride 64
 ```
 
-Inference:
+**v25 — tail-focused** (best bin>0.2 cov, POD@0.2, q975 soft-POD@0.4):
 ```
---ensemble_n 32 --m_target 0.7 --predict_stride 64
+Training: v20 +
+  --tile_mean_loss_weight 15.0 (vs 5.0)
+  --wasserstein_loss_weight 0.5 (vs 0.2)
+  --hist_loss_weight 1.0 (vs 0.3)
+  --pattern_loss_weight 0.5 (vs 0.3)
+  --mean_loss_weight 0.1 (vs 1.0)
+  --mean_head_pixel_weight_alpha 1.0 --mean_head_pixel_weight_eps 0.01
+Inference: same as v20
 ```
+
+**v24 — middle ground** (decent bulk + decent tail): v25 settings but
+`--mean_loss_weight 0.3`.
+
+The trade-off: stronger mean head pixel weighting (α=1.0) lifts hotspot
+predictions but pulls the bulk's median pred from +0.001 to ~+0.02.
+Pixel-precise matching is *not* a goal of this work; mean preservation
+of the bulk distribution is. v20 maximises the latter; v25 maximises
+upper-tail coverage. v24 splits the difference.
 
 Performance note: predict_region_diffusion.py now calls
 `torch.mps.empty_cache()` between batches and explicitly deletes
