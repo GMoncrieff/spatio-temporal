@@ -320,8 +320,19 @@ def main():
             # signed_log1p) so callers always work in raw Δhm units.
             samples_raw = module.denormalize(samples.float())
 
-        # Aggregate per tile
+        # Aggregate per tile (move to CPU immediately so we can free MPS memory).
         samples_dhm = samples_raw.cpu().numpy()
+        # Free everything still on MPS — otherwise these tensors pile up across
+        # batches, the MPS allocator falls back to host swap, and the per-batch
+        # cost climbs from ~30s to several minutes. Manually clearing the cache
+        # keeps the run at its baseline ~30s per 4-tile batch.
+        del samples, samples_raw, cond, bdyn_t, bstat_t, bll_t, bhm_t_t
+        if m_scalar is not None:
+            del m_scalar
+        if device.type == "mps":
+            torch.mps.empty_cache()
+        elif device.type == "cuda":
+            torch.cuda.empty_cache()
         # samples_dhm: [N, B, 1, H, W]
         med = np.median(samples_dhm, axis=0)[:, 0]              # [B, H, W]
         q025 = np.quantile(samples_dhm, 0.025, axis=0)[:, 0]
