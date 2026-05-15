@@ -3,10 +3,15 @@
 ## Overview
 
 This project forecasts the Human Modification (HM) index 20 years ahead using a
-**conditional 2D diffusion U-Net**. Quantile bounds and uncertainty come from
-ensemble sampling at inference rather than dedicated quantile heads — every
-prediction is a draw from the conditional posterior P(Δhm | covariates), so
-quantiles emerge as empirical statistics over N samples per chip.
+**conditional 2D diffusion U-Net with a CorrDiff residual decomposition**.
+Quantile bounds and uncertainty come from ensemble sampling at inference —
+every prediction is a draw from the conditional posterior P(Δhm | covariates),
+so quantiles emerge as empirical statistics over N samples per chip.
+
+A small deterministic *mean head* predicts the conditional-mean Δhm μ; the
+diffusion U-Net learns only the residual r = target − μ. This frees the
+diffusion's stochastic capacity from re-modelling the bulk and lets it express
+rare-event tails properly.
 
 The earlier ConvLSTM + hybrid-loss approach is preserved verbatim under
 `baselines/convlstm/` for the data-paper comparison.
@@ -16,18 +21,23 @@ The earlier ConvLSTM + hybrid-loss approach is preserved verbatim under
 - **Single 20-year horizon, generative**: predicts Δhm = HM(t+20) − HM(t)
   rather than absolute HM, with HM(t) supplied as an explicit conditioning
   channel.
-- **Distributional fidelity over pointwise accuracy**: ensemble samples capture
-  *where* and *how much* change occurs, instead of collapsing the conditional
-  to a smeared mean.
-- **Reuses the existing data layer**: per-variable normalization, validity
-  masks, regional GeoJSON masking, and W&B integration carry over unchanged.
+- **CorrDiff residual decomposition**: a small joint-trained mean head
+  predicts μ deterministically; the diffusion residual handles the rare-event
+  tail.
+- **Tile-aware loss stack**: per-tile histogram intersection, tile-mean MSE,
+  multi-scale binary pattern matching, and Wasserstein marginal regularisation
+  align training with the user-target metrics rather than per-pixel matching.
+- **FIDE-style magnitude conditioning**: scalar `M = max(|Δhm|)` per chip is
+  an explicit conditioning channel; at inference the user can request a
+  target magnitude.
 - **MPS / CUDA / CPU**: end-to-end pipeline runs on Apple Silicon, NVIDIA, or
-  CPU with no code changes.
+  CPU with no code changes. Predict uses `torch.mps.empty_cache()` between
+  batches to keep MPS inference fast.
 
 ## Documentation
 
-- **[Diffusion v1 results](docs/diffusion_v1_results.md)** — end-to-end
-  evaluation on the small dev region (model details, metrics, sample grid).
+- **[Diffusion results](docs/diffusion_v1_results.md)** — full iteration
+  history (v8 → v26), metrics, and three production-ready recipes.
 - **[Baseline (ConvLSTM) technical guide](docs/simple_model_architecture_and_training.md)**
   — original multi-horizon, quantile-head ConvLSTM design.
 
@@ -46,7 +56,7 @@ spatio_temporal/
 │   ├── locationencoder/                      # shared LocationEncoder package
 │   └── models/
 │       ├── diffusion_unet.py                 # ConditionalDiffusionUNet (UNet2DModel wrapper)
-│       └── diffusion_lightning.py            # DiffusionLightningModule
+│       └── diffusion_lightning.py            # DiffusionLightningModule + CorrDiffMeanHead
 │
 ├── baselines/
 │   └── convlstm/                             # FROZEN ConvLSTM baseline
@@ -56,21 +66,21 @@ spatio_temporal/
 │       └── tests/                            # 21 ConvLSTM tests
 │
 ├── scripts/
-│   ├── torchgeo_dataloader.py                # adapted: target_mode='delta_20yr', restrict_to_region
+│   ├── torchgeo_dataloader.py                # target_mode='delta_20yr', restrict_to_region,
+│   │                                         #   target_max_dhm scalar, weighted sampling
 │   ├── train_diffusion.py                    # diffusion training entrypoint
-│   ├── predict_region_diffusion.py           # ensemble region prediction
-│   ├── evaluate_diffusion.py                 # tile-level MAE + histogram-intersection eval
+│   ├── predict_region_diffusion.py           # ensemble region prediction (MPS-cache-safe)
+│   ├── evaluate_diffusion.py                 # tile-level + tail-sensitive eval
 │   └── ...                                   # shared visualization utilities
 │
 ├── tests/
-│   ├── test_diffusion_dataloader.py          # delta_20yr dataloader shape tests
-│   ├── test_diffusion_unet.py                # forward shape / param count
-│   ├── test_diffusion_training.py            # loss decreases on synthetic batch
+│   ├── test_diffusion_dataloader.py
+│   ├── test_diffusion_unet.py
+│   ├── test_diffusion_training.py
 │   └── test_torchgeo_dataloader.py
 │
 ├── docs/
-│   ├── diffusion_v1_results.md
-│   └── simple_model_architecture_and_training.md
+│   └── diffusion_v1_results.md
 │
 ├── outputs/
 │   └── diffusion_v1/                         # report figures + metrics.json
@@ -113,46 +123,98 @@ on the same global grid (1 km, EPSG:4326).
 
 ## Usage
 
-### Diffusion training
+### Quickstart (v26 production recipe — recommended)
+
+The current best configuration on the small dev region, targeting the
+user-stated criteria of (a) pixel coverage on high-change bins and (b)
+tile-level histogram intersection.
+
+**Train (100 epochs ≈ 110 min on Apple M-series MPS):**
 
 ```bash
 python scripts/train_diffusion.py \
-  --max_epochs 50 \
-  --base_channels 128 \
-  --batch_size 4 \
-  --train_chips 256 \
-  --val_chips 32 \
+  --max_epochs 100 \
+  --use_ema \
+  --weighted_sampling --weight_alpha 1 \
+  --pattern_loss_weight 0.5 --pattern_scales 8 16 32 \
+  --tile_mean_loss_weight 15.0 --tile_mean_scales 8 16 32 64 \
+  --wasserstein_loss_weight 0.5 \
+  --hist_loss_weight 1.0 --hist_temperature 0.05 --hist_scales 16 32 \
+  --tv_loss_weight 1.0 --tv_loss_target_floor 0.05 \
+  --min_snr_gamma 5 \
+  --use_magnitude_cond --m_dropout_prob 0.3 --m_norm_scale 0.5 \
+  --use_mean_head --mean_head_hidden 128 --mean_loss_weight 0.1 \
+  --mean_head_pixel_weight_alpha 1.0 --mean_head_pixel_weight_eps 0.01 \
   --restrict_to_region config/region_to_predict_small.geojson \
-  --wandb_run_name v2-mac-50epoch-base128
+  --wandb_run_name v26-100ep-tail-focused
 ```
 
-Common knobs:
+**Predict (~80 min at n=64 on MPS):**
+
+```bash
+python scripts/predict_region_diffusion.py \
+  --checkpoint <path-to.ckpt> \
+  --predict_region config/region_to_predict_small.geojson \
+  --predict_stride 64 \
+  --ensemble_n 64 \
+  --m_target 0.7
+```
+
+**Evaluate:**
+
+```bash
+python scripts/evaluate_diffusion.py \
+  --checkpoint <path-to.ckpt> \
+  --wandb_run glennwithtwons/spatio-temporal-diffusion/<runid>
+```
+
+This writes `docs/diffusion_v1_results.md` with the iteration history,
+per-bin coverage, tail diagnostics (Q-Q max-of-field, R95p, exceedance POD),
+and a sample grid.
+
+### Common training knobs
 
 | Argument | Default | Description |
 |---|---|---|
 | `--max_epochs` | 5 | Training epochs |
 | `--chip_size` | 64 | Spatial chip size |
 | `--batch_size` | 16 | Mini-batch size |
-| `--base_channels` | 128 | U-Net base channels (spec target) |
+| `--base_channels` | 128 | U-Net base channels |
 | `--channel_mults` | `[1, 2, 2, 4]` | Per-stage channel multipliers |
+| `--use_ema` | off | Track EMA weights for sampling |
+| `--weighted_sampling` | off | Oversample chips with high `max|Δhm|` |
 | `--num_train_timesteps` | 1000 | Diffusion training timesteps |
-| `--num_inference_steps` | 30 | DDIM sampling steps at inference |
-| `--ensemble_n` | 16 | Samples per chip aggregated in prediction |
-| `--restrict_to_region` | `region_to_predict_small.geojson` | Region mask for chips |
+| `--num_inference_steps` | 30 | DDIM sampling steps |
+| `--ensemble_n` | 16 | Samples per chip (use 32–64 in production) |
+| `--restrict_to_region` | small region | Region mask for chips |
 | `--precision` | `32-true` | Use `bf16-mixed` on Ampere+ CUDA |
 
-### Region prediction
+### CorrDiff / loss-stack knobs
 
-```bash
-python scripts/predict_region_diffusion.py \
-  --checkpoint <path-to.ckpt> \
-  --predict_region config/region_to_predict_small.geojson \
-  --predict_stride 32 \
-  --ensemble_n 16 \
-  --num_inference_steps 30
-```
+| Argument | Default | Description |
+|---|---|---|
+| `--use_mean_head` | off | Enable CorrDiff residual decomposition |
+| `--mean_head_hidden` | 64 | Mean head hidden channels |
+| `--mean_loss_weight` | 1.0 | Mean head MSE multiplier |
+| `--mean_head_pixel_weight_alpha` | 0.0 | Pixel weight = `|target|^α + ε`; α=1 lifts tail predictions |
+| `--mean_head_pixel_weight_eps` | 0.01 | Floor for the pixel weight |
+| `--tile_mean_loss_weight` | 0.0 | Multi-scale tile-mean MSE on x0_pred |
+| `--tile_mean_scales` | `[8, 16]` | Avg-pool scales (use `8 16 32 64`) |
+| `--wasserstein_loss_weight` | 0.0 | 1D marginal Wasserstein on pixel histogram |
+| `--hist_loss_weight` | 0.0 | Per-tile soft-histogram intersection loss |
+| `--hist_temperature` | 0.01 | Sigmoid temp for soft binning |
+| `--hist_scales` | `[16, 32]` | Avg-pool scales for the histogram loss |
+| `--pattern_loss_weight` | 0.0 | Multi-scale binary-pattern matching loss |
+| `--tv_loss_weight` | 0.0 | TV loss on x0_pred (smooths samples) |
+| `--tv_loss_target_floor` | 0.05 | Masks TV out where `|target| > floor` (preserves tail) |
+| `--min_snr_gamma` | 0.0 | Hang-2023 min-SNR-γ weighting (5 is standard) |
+| `--use_magnitude_cond` | off | FIDE-style block-maxima conditioning channel |
+| `--m_dropout_prob` | 0.0 | Drop M to null with this probability during training |
+| `--m_norm_scale` | 0.5 | Divisor for raw `|Δhm|` max in the conditioning channel |
 
-Outputs four GeoTIFFs to `data/predictions_diffusion/`:
+### Region prediction outputs
+
+Four GeoTIFFs in `data/predictions_diffusion/`:
 
 ```
 prediction_dhm_2020_median.tif   # ensemble median
@@ -161,31 +223,48 @@ prediction_dhm_2020_q975.tif     # 97.5th percentile (upper band)
 prediction_dhm_2020_std.tif      # ensemble std (uncertainty)
 ```
 
-### Tile-level evaluation
+## Architecture
 
-```bash
-python scripts/evaluate_diffusion.py \
-  --checkpoint <path-to.ckpt> \
-  --wandb_run glennwithtwons/spatio-temporal-diffusion/<runid>
-```
-
-Generates `outputs/diffusion_v1/{map_comparison.png, tile_metrics.png,
-samples_vs_observed.png, metrics.json}` and writes
-`docs/diffusion_v1_results.md`.
-
-## Architecture (diffusion v1)
+### Diffusion model
 
 - **Backbone**: `diffusers.UNet2DModel`, 4 resolution stages, `base_channels=128`,
   channel multipliers `[1, 2, 2, 4]`, self-attention at the lowest two stages,
   ~74 M parameters.
-- **Conditioning** (49 channels concatenated to the noisy target every step):
-  3 timesteps × 11 dynamic vars (33) + 7 static vars + 8 LocationEncoder
-  channels + 1 explicit HM(t) reference channel.
+- **Conditioning** (56 channels concatenated to the noisy target every step):
+  3 timesteps × 13 dynamic vars (HM + 12 component/distance) + 7 static vars +
+  8 LocationEncoder channels + 1 HM(t) reference + 1 magnitude scalar M.
 - **Objective**: v-prediction with cosine schedule
   (`DDPMScheduler(prediction_type="v_prediction", beta_schedule="squaredcos_cap_v2")`).
-- **Sampler**: DDIM at inference, 30 steps, 16-sample ensemble per chip.
-- **Aggregation**: ensemble median (central), 2.5 % / 97.5 % quantiles
-  (bounds), std (uncertainty).
+- **Sampler**: DDIM at inference, 30 steps. Production ensemble = 64 samples.
+
+### CorrDiff mean head
+
+A small 4-layer conv stack (`CorrDiffMeanHead`) takes the same conditioning
+the U-Net sees and outputs a deterministic μ. Trained jointly with an MSE
+loss on `(μ, target)`; the diffusion model learns the residual
+`r = target − μ.detach()` instead of the full target. At inference,
+`sample()` adds μ back so callers always see the full predicted Δhm.
+
+The mean head's MSE can be **pixel-weighted by `|target|^α`** so the rare
+high-magnitude pixels aren't averaged out by the dominant near-zero bulk —
+this is the key knob that unlocks high-bucket coverage. Combined with the
+`mean_loss_weight` multiplier, this trades bulk-vs-tail along a continuum
+that the three production recipes (v20 / v24 / v26) cover.
+
+### Loss stack rationale
+
+The user's success criterion is (a) **pixel coverage** (q025–q975 envelope
+brackets observed pixels, including high-change ones) and (b) **tile-level
+amount of change** (per-tile aggregate magnitude / histogram match). Pixel-
+precise magnitude matching is *not* a goal. The loss stack reflects this:
+
+- Tile-mean MSE + per-tile histogram intersection + multi-scale binary pattern
+  loss → tile-level criteria.
+- Marginal Wasserstein → distribution-shape match across the batch.
+- TV(masked) → smooths individual samples in the smooth (zero-near) region
+  without touching the tail.
+- Mean-head pixel weighting → unlock high-magnitude predictions on hotspot
+  tiles.
 
 ## Baseline (ConvLSTM)
 
