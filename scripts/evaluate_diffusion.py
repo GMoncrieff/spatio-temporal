@@ -614,12 +614,14 @@ Pixel-precise magnitude matching is *not* a goal.
 | v22 | 0.135 | 0.005 | 0.471 | 0.687 | 0.0051 | 0.952 | 0.256 | α=0.3 — mediocre middle |
 | v23 | **0.441** | 0.037 | 0.175 | 0.622 | 0.0279 | 0.485 | 0.413 | α=1.0 + 3× bulk anchors — best bin>0.1 cov |
 | v24 | 0.247 | 0.042 | 0.343 | 0.534 | 0.0129 | 0.718 | 0.389 | mw=0.3 — best balance bin>0.2 |
-| **v25** | 0.239 | **0.048** | 0.246 | 0.412 | 0.0209 | 0.543 | 0.411 | **mw=0.1 — best upper-tail; first q975→0.4** |
+| v25 | 0.239 | 0.048 | 0.246 | 0.412 | 0.0209 | 0.543 | 0.411 | mw=0.1 — first q975→0.4 |
+| **v26** | 0.247 | **0.061** | 0.289 | 0.678 | 0.0130 | 0.829 | **0.491** | **v25 + 100 epochs + n=64 ensemble — FIRST bin>0.4 cov (0.050)** |
 
 v13 was the architectural breakthrough (CorrDiff residual). v20 is
-the best **balanced** result. v24 is the best **bin>0.2 / balance**.
-v25 has the **best upper-tail** including first non-zero q975 reach
-to 0.4. Choice depends on which trade-off you want.
+the best **balanced** result. **v26** is the new best across the
+board — same losses as v25 but trained for 100 epochs (vs 30) and
+predicted with **n=64** ensemble (vs 32). First iteration with
+non-zero coverage on bin > 0.4 (5%) and POD@0.4 (8.7%).
 
 ### Production recipes
 
@@ -639,20 +641,23 @@ Inference:
   --ensemble_n 32 --m_target 0.7 --predict_stride 64
 ```
 
-**v25 — tail-focused** (best bin>0.2 cov, POD@0.2, q975 soft-POD@0.4):
+**v26 — tail-focused, new operational best** (first bin>0.4 cov,
+best across-the-board on tail AND nearly recovers v20 bulk):
 ```
 Training: v20 +
+  --max_epochs 100 (vs 30)
   --tile_mean_loss_weight 15.0 (vs 5.0)
   --wasserstein_loss_weight 0.5 (vs 0.2)
   --hist_loss_weight 1.0 (vs 0.3)
   --pattern_loss_weight 0.5 (vs 0.3)
   --mean_loss_weight 0.1 (vs 1.0)
   --mean_head_pixel_weight_alpha 1.0 --mean_head_pixel_weight_eps 0.01
-Inference: same as v20
+Inference:
+  --ensemble_n 64 --m_target 0.7 --predict_stride 64
 ```
 
 **v24 — middle ground** (decent bulk + decent tail): v25 settings but
-`--mean_loss_weight 0.3`.
+`--mean_loss_weight 0.3`, 30 epochs, n=32.
 
 The trade-off: stronger mean head pixel weighting (α=1.0) lifts hotspot
 predictions but pulls the bulk's median pred from +0.001 to ~+0.02.
