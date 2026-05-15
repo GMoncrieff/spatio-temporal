@@ -169,6 +169,18 @@ def parse_args():
                         "threshold, so the model can still produce sharp "
                         "high-magnitude features. 0.05 means smoothness "
                         "applies only where true Δhm is in [-0.05, +0.05].")
+    p.add_argument("--zero_anchor_loss_weight", type=float, default=0.0,
+                   help="L2 anchor on near-zero target pixels — fights the "
+                        "bulk negative over-prediction. Wherever |target| <= "
+                        "zero_anchor_threshold, pred is pushed toward 0. "
+                        "0=off; 1.0–5.0 typical.")
+    p.add_argument("--zero_anchor_threshold", type=float, default=0.005,
+                   help="Pixels with |target| <= this are treated as zero-mode "
+                        "for the zero-anchor loss.")
+    p.add_argument("--edge_match_loss_weight", type=float, default=0.0,
+                   help="L2 on spatial gradient mismatch — fights the smoothing "
+                        "issue by forcing predicted gradients to match target "
+                        "gradients. 0=off; 0.5–2.0 typical.")
 
     # Location encoder
     p.add_argument("--use_location_encoder", action="store_true", default=True)
@@ -302,6 +314,9 @@ def main():
         hist_temperature=args.hist_temperature,
         tv_loss_weight=args.tv_loss_weight,
         tv_loss_target_floor=args.tv_loss_target_floor,
+        zero_anchor_loss_weight=args.zero_anchor_loss_weight,
+        zero_anchor_threshold=args.zero_anchor_threshold,
+        edge_match_loss_weight=args.edge_match_loss_weight,
     )
     n_params = sum(p.numel() for p in module.parameters())
     print(f"  module param count: {n_params/1e6:.1f}M")

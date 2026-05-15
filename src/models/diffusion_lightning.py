@@ -116,6 +116,9 @@ class DiffusionLightningModule(pl.LightningModule):
         hist_temperature: float = 0.01,
         tv_loss_weight: float = 0.0,
         tv_loss_target_floor: float = 0.05,
+        zero_anchor_loss_weight: float = 0.0,
+        zero_anchor_threshold: float = 0.005,
+        edge_match_loss_weight: float = 0.0,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -164,6 +167,9 @@ class DiffusionLightningModule(pl.LightningModule):
         self.hist_temperature = float(hist_temperature)
         self.tv_loss_weight = float(tv_loss_weight)
         self.tv_loss_target_floor = float(tv_loss_target_floor)
+        self.zero_anchor_loss_weight = float(zero_anchor_loss_weight)
+        self.zero_anchor_threshold = float(zero_anchor_threshold)
+        self.edge_match_loss_weight = float(edge_match_loss_weight)
 
         loc = _maybe_build_location_encoder(location_encoder_kwargs)
         if loc is None:
@@ -322,6 +328,44 @@ class DiffusionLightningModule(pl.LightningModule):
             sq = sq * snr_w
         denom = valid_f.sum().clamp(min=1.0)
         return (sq * w_pix * valid_f).sum() / denom
+
+    def _zero_anchor_loss(self, x0_pred, target_dhm, valid):
+        """L2 anchor on near-zero pixels — fights the bulk negative over-
+        prediction observed in v26 (62% of pixels predicted in [-0.05, -0.005)
+        while obs has only 5%). Wherever |target| ≤ zero_anchor_threshold the
+        prediction is pushed toward 0, breaking the model's tendency to use
+        slightly-negative noise as filler in the bulk region.
+        """
+        if self.zero_anchor_loss_weight <= 0:
+            return torch.zeros((), device=x0_pred.device)
+        near_zero = (target_dhm.abs() <= self.zero_anchor_threshold).float()
+        valid_f = valid.float()
+        mask = near_zero * valid_f
+        denom = mask.sum().clamp(min=1.0)
+        return (x0_pred.pow(2) * mask).sum() / denom
+
+    def _edge_match_loss(self, x0_pred, target_dhm, valid):
+        """L2 on the spatial gradient — fights the v26 smoothing issue.
+
+        The diffusion's natural Gaussian-like sampling produces spatially-
+        correlated blobs around hotspots; obs change is more concentrated.
+        Penalising ‖∇x_pred − ∇target‖² forces predicted gradients to match
+        target gradients pixel-by-pixel, encouraging sharp edges where the
+        truth has them and flat regions where it doesn't.
+        """
+        if self.edge_match_loss_weight <= 0:
+            return torch.zeros((), device=x0_pred.device)
+        dx_pred = x0_pred[..., 1:, :] - x0_pred[..., :-1, :]
+        dy_pred = x0_pred[..., :, 1:] - x0_pred[..., :, :-1]
+        dx_targ = target_dhm[..., 1:, :] - target_dhm[..., :-1, :]
+        dy_targ = target_dhm[..., :, 1:] - target_dhm[..., :, :-1]
+        vf = valid.float()
+        mx = vf[..., 1:, :] * vf[..., :-1, :]
+        my = vf[..., :, 1:] * vf[..., :, :-1]
+        n = (mx.sum() + my.sum()).clamp(min=1.0)
+        e_x = ((dx_pred - dx_targ).pow(2) * mx).sum()
+        e_y = ((dy_pred - dy_targ).pow(2) * my).sum()
+        return (e_x + e_y) / n
 
     def _tv_loss(self, x0_pred, target_dhm, valid):
         """Total Variation loss on predicted Δhm — addresses sample noisiness.
@@ -560,7 +604,9 @@ class DiffusionLightningModule(pl.LightningModule):
                    or self.wasserstein_loss_weight > 0
                    or self.tile_mean_loss_weight > 0
                    or self.hist_loss_weight > 0
-                   or self.tv_loss_weight > 0)
+                   or self.tv_loss_weight > 0
+                   or self.zero_anchor_loss_weight > 0
+                   or self.edge_match_loss_weight > 0)
         x0_pred = self._x0_pred_from_v(noisy, v_pred, t) if need_x0 else None
         # Pattern / Wasserstein losses must operate in *target space* (not
         # residual space) so their thresholds and histograms correspond to
@@ -597,6 +643,16 @@ class DiffusionLightningModule(pl.LightningModule):
             tv = self._tv_loss(x0_pred_full, target_for_loss, valid)
             total_loss = total_loss + self.tv_loss_weight * tv
             self.log(f"{log_prefix}/tv_loss", tv, on_step=True, on_epoch=True)
+
+        if self.zero_anchor_loss_weight > 0:
+            za = self._zero_anchor_loss(x0_pred_full, target_for_loss, valid)
+            total_loss = total_loss + self.zero_anchor_loss_weight * za
+            self.log(f"{log_prefix}/zero_anchor_loss", za, on_step=True, on_epoch=True)
+
+        if self.edge_match_loss_weight > 0:
+            em = self._edge_match_loss(x0_pred_full, target_for_loss, valid)
+            total_loss = total_loss + self.edge_match_loss_weight * em
+            self.log(f"{log_prefix}/edge_match_loss", em, on_step=True, on_epoch=True)
 
         self.log(f"{log_prefix}/loss", total_loss, prog_bar=True, on_step=True, on_epoch=True)
         return total_loss
