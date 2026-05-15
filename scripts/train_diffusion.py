@@ -181,6 +181,15 @@ def parse_args():
                    help="L2 on spatial gradient mismatch — fights the smoothing "
                         "issue by forcing predicted gradients to match target "
                         "gradients. 0=off; 0.5–2.0 typical.")
+    p.add_argument("--zero_anchor_neg_multiplier", type=float, default=1.0,
+                   help="Asymmetric zero anchor: multiplier on |pred|² when "
+                        "pred < 0 at near-zero target pixels. 1=symmetric; "
+                        ">1 penalises negative side more (fights bulk negative "
+                        "over-prediction surgically). 3-5 typical.")
+    p.add_argument("--spectral_loss_weight", type=float, default=0.0,
+                   help="2D FFT power-spectrum match (radial-frequency weighted). "
+                        "Penalises mismatch in high-frequency spatial content, "
+                        "encouraging sharp localised features. 0=off; 0.1-1.0 typical.")
 
     # Location encoder
     p.add_argument("--use_location_encoder", action="store_true", default=True)
@@ -316,7 +325,9 @@ def main():
         tv_loss_target_floor=args.tv_loss_target_floor,
         zero_anchor_loss_weight=args.zero_anchor_loss_weight,
         zero_anchor_threshold=args.zero_anchor_threshold,
+        zero_anchor_neg_multiplier=args.zero_anchor_neg_multiplier,
         edge_match_loss_weight=args.edge_match_loss_weight,
+        spectral_loss_weight=args.spectral_loss_weight,
     )
     n_params = sum(p.numel() for p in module.parameters())
     print(f"  module param count: {n_params/1e6:.1f}M")

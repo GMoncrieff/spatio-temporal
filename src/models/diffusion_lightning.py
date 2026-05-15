@@ -118,7 +118,9 @@ class DiffusionLightningModule(pl.LightningModule):
         tv_loss_target_floor: float = 0.05,
         zero_anchor_loss_weight: float = 0.0,
         zero_anchor_threshold: float = 0.005,
+        zero_anchor_neg_multiplier: float = 1.0,
         edge_match_loss_weight: float = 0.0,
+        spectral_loss_weight: float = 0.0,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -169,7 +171,9 @@ class DiffusionLightningModule(pl.LightningModule):
         self.tv_loss_target_floor = float(tv_loss_target_floor)
         self.zero_anchor_loss_weight = float(zero_anchor_loss_weight)
         self.zero_anchor_threshold = float(zero_anchor_threshold)
+        self.zero_anchor_neg_multiplier = float(zero_anchor_neg_multiplier)
         self.edge_match_loss_weight = float(edge_match_loss_weight)
+        self.spectral_loss_weight = float(spectral_loss_weight)
 
         loc = _maybe_build_location_encoder(location_encoder_kwargs)
         if loc is None:
@@ -330,11 +334,14 @@ class DiffusionLightningModule(pl.LightningModule):
         return (sq * w_pix * valid_f).sum() / denom
 
     def _zero_anchor_loss(self, x0_pred, target_dhm, valid):
-        """L2 anchor on near-zero pixels — fights the bulk negative over-
-        prediction observed in v26 (62% of pixels predicted in [-0.05, -0.005)
-        while obs has only 5%). Wherever |target| ≤ zero_anchor_threshold the
-        prediction is pushed toward 0, breaking the model's tendency to use
-        slightly-negative noise as filler in the bulk region.
+        """(Optionally asymmetric) L2 anchor on near-zero pixels.
+
+        When zero_anchor_neg_multiplier > 1, negative predictions at near-zero
+        target pixels get extra weight (per-pixel multiplier = neg_mul). This
+        directly attacks the user's 'too much negative change' observation
+        without symmetrically suppressing the positive side, which would also
+        knock down the rare positive-side blob noise that the bulk distribution
+        actually contains a small amount of.
         """
         if self.zero_anchor_loss_weight <= 0:
             return torch.zeros((), device=x0_pred.device)
@@ -342,7 +349,42 @@ class DiffusionLightningModule(pl.LightningModule):
         valid_f = valid.float()
         mask = near_zero * valid_f
         denom = mask.sum().clamp(min=1.0)
-        return (x0_pred.pow(2) * mask).sum() / denom
+        sq = x0_pred.pow(2)
+        if self.zero_anchor_neg_multiplier > 1.0:
+            asym = 1.0 + (self.zero_anchor_neg_multiplier - 1.0) * (x0_pred < 0).float()
+            sq = sq * asym
+        return (sq * mask).sum() / denom
+
+    def _spectral_sharpness_loss(self, x0_pred, target_dhm, valid):
+        """L2 on the 2D FFT power spectrum, weighted toward high frequencies.
+
+        The diffusion produces predictions that under-represent high-frequency
+        spatial content (the user's 'too smooth' observation). FFT of the
+        prediction and the target into 2D power spectra, weighted by radial
+        frequency so high-frequency mismatch dominates the loss. Encourages
+        sharp localised features that match where the truth has them.
+        """
+        if self.spectral_loss_weight <= 0:
+            return torch.zeros((), device=x0_pred.device)
+        v = valid.float()
+        # Mask out invalid pixels before FFT so they don't pollute the spectrum.
+        p = x0_pred * v
+        t = target_dhm * v
+        # rfft2 on the last 2 dims — input must be 4D [B, 1, H, W]
+        Fp = torch.fft.rfft2(p, dim=(-2, -1))
+        Ft = torch.fft.rfft2(t, dim=(-2, -1))
+        # Power spectrum
+        Pp = Fp.abs().pow(2)
+        Pt = Ft.abs().pow(2)
+        # Radial frequency weight: emphasise high frequencies linearly
+        B, C, H, W = p.shape
+        kh = torch.fft.fftfreq(H, device=p.device).abs().view(1, 1, H, 1)
+        kw = torch.fft.rfftfreq(W, device=p.device).abs().view(1, 1, 1, -1)
+        radial = torch.sqrt(kh * kh + kw * kw)  # in [0, sqrt(2)/2]
+        weight = radial / (radial.max() + 1e-8)  # normalise to [0, 1]
+        # Loss = weighted MSE between power spectra (log to compress scale).
+        diff = (Pp.add(1e-8).log() - Pt.add(1e-8).log()).pow(2)
+        return (diff * weight).mean()
 
     def _edge_match_loss(self, x0_pred, target_dhm, valid):
         """L2 on the spatial gradient — fights the v26 smoothing issue.
@@ -606,7 +648,8 @@ class DiffusionLightningModule(pl.LightningModule):
                    or self.hist_loss_weight > 0
                    or self.tv_loss_weight > 0
                    or self.zero_anchor_loss_weight > 0
-                   or self.edge_match_loss_weight > 0)
+                   or self.edge_match_loss_weight > 0
+                   or self.spectral_loss_weight > 0)
         x0_pred = self._x0_pred_from_v(noisy, v_pred, t) if need_x0 else None
         # Pattern / Wasserstein losses must operate in *target space* (not
         # residual space) so their thresholds and histograms correspond to
@@ -653,6 +696,11 @@ class DiffusionLightningModule(pl.LightningModule):
             em = self._edge_match_loss(x0_pred_full, target_for_loss, valid)
             total_loss = total_loss + self.edge_match_loss_weight * em
             self.log(f"{log_prefix}/edge_match_loss", em, on_step=True, on_epoch=True)
+
+        if self.spectral_loss_weight > 0:
+            sp = self._spectral_sharpness_loss(x0_pred_full, target_for_loss, valid)
+            total_loss = total_loss + self.spectral_loss_weight * sp
+            self.log(f"{log_prefix}/spectral_loss", sp, on_step=True, on_epoch=True)
 
         self.log(f"{log_prefix}/loss", total_loss, prog_bar=True, on_step=True, on_epoch=True)
         return total_loss
