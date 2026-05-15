@@ -7,7 +7,7 @@
 - Aggregate-tile size: **16×16** pixels (10 km blocks).
 - Histogram bins (rarity-weighted, matches baseline `histogram_loss.py`):
   `[-1.0, -0.005, 0.005, 0.02, 0.1, 0.2, 0.4, 0.6, 1.0]`.
-- W&B run: [glennwithtwons/spatio-temporal-diffusion/tqwzz9ew](https://wandb.ai/glennwithtwons/spatio-temporal-diffusion/tqwzz9ew)
+- W&B run: [glennwithtwons/spatio-temporal-diffusion/8i4lbs9l](https://wandb.ai/glennwithtwons/spatio-temporal-diffusion/8i4lbs9l)
 
 
 ## Iteration history (best-of-run on user-target metrics)
@@ -85,8 +85,8 @@ batches and the predict run slows from ~40 min to 2-3 h.
 
 ## Model & checkpoint
 
-- Checkpoint: `spatio-temporal-diffusion/tqwzz9ew/checkpoints/dhm-diffusion-epoch29-valloss1.0799.ckpt`
-- Stopping epoch: 29 (global step 480)
+- Checkpoint: `spatio-temporal-diffusion/8i4lbs9l/checkpoints/dhm-diffusion-epoch94-valloss0.7645.ckpt`
+- Stopping epoch: 94 (global step 1520)
 - Architecture: `ConditionalDiffusionUNet` (`diffusers.UNet2DModel`)
   - sample_size = 64
   - base_channels = 128
@@ -106,13 +106,13 @@ batches and the predict run slows from ~40 min to 2-3 h.
 | Metric | Value |
 |---|---|
 | Tiles with valid coverage | 4,394 of 7,150 |
-| Tile-mean MAE (median) | **0.0209** |
-| Tile-mean MAE (mean) | 0.0250 |
-| Tile-mean MAE (95th %ile) | 0.0597 |
-| Histogram intersection (median) | **0.246** |
-| Histogram intersection (mean) | 0.291 |
-| Pearson r (predicted vs. observed tile-mean Δhm) | 0.412 |
-| Coverage rate (q025 ≤ obs ≤ q975), all bins | 0.543 (target ≈ 0.95) |
+| Tile-mean MAE (median) | **0.0130** |
+| Tile-mean MAE (mean) | 0.0152 |
+| Tile-mean MAE (95th %ile) | 0.0352 |
+| Histogram intersection (median) | **0.289** |
+| Histogram intersection (mean) | 0.325 |
+| Pearson r (predicted vs. observed tile-mean Δhm) | 0.678 |
+| Coverage rate (q025 ≤ obs ≤ q975), all bins | 0.829 (target ≈ 0.95) |
 
 ### Coverage stratified by Δhm change bin
 
@@ -123,13 +123,13 @@ ones where the model has to express genuine uncertainty.
 
 | Δhm bin | n pixels | Coverage |
 |---|---:|---:|
-| `[ -1.000, -0.005]` | 56,357 | 0.383 |
-| `[ -0.005, +0.005]` | 742,163 | 0.548 |
-| `[ +0.005, +0.020]` | 116,330 | 0.506 |
-| `[ +0.020, +0.100]` | 97,708 | 0.683 |
-| `[ +0.100, +0.200]` | 10,296 | 0.239 |
-| `[ +0.200, +0.400]` | 1,614 | 0.048 |
-| `[ +0.400, +0.600]` | 120 | 0.000 |
+| `[ -1.000, -0.005]` | 56,357 | 0.675 |
+| `[ -0.005, +0.005]` | 742,163 | 0.905 |
+| `[ +0.005, +0.020]` | 116,330 | 0.692 |
+| `[ +0.020, +0.100]` | 97,708 | 0.577 |
+| `[ +0.100, +0.200]` | 10,296 | 0.247 |
+| `[ +0.200, +0.400]` | 1,614 | 0.061 |
+| `[ +0.400, +0.600]` | 120 | 0.050 |
 | `[ +0.600, +1.000]` | 7 | 0.000 |
 
 ## Tail diagnostics
@@ -143,17 +143,17 @@ WassDiff (IEEE TGRS 2025), ExtremeCast (AAAI 2024), and the Aich et al. (GMD
 
 - Threshold: 0.0667
 - Observed tail mass: 1245.5662
-- Predicted tail mass: 1670.6172
-- **Ratio (pred / obs):** **1.341** (<<1 = under-predicting tail; ~1 = calibrated; >1 = over)
+- Predicted tail mass: 941.0035
+- **Ratio (pred / obs):** **0.755** (<<1 = under-predicting tail; ~1 = calibrated; >1 = over)
 
 ### Tail exceedance (deterministic + q975 ensemble support)
 
 | Threshold | n(obs>t) | n(pred>t) | POD | CSI | FAR | q975 soft-POD |
 |---|---|---|---|---|---|---|
-| +0.050 |     42,889 |    169,912 | 0.381 | 0.083 | 0.904 | 0.943 |
-| +0.100 |     12,037 |     15,339 | 0.138 | 0.064 | 0.892 | 0.567 |
-| +0.200 |      1,741 |      1,184 | 0.070 | 0.043 | 0.898 | 0.148 |
-| +0.400 |        127 |          1 | 0.000 | 0.000 | 1.000 | 0.047 |
+| +0.050 |     42,889 |     60,826 | 0.364 | 0.177 | 0.743 | 0.799 |
+| +0.100 |     12,037 |      9,955 | 0.160 | 0.096 | 0.806 | 0.500 |
+| +0.200 |      1,741 |        299 | 0.071 | 0.065 | 0.585 | 0.183 |
+| +0.400 |        127 |         15 | 0.087 | 0.084 | 0.267 | 0.110 |
 
 ![Q-Q max-of-field](../outputs/diffusion_v1/qq_max_of_field.png)
 
