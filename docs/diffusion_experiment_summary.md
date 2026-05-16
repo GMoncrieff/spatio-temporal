@@ -214,9 +214,29 @@ from inference levers** (v36-family residual scaling + diverse m).
 
   v36d wins on tail-coverage metrics (POD, bin > 0.1/0.2/0.4) and
   pushes the upper-tile-max higher, but the median bulk drifts slightly
-  positive and R95p overshoots. Pick v36c when bulk calibration matters
-  (publishing, model comparison); pick v36d when high-change bin
-  coverage is the priority (risk maps, scenario screening).
+  positive and R95p overshoots.
+
+* **v36e** (sweet-spot recipe, full small region): the middle ground —
+  `residual_scale_pos=3.5`, `neg=0.35`, `m_sample_max=1.2`,
+  `cond_perturb_std=0.08`. Keeps v36c's bulk calibration while
+  picking up most of v36d's tail:
+
+  | Metric | v36c | v36e | v36d |
+  |---|---|---|---|
+  | MAE median | **0.0065** | **0.0066** | 0.0074 |
+  | Pearson r | **0.709** | 0.704 | 0.686 |
+  | xinter | **0.544** | 0.543 | 0.534 |
+  | Coverage rate | 0.770 | 0.756 | 0.741 |
+  | Q-Q max global | 0.529 | **0.552** | 0.577 (obs 0.656) |
+  | Q-Q mean | +0.010 | +0.011 | +0.014 (obs +0.007) |
+  | R95p | 0.983 | 1.18 | 1.60 |
+  | std p95 | 0.044 | 0.050 | 0.056 |
+  | hot/flat | 1.35 | 1.36 | 1.39 |
+
+  **v36e is the recommended balanced recipe** — almost no fidelity cost
+  vs v36c, but picks up a meaningful tail (Q-Q max 0.552, std p95 0.050,
+  R95p 1.18 — only slightly over). When the user needs even more tail,
+  step up to v36d.
 
 ## Trade-off space
 
