@@ -163,11 +163,34 @@ end-to-end sampled trajectory. We document this as a hard structural
 finding for this U-Net + DDIM combo. **Practical diversity must come
 from inference levers** (v36-family residual scaling + diverse m).
 
-* **v36c** (production diversity recipe, predicting): v26 ckpt with the
-  v36b inference levers (residual_scale_pos=3, neg=0.4, m_sample_diverse
-  [0.05, 1.0], cond_perturb_std=0.08). Combines the user's preferred
-  v26 model with the inference-only diversity. Predictable cost:
-  positive bias in median shifts slightly upward.
+* **v36c** (production diversity recipe, full small region):
+  v26 ckpt + residual_scale_pos=3, neg=0.4, m_sample_diverse [0.05, 1.0],
+  cond_perturb_std=0.08, n=16. Result is a clean dominant improvement
+  on every user metric:
+
+  | Metric | v26 | v36c | Change |
+  |---|---|---|---|
+  | MAE median | 0.0128 | **0.0065** | **−49 %** |
+  | Pearson r | 0.436 | **0.709** | **+62 %** |
+  | xinter | 0.362 | **0.544** | +50 % |
+  | Coverage rate (q025-q975) | 0.689 | **0.770** | +12 % |
+  | bin > 0.1 coverage | 0.231 | **0.426** | +84 % |
+  | bin > 0.2 coverage | 0.040 | **0.125** | +3.1× |
+  | **bin > 0.4 coverage** | **0.000** | **0.079** | first ever! |
+  | **bin > 0.6 coverage** | **0.000** | **0.143** | first ever! |
+  | Q-Q max global ratio | 0.62 | **0.81** | pred 0.53 vs obs 0.66 |
+  | Q-Q mean ratio | +0.018 vs +0.007 (off) | **+0.010 vs +0.007** | nearly perfect |
+  | Negative fraction | 0.21 (vs obs 0.47!) | **0.47** | matches obs |
+  | R95p ratio | n/a | **0.983** | tail mass matches |
+  | std p95 (per-pixel) | 0.029 | **0.044** | +52 % |
+  | hot/flat std ratio | 0.99 | **1.35** | diversity at hotspots |
+
+  Diversity is now concentrated at hotspots (hot/flat 1.35), so the
+  ensemble actually expresses uncertainty where the action is — not as
+  uniform grain across the field. Q-Q max global went from 0.40 to
+  0.53 (obs is 0.66). Per-bin coverage above 0.4 is non-zero for the
+  first time. Negative-pixel fraction matches obs exactly (0.47 vs
+  0.47).
 
 ## Trade-off space
 
