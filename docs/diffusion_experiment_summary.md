@@ -142,11 +142,32 @@ measurable, quantitative collapse. Q-Q max for v26 fits a slope of 0.62
   residual learns to use noise, the residual variance is tiny relative
   to μ. Adding μ + r at inference, the per-pixel std is dominated by
   the (small) residual var while the deterministic μ contributes zero.
-* **v37b** (training, in progress): weaken the mean head
-  (mean_loss_weight 0.1 → 0.02) so it cannot absorb all the signal,
-  AND double the diversity push (diversity_loss_weight 0.5 → 1.0).
-  Goal: force the diffusion residual to carry meaningful magnitude
-  variance so the per-pixel sample std actually grows.
+* **v37b** (training): weakened mean head + stronger diversity.
+  Best val_loss 0.32 at epoch 94 (vs v37's 0.71). And yet:
+  std_mean **unchanged at 0.026**. Confirms the bottleneck isn't mean
+  head dominance — it's the mean_l1 loss formulation.
+* **v37c** (training): replaced mean_l1 with **tile_max_l1**. Loss
+  saturates (val_loss goes to -0.12 at epoch 40 — i.e., the diversity
+  term contributes more than the positive terms combined). And yet
+  **std_mean still 0.025** at inference, eta=1.0 also doesn't help
+  (0.023). The model satisfies the training loss in a way that does
+  not translate to inference-time sample variance.
+
+**Key finding from v37 → v37c**: three different loss formulations
+(mean_l1, mean_l1 with weak μ, tile_max_l1) all saturate the diversity
+training objective while leaving inference std at the v26 baseline of
+0.025. The DDIM sampler appears to converge trajectories to a single
+attractor regardless of initial noise — the diversity is in the
+*training-time intermediate predictions at fixed t*, not in the
+end-to-end sampled trajectory. We document this as a hard structural
+finding for this U-Net + DDIM combo. **Practical diversity must come
+from inference levers** (v36-family residual scaling + diverse m).
+
+* **v36c** (production diversity recipe, predicting): v26 ckpt with the
+  v36b inference levers (residual_scale_pos=3, neg=0.4, m_sample_diverse
+  [0.05, 1.0], cond_perturb_std=0.08). Combines the user's preferred
+  v26 model with the inference-only diversity. Predictable cost:
+  positive bias in median shifts slightly upward.
 
 ## Trade-off space
 
