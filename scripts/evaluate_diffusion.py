@@ -660,55 +660,64 @@ Pixel-precise magnitude matching is *not* a goal.
 | v23 | **0.441** | 0.037 | 0.175 | 0.622 | 0.0279 | 0.485 | 0.413 | α=1.0 + 3× bulk anchors — best bin>0.1 cov |
 | v24 | 0.247 | 0.042 | 0.343 | 0.534 | 0.0129 | 0.718 | 0.389 | mw=0.3 — best balance bin>0.2 |
 | v25 | 0.239 | 0.048 | 0.246 | 0.412 | 0.0209 | 0.543 | 0.411 | mw=0.1 — first q975→0.4 |
-| **v26** | 0.247 | **0.061** | 0.289 | 0.678 | 0.0130 | 0.829 | **0.491** | **v25 + 100 epochs + n=64 ensemble — FIRST bin>0.4 cov (0.050)** |
+| v26 | 0.247 | 0.061 | 0.289 | 0.678 | 0.0130 | 0.829 | 0.491 | v25 + 100 ep + n=64 — first bin>0.4 cov (0.050) |
+| v36c | 0.426 | 0.125 | 0.544 | 0.709 | 0.0065 | 0.770 | 0.529 | v26 ckpt + inference levers — balanced |
+| v36d | 0.528 | 0.203 | 0.534 | 0.686 | 0.0074 | 0.741 | 0.577 | aggressive levers — tail-focused |
+| **v36e** | **0.464** | **0.158** | **0.543** | **0.704** | **0.0066** | **0.756** | **0.552** | **sweet-spot levers — new operational best** |
 
-v13 was the architectural breakthrough (CorrDiff residual). v20 is
-the best **balanced** result. **v26** is the new best across the
-board — same losses as v25 but trained for 100 epochs (vs 30) and
-predicted with **n=64** ensemble (vs 32). First iteration with
-non-zero coverage on bin > 0.4 (5%) and POD@0.4 (8.7%).
+v13 was the architectural breakthrough (CorrDiff residual). v26 was
+the previous best trained model. The v36 family changed the game by
+showing that **inference-time levers on the v26 checkpoint** dominate
+every trained variant: per-bin coverage at high-change bins roughly
+doubles, MAE halves, Pearson r jumps 0.44 → 0.70, and Q-Q max pred
+climbs from 0.40 to 0.55 (obs 0.66). Three training-side diversity
+losses (v37/v37b/v37c) saturated their objectives but left inference
+per-pixel std unchanged at 0.025; the U-Net + DDIM combo can't be made
+more diverse through training-time loss formulations, only through
+inference levers.
 
 ### Production recipes
 
-**v20 — bulk-balanced** (best xinter, MAE, coverage rate, Pearson):
+All three production recipes use the **same v26 checkpoint** with
+different inference-time lever combinations. No retraining.
+
+**v36e — sweet-spot, recommended** (best balance):
 ```
-Training:
-  --use_ema --weighted_sampling --weight_alpha 1
-  --pattern_loss_weight 0.3 --pattern_scales 8 16 32
-  --tile_mean_loss_weight 5.0 --tile_mean_scales 8 16 32 64
-  --wasserstein_loss_weight 0.2
-  --hist_loss_weight 0.3 --hist_temperature 0.05 --hist_scales 16 32
-  --tv_loss_weight 1.0 --tv_loss_target_floor 0.05
-  --min_snr_gamma 5
-  --use_magnitude_cond --m_dropout_prob 0.3 --m_norm_scale 0.5
-  --use_mean_head --mean_head_hidden 128 --mean_loss_weight 1.0
-Inference:
-  --ensemble_n 32 --m_target 0.7 --predict_stride 64
+python scripts/predict_region_diffusion.py \
+  --checkpoint <v26-ckpt> \
+  --predict_region config/region_to_predict_small.geojson \
+  --output_dir data/predictions_diffusion/v36e \
+  --ensemble_n 16 --predict_batch_size 2 --num_inference_steps 30 \
+  --m_sample_diverse --m_sample_min 0.05 --m_sample_max 1.2 \
+  --residual_scale_pos 3.5 --residual_scale_neg 0.35 \
+  --cond_perturb_std 0.08
 ```
 
-**v26 — tail-focused, new operational best** (first bin>0.4 cov,
-best across-the-board on tail AND nearly recovers v20 bulk):
+**v36c — bulk-balanced** (best MAE, Pearson, R95p calibration):
 ```
-Training: v20 +
-  --max_epochs 100 (vs 30)
-  --tile_mean_loss_weight 15.0 (vs 5.0)
-  --wasserstein_loss_weight 0.5 (vs 0.2)
-  --hist_loss_weight 1.0 (vs 0.3)
-  --pattern_loss_weight 0.5 (vs 0.3)
-  --mean_loss_weight 0.1 (vs 1.0)
-  --mean_head_pixel_weight_alpha 1.0 --mean_head_pixel_weight_eps 0.01
-Inference:
-  --ensemble_n 64 --m_target 0.7 --predict_stride 64
+... --m_sample_max 1.0 --residual_scale_pos 3.0 \
+    --residual_scale_neg 0.40 --cond_perturb_std 0.08
 ```
 
-**v24 — middle ground** (decent bulk + decent tail): v25 settings but
-`--mean_loss_weight 0.3`, 30 epochs, n=32.
+**v36d — tail-focused** (highest bin>0.2 / bin>0.4 coverage):
+```
+... --m_sample_max 1.5 --residual_scale_pos 4.0 \
+    --residual_scale_neg 0.30 --cond_perturb_std 0.10
+```
 
-The trade-off: stronger mean head pixel weighting (α=1.0) lifts hotspot
-predictions but pulls the bulk's median pred from +0.001 to ~+0.02.
-Pixel-precise matching is *not* a goal of this work; mean preservation
-of the bulk distribution is. v20 maximises the latter; v25 maximises
-upper-tail coverage. v24 splits the difference.
+The four inference levers:
+- `--m_sample_diverse`: each ensemble member draws its own m_target ~
+  Uniform[min, max]. Different m → different μ AND different residual.
+- `--residual_scale_pos/neg`: asymmetric scaling of the CorrDiff
+  residual before adding μ back. >1 on positive side lifts Q-Q max;
+  <1 on negative side matches obs negative-pixel fraction.
+- `--cond_perturb_std`: small Gaussian noise on the full conditioning
+  per sample → structural diversity at hotspots (hot/flat std ratio
+  jumps from ~1.0 to ~1.36).
+
+The trade-off across the v36 family: more aggressive levers (v36d)
+push the upper tail further but slightly worsen MAE and inflate R95p
+above 1.0. v36c is the safest; v36d for risk maps; v36e splits.
 
 Performance note: predict_region_diffusion.py now calls
 `torch.mps.empty_cache()` between batches and explicitly deletes
