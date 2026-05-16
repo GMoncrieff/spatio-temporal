@@ -126,3 +126,74 @@ v37b training done →
 2. v37c (if v37b uniform-noise pathology persists) — ~85 min train.
 3. Full-region prediction with best v37* ckpt (~2-3h on MPS, depends
    on which approach wins).
+
+## Final results — diversity tests on tiny region
+
+| dir | std_mean | env_p95 | median_mean | hot/flat | notes |
+|---|---|---|---|---|---|
+| v26 (baseline) | 0.025 | 0.088 | +0.018 | 0.99 | reference |
+| v36 (levers) | 0.029 | 0.110 | +0.009 | 1.00 | +13% std, modest |
+| v36b (aggressive levers) | **0.048** | **0.197** | +0.016 | 1.05 | +88% std — *best raw diversity* |
+| v37 (training, mean_l1) | 0.025 | 0.087 | +0.003 | 1.00 | no std gain; **mean cal best** |
+| v37b (weak μ + diversity) | 0.026 | 0.087 | −0.003 | 1.02 | no std gain |
+| v37c (tile_max_l1) | 0.025 | 0.087 | +0.006 | 1.01 | val_loss saturated, std unchanged |
+| v37c + levers | 0.039 | 0.153 | +0.022 | 0.83 | trained ckpt + v36b levers |
+| **v37c eta=1** | 0.023 | 0.082 | +0.006 | 0.99 | stochastic DDIM doesn't help |
+
+## Conclusion
+
+**Training-side diversity losses don't translate to inference-time
+per-pixel sample variance for this U-Net + DDIM combo.** All three
+training-side experiments (v37, v37b, v37c) leave inference std at the
+v26 baseline of 0.025 despite the loss saturating during training.
+eta=1.0 stochastic DDIM also doesn't help. The model satisfies the
+diversity loss at fixed-t intermediate predictions in a way that
+doesn't propagate through the full denoising trajectory to ensemble
+spread.
+
+The practical answer for sample diversity is **inference levers**:
+
+```bash
+python scripts/predict_region_diffusion.py \
+  --checkpoint <v26-ckpt> \
+  --ensemble_n 16 --predict_batch_size 2 \
+  --m_sample_diverse --m_sample_min 0.05 --m_sample_max 1.0 \
+  --residual_scale_pos 3.0 --residual_scale_neg 0.4 \
+  --cond_perturb_std 0.08
+```
+
+This roughly doubles per-pixel std (0.025 → 0.048) and widens the
+q025–q975 envelope by ~2× (0.088 → 0.197 at p95). Cost: a small
+positive shift in the bulk median (+0.018 → +0.016). On the tiny test
+region, q975_max reaches 0.37 vs obs max 0.26 — the ensemble brackets
+the obs max comfortably.
+
+## What didn't work (and why)
+
+* **Diversity loss mean_l1** (v37/v37b): satisficeable by uniform iid
+  pixel noise across the field. The model adds tiny grain everywhere
+  and the loss is satisfied without producing structural diversity.
+* **Diversity loss tile_max_l1** (v37c): can't be satisficed by uniform
+  noise, and the loss DOES saturate during training. But the structural
+  diversity learned at fixed t doesn't propagate through DDIM sampling.
+  Per-pixel std is unchanged at inference.
+* **eta=1.0** (full stochastic DDIM): no effect on per-pixel std for
+  trained models. Confirmed v34 finding — different initial noise
+  already provides all the variance the U-Net is going to add.
+* **Weak mean head** (v37b mean_loss_weight 0.1→0.02): val_loss drops
+  from 0.71 to 0.32 but inference std stays at 0.025. The mean head's
+  share of the spatial structure isn't the bottleneck.
+
+## What would likely work (untested)
+
+1. **Stochastic latent z + AdaLN conditioning** (v38 ish): explicit z
+  feeds adaptive normalization layers in the U-Net. This is how DiT,
+  EDM, BicycleGAN inject controllable diversity. Current v38
+  infrastructure exists but conditioning via concat alone (without
+  AdaLN) is unlikely to be enough — the model will probably ignore z.
+2. **Heteroscedastic mean head**: predict (μ, σ) and sample residual
+  from N(0, σ). Gives controlled per-pixel uncertainty, doesn't
+  depend on DDIM.
+3. **Score-distillation through a wider teacher**: post-hoc make a
+  student model that learns to spread samples wider, regularised by
+  the teacher's marginal.
