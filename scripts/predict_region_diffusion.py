@@ -100,6 +100,15 @@ def parse_args():
                         "→ different μ and residual → structural diversity "
                         "without retraining. 0=off; 0.05-0.20 typical. Risk: "
                         "too large (>0.3) pushes the model OOD.")
+    p.add_argument("--residual_mask_threshold", type=float, default=0.0,
+                   help="Spatial gate on the residual scaling: pixels with "
+                        "|μ| < threshold get effective scale ≈ 1 (preserves "
+                        "smooth, near-zero backgrounds); pixels with |μ| ≫ "
+                        "threshold get the full --residual_scale_pos/neg. "
+                        "0.0 disables the gate (uniform scaling, v36c-style). "
+                        "0.02-0.05 is a good range for the small region.")
+    p.add_argument("--residual_mask_softness", type=float, default=0.02,
+                   help="Sigmoid width for the residual mask transition.")
     p.add_argument("--vary_latent_z", action="store_true", default=True,
                    help="When the model has latent_z_dim > 0, sample a fresh z "
                         "for each ensemble member at inference (the v38 lever). "
@@ -405,6 +414,8 @@ def main():
                     eta=args.eta,
                     residual_scale_pos=args.residual_scale_pos,
                     residual_scale_neg=args.residual_scale_neg,
+                    residual_mask_threshold=args.residual_mask_threshold,
+                    residual_mask_softness=args.residual_mask_softness,
                 )  # [1, N*B_real, 1, H, W]
                 samples = samples.view(args.ensemble_n, B_real, 1, samples.shape[-2], samples.shape[-1])
                 cond = base_cond  # keep for cleanup line below
@@ -419,6 +430,8 @@ def main():
                     eta=args.eta,
                     residual_scale_pos=args.residual_scale_pos,
                     residual_scale_neg=args.residual_scale_neg,
+                    residual_mask_threshold=args.residual_mask_threshold,
+                    residual_mask_softness=args.residual_mask_softness,
                 )  # [N, B, 1, H, W] in normalised (and possibly transformed) model space.
             # module.denormalize handles z-score AND inverse target transform (e.g.
             # signed_log1p) so callers always work in raw Δhm units.

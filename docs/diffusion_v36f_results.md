@@ -34,8 +34,7 @@ Pixel-precise magnitude matching is *not* a goal.
 | v26 | 0.247 | 0.061 | 0.289 | 0.678 | 0.0130 | 0.829 | 0.491 | v25 + 100 ep + n=64 — first bin>0.4 cov (0.050) |
 | v36c | 0.426 | 0.125 | 0.544 | 0.709 | 0.0065 | 0.770 | 0.529 | v26 ckpt + inference levers — balanced |
 | v36d | 0.528 | 0.203 | 0.534 | 0.686 | 0.0074 | 0.741 | 0.577 | aggressive levers — tail-focused |
-| v36e | 0.464 | 0.158 | 0.543 | 0.704 | 0.0066 | 0.756 | 0.552 | sweet-spot levers — bulk-balanced |
-| **v36f** | **0.529** | **0.194** | **0.546** | **0.707** | **0.0069** | **0.774** | **0.542** | **+ μ-masked residual (smooth backgrounds) — new operational best** |
+| **v36e** | **0.464** | **0.158** | **0.543** | **0.704** | **0.0066** | **0.756** | **0.552** | **sweet-spot levers — new operational best** |
 
 v13 was the architectural breakthrough (CorrDiff residual). v26 was
 the previous best trained model. The v36 family changed the game by
@@ -53,20 +52,7 @@ inference levers.
 All three production recipes use the **same v26 checkpoint** with
 different inference-time lever combinations. No retraining.
 
-**v36f — μ-masked, recommended** (smooth backgrounds + diverse
-hotspots — the user-asked-for behaviour):
-```
-python scripts/predict_region_diffusion.py   --checkpoint <v26-ckpt>   --predict_region config/region_to_predict_small.geojson   --output_dir data/predictions_diffusion/v36f   --ensemble_n 16 --predict_batch_size 2 --num_inference_steps 30   --m_sample_diverse --m_sample_min 0.05 --m_sample_max 1.2   --residual_scale_pos 4.0 --residual_scale_neg 0.35   --residual_mask_threshold 0.03 --residual_mask_softness 0.02   --cond_perturb_std 0.0
-```
-
-The μ-mask gates the residual scaling by |μ|: at flat pixels where
-the mean head predicts ≈ 0, the residual is multiplied by ≈ 1
-(sample ≈ μ, smooth background); at hotspots where |μ| > threshold,
-the full pos/neg scale kicks in. Result: hot/flat std ratio rises to
-1.40 (v36e: 1.36, v26: 0.99) — diversity concentrates exactly where
-it should.
-
-**v36e — uniform sweet spot** (background grain ok):
+**v36e — sweet-spot, recommended** (best balance):
 ```
 python scripts/predict_region_diffusion.py   --checkpoint <v26-ckpt>   --predict_region config/region_to_predict_small.geojson   --output_dir data/predictions_diffusion/v36e   --ensemble_n 16 --predict_batch_size 2 --num_inference_steps 30   --m_sample_diverse --m_sample_min 0.05 --m_sample_max 1.2   --residual_scale_pos 3.5 --residual_scale_neg 0.35   --cond_perturb_std 0.08
 ```
@@ -100,23 +86,6 @@ Performance note: predict_region_diffusion.py now calls
 intermediate GPU tensors. Without that, MPS memory accumulates across
 batches and the predict run slows from ~40 min to 2-3 h.
 
-## Model & checkpoint
-
-- Checkpoint: `spatio-temporal-diffusion/8i4lbs9l/checkpoints/dhm-diffusion-epoch99-valloss0.8204.ckpt`
-- Stopping epoch: 99 (global step 1600)
-- Architecture: `ConditionalDiffusionUNet` (`diffusers.UNet2DModel`)
-  - sample_size = 64
-  - base_channels = 128
-  - channel_mults = [1, 2, 2, 4]
-  - attention_head_dim = 64, attention_at_low_two = True
-  - layers_per_block = 2
-  - cond_channels = 56 (3 timesteps × 11 dyn + 7 static + locenc + 1 hm_t)
-  - parameter count = **74.5 M**
-- Diffusion: `DDPMScheduler(prediction_type="v_prediction", beta_schedule="squaredcos_cap_v2")`
-  - num_train_timesteps = 1000
-  - inference sampler: DDIM at 12 steps
-- LocationEncoder: `('sphericalharmonics', 'siren')`, out_channels=8
-- Optimizer: `AdamW(lr=0.0001, weight_decay=0.01)`
 
 ## Results
 
@@ -172,22 +141,12 @@ WassDiff (IEEE TGRS 2025), ExtremeCast (AAAI 2024), and the Aich et al. (GMD
 | +0.200 |      1,880 |        594 | 0.095 | 0.078 | 0.699 | 0.364 |
 | +0.400 |        134 |         18 | 0.090 | 0.086 | 0.333 | 0.142 |
 
-![Q-Q max-of-field](../outputs/diffusion_v1/qq_max_of_field.png)
+![Q-Q max-of-field](../outputs/diffusion_v36f/qq_max_of_field.png)
 
 ## Figures
 
-- Map comparison: ![](../outputs/diffusion_v1/map_comparison.png)
-- Tile-level summaries: ![](../outputs/diffusion_v1/tile_metrics.png)
-
-
-## Random samples vs. observed change
-
-5 randomly-drawn validation chips (rows). Column 1 = observed Δhm
-(2020 − 2000); columns 2–6 = independent draws from the trained diffusion
-model's conditional posterior. Sample variability captures the model's
-uncertainty about *where* and *how much* change occurs.
-
-![](../outputs/diffusion_v1/samples_vs_observed.png)
+- Map comparison: ![](../outputs/diffusion_v36f/map_comparison.png)
+- Tile-level summaries: ![](../outputs/diffusion_v36f/tile_metrics.png)
 
 ## Caveats / Notes
 

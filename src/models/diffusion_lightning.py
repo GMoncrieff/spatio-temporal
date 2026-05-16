@@ -894,6 +894,8 @@ class DiffusionLightningModule(pl.LightningModule):
         eta: float = 0.0,
         residual_scale_pos: float = 1.0,
         residual_scale_neg: float = 1.0,
+        residual_mask_threshold: float = 0.0,
+        residual_mask_softness: float = 0.02,
     ) -> torch.Tensor:
         """Run DDIM sampling. Returns [n_samples, B, 1, H, W].
 
@@ -907,6 +909,13 @@ class DiffusionLightningModule(pl.LightningModule):
         residual_scale_pos > 1 boosts diversity in the high-change direction
         and shifts the per-tile max upward; residual_scale_neg < 1 dampens
         spurious negative-change pixels.
+
+        `residual_mask_threshold` > 0 spatially gates the residual scaling by
+        |μ|: pixels where |μ| < threshold get effective scale ≈ 1 (so
+        sample ≈ μ — smooth backgrounds); pixels where |μ| ≫ threshold get
+        the full pos/neg scale. The transition is a sigmoid with width
+        `residual_mask_softness`. Use this to keep flat regions clean while
+        still letting hotspots vary across the ensemble.
         """
         steps = num_inference_steps or self.num_inference_steps
         scheduler = DDIMScheduler.from_config(self.train_scheduler.config)
@@ -944,11 +953,25 @@ class DiffusionLightningModule(pl.LightningModule):
                     # sample residuals in model space. Scaling them is a
                     # post-hoc lever — it changes the marginal distribution
                     # of residual values without retraining.
-                    samples = torch.where(
-                        samples > 0,
-                        samples * float(residual_scale_pos),
-                        samples * float(residual_scale_neg),
-                    )
+                    pos_scale = float(residual_scale_pos)
+                    neg_scale = float(residual_scale_neg)
+                    if residual_mask_threshold > 0.0:
+                        # Spatial gate by |μ|: pixels with small μ keep
+                        # scale ≈ 1 (smooth backgrounds), pixels with large
+                        # |μ| get the full scale (diverse hotspots).
+                        softness = max(float(residual_mask_softness), 1e-6)
+                        weight = torch.sigmoid(
+                            (mu.abs() - float(residual_mask_threshold)) / softness
+                        ).unsqueeze(0)                            # [1, B, 1, H, W]
+                        eff_pos = 1.0 + (pos_scale - 1.0) * weight
+                        eff_neg = 1.0 + (neg_scale - 1.0) * weight
+                        samples = torch.where(samples > 0,
+                                              samples * eff_pos,
+                                              samples * eff_neg)
+                    else:
+                        samples = torch.where(samples > 0,
+                                              samples * pos_scale,
+                                              samples * neg_scale)
                 samples = samples + mu.unsqueeze(0)               # broadcast over N
             return samples
         finally:
