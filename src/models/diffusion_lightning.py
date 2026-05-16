@@ -780,6 +780,7 @@ class DiffusionLightningModule(pl.LightningModule):
         generator: Optional[torch.Generator] = None,
         use_ema: Optional[bool] = None,
         guidance_scale: float = 1.0,
+        eta: float = 0.0,
     ) -> torch.Tensor:
         """Run DDIM sampling. Returns [n_samples, B, 1, H, W].
 
@@ -811,7 +812,7 @@ class DiffusionLightningModule(pl.LightningModule):
                     v_pred = v_uncond + guidance_scale * (v_cond - v_uncond)
                 else:
                     v_pred = self.unet(x, cond_tiled, t_batch)
-                x = scheduler.step(v_pred, t, x).prev_sample
+                x = scheduler.step(v_pred, t, x, eta=eta).prev_sample
             samples = x.view(n_samples, B, 1, H, W)
             # CorrDiff: outputs are residuals; add μ to recover full prediction
             if self.use_mean_head and self.mean_head is not None:

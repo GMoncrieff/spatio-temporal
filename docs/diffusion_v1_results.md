@@ -111,13 +111,13 @@ batches and the predict run slows from ~40 min to 2-3 h.
 | Metric | Value |
 |---|---|
 | Tiles with valid coverage | 4,394 of 7,150 |
-| Tile-mean MAE (median) | **0.0137** |
-| Tile-mean MAE (mean) | 0.0184 |
-| Tile-mean MAE (95th %ile) | 0.0514 |
+| Tile-mean MAE (median) | **0.0136** |
+| Tile-mean MAE (mean) | 0.0182 |
+| Tile-mean MAE (95th %ile) | 0.0503 |
 | Histogram intersection (median) | **0.351** |
-| Histogram intersection (mean) | 0.361 |
-| Pearson r (predicted vs. observed tile-mean Δhm) | 0.560 |
-| Coverage rate (q025 ≤ obs ≤ q975), all bins | 0.662 (target ≈ 0.95) |
+| Histogram intersection (mean) | 0.360 |
+| Pearson r (predicted vs. observed tile-mean Δhm) | 0.553 |
+| Coverage rate (q025 ≤ obs ≤ q975), all bins | 0.659 (target ≈ 0.95) |
 
 ### Coverage stratified by Δhm change bin
 
@@ -128,11 +128,11 @@ ones where the model has to express genuine uncertainty.
 
 | Δhm bin | n pixels | Coverage |
 |---|---:|---:|
-| `[ -1.000, -0.005]` | 56,357 | 0.448 |
-| `[ -0.005, +0.005]` | 742,163 | 0.709 |
-| `[ +0.005, +0.020]` | 116,330 | 0.543 |
-| `[ +0.020, +0.100]` | 97,708 | 0.623 |
-| `[ +0.100, +0.200]` | 10,296 | 0.273 |
+| `[ -1.000, -0.005]` | 56,357 | 0.445 |
+| `[ -0.005, +0.005]` | 742,163 | 0.707 |
+| `[ +0.005, +0.020]` | 116,330 | 0.542 |
+| `[ +0.020, +0.100]` | 97,708 | 0.614 |
+| `[ +0.100, +0.200]` | 10,296 | 0.251 |
 | `[ +0.200, +0.400]` | 1,614 | 0.048 |
 | `[ +0.400, +0.600]` | 120 | 0.008 |
 | `[ +0.600, +1.000]` | 7 | 0.000 |
@@ -148,17 +148,17 @@ WassDiff (IEEE TGRS 2025), ExtremeCast (AAAI 2024), and the Aich et al. (GMD
 
 - Threshold: 0.0667
 - Observed tail mass: 1245.5662
-- Predicted tail mass: 2062.4858
-- **Ratio (pred / obs):** **1.656** (<<1 = under-predicting tail; ~1 = calibrated; >1 = over)
+- Predicted tail mass: 1896.3333
+- **Ratio (pred / obs):** **1.522** (<<1 = under-predicting tail; ~1 = calibrated; >1 = over)
 
 ### Tail exceedance (deterministic + q975 ensemble support)
 
 | Threshold | n(obs>t) | n(pred>t) | POD | CSI | FAR | q975 soft-POD |
 |---|---|---|---|---|---|---|
-| +0.050 |     42,889 |    126,629 | 0.467 | 0.134 | 0.842 | 0.923 |
-| +0.100 |     12,037 |     20,797 | 0.195 | 0.077 | 0.887 | 0.593 |
-| +0.200 |      1,741 |      1,576 | 0.087 | 0.048 | 0.904 | 0.184 |
-| +0.400 |        127 |         16 | 0.063 | 0.059 | 0.500 | 0.102 |
+| +0.050 |     42,889 |    124,384 | 0.457 | 0.133 | 0.842 | 0.914 |
+| +0.100 |     12,037 |     18,798 | 0.183 | 0.077 | 0.883 | 0.568 |
+| +0.200 |      1,741 |      1,517 | 0.083 | 0.047 | 0.904 | 0.175 |
+| +0.400 |        127 |         13 | 0.055 | 0.053 | 0.462 | 0.094 |
 
 ![Q-Q max-of-field](../outputs/diffusion_v1/qq_max_of_field.png)
 

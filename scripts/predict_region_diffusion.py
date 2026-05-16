@@ -63,6 +63,8 @@ def parse_args():
                    help="Optional path to a JSON dump of the training "
                         "dataset's hm_mean/hm_std/comp_*/static_* stats. "
                         "If unset, recompute fresh stats from a quick sample.")
+    p.add_argument("--eta", type=float, default=0.0,
+                   help="DDIM stochasticity; 0=deterministic, 1=fully stochastic.")
     p.add_argument("--m_target", type=float, default=None,
                    help="Inference value for the FIDE-style block-maxima "
                         "conditioning channel (raw |Δhm| units). Only used if "
@@ -315,6 +317,7 @@ def main():
                 cond, n_samples=args.ensemble_n,
                 num_inference_steps=args.num_inference_steps,
                 guidance_scale=args.guidance_scale,
+                eta=args.eta,
             )  # [N, B, 1, H, W] in normalised (and possibly transformed) model space.
             # module.denormalize handles z-score AND inverse target transform (e.g.
             # signed_log1p) so callers always work in raw Δhm units.
