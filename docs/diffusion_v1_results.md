@@ -7,7 +7,7 @@
 - Aggregate-tile size: **16×16** pixels (10 km blocks).
 - Histogram bins (rarity-weighted, matches baseline `histogram_loss.py`):
   `[-1.0, -0.005, 0.005, 0.02, 0.1, 0.2, 0.4, 0.6, 1.0]`.
-- W&B run: [glennwithtwons/spatio-temporal-diffusion/zduofz9i](https://wandb.ai/glennwithtwons/spatio-temporal-diffusion/zduofz9i)
+- W&B run: [glennwithtwons/spatio-temporal-diffusion/19279ibv](https://wandb.ai/glennwithtwons/spatio-temporal-diffusion/19279ibv)
 
 
 ## Iteration history (best-of-run on user-target metrics)
@@ -90,8 +90,8 @@ batches and the predict run slows from ~40 min to 2-3 h.
 
 ## Model & checkpoint
 
-- Checkpoint: `spatio-temporal-diffusion/zduofz9i/checkpoints/dhm-diffusion-epoch50-valloss5.1278.ckpt`
-- Stopping epoch: 50 (global step 816)
+- Checkpoint: `spatio-temporal-diffusion/19279ibv/checkpoints/dhm-diffusion-epoch21-valloss3.0898.ckpt`
+- Stopping epoch: 21 (global step 352)
 - Architecture: `ConditionalDiffusionUNet` (`diffusers.UNet2DModel`)
   - sample_size = 64
   - base_channels = 128
@@ -99,7 +99,7 @@ batches and the predict run slows from ~40 min to 2-3 h.
   - attention_head_dim = 64, attention_at_low_two = True
   - layers_per_block = 2
   - cond_channels = 56 (3 timesteps × 11 dyn + 7 static + locenc + 1 hm_t)
-  - parameter count = **74.5 M**
+  - parameter count = **75.4 M**
 - Diffusion: `DDPMScheduler(prediction_type="v_prediction", beta_schedule="squaredcos_cap_v2")`
   - num_train_timesteps = 1000
   - inference sampler: DDIM at 12 steps
@@ -111,13 +111,13 @@ batches and the predict run slows from ~40 min to 2-3 h.
 | Metric | Value |
 |---|---|
 | Tiles with valid coverage | 4,394 of 7,150 |
-| Tile-mean MAE (median) | **0.0136** |
-| Tile-mean MAE (mean) | 0.0182 |
-| Tile-mean MAE (95th %ile) | 0.0503 |
-| Histogram intersection (median) | **0.351** |
-| Histogram intersection (mean) | 0.360 |
-| Pearson r (predicted vs. observed tile-mean Δhm) | 0.553 |
-| Coverage rate (q025 ≤ obs ≤ q975), all bins | 0.659 (target ≈ 0.95) |
+| Tile-mean MAE (median) | **0.0128** |
+| Tile-mean MAE (mean) | 0.0173 |
+| Tile-mean MAE (95th %ile) | 0.0480 |
+| Histogram intersection (median) | **0.353** |
+| Histogram intersection (mean) | 0.362 |
+| Pearson r (predicted vs. observed tile-mean Δhm) | 0.436 |
+| Coverage rate (q025 ≤ obs ≤ q975), all bins | 0.689 (target ≈ 0.95) |
 
 ### Coverage stratified by Δhm change bin
 
@@ -128,13 +128,13 @@ ones where the model has to express genuine uncertainty.
 
 | Δhm bin | n pixels | Coverage |
 |---|---:|---:|
-| `[ -1.000, -0.005]` | 56,357 | 0.445 |
-| `[ -0.005, +0.005]` | 742,163 | 0.707 |
-| `[ +0.005, +0.020]` | 116,330 | 0.542 |
-| `[ +0.020, +0.100]` | 97,708 | 0.614 |
-| `[ +0.100, +0.200]` | 10,296 | 0.251 |
-| `[ +0.200, +0.400]` | 1,614 | 0.048 |
-| `[ +0.400, +0.600]` | 120 | 0.008 |
+| `[ -1.000, -0.005]` | 56,357 | 0.416 |
+| `[ -0.005, +0.005]` | 742,163 | 0.731 |
+| `[ +0.005, +0.020]` | 116,330 | 0.581 |
+| `[ +0.020, +0.100]` | 97,708 | 0.711 |
+| `[ +0.100, +0.200]` | 10,296 | 0.231 |
+| `[ +0.200, +0.400]` | 1,614 | 0.040 |
+| `[ +0.400, +0.600]` | 120 | 0.000 |
 | `[ +0.600, +1.000]` | 7 | 0.000 |
 
 ## Tail diagnostics
@@ -148,17 +148,17 @@ WassDiff (IEEE TGRS 2025), ExtremeCast (AAAI 2024), and the Aich et al. (GMD
 
 - Threshold: 0.0667
 - Observed tail mass: 1245.5662
-- Predicted tail mass: 1896.3333
-- **Ratio (pred / obs):** **1.522** (<<1 = under-predicting tail; ~1 = calibrated; >1 = over)
+- Predicted tail mass: 1067.3802
+- **Ratio (pred / obs):** **0.857** (<<1 = under-predicting tail; ~1 = calibrated; >1 = over)
 
 ### Tail exceedance (deterministic + q975 ensemble support)
 
 | Threshold | n(obs>t) | n(pred>t) | POD | CSI | FAR | q975 soft-POD |
 |---|---|---|---|---|---|---|
-| +0.050 |     42,889 |    124,384 | 0.457 | 0.133 | 0.842 | 0.914 |
-| +0.100 |     12,037 |     18,798 | 0.183 | 0.077 | 0.883 | 0.568 |
-| +0.200 |      1,741 |      1,517 | 0.083 | 0.047 | 0.904 | 0.175 |
-| +0.400 |        127 |         13 | 0.055 | 0.053 | 0.462 | 0.094 |
+| +0.050 |     42,889 |     92,357 | 0.310 | 0.109 | 0.856 | 0.950 |
+| +0.100 |     12,037 |     11,284 | 0.101 | 0.055 | 0.892 | 0.553 |
+| +0.200 |      1,741 |        410 | 0.045 | 0.038 | 0.810 | 0.106 |
+| +0.400 |        127 |          2 | 0.000 | 0.000 | 1.000 | 0.055 |
 
 ![Q-Q max-of-field](../outputs/diffusion_v1/qq_max_of_field.png)
 
