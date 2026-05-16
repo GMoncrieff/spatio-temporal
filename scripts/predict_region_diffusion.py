@@ -100,6 +100,11 @@ def parse_args():
                         "→ different μ and residual → structural diversity "
                         "without retraining. 0=off; 0.05-0.20 typical. Risk: "
                         "too large (>0.3) pushes the model OOD.")
+    p.add_argument("--vary_latent_z", action="store_true", default=True,
+                   help="When the model has latent_z_dim > 0, sample a fresh z "
+                        "for each ensemble member at inference (the v38 lever). "
+                        "On by default for any latent-z checkpoint.")
+    p.add_argument("--no_vary_latent_z", dest="vary_latent_z", action="store_false")
     return p.parse_args()
 
 
@@ -342,9 +347,12 @@ def main():
                 m_scalar = torch.full(
                     (B_real,), m_val, device=device, dtype=torch.float32,
                 )
+            module_latent_z = int(getattr(module, "latent_z_dim", 0))
             use_per_sample_cond = (
-                args.m_sample_diverse and getattr(module, "use_magnitude_cond", False)
-            ) or args.cond_perturb_std > 0
+                (args.m_sample_diverse and getattr(module, "use_magnitude_cond", False))
+                or args.cond_perturb_std > 0
+                or (module_latent_z > 0 and args.vary_latent_z)
+            )
             if use_per_sample_cond:
                 # Build conditioning ONCE (assemble_conditioning runs the
                 # location encoder, which is the expensive step), then replicate
@@ -360,15 +368,34 @@ def main():
                 Hc, Wc = base_cond.shape[-2], base_cond.shape[-1]
                 cond_diverse = base_cond.repeat(N, 1, 1, 1)  # [N*B_real, C, H, W]
                 if args.m_sample_diverse and getattr(module, "use_magnitude_cond", False):
-                    # Replace the last channel (which assemble_conditioning
-                    # placed as the m channel when use_magnitude_cond is True).
+                    # The m channel is the LAST one when latent_z_dim=0, or
+                    # the one IMMEDIATELY BEFORE the z block when both are on
+                    # (assemble_conditioning appends m then z). Compute the
+                    # m channel slice based on what the loaded module has.
+                    m_end = cond_diverse.shape[1] - module_latent_z
+                    m_start = m_end - 1
                     m_all = torch.empty(
                         N * B_real, device=device, dtype=torch.float32,
                     ).uniform_(args.m_sample_min, args.m_sample_max)
                     m_norm = (m_all / max(getattr(module, "m_norm_scale", 0.5), 1e-8)).view(
                         N * B_real, 1, 1, 1
                     ).expand(N * B_real, 1, Hc, Wc).to(cond_diverse.dtype)
-                    cond_diverse[:, -1:, :, :] = m_norm
+                    cond_diverse[:, m_start:m_end, :, :] = m_norm
+                if module_latent_z > 0 and args.vary_latent_z:
+                    # Replace the latent_z_dim channels (located just before
+                    # any future channels — currently the last channels after
+                    # m). assemble_conditioning placed z as the last block when
+                    # use_magnitude_cond is False, OR after m when True.
+                    # We saved base_cond above with m as last; if both m and z
+                    # are present, z is the FINAL latent_z_dim channels.
+                    z_all = torch.randn(
+                        N * B_real, module_latent_z,
+                        device=device, dtype=torch.float32,
+                    )
+                    z_chan = z_all.view(N * B_real, module_latent_z, 1, 1).expand(
+                        N * B_real, module_latent_z, Hc, Wc,
+                    ).to(cond_diverse.dtype)
+                    cond_diverse[:, -module_latent_z:, :, :] = z_chan
                 if args.cond_perturb_std > 0:
                     cond_diverse = cond_diverse + args.cond_perturb_std * torch.randn_like(cond_diverse)
                 samples = module.sample(

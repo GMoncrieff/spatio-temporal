@@ -207,6 +207,13 @@ def parse_args():
                         "2.0 lets samples spread to ~0.05 raw Δhm before the "
                         "loss stops rewarding more divergence — roughly 2x the "
                         "v26 per-pixel std baseline.")
+    p.add_argument("--latent_z_dim", type=int, default=0,
+                   help="Add a stochastic latent z ~ N(0, I) of this width to "
+                        "the conditioning. Each channel is broadcast spatially "
+                        "and concatenated to cond. The model learns to use z as "
+                        "an explicit 'diversity dial' separate from the diffusion "
+                        "noise. Pairs well with --diversity_loss_weight (the loss "
+                        "forces z to be informative). 0=off; 1-4 typical.")
 
     # Location encoder
     p.add_argument("--use_location_encoder", action="store_true", default=True)
@@ -264,13 +271,14 @@ def make_loaders(args):
 
 def compute_cond_channels(sample_batch, args):
     """Total conditioning channels = T*C_dyn + C_static + locenc_out + 1 (hm_t)
-    + 1 (block-maxima M) when use_magnitude_cond is on."""
+    + 1 (block-maxima M) when use_magnitude_cond is on
+    + latent_z_dim (when > 0)."""
     T = sample_batch["input_dynamic"].shape[1]
     C_dyn = sample_batch["input_dynamic"].shape[2]
     C_static = sample_batch["input_static"].shape[1]
     locenc = args.locenc_out_channels if args.use_location_encoder else 0
     extra = 1 if args.use_magnitude_cond else 0
-    return T * C_dyn + C_static + locenc + 1 + extra
+    return T * C_dyn + C_static + locenc + 1 + extra + int(getattr(args, "latent_z_dim", 0))
 
 
 def main():
@@ -347,6 +355,7 @@ def main():
         spectral_loss_weight=args.spectral_loss_weight,
         diversity_loss_weight=args.diversity_loss_weight,
         diversity_loss_clip=args.diversity_loss_clip,
+        latent_z_dim=args.latent_z_dim,
     )
     n_params = sum(p.numel() for p in module.parameters())
     print(f"  module param count: {n_params/1e6:.1f}M")

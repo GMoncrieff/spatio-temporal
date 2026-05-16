@@ -123,6 +123,7 @@ class DiffusionLightningModule(pl.LightningModule):
         spectral_loss_weight: float = 0.0,
         diversity_loss_weight: float = 0.0,
         diversity_loss_clip: float = 2.0,
+        latent_z_dim: int = 0,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -178,6 +179,7 @@ class DiffusionLightningModule(pl.LightningModule):
         self.spectral_loss_weight = float(spectral_loss_weight)
         self.diversity_loss_weight = float(diversity_loss_weight)
         self.diversity_loss_clip = float(diversity_loss_clip)
+        self.latent_z_dim = int(latent_z_dim)
 
         loc = _maybe_build_location_encoder(location_encoder_kwargs)
         if loc is None:
@@ -226,6 +228,7 @@ class DiffusionLightningModule(pl.LightningModule):
         lonlat: Optional[torch.Tensor],   # [B, H, W, 2]
         hm_t_normalized: torch.Tensor, # [B, 1, H, W]
         m_scalar: Optional[torch.Tensor] = None,   # [B] raw |Δhm| scalar; only used if use_magnitude_cond
+        latent_z: Optional[torch.Tensor] = None,   # [B, latent_z_dim] stochastic latent; only used if latent_z_dim>0
     ) -> torch.Tensor:
         """Concatenate all conditioning channels into [B, C_cond, H, W].
 
@@ -256,6 +259,19 @@ class DiffusionLightningModule(pl.LightningModule):
                 m_norm = (m_scalar.float() / max(self.m_norm_scale, 1e-8)).view(B, 1, 1, 1)
                 m_chan = m_norm.expand(B, 1, H, W).to(input_dynamic.dtype)
             parts.append(m_chan)
+        if self.latent_z_dim > 0:
+            if latent_z is None:
+                z_chan = torch.zeros(
+                    (B, self.latent_z_dim, H, W),
+                    device=input_dynamic.device,
+                    dtype=input_dynamic.dtype,
+                )
+            else:
+                # latent_z shape: [B, latent_z_dim]
+                z_chan = latent_z.float().view(B, self.latent_z_dim, 1, 1).expand(
+                    B, self.latent_z_dim, H, W,
+                ).to(input_dynamic.dtype)
+            parts.append(z_chan)
         cond = torch.cat(parts, dim=1)
         return torch.nan_to_num(cond, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -272,12 +288,25 @@ class DiffusionLightningModule(pl.LightningModule):
                 B = m.shape[0]
                 keep = (torch.rand(B, device=m.device) > self.m_dropout_prob)
                 m = torch.where(keep, m, torch.zeros_like(m))
+        z = None
+        if self.latent_z_dim > 0:
+            # Sample z ~ N(0, 1) per chip during training so the model sees
+            # different latents on every step; at validation we also sample,
+            # because the latent is part of the conditional distribution by
+            # design (we want val_loss to also reflect that the model uses z).
+            B = batch["input_dynamic"].shape[0]
+            z = torch.randn(
+                B, self.latent_z_dim,
+                device=batch["input_dynamic"].device,
+                dtype=torch.float32,
+            )
         return self.assemble_conditioning(
             batch["input_dynamic"],
             batch["input_static"],
             batch.get("lonlat"),
             batch["hm_t_normalized"],
             m_scalar=m,
+            latent_z=z,
         )
 
     def _snr_weights(self, t):
@@ -725,15 +754,24 @@ class DiffusionLightningModule(pl.LightningModule):
             self.log(f"{log_prefix}/spectral_loss", sp, on_step=True, on_epoch=True)
 
         if self.diversity_loss_weight > 0:
-            # Second forward pass with an INDEPENDENT noise draw at the same t,
-            # so any output difference is attributable to the noise rather than
-            # the noise schedule. Same conditioning, same t — diversity loss
-            # rewards (x0_pred_a, x0_pred_b) being far apart in the residual
-            # space, forcing the model to use noise as a source of variation
-            # rather than collapsing every z to ≈0 (the v26 failure mode).
+            # Second forward pass with an INDEPENDENT noise draw at the same t.
+            # When the latent z input is enabled, the z channels are ALSO
+            # resampled for the second pass so the diversity loss sees variation
+            # in (noise, z) jointly — that's the v38 hypothesis that an
+            # explicit stochastic latent gives the model a separate "diversity
+            # dial" from the diffusion noise.
+            if self.latent_z_dim > 0:
+                z_b = torch.randn(B, self.latent_z_dim, device=x_0.device)
+                cond_b = cond.clone()
+                z_b_chan = z_b.view(B, self.latent_z_dim, 1, 1).expand(
+                    B, self.latent_z_dim, cond.shape[-2], cond.shape[-1],
+                ).to(cond.dtype)
+                cond_b[:, -self.latent_z_dim:, :, :] = z_b_chan
+            else:
+                cond_b = cond
             noise_b = torch.randn_like(x_0)
             noisy_b = self.train_scheduler.add_noise(x_0, noise_b, t)
-            v_pred_b = self.unet(noisy_b, cond, t)
+            v_pred_b = self.unet(noisy_b, cond_b, t)
             x0_pred_b = self._x0_pred_from_v(noisy_b, v_pred_b, t)
             if mu is not None:
                 x0_pred_b_full = x0_pred_b + mu.detach()
