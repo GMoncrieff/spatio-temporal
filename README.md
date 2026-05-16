@@ -127,13 +127,18 @@ on the same global grid (1 km, EPSG:4326).
 
 ## Usage
 
-### Quickstart (v26 production recipe — recommended)
+### Quickstart (v36c production recipe — recommended)
 
-The current best configuration on the small dev region, targeting the
-user-stated criteria of (a) pixel coverage on high-change bins and (b)
-tile-level histogram intersection.
+The current best configuration uses the v26 checkpoint with **inference-
+time diversity levers** that concentrate sample variance at hotspots
+rather than producing uniform per-pixel grain. Result vs v26 baseline:
+MAE −49 %, Pearson r 0.44→0.71, bin > 0.4 coverage 0→0.08, bin > 0.6
+coverage 0→0.14, Q-Q max global 0.40→0.53 (obs 0.66), negative-pixel
+fraction 0.21→0.47 (matches obs).
 
 **Train (100 epochs ≈ 110 min on Apple M-series MPS):**
+
+Same v26 recipe as before.
 
 ```bash
 python scripts/train_diffusion.py \
@@ -153,16 +158,29 @@ python scripts/train_diffusion.py \
   --wandb_run_name v26-100ep-tail-focused
 ```
 
-**Predict (~80 min at n=64 on MPS):**
+**Predict — v36c levers (~90 min at n=16 on memory-constrained MPS):**
 
 ```bash
 python scripts/predict_region_diffusion.py \
-  --checkpoint <path-to.ckpt> \
+  --checkpoint <v26-ckpt-path> \
   --predict_region config/region_to_predict_small.geojson \
-  --predict_stride 64 \
-  --ensemble_n 64 \
-  --m_target 0.7
+  --output_dir data/predictions_diffusion/v36c \
+  --ensemble_n 16 --predict_batch_size 2 \
+  --num_inference_steps 30 \
+  --m_sample_diverse --m_sample_min 0.05 --m_sample_max 1.0 \
+  --residual_scale_pos 3.0 --residual_scale_neg 0.4 \
+  --cond_perturb_std 0.08
 ```
+
+The four diversity levers:
+- `--m_sample_diverse`: each ensemble member draws its own m_target ~
+  Uniform[min, max]. Different m → different μ AND different residual.
+- `--residual_scale_pos / --residual_scale_neg`: asymmetric scaling on
+  the diffusion residual (3× positive, 0.4× negative) before adding μ
+  back. Lifts max magnitude and reduces spurious negative excursions.
+- `--cond_perturb_std`: small Gaussian noise added to the full
+  conditioning per sample. Different samples see slightly different
+  context → different μ → structural diversity.
 
 **Evaluate:**
 
