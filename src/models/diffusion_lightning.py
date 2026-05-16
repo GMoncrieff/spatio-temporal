@@ -121,6 +121,8 @@ class DiffusionLightningModule(pl.LightningModule):
         zero_anchor_neg_multiplier: float = 1.0,
         edge_match_loss_weight: float = 0.0,
         spectral_loss_weight: float = 0.0,
+        diversity_loss_weight: float = 0.0,
+        diversity_loss_clip: float = 2.0,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -174,6 +176,8 @@ class DiffusionLightningModule(pl.LightningModule):
         self.zero_anchor_neg_multiplier = float(zero_anchor_neg_multiplier)
         self.edge_match_loss_weight = float(edge_match_loss_weight)
         self.spectral_loss_weight = float(spectral_loss_weight)
+        self.diversity_loss_weight = float(diversity_loss_weight)
+        self.diversity_loss_clip = float(diversity_loss_clip)
 
         loc = _maybe_build_location_encoder(location_encoder_kwargs)
         if loc is None:
@@ -385,6 +389,23 @@ class DiffusionLightningModule(pl.LightningModule):
         # Loss = weighted MSE between power spectra (log to compress scale).
         diff = (Pp.add(1e-8).log() - Pt.add(1e-8).log()).pow(2)
         return (diff * weight).mean()
+
+    def _diversity_loss(self, x0_a, x0_b, valid):
+        """MSGAN-style mode-seeking loss: maximise sample-to-sample variation.
+
+        Two independent noise draws are mapped through the U-Net at the same
+        timestep. We return -mean(|x0_a − x0_b|) so that minimising this term
+        pushes the two predictions apart. The result is clipped at
+        `diversity_loss_clip` so unbounded growth can't dominate the other
+        losses and destroy conditional fidelity. Acts directly on the residual
+        in CorrDiff mode — i.e., we are demanding the residual head genuinely
+        use the noise input rather than mapping every z to ≈0.
+        """
+        if self.diversity_loss_weight <= 0:
+            return torch.zeros((), device=x0_a.device)
+        valid_f = valid.float()
+        diff = ((x0_a - x0_b).abs() * valid_f).sum() / valid_f.sum().clamp(min=1.0)
+        return -torch.clamp(diff, max=self.diversity_loss_clip)
 
     def _edge_match_loss(self, x0_pred, target_dhm, valid):
         """L2 on the spatial gradient — fights the v26 smoothing issue.
@@ -649,7 +670,8 @@ class DiffusionLightningModule(pl.LightningModule):
                    or self.tv_loss_weight > 0
                    or self.zero_anchor_loss_weight > 0
                    or self.edge_match_loss_weight > 0
-                   or self.spectral_loss_weight > 0)
+                   or self.spectral_loss_weight > 0
+                   or self.diversity_loss_weight > 0)
         x0_pred = self._x0_pred_from_v(noisy, v_pred, t) if need_x0 else None
         # Pattern / Wasserstein losses must operate in *target space* (not
         # residual space) so their thresholds and histograms correspond to
@@ -701,6 +723,25 @@ class DiffusionLightningModule(pl.LightningModule):
             sp = self._spectral_sharpness_loss(x0_pred_full, target_for_loss, valid)
             total_loss = total_loss + self.spectral_loss_weight * sp
             self.log(f"{log_prefix}/spectral_loss", sp, on_step=True, on_epoch=True)
+
+        if self.diversity_loss_weight > 0:
+            # Second forward pass with an INDEPENDENT noise draw at the same t,
+            # so any output difference is attributable to the noise rather than
+            # the noise schedule. Same conditioning, same t — diversity loss
+            # rewards (x0_pred_a, x0_pred_b) being far apart in the residual
+            # space, forcing the model to use noise as a source of variation
+            # rather than collapsing every z to ≈0 (the v26 failure mode).
+            noise_b = torch.randn_like(x_0)
+            noisy_b = self.train_scheduler.add_noise(x_0, noise_b, t)
+            v_pred_b = self.unet(noisy_b, cond, t)
+            x0_pred_b = self._x0_pred_from_v(noisy_b, v_pred_b, t)
+            if mu is not None:
+                x0_pred_b_full = x0_pred_b + mu.detach()
+            else:
+                x0_pred_b_full = x0_pred_b
+            div_loss = self._diversity_loss(x0_pred_full, x0_pred_b_full, valid)
+            total_loss = total_loss + self.diversity_loss_weight * div_loss
+            self.log(f"{log_prefix}/diversity_loss", div_loss, on_step=True, on_epoch=True)
 
         self.log(f"{log_prefix}/loss", total_loss, prog_bar=True, on_step=True, on_epoch=True)
         return total_loss
@@ -781,11 +822,21 @@ class DiffusionLightningModule(pl.LightningModule):
         use_ema: Optional[bool] = None,
         guidance_scale: float = 1.0,
         eta: float = 0.0,
+        residual_scale_pos: float = 1.0,
+        residual_scale_neg: float = 1.0,
     ) -> torch.Tensor:
         """Run DDIM sampling. Returns [n_samples, B, 1, H, W].
 
         If `use_ema` is True (or None and self.use_ema is True), swap to EMA
         weights for sampling, then restore the live training weights.
+
+        `residual_scale_pos` / `residual_scale_neg` apply only when the mean
+        head is used (CorrDiff). They independently scale the positive and
+        negative parts of each per-sample residual before it is added back to
+        μ. Set both to 1.0 (default) for the original CorrDiff behaviour.
+        residual_scale_pos > 1 boosts diversity in the high-change direction
+        and shifts the per-tile max upward; residual_scale_neg < 1 dampens
+        spurious negative-change pixels.
         """
         steps = num_inference_steps or self.num_inference_steps
         scheduler = DDIMScheduler.from_config(self.train_scheduler.config)
@@ -818,6 +869,16 @@ class DiffusionLightningModule(pl.LightningModule):
             if self.use_mean_head and self.mean_head is not None:
                 with torch.no_grad():
                     mu = self.mean_head(conditioning)             # [B, 1, H, W]
+                if residual_scale_pos != 1.0 or residual_scale_neg != 1.0:
+                    # Asymmetric residual scaling. samples here are the per-
+                    # sample residuals in model space. Scaling them is a
+                    # post-hoc lever — it changes the marginal distribution
+                    # of residual values without retraining.
+                    samples = torch.where(
+                        samples > 0,
+                        samples * float(residual_scale_pos),
+                        samples * float(residual_scale_neg),
+                    )
                 samples = samples + mu.unsqueeze(0)               # broadcast over N
             return samples
         finally:

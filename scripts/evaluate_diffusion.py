@@ -272,6 +272,31 @@ def qq_max_of_field(pred, obs, valid, tile_size, q=np.linspace(0.0, 1.0, 51)):
     }
 
 
+def qq_mean_of_field(pred, obs, valid, tile_size, q=np.linspace(0.0, 1.0, 51)):
+    """Q-Q comparison of per-tile spatial mean(Δhm).
+
+    Parallel to qq_max_of_field but on the *amount* of change per tile rather
+    than the magnitude of the most extreme pixel. Slope < 1 in the upper tail
+    = systematic under-prediction of overall tile-level change; slope > 1
+    above zero = over-prediction; intercept ≠ 0 = systematic bias.
+    """
+    pred_mean, c_p = tile_means(pred, valid, tile_size)
+    obs_mean, c_o = tile_means(obs, valid, tile_size)
+    keep = (c_p > 0) & (c_o > 0) & np.isfinite(pred_mean) & np.isfinite(obs_mean)
+    if keep.sum() == 0:
+        return None
+    pred_q = np.quantile(pred_mean[keep], q)
+    obs_q = np.quantile(obs_mean[keep], q)
+    return {
+        "quantiles": q.tolist(),
+        "pred_q": pred_q.tolist(),
+        "obs_q": obs_q.tolist(),
+        "n_tiles": int(keep.sum()),
+        "pred_mean_global": float(np.mean(pred_mean[keep])),
+        "obs_mean_global": float(np.mean(obs_mean[keep])),
+    }
+
+
 def r95p_index(pred, obs, valid, percentile=95):
     """R95p: ratio of total Δhm mass above the p-th percentile of observations.
 
@@ -352,6 +377,26 @@ def plot_qq_max_of_field(qq, out_path):
     ax.set_xlabel("Observed per-tile max(Δhm)")
     ax.set_ylabel("Predicted per-tile max(Δhm)")
     ax.set_title("Q-Q: per-tile spatial maximum")
+    ax.legend(loc="lower right")
+    ax.grid(True, alpha=0.3)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_qq_mean_of_field(qq, out_path):
+    """Diagonal Q-Q of per-tile mean(Δhm) — companion to Q-Q max plot."""
+    if qq is None:
+        return
+    pred_q = np.asarray(qq["pred_q"])
+    obs_q = np.asarray(qq["obs_q"])
+    fig, ax = plt.subplots(figsize=(5.5, 5.5), constrained_layout=True)
+    lim_lo = float(min(pred_q.min(), obs_q.min()))
+    lim_hi = float(max(pred_q.max(), obs_q.max()))
+    ax.plot([lim_lo, lim_hi], [lim_lo, lim_hi], "b--", linewidth=1, label="y = x")
+    ax.plot(obs_q, pred_q, "r-o", markersize=3, linewidth=1.2, label="pred vs obs")
+    ax.set_xlabel("Observed per-tile mean(Δhm)")
+    ax.set_ylabel("Predicted per-tile mean(Δhm)")
+    ax.set_title("Q-Q: per-tile spatial mean")
     ax.legend(loc="lower right")
     ax.grid(True, alpha=0.3)
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -785,6 +830,7 @@ def main():
     # Coverage: how often the observed Δhm falls inside the predicted band.
     q025_path = os.path.join(args.pred_dir, "prediction_dhm_2020_q025.tif")
     q975_path = os.path.join(args.pred_dir, "prediction_dhm_2020_q975.tif")
+    std_path = os.path.join(args.pred_dir, "prediction_dhm_2020_std.tif")
     cov = float("nan")
     bin_cov = None
     if os.path.exists(q025_path) and os.path.exists(q975_path):
@@ -797,8 +843,26 @@ def main():
         bin_cov = per_bin_coverage(obs, q025, q975, cov_valid, HIST_BIN_EDGES)
     else:
         q975 = None
+    # Sample-to-sample diversity diagnostic. Mean + p95 of the per-pixel std
+    # raster (produced by predict_region_diffusion.py) — a direct measure of
+    # how much the ensemble samples disagree per pixel.
+    diversity_stats = None
+    if os.path.exists(std_path):
+        with rasterio.open(std_path) as r:
+            std_arr = r.read(1)
+        s_valid = valid & np.isfinite(std_arr)
+        if s_valid.any():
+            s = std_arr[s_valid]
+            diversity_stats = {
+                "std_mean": float(s.mean()),
+                "std_median": float(np.median(s)),
+                "std_p95": float(np.percentile(s, 95)),
+                "std_max": float(s.max()),
+                "n_valid_pixels": int(s_valid.sum()),
+            }
 
     qq_max = qq_max_of_field(pred, obs, valid, args.tile_size)
+    qq_mean = qq_mean_of_field(pred, obs, valid, args.tile_size)
     r95p = r95p_index(pred, obs, valid, percentile=95)
     tail_exceed = tail_exceedance_metrics(
         pred, obs, q975, valid, thresholds=(0.05, 0.1, 0.2, 0.4)
@@ -816,8 +880,10 @@ def main():
         coverage_rate=cov,
         per_bin_coverage=bin_cov,
         qq_max_of_field=qq_max,
+        qq_mean_of_field=qq_mean,
         r95p=r95p,
         tail_exceedance=tail_exceed,
+        sample_diversity=diversity_stats,
     )
     print("Metrics:")
     for k, v in metrics.items():
@@ -835,6 +901,17 @@ def main():
                 continue
             print(f"  qq_max_of_field: pred_max_global={v['pred_max_global']:.4f}  "
                   f"obs_max_global={v['obs_max_global']:.4f}  n_tiles={v['n_tiles']}")
+        elif k == "qq_mean_of_field":
+            if v is None:
+                continue
+            print(f"  qq_mean_of_field: pred_mean_global={v['pred_mean_global']:+.4f}  "
+                  f"obs_mean_global={v['obs_mean_global']:+.4f}  n_tiles={v['n_tiles']}")
+        elif k == "sample_diversity":
+            if v is None:
+                continue
+            print(f"  sample_diversity: std_mean={v['std_mean']:.4f}  "
+                  f"std_median={v['std_median']:.4f}  "
+                  f"std_p95={v['std_p95']:.4f}  std_max={v['std_max']:.4f}")
         elif k == "r95p":
             if v is None:
                 continue
@@ -865,6 +942,10 @@ def main():
     plot_qq_max_of_field(qq_max, qq_path)
     if qq_max is not None:
         print(f"Wrote: {qq_path}")
+    qq_mean_path = out_dir / "qq_mean_of_field.png"
+    plot_qq_mean_of_field(qq_mean, qq_mean_path)
+    if qq_mean is not None:
+        print(f"Wrote: {qq_mean_path}")
 
     sample_grid_path = None
     model_info = None

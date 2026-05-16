@@ -70,6 +70,36 @@ def parse_args():
                         "conditioning channel (raw |Δhm| units). Only used if "
                         "the checkpoint's use_magnitude_cond is True. Typical "
                         "choices: training-set 99th percentile of max|Δhm| (≈0.5).")
+    p.add_argument("--residual_scale_pos", type=float, default=1.0,
+                   help="CorrDiff post-hoc lever (mean-head models only). "
+                        "Multiplier applied to positive residuals (samples > 0 "
+                        "in model space) before adding back to μ. >1 boosts "
+                        "diversity in the high-change direction and lifts the "
+                        "per-tile max. Default 1.0 (off).")
+    p.add_argument("--residual_scale_neg", type=float, default=1.0,
+                   help="Mirror of --residual_scale_pos for negative "
+                        "residuals. <1 dampens spurious negative-change "
+                        "pixels (attacks the 'too many negatives' bias). "
+                        "Default 1.0 (off).")
+    p.add_argument("--m_sample_diverse", action="store_true",
+                   help="Per-sample diverse magnitude conditioning. For each "
+                        "ensemble member, draw a different m_target uniformly "
+                        "in [m_sample_min, m_sample_max]. This injects "
+                        "structural diversity — different m's produce "
+                        "different conditional means μ AND different diffusion "
+                        "residuals — without retraining. Requires the "
+                        "checkpoint to have use_magnitude_cond=True.")
+    p.add_argument("--m_sample_min", type=float, default=0.05,
+                   help="Lower bound for per-sample m draws (raw |Δhm| units).")
+    p.add_argument("--m_sample_max", type=float, default=1.0,
+                   help="Upper bound for per-sample m draws (raw |Δhm| units).")
+    p.add_argument("--cond_perturb_std", type=float, default=0.0,
+                   help="Per-sample conditioning noise: add ε ~ N(0, σ²) to "
+                        "every conditioning channel for each ensemble member. "
+                        "Different samples then see slightly different context "
+                        "→ different μ and residual → structural diversity "
+                        "without retraining. 0=off; 0.05-0.20 typical. Risk: "
+                        "too large (>0.3) pushes the model OOD.")
     return p.parse_args()
 
 
@@ -306,19 +336,63 @@ def main():
 
         with torch.no_grad():
             m_scalar = None
+            B_real = bdyn_t.shape[0]
             if getattr(module, "use_magnitude_cond", False):
                 m_val = float(args.m_target) if args.m_target is not None else 0.0
                 m_scalar = torch.full(
-                    (bdyn_t.shape[0],), m_val, device=device, dtype=torch.float32,
+                    (B_real,), m_val, device=device, dtype=torch.float32,
                 )
-            cond = module.assemble_conditioning(bdyn_t, bstat_t, bll_t, bhm_t_t,
-                                                m_scalar=m_scalar)
-            samples = module.sample(
-                cond, n_samples=args.ensemble_n,
-                num_inference_steps=args.num_inference_steps,
-                guidance_scale=args.guidance_scale,
-                eta=args.eta,
-            )  # [N, B, 1, H, W] in normalised (and possibly transformed) model space.
+            use_per_sample_cond = (
+                args.m_sample_diverse and getattr(module, "use_magnitude_cond", False)
+            ) or args.cond_perturb_std > 0
+            if use_per_sample_cond:
+                # Build conditioning ONCE (assemble_conditioning runs the
+                # location encoder, which is the expensive step), then replicate
+                # to N×B_real and vary only the bits that need to vary per
+                # sample (m channel and / or additive ε). Order in the batch
+                # dim: [sample_0_all_tiles, sample_1_all_tiles, ...]. Doing the
+                # naive N-call assembly inside the loop is 50–100× slower on
+                # MPS and pushes the per-batch cost to ~10s instead of ~0.2s.
+                base_cond = module.assemble_conditioning(
+                    bdyn_t, bstat_t, bll_t, bhm_t_t, m_scalar=m_scalar,
+                )  # [B_real, C, H, W]
+                N = args.ensemble_n
+                Hc, Wc = base_cond.shape[-2], base_cond.shape[-1]
+                cond_diverse = base_cond.repeat(N, 1, 1, 1)  # [N*B_real, C, H, W]
+                if args.m_sample_diverse and getattr(module, "use_magnitude_cond", False):
+                    # Replace the last channel (which assemble_conditioning
+                    # placed as the m channel when use_magnitude_cond is True).
+                    m_all = torch.empty(
+                        N * B_real, device=device, dtype=torch.float32,
+                    ).uniform_(args.m_sample_min, args.m_sample_max)
+                    m_norm = (m_all / max(getattr(module, "m_norm_scale", 0.5), 1e-8)).view(
+                        N * B_real, 1, 1, 1
+                    ).expand(N * B_real, 1, Hc, Wc).to(cond_diverse.dtype)
+                    cond_diverse[:, -1:, :, :] = m_norm
+                if args.cond_perturb_std > 0:
+                    cond_diverse = cond_diverse + args.cond_perturb_std * torch.randn_like(cond_diverse)
+                samples = module.sample(
+                    cond_diverse, n_samples=1,
+                    num_inference_steps=args.num_inference_steps,
+                    guidance_scale=args.guidance_scale,
+                    eta=args.eta,
+                    residual_scale_pos=args.residual_scale_pos,
+                    residual_scale_neg=args.residual_scale_neg,
+                )  # [1, N*B_real, 1, H, W]
+                samples = samples.view(args.ensemble_n, B_real, 1, samples.shape[-2], samples.shape[-1])
+                cond = base_cond  # keep for cleanup line below
+                del base_cond, cond_diverse
+            else:
+                cond = module.assemble_conditioning(bdyn_t, bstat_t, bll_t, bhm_t_t,
+                                                    m_scalar=m_scalar)
+                samples = module.sample(
+                    cond, n_samples=args.ensemble_n,
+                    num_inference_steps=args.num_inference_steps,
+                    guidance_scale=args.guidance_scale,
+                    eta=args.eta,
+                    residual_scale_pos=args.residual_scale_pos,
+                    residual_scale_neg=args.residual_scale_neg,
+                )  # [N, B, 1, H, W] in normalised (and possibly transformed) model space.
             # module.denormalize handles z-score AND inverse target transform (e.g.
             # signed_log1p) so callers always work in raw Δhm units.
             samples_raw = module.denormalize(samples.float())

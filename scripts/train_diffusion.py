@@ -190,6 +190,23 @@ def parse_args():
                    help="2D FFT power-spectrum match (radial-frequency weighted). "
                         "Penalises mismatch in high-frequency spatial content, "
                         "encouraging sharp localised features. 0=off; 0.1-1.0 typical.")
+    p.add_argument("--diversity_loss_weight", type=float, default=0.0,
+                   help="MSGAN-style mode-seeking diversity loss. Each step does "
+                        "a second U-Net forward pass with an independent noise "
+                        "draw at the same t, and we penalise the two predictions "
+                        "for being too similar. Directly attacks the v26 'samples "
+                        "are too confident / too similar' failure mode by forcing "
+                        "the residual head to actually use noise as a source of "
+                        "variation. 0=off; 0.5-3.0 typical. Roughly 2x training "
+                        "step cost.")
+    p.add_argument("--diversity_loss_clip", type=float, default=2.0,
+                   help="Clip the per-pixel |x0_a - x0_b| mean used in the "
+                        "diversity loss at this value. Prevents the loss from "
+                        "growing unbounded and destroying conditional fidelity. "
+                        "In normalised model space (dhm_std≈0.026), a clip of "
+                        "2.0 lets samples spread to ~0.05 raw Δhm before the "
+                        "loss stops rewarding more divergence — roughly 2x the "
+                        "v26 per-pixel std baseline.")
 
     # Location encoder
     p.add_argument("--use_location_encoder", action="store_true", default=True)
@@ -328,6 +345,8 @@ def main():
         zero_anchor_neg_multiplier=args.zero_anchor_neg_multiplier,
         edge_match_loss_weight=args.edge_match_loss_weight,
         spectral_loss_weight=args.spectral_loss_weight,
+        diversity_loss_weight=args.diversity_loss_weight,
+        diversity_loss_clip=args.diversity_loss_clip,
     )
     n_params = sum(p.numel() for p in module.parameters())
     print(f"  module param count: {n_params/1e6:.1f}M")
