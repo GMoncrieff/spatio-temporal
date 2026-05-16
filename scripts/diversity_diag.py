@@ -40,6 +40,22 @@ def stats_for_dir(d: Path) -> dict:
         "p95": float(np.percentile(w, 95)),
         "max": float(w.max()),
     }
+    # Hotspot vs flat std (does diversity concentrate at hotspots?)
+    with rasterio.open(d / "prediction_dhm_2020_median.tif") as r:
+        med = r.read(1)
+    with rasterio.open(d / "prediction_dhm_2020_std.tif") as r:
+        std = r.read(1)
+    v = np.isfinite(med) & np.isfinite(std)
+    if v.any():
+        hot = v & (np.abs(med) > 0.05)
+        flat = v & (np.abs(med) < 0.01)
+        h_mean = float(std[hot].mean()) if hot.any() else float("nan")
+        f_mean = float(std[flat].mean()) if flat.any() else float("nan")
+        out["hotspot_std"] = {
+            "hotspot_mean": h_mean,
+            "flat_mean": f_mean,
+            "ratio": (h_mean / f_mean) if (np.isfinite(h_mean) and np.isfinite(f_mean) and f_mean > 0) else float("nan"),
+        }
     return out
 
 
@@ -57,16 +73,19 @@ def main():
             continue
     # Print as table
     cols = ["std_mean", "std_p95", "envelope_mean", "envelope_p95",
-            "median_mean", "median_p5", "median_p95", "median_max"]
+            "median_mean", "median_p5", "median_p95", "median_max",
+            "std_hot", "std_flat", "hot/flat"]
     print(f"{'dir':<35s}", *(f"{c:>12s}" for c in cols))
     for d, r in results:
         if r is None:
             continue
+        h = r.get("hotspot_std", {"hotspot_mean": float("nan"), "flat_mean": float("nan"), "ratio": float("nan")})
         row = [
             r["std"]["mean"], r["std"]["p95"],
             r["envelope_width"]["mean"], r["envelope_width"]["p95"],
             r["median"]["mean"], r["median"]["p5"], r["median"]["p95"],
             r["median"]["max"],
+            h["hotspot_mean"], h["flat_mean"], h["ratio"],
         ]
         s = f"{str(d):<35s}" + "".join(f"{v:>+12.4f}" for v in row)
         print(s)
