@@ -192,6 +192,32 @@ from inference levers** (v36-family residual scaling + diverse m).
   first time. Negative-pixel fraction matches obs exactly (0.47 vs
   0.47).
 
+* **v36d** (tail-focused, full small region): more aggressive levers
+  (`residual_scale_pos=4`, `neg=0.3`, `m_sample_max=1.5`,
+  `cond_perturb_std=0.10`). Trades fidelity for tail magnitude:
+
+  | Metric | v36c | v36d |
+  |---|---|---|
+  | MAE median | **0.0065** | 0.0074 |
+  | Pearson r | **0.709** | 0.686 |
+  | bin > 0.1 cov | 0.426 | **0.528** |
+  | bin > 0.2 cov | 0.125 | **0.203** |
+  | bin > 0.4 cov | 0.079 | **0.110** |
+  | Q-Q max global | 0.529 | **0.577** (obs 0.656) |
+  | Q-Q mean | +0.010 | +0.014 (vs obs +0.007) |
+  | R95p ratio | **0.983** | 1.599 (over) |
+  | std p95 | 0.044 | **0.056** |
+  | hot/flat | 1.35 | **1.39** |
+  | POD@0.1 | 0.178 | **0.224** |
+  | POD@0.2 | 0.084 | **0.115** |
+  | q975 soft-POD@0.4 | 0.112 | **0.164** |
+
+  v36d wins on tail-coverage metrics (POD, bin > 0.1/0.2/0.4) and
+  pushes the upper-tile-max higher, but the median bulk drifts slightly
+  positive and R95p overshoots. Pick v36c when bulk calibration matters
+  (publishing, model comparison); pick v36d when high-change bin
+  coverage is the priority (risk maps, scenario screening).
+
 ## Trade-off space
 
 The single most important knob is **`mean_head_pixel_weight_alpha`**.
