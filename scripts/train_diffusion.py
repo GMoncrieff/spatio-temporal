@@ -207,6 +207,16 @@ def parse_args():
                         "2.0 lets samples spread to ~0.05 raw Δhm before the "
                         "loss stops rewarding more divergence — roughly 2x the "
                         "v26 per-pixel std baseline.")
+    p.add_argument("--diversity_loss_kind", default="mean_l1",
+                   choices=("mean_l1", "tile_max_l1"),
+                   help="mean_l1 (v37 default) penalises per-pixel mean L1 "
+                        "between paired samples — can be satisfied by uniform "
+                        "iid noise. tile_max_l1 penalises difference of per-"
+                        "tile max values — rewards structural diversity, not "
+                        "grain (v37c hypothesis).")
+    p.add_argument("--diversity_loss_tile_size", type=int, default=16,
+                   help="Tile size for tile_max_l1. 16 ≈ 16×16 pixel blocks "
+                        "(matches evaluation tile size).")
     p.add_argument("--latent_z_dim", type=int, default=0,
                    help="Add a stochastic latent z ~ N(0, I) of this width to "
                         "the conditioning. Each channel is broadcast spatially "
@@ -355,6 +365,8 @@ def main():
         spectral_loss_weight=args.spectral_loss_weight,
         diversity_loss_weight=args.diversity_loss_weight,
         diversity_loss_clip=args.diversity_loss_clip,
+        diversity_loss_kind=args.diversity_loss_kind,
+        diversity_loss_tile_size=args.diversity_loss_tile_size,
         latent_z_dim=args.latent_z_dim,
     )
     n_params = sum(p.numel() for p in module.parameters())

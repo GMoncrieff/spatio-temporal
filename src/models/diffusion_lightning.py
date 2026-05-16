@@ -123,6 +123,8 @@ class DiffusionLightningModule(pl.LightningModule):
         spectral_loss_weight: float = 0.0,
         diversity_loss_weight: float = 0.0,
         diversity_loss_clip: float = 2.0,
+        diversity_loss_kind: str = "mean_l1",
+        diversity_loss_tile_size: int = 16,
         latent_z_dim: int = 0,
     ):
         super().__init__()
@@ -179,6 +181,12 @@ class DiffusionLightningModule(pl.LightningModule):
         self.spectral_loss_weight = float(spectral_loss_weight)
         self.diversity_loss_weight = float(diversity_loss_weight)
         self.diversity_loss_clip = float(diversity_loss_clip)
+        if diversity_loss_kind not in ("mean_l1", "tile_max_l1"):
+            raise ValueError(
+                f"diversity_loss_kind must be 'mean_l1' or 'tile_max_l1', got {diversity_loss_kind!r}"
+            )
+        self.diversity_loss_kind = str(diversity_loss_kind)
+        self.diversity_loss_tile_size = int(diversity_loss_tile_size)
         self.latent_z_dim = int(latent_z_dim)
 
         loc = _maybe_build_location_encoder(location_encoder_kwargs)
@@ -420,20 +428,44 @@ class DiffusionLightningModule(pl.LightningModule):
         return (diff * weight).mean()
 
     def _diversity_loss(self, x0_a, x0_b, valid):
-        """MSGAN-style mode-seeking loss: maximise sample-to-sample variation.
+        """Mode-seeking loss: maximise sample-to-sample variation.
 
-        Two independent noise draws are mapped through the U-Net at the same
-        timestep. We return -mean(|x0_a − x0_b|) so that minimising this term
-        pushes the two predictions apart. The result is clipped at
-        `diversity_loss_clip` so unbounded growth can't dominate the other
-        losses and destroy conditional fidelity. Acts directly on the residual
-        in CorrDiff mode — i.e., we are demanding the residual head genuinely
-        use the noise input rather than mapping every z to ≈0.
+        Two independent noise draws (and z draws if latent_z_dim>0) are mapped
+        through the U-Net at the same timestep. We return a NEGATIVE difference
+        statistic so minimising the loss pushes the two predictions apart.
+
+        `diversity_loss_kind`:
+        * "mean_l1" (MSGAN-style, original v37): mean of per-pixel |x0_a - x0_b|.
+          Pathology — model can satisfy this with uniform iid noise across the
+          field, giving "diversity" that's just grain (v37 outcome).
+        * "tile_max_l1": for each non-overlapping tile, take the per-tile max
+          of x0_a and x0_b separately, then average |max_a - max_b| across
+          tiles. Rewards a different MAGNITUDE per tile across samples —
+          structural diversity that uniform noise can't satisfy.
+
+        Result is clipped at `diversity_loss_clip` so unbounded growth can't
+        destroy conditional fidelity. Acts on the residual in CorrDiff mode.
         """
         if self.diversity_loss_weight <= 0:
             return torch.zeros((), device=x0_a.device)
         valid_f = valid.float()
-        diff = ((x0_a - x0_b).abs() * valid_f).sum() / valid_f.sum().clamp(min=1.0)
+        if self.diversity_loss_kind == "tile_max_l1":
+            s = self.diversity_loss_tile_size
+            if x0_a.shape[-1] < s or x0_a.shape[-2] < s:
+                # Fall back to mean_l1 if tile size too large
+                diff = ((x0_a - x0_b).abs() * valid_f).sum() / valid_f.sum().clamp(min=1.0)
+            else:
+                # Mask invalid pixels to -infty so they don't dominate the max
+                ma = x0_a * valid_f + (-1e6) * (1.0 - valid_f)
+                mb = x0_b * valid_f + (-1e6) * (1.0 - valid_f)
+                max_a = F.max_pool2d(ma, s, s)
+                max_b = F.max_pool2d(mb, s, s)
+                # Only count tiles where at least one valid pixel existed
+                tile_valid = (F.avg_pool2d(valid_f, s, s) > 0).float()
+                diff_t = (max_a - max_b).abs() * tile_valid
+                diff = diff_t.sum() / tile_valid.sum().clamp(min=1.0)
+        else:
+            diff = ((x0_a - x0_b).abs() * valid_f).sum() / valid_f.sum().clamp(min=1.0)
         return -torch.clamp(diff, max=self.diversity_loss_clip)
 
     def _edge_match_loss(self, x0_pred, target_dhm, valid):
