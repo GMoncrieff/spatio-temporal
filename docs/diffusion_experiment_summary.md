@@ -100,6 +100,54 @@ Sweep:
   bigger mean head over-absorbs the rare-event signal, leaving the
   diffusion residual too narrow.
 
+### Phase 6 — Sample diversity (v36 → v37)
+
+After v33–v35 confirmed that *inference-side knobs alone don't help*,
+user feedback re-framed the problem: per-pixel std across the v26
+ensemble is only **0.025** in raw Δhm units — vanishingly narrow
+relative to the target range of ±0.4. "Predictions too similar" was a
+measurable, quantitative collapse. Q-Q max for v26 fits a slope of 0.62
+(pred max 0.40 vs obs 0.66) and per-tile bias is +0.018 (vs obs +0.006).
+
+* **v36** (inference levers, no retrain):
+  * `--residual_scale_pos 2.0 / --residual_scale_neg 0.5` asymmetric
+    scaling of CorrDiff residuals before adding back to μ.
+  * `--m_sample_diverse --m_sample_min 0.1 --m_sample_max 0.8` per-
+    ensemble-member m_target draws — different m → different μ AND
+    different residual → structural diversity.
+  * Result on tiny test region: std_mean 0.025 → 0.029 (+13 %),
+    envelope_p95 +26 %. Modest gain, confirms the CorrDiff residual
+    head is fundamentally too low-entropy.
+* **v36b** (aggressive: pos=4, neg=0.25, m=[0.05, 1.5], cond_perturb=0.1):
+  std_mean 0.048 (+88 %), envelope_p95 0.197 (+124 %) — real diversity
+  but inflates the positive bulk bias. Not a free lunch.
+* **v37** (training): MSGAN-style mode-seeking diversity loss. Second
+  U-Net forward at the same t with independent noise; penalty on
+  -clamp(mean|x0_a - x0_b|, max=2.0). Doubles training step cost.
+  Wired as `--diversity_loss_weight` (~0.5) and `--diversity_loss_clip`.
+  Trained 100 epochs in 45 min — best val_loss 0.71 at epoch 70 (vs
+  v26's 0.82), then val_loss climbed back to 1.14 at epoch 99 (model
+  destabilised by the diversity push).
+  **Result on tiny region (using best ckpt):**
+  * **No diversity gain**: std_mean 0.025 (== v26), envelope_p95 0.087
+    (≈ v26). Per-pixel sample-to-sample variance unchanged.
+  * **But mean calibration improved**: median_mean +0.003 vs obs +0.010
+    (v26 was +0.018, a 3× over-prediction). The diversity loss
+    paid for itself in bias correction rather than diversity.
+  * Adding v36 inference levers on top (v37l) restored some diversity
+    (std 0.035, envelope_p95 0.136) but pushed the median bias back
+    to +0.017 (the levers shift the mean even on a recalibrated base).
+* **Hypothesis for v37's failure-to-diversify**: the mean head μ is so
+  dominant (α=1, pixel-weighted; mw=0.1) that even if the diffusion
+  residual learns to use noise, the residual variance is tiny relative
+  to μ. Adding μ + r at inference, the per-pixel std is dominated by
+  the (small) residual var while the deterministic μ contributes zero.
+* **v37b** (training, in progress): weaken the mean head
+  (mean_loss_weight 0.1 → 0.02) so it cannot absorb all the signal,
+  AND double the diversity push (diversity_loss_weight 0.5 → 1.0).
+  Goal: force the diffusion residual to carry meaningful magnitude
+  variance so the per-pixel sample std actually grows.
+
 ## Trade-off space
 
 The single most important knob is **`mean_head_pixel_weight_alpha`**.
