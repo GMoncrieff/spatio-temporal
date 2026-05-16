@@ -36,8 +36,12 @@ The earlier ConvLSTM + hybrid-loss approach is preserved verbatim under
 
 ## Documentation
 
-- **[Diffusion results](docs/diffusion_v1_results.md)** — full iteration
-  history (v8 → v26), metrics, and three production-ready recipes.
+- **[Diffusion experiment summary](docs/diffusion_experiment_summary.md)** —
+  full iteration history (v8 → v37+), trade-off space, lessons.
+- **[Diversity investigation notes](docs/diversity_investigation_notes.md)** —
+  current focus: making samples diverse beyond uniform per-pixel grain.
+- **[Diffusion results (older)](docs/diffusion_v1_results.md)** — first-cycle
+  per-metric report (v8 → v26), kept for reference.
 - **[Baseline (ConvLSTM) technical guide](docs/simple_model_architecture_and_training.md)**
   — original multi-horizon, quantile-head ConvLSTM design.
 
