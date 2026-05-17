@@ -578,7 +578,8 @@ def _render_bin_coverage_table(per_bin):
 
 
 def write_report(metrics, args, report_path, panel_path, summary_path,
-                 model_info=None, sample_grid_path=None, qq_path=None):
+                 model_info=None, sample_grid_path=None, qq_path=None,
+                 qq_mean_path=None):
     rel = lambda p: os.path.relpath(p, os.path.dirname(report_path))
 
     model_section = ""
@@ -802,6 +803,7 @@ WassDiff (IEEE TGRS 2025), ExtremeCast (AAAI 2024), and the Aich et al. (GMD
 {_render_r95p(metrics.get('r95p'))}
 {_render_tail_exceedance_table(metrics.get('tail_exceedance'))}
 {f"![Q-Q max-of-field]({rel(qq_path)})" if qq_path is not None else ""}
+{f"![Q-Q mean-of-field]({rel(qq_mean_path)})" if qq_mean_path is not None else ""}
 
 ## Figures
 
@@ -1019,7 +1021,8 @@ def main():
 
     write_report(metrics, args, args.report, panel_path, summary_path,
                  model_info=model_info, sample_grid_path=sample_grid_path,
-                 qq_path=qq_path if qq_max is not None else None)
+                 qq_path=qq_path if qq_max is not None else None,
+                 qq_mean_path=qq_mean_path if qq_mean is not None else None)
     print(f"Wrote report: {args.report}")
 
     metrics_json = out_dir / "metrics.json"

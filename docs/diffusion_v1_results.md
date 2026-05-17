@@ -186,6 +186,7 @@ WassDiff (IEEE TGRS 2025), ExtremeCast (AAAI 2024), and the Aich et al. (GMD
 | +0.400 |        134 |         19 | 0.090 | 0.085 | 0.368 | 0.142 |
 
 ![Q-Q max-of-field](../outputs/diffusion_v1/qq_max_of_field.png)
+![Q-Q mean-of-field](../outputs/diffusion_v1/qq_mean_of_field.png)
 
 ## Figures
 
