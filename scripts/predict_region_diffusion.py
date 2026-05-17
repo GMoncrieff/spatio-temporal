@@ -109,6 +109,13 @@ def parse_args():
                         "0.02-0.05 is a good range for the small region.")
     p.add_argument("--residual_mask_softness", type=float, default=0.02,
                    help="Sigmoid width for the residual mask transition.")
+    p.add_argument("--cond_perturb_lowfreq_size", type=int, default=0,
+                   help="If >0, the cond perturbation becomes a SPATIAL "
+                        "low-freq field: generate N×N random Gaussian per "
+                        "sample, bilinear-upsample to tile size, multiply by "
+                        "cond_perturb_std, add to conditioning. Coherent "
+                        "enough to translate μ's hotspots in space rather "
+                        "than add per-pixel grain. 4-8 typical (for 64-tile).")
     p.add_argument("--residual_mask_mode", default="scale",
                    choices=("scale", "gate"),
                    help="'scale' (default) — flat pixels keep residual at 1×, "
@@ -412,7 +419,24 @@ def main():
                     ).to(cond_diverse.dtype)
                     cond_diverse[:, -module_latent_z:, :, :] = z_chan
                 if args.cond_perturb_std > 0:
-                    cond_diverse = cond_diverse + args.cond_perturb_std * torch.randn_like(cond_diverse)
+                    if args.cond_perturb_lowfreq_size > 0:
+                        # Low-freq spatial perturbation: random N×N Gaussian
+                        # per (sample, tile, channel) → bilinear-upsample to
+                        # cond spatial size. Coherent shift, not per-pixel
+                        # grain. Translates μ's hotspot predictions in space.
+                        Cc = cond_diverse.shape[1]
+                        lf = torch.randn(
+                            cond_diverse.shape[0], Cc,
+                            args.cond_perturb_lowfreq_size,
+                            args.cond_perturb_lowfreq_size,
+                            device=device, dtype=cond_diverse.dtype,
+                        )
+                        lf_up = torch.nn.functional.interpolate(
+                            lf, size=(Hc, Wc), mode="bilinear", align_corners=False,
+                        )
+                        cond_diverse = cond_diverse + args.cond_perturb_std * lf_up
+                    else:
+                        cond_diverse = cond_diverse + args.cond_perturb_std * torch.randn_like(cond_diverse)
                 samples = module.sample(
                     cond_diverse, n_samples=1,
                     num_inference_steps=args.num_inference_steps,

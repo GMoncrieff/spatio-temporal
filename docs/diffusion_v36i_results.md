@@ -36,8 +36,7 @@ Pixel-precise magnitude matching is *not* a goal.
 | v36d | 0.528 | 0.203 | 0.534 | 0.686 | 0.0074 | 0.741 | 0.577 | aggressive levers — tail-focused |
 | v36e | 0.464 | 0.158 | 0.543 | 0.704 | 0.0066 | 0.756 | 0.552 | sweet-spot levers — bulk-balanced |
 | v36f | 0.529 | 0.194 | 0.546 | 0.707 | 0.0069 | 0.774 | 0.542 | + μ-masked residual (scale mode) |
-| v36h | 0.524 | 0.196 | 0.547 | 0.699 | 0.0070 | 0.712 | 0.567 | + μ-mask GATE mode — cleanest backgrounds (hot/flat 1.46) |
-| **v36i** | **0.607** | **0.251** | **0.546** | **0.702** | **0.0067** | **0.720** | **0.557** | **+ low-freq spatial cond perturb — hotspots shift across samples (hot/flat 1.59)** |
+| **v36h** | **0.524** | **0.196** | **0.547** | **0.699** | **0.0070** | **0.712** | **0.567** | **+ μ-mask GATE mode — cleanest backgrounds (hot/flat 1.46)** |
 
 v13 was the architectural breakthrough (CorrDiff residual). v26 was
 the previous best trained model. The v36 family changed the game by
@@ -55,25 +54,8 @@ inference levers.
 All three production recipes use the **same v26 checkpoint** with
 different inference-time lever combinations. No retraining.
 
-**v36i — low-freq spatial perturbation + gate mode, recommended**
-(hotspots shift across samples — true spatial diversity, hot/flat =
-1.59, bin > 0.1 cov 0.607):
-```
-python scripts/predict_region_diffusion.py   --checkpoint <v26-ckpt>   --predict_region config/region_to_predict_small.geojson   --output_dir data/predictions_diffusion/v36i   --ensemble_n 16 --predict_batch_size 2 --num_inference_steps 30   --m_sample_diverse --m_sample_min 0.2 --m_sample_max 0.8   --residual_scale_pos 5.0 --residual_scale_neg 0.30   --residual_mask_threshold 0.07 --residual_mask_softness 0.01   --residual_mask_mode gate   --cond_perturb_std 0.05 --cond_perturb_lowfreq_size 6
-```
-
-The `--cond_perturb_lowfreq_size` flag turns the conditioning
-perturbation into a coherent low-frequency spatial field: per sample,
-generate a 6×6 random Gaussian, bilinear-upsample to the chip size,
-scale by 0.05, add to the conditioning. Coherent enough to *shift μ's
-hotspot predictions in space* across samples (the missing piece that
-per-pixel grain in earlier recipes couldn't deliver). Result: bin>0.1
-coverage jumps 0.524 → 0.607 because different ensemble members now
-place hotspots at slightly different locations and brackett more
-high-change pixels collectively.
-
-**v36h — μ-mask GATE mode** (cleanest backgrounds, less spatial diversity,
-hot/flat = 1.46):
+**v36h — μ-mask GATE mode, recommended** (cleanest backgrounds, most
+concentrated diversity, hot/flat = 1.46):
 ```
 python scripts/predict_region_diffusion.py   --checkpoint <v26-ckpt>   --predict_region config/region_to_predict_small.geojson   --output_dir data/predictions_diffusion/v36h   --ensemble_n 16 --predict_batch_size 2 --num_inference_steps 30   --m_sample_diverse --m_sample_min 0.05 --m_sample_max 1.2   --residual_scale_pos 4.0 --residual_scale_neg 0.35   --residual_mask_threshold 0.04 --residual_mask_softness 0.015   --residual_mask_mode gate   --cond_perturb_std 0.0
 ```
@@ -131,23 +113,6 @@ Performance note: predict_region_diffusion.py now calls
 intermediate GPU tensors. Without that, MPS memory accumulates across
 batches and the predict run slows from ~40 min to 2-3 h.
 
-## Model & checkpoint
-
-- Checkpoint: `spatio-temporal-diffusion/8i4lbs9l/checkpoints/dhm-diffusion-epoch99-valloss0.8204.ckpt`
-- Stopping epoch: 99 (global step 1600)
-- Architecture: `ConditionalDiffusionUNet` (`diffusers.UNet2DModel`)
-  - sample_size = 64
-  - base_channels = 128
-  - channel_mults = [1, 2, 2, 4]
-  - attention_head_dim = 64, attention_at_low_two = True
-  - layers_per_block = 2
-  - cond_channels = 56 (3 timesteps × 11 dyn + 7 static + locenc + 1 hm_t)
-  - parameter count = **74.5 M**
-- Diffusion: `DDPMScheduler(prediction_type="v_prediction", beta_schedule="squaredcos_cap_v2")`
-  - num_train_timesteps = 1000
-  - inference sampler: DDIM at 12 steps
-- LocationEncoder: `('sphericalharmonics', 'siren')`, out_channels=8
-- Optimizer: `AdamW(lr=0.0001, weight_decay=0.01)`
 
 ## Results
 
@@ -203,23 +168,13 @@ WassDiff (IEEE TGRS 2025), ExtremeCast (AAAI 2024), and the Aich et al. (GMD
 | +0.200 |      1,880 |        572 | 0.089 | 0.073 | 0.708 | 0.441 |
 | +0.400 |        134 |         16 | 0.097 | 0.095 | 0.188 | 0.127 |
 
-![Q-Q max-of-field](../outputs/diffusion_v1/qq_max_of_field.png)
-![Q-Q mean-of-field](../outputs/diffusion_v1/qq_mean_of_field.png)
+![Q-Q max-of-field](../outputs/diffusion_v36i/qq_max_of_field.png)
+![Q-Q mean-of-field](../outputs/diffusion_v36i/qq_mean_of_field.png)
 
 ## Figures
 
-- Map comparison: ![](../outputs/diffusion_v1/map_comparison.png)
-- Tile-level summaries: ![](../outputs/diffusion_v1/tile_metrics.png)
-
-
-## Random samples vs. observed change
-
-5 randomly-drawn validation chips (rows). Column 1 = observed Δhm
-(2020 − 2000); columns 2–6 = independent draws from the trained diffusion
-model's conditional posterior. Sample variability captures the model's
-uncertainty about *where* and *how much* change occurs.
-
-![](../outputs/diffusion_v1/samples_vs_observed.png)
+- Map comparison: ![](../outputs/diffusion_v36i/map_comparison.png)
+- Tile-level summaries: ![](../outputs/diffusion_v36i/tile_metrics.png)
 
 ## Caveats / Notes
 
