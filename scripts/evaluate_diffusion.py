@@ -664,7 +664,8 @@ Pixel-precise magnitude matching is *not* a goal.
 | v36c | 0.426 | 0.125 | 0.544 | 0.709 | 0.0065 | 0.770 | 0.529 | v26 ckpt + inference levers — balanced |
 | v36d | 0.528 | 0.203 | 0.534 | 0.686 | 0.0074 | 0.741 | 0.577 | aggressive levers — tail-focused |
 | v36e | 0.464 | 0.158 | 0.543 | 0.704 | 0.0066 | 0.756 | 0.552 | sweet-spot levers — bulk-balanced |
-| **v36f** | **0.529** | **0.194** | **0.546** | **0.707** | **0.0069** | **0.774** | **0.542** | **+ μ-masked residual (smooth backgrounds) — new operational best** |
+| v36f | 0.529 | 0.194 | 0.546 | 0.707 | 0.0069 | 0.774 | 0.542 | + μ-masked residual (scale mode) |
+| **v36h** | **0.524** | **0.196** | **0.547** | **0.699** | **0.0070** | **0.712** | **0.567** | **+ μ-mask GATE mode — cleanest backgrounds (hot/flat 1.46)** |
 
 v13 was the architectural breakthrough (CorrDiff residual). v26 was
 the previous best trained model. The v36 family changed the game by
@@ -682,8 +683,31 @@ inference levers.
 All three production recipes use the **same v26 checkpoint** with
 different inference-time lever combinations. No retraining.
 
-**v36f — μ-masked, recommended** (smooth backgrounds + diverse
-hotspots — the user-asked-for behaviour):
+**v36h — μ-mask GATE mode, recommended** (cleanest backgrounds, most
+concentrated diversity, hot/flat = 1.46):
+```
+python scripts/predict_region_diffusion.py \
+  --checkpoint <v26-ckpt> \
+  --predict_region config/region_to_predict_small.geojson \
+  --output_dir data/predictions_diffusion/v36h \
+  --ensemble_n 16 --predict_batch_size 2 --num_inference_steps 30 \
+  --m_sample_diverse --m_sample_min 0.05 --m_sample_max 1.2 \
+  --residual_scale_pos 4.0 --residual_scale_neg 0.35 \
+  --residual_mask_threshold 0.04 --residual_mask_softness 0.015 \
+  --residual_mask_mode gate \
+  --cond_perturb_std 0.0
+```
+
+GATE mode multiplies the residual by `weight * scale` at every pixel
+(rather than `1 + (scale-1) * weight`). At flat pixels where |μ| <
+threshold, weight ≈ 0 so the residual goes to ≈ 0 and `sample = μ`
+exactly — truly smooth, near-zero backgrounds. Hotspots get the full
+scaling. Trade-off: q025-q975 envelope is too narrow at flat pixels
+to bracket the small non-zero obs values there → coverage_rate drops
+from 0.774 (v36f) to 0.712. Use this when visual cleanness matters
+more than calibration; use v36f when calibration matters more.
+
+**v36f — μ-masked scale mode** (mid-ground, calibrated):
 ```
 python scripts/predict_region_diffusion.py \
   --checkpoint <v26-ckpt> \
@@ -692,16 +716,13 @@ python scripts/predict_region_diffusion.py \
   --ensemble_n 16 --predict_batch_size 2 --num_inference_steps 30 \
   --m_sample_diverse --m_sample_min 0.05 --m_sample_max 1.2 \
   --residual_scale_pos 4.0 --residual_scale_neg 0.35 \
-  --residual_mask_threshold 0.03 --residual_mask_softness 0.02 \
-  --cond_perturb_std 0.0
+  --residual_mask_threshold 0.03 --residual_mask_softness 0.02
 ```
 
-The μ-mask gates the residual scaling by |μ|: at flat pixels where
-the mean head predicts ≈ 0, the residual is multiplied by ≈ 1
-(sample ≈ μ, smooth background); at hotspots where |μ| > threshold,
-the full pos/neg scale kicks in. Result: hot/flat std ratio rises to
-1.40 (v36e: 1.36, v26: 0.99) — diversity concentrates exactly where
-it should.
+Same structure as v36h but in "scale" mode: at flat pixels the
+residual is multiplied by ≈ 1 (kept as the trained baseline residual),
+so sample ≈ μ + tiny residual. Backgrounds have a faint 0.024 RMS
+grain; in return coverage_rate stays at 0.774 (best of all recipes).
 
 **v36e — uniform sweet spot** (background grain ok):
 ```

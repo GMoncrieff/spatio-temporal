@@ -896,6 +896,7 @@ class DiffusionLightningModule(pl.LightningModule):
         residual_scale_neg: float = 1.0,
         residual_mask_threshold: float = 0.0,
         residual_mask_softness: float = 0.02,
+        residual_mask_mode: str = "scale",
     ) -> torch.Tensor:
         """Run DDIM sampling. Returns [n_samples, B, 1, H, W].
 
@@ -956,15 +957,21 @@ class DiffusionLightningModule(pl.LightningModule):
                     pos_scale = float(residual_scale_pos)
                     neg_scale = float(residual_scale_neg)
                     if residual_mask_threshold > 0.0:
-                        # Spatial gate by |μ|: pixels with small μ keep
-                        # scale ≈ 1 (smooth backgrounds), pixels with large
-                        # |μ| get the full scale (diverse hotspots).
+                        # Spatial gate by |μ|. Two modes:
+                        # - "scale" (default): pixels with small μ keep scale ≈ 1
+                        #   (residual unscaled, sample = μ + residual_baseline).
+                        # - "gate": pixels with small μ get scale ≈ 0
+                        #   (residual zeroed → sample = μ exactly, truly smooth).
                         softness = max(float(residual_mask_softness), 1e-6)
                         weight = torch.sigmoid(
                             (mu.abs() - float(residual_mask_threshold)) / softness
                         ).unsqueeze(0)                            # [1, B, 1, H, W]
-                        eff_pos = 1.0 + (pos_scale - 1.0) * weight
-                        eff_neg = 1.0 + (neg_scale - 1.0) * weight
+                        if residual_mask_mode == "gate":
+                            eff_pos = pos_scale * weight
+                            eff_neg = neg_scale * weight
+                        else:  # "scale"
+                            eff_pos = 1.0 + (pos_scale - 1.0) * weight
+                            eff_neg = 1.0 + (neg_scale - 1.0) * weight
                         samples = torch.where(samples > 0,
                                               samples * eff_pos,
                                               samples * eff_neg)

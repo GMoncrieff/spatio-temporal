@@ -109,6 +109,12 @@ def parse_args():
                         "0.02-0.05 is a good range for the small region.")
     p.add_argument("--residual_mask_softness", type=float, default=0.02,
                    help="Sigmoid width for the residual mask transition.")
+    p.add_argument("--residual_mask_mode", default="scale",
+                   choices=("scale", "gate"),
+                   help="'scale' (default) — flat pixels keep residual at 1×, "
+                        "so sample = μ + residual_baseline. 'gate' — flat "
+                        "pixels get residual × 0 → sample = μ exactly, "
+                        "truly smooth backgrounds.")
     p.add_argument("--vary_latent_z", action="store_true", default=True,
                    help="When the model has latent_z_dim > 0, sample a fresh z "
                         "for each ensemble member at inference (the v38 lever). "
@@ -416,6 +422,7 @@ def main():
                     residual_scale_neg=args.residual_scale_neg,
                     residual_mask_threshold=args.residual_mask_threshold,
                     residual_mask_softness=args.residual_mask_softness,
+                    residual_mask_mode=args.residual_mask_mode,
                 )  # [1, N*B_real, 1, H, W]
                 samples = samples.view(args.ensemble_n, B_real, 1, samples.shape[-2], samples.shape[-1])
                 cond = base_cond  # keep for cleanup line below
@@ -432,6 +439,7 @@ def main():
                     residual_scale_neg=args.residual_scale_neg,
                     residual_mask_threshold=args.residual_mask_threshold,
                     residual_mask_softness=args.residual_mask_softness,
+                    residual_mask_mode=args.residual_mask_mode,
                 )  # [N, B, 1, H, W] in normalised (and possibly transformed) model space.
             # module.denormalize handles z-score AND inverse target transform (e.g.
             # signed_log1p) so callers always work in raw Δhm units.
