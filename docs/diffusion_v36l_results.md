@@ -131,23 +131,6 @@ Performance note: predict_region_diffusion.py now calls
 intermediate GPU tensors. Without that, MPS memory accumulates across
 batches and the predict run slows from ~40 min to 2-3 h.
 
-## Model & checkpoint
-
-- Checkpoint: `spatio-temporal-diffusion/8i4lbs9l/checkpoints/dhm-diffusion-epoch99-valloss0.8204.ckpt`
-- Stopping epoch: 99 (global step 1600)
-- Architecture: `ConditionalDiffusionUNet` (`diffusers.UNet2DModel`)
-  - sample_size = 64
-  - base_channels = 128
-  - channel_mults = [1, 2, 2, 4]
-  - attention_head_dim = 64, attention_at_low_two = True
-  - layers_per_block = 2
-  - cond_channels = 56 (3 timesteps × 11 dyn + 7 static + locenc + 1 hm_t)
-  - parameter count = **74.5 M**
-- Diffusion: `DDPMScheduler(prediction_type="v_prediction", beta_schedule="squaredcos_cap_v2")`
-  - num_train_timesteps = 1000
-  - inference sampler: DDIM at 12 steps
-- LocationEncoder: `('sphericalharmonics', 'siren')`, out_channels=8
-- Optimizer: `AdamW(lr=0.0001, weight_decay=0.01)`
 
 ## Results
 
@@ -203,23 +186,13 @@ WassDiff (IEEE TGRS 2025), ExtremeCast (AAAI 2024), and the Aich et al. (GMD
 | +0.200 |      1,880 |        553 | 0.087 | 0.072 | 0.703 | 0.427 |
 | +0.400 |        134 |         15 | 0.090 | 0.088 | 0.200 | 0.127 |
 
-![Q-Q max-of-field](../outputs/diffusion_v1/qq_max_of_field.png)
-![Q-Q mean-of-field](../outputs/diffusion_v1/qq_mean_of_field.png)
+![Q-Q max-of-field](../outputs/diffusion_v36l/qq_max_of_field.png)
+![Q-Q mean-of-field](../outputs/diffusion_v36l/qq_mean_of_field.png)
 
 ## Figures
 
-- Map comparison: ![](../outputs/diffusion_v1/map_comparison.png)
-- Tile-level summaries: ![](../outputs/diffusion_v1/tile_metrics.png)
-
-
-## Random samples vs. observed change
-
-5 randomly-drawn validation chips (rows). Column 1 = observed Δhm
-(2020 − 2000); columns 2–6 = independent draws from the trained diffusion
-model's conditional posterior. Sample variability captures the model's
-uncertainty about *where* and *how much* change occurs.
-
-![](../outputs/diffusion_v1/samples_vs_observed.png)
+- Map comparison: ![](../outputs/diffusion_v36l/map_comparison.png)
+- Tile-level summaries: ![](../outputs/diffusion_v36l/tile_metrics.png)
 
 ## Caveats / Notes
 

@@ -897,6 +897,7 @@ class DiffusionLightningModule(pl.LightningModule):
         residual_mask_threshold: float = 0.0,
         residual_mask_softness: float = 0.02,
         residual_mask_mode: str = "scale",
+        mu_zero_below: float = 0.0,
     ) -> torch.Tensor:
         """Run DDIM sampling. Returns [n_samples, B, 1, H, W].
 
@@ -949,6 +950,12 @@ class DiffusionLightningModule(pl.LightningModule):
             if self.use_mean_head and self.mean_head is not None:
                 with torch.no_grad():
                     mu = self.mean_head(conditioning)             # [B, 1, H, W]
+                if mu_zero_below > 0.0:
+                    # Force μ to exactly zero where |μ| < mu_zero_below.
+                    # Backgrounds become true zeros (matches obs's many
+                    # zero-change pixels) instead of small-positive μ values.
+                    mu = torch.where(mu.abs() < float(mu_zero_below),
+                                     torch.zeros_like(mu), mu)
                 if residual_scale_pos != 1.0 or residual_scale_neg != 1.0:
                     # Asymmetric residual scaling. samples here are the per-
                     # sample residuals in model space. Scaling them is a

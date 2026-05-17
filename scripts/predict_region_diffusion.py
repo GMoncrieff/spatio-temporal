@@ -116,6 +116,11 @@ def parse_args():
                         "cond_perturb_std, add to conditioning. Coherent "
                         "enough to translate μ's hotspots in space rather "
                         "than add per-pixel grain. 4-8 typical (for 64-tile).")
+    p.add_argument("--mu_zero_below", type=float, default=0.0,
+                   help="Force μ to exactly 0 where |μ| < this. Backgrounds "
+                        "become true zeros (matches obs's many zero-change "
+                        "pixels) rather than small-positive μ values. "
+                        "0.0 disables; 0.03-0.08 typical.")
     p.add_argument("--residual_mask_mode", default="scale",
                    choices=("scale", "gate"),
                    help="'scale' (default) — flat pixels keep residual at 1×, "
@@ -447,6 +452,7 @@ def main():
                     residual_mask_threshold=args.residual_mask_threshold,
                     residual_mask_softness=args.residual_mask_softness,
                     residual_mask_mode=args.residual_mask_mode,
+                    mu_zero_below=args.mu_zero_below,
                 )  # [1, N*B_real, 1, H, W]
                 samples = samples.view(args.ensemble_n, B_real, 1, samples.shape[-2], samples.shape[-1])
                 cond = base_cond  # keep for cleanup line below
@@ -464,6 +470,7 @@ def main():
                     residual_mask_threshold=args.residual_mask_threshold,
                     residual_mask_softness=args.residual_mask_softness,
                     residual_mask_mode=args.residual_mask_mode,
+                    mu_zero_below=args.mu_zero_below,
                 )  # [N, B, 1, H, W] in normalised (and possibly transformed) model space.
             # module.denormalize handles z-score AND inverse target transform (e.g.
             # signed_log1p) so callers always work in raw Δhm units.
