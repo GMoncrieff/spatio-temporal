@@ -127,6 +127,16 @@ def parse_args():
                         "so sample = μ + residual_baseline. 'gate' — flat "
                         "pixels get residual × 0 → sample = μ exactly, "
                         "truly smooth backgrounds.")
+    p.add_argument("--final_clip_below", type=float, default=0.0,
+                   help="After μ+residual is summed, zero out predictions "
+                        "where |pred| < threshold. Kills pervasive small "
+                        "negatives in obs-flat regions (and small positives). "
+                        "0.0 disables; 0.005-0.015 typical.")
+    p.add_argument("--zero_negatives", action="store_true",
+                   help="Clamp all final predictions >= 0. Obs has only "
+                        "~5%% negative pixels; this kills spurious negative "
+                        "predictions in obs-flat regions and forces Q-Q to "
+                        "stay at or below 1:1 in the negative-quantile half.")
     p.add_argument("--vary_latent_z", action="store_true", default=True,
                    help="When the model has latent_z_dim > 0, sample a fresh z "
                         "for each ensemble member at inference (the v38 lever). "
@@ -453,6 +463,8 @@ def main():
                     residual_mask_softness=args.residual_mask_softness,
                     residual_mask_mode=args.residual_mask_mode,
                     mu_zero_below=args.mu_zero_below,
+                    final_clip_below=args.final_clip_below,
+                    zero_negatives=args.zero_negatives,
                 )  # [1, N*B_real, 1, H, W]
                 samples = samples.view(args.ensemble_n, B_real, 1, samples.shape[-2], samples.shape[-1])
                 cond = base_cond  # keep for cleanup line below
@@ -471,6 +483,8 @@ def main():
                     residual_mask_softness=args.residual_mask_softness,
                     residual_mask_mode=args.residual_mask_mode,
                     mu_zero_below=args.mu_zero_below,
+                    final_clip_below=args.final_clip_below,
+                    zero_negatives=args.zero_negatives,
                 )  # [N, B, 1, H, W] in normalised (and possibly transformed) model space.
             # module.denormalize handles z-score AND inverse target transform (e.g.
             # signed_log1p) so callers always work in raw Δhm units.
@@ -494,6 +508,18 @@ def main():
         q025 = np.quantile(samples_dhm, 0.025, axis=0)[:, 0]
         q975 = np.quantile(samples_dhm, 0.975, axis=0)[:, 0]
         std = samples_dhm.std(axis=0)[:, 0]
+        # Post-aggregation clean-up: in v36hh-style recipes the per-sample
+        # clip can still leave the MEDIAN raster with small drift values
+        # because median(zeros + strong negatives) interpolates to a small
+        # negative. Re-apply the clip and (optionally) zero negatives on
+        # the aggregated rasters.
+        if args.final_clip_below > 0.0:
+            thr = float(args.final_clip_below)
+            for arr in (med, q025, q975):
+                arr[np.abs(arr) < thr] = 0.0
+        if args.zero_negatives:
+            for arr in (med, q025, q975):
+                arr[arr < 0.0] = 0.0
 
         for t_idx, (i, j, hi, wj, li0, lj0, valid_mask, input_invalid) in enumerate(meta):
             stats_per_tile = {

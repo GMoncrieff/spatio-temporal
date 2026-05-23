@@ -898,6 +898,8 @@ class DiffusionLightningModule(pl.LightningModule):
         residual_mask_softness: float = 0.02,
         residual_mask_mode: str = "scale",
         mu_zero_below: float = 0.0,
+        final_clip_below: float = 0.0,
+        zero_negatives: bool = False,
     ) -> torch.Tensor:
         """Run DDIM sampling. Returns [n_samples, B, 1, H, W].
 
@@ -987,6 +989,13 @@ class DiffusionLightningModule(pl.LightningModule):
                                               samples * pos_scale,
                                               samples * neg_scale)
                 samples = samples + mu.unsqueeze(0)               # broadcast over N
+            if final_clip_below > 0.0:
+                thr = float(final_clip_below)
+                samples = torch.where(samples.abs() < thr,
+                                      torch.zeros_like(samples),
+                                      samples)
+            if zero_negatives:
+                samples = torch.clamp(samples, min=0.0)
             return samples
         finally:
             self._restore_from_backup(backup)
