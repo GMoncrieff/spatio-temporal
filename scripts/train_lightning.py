@@ -1397,6 +1397,31 @@ if __name__ == "__main__":
             pass
 
     # -------------------- Large-area prediction to GeoTIFF --------------------
+    # Snapshot everything prediction needs from the training dataset, so the loaders (and
+    # their persistent worker processes) can be released first. At the global extent the
+    # blending accumulators need tens of GB, and two folds run concurrently.
+    _ds_train = train_loader.dataset
+    PREDICT_STATS = {
+        'hm_mean': _ds_train.hm_mean,
+        'hm_std': _ds_train.hm_std,
+        'elev_mean': _ds_train.elev_mean,
+        'elev_std': _ds_train.elev_std,
+        'include_components': bool(getattr(_ds_train, 'include_components', True)),
+        'comp_means': dict(_ds_train.comp_means),
+        'comp_stds': dict(_ds_train.comp_stds),
+        'static_means': list(_ds_train.static_means),
+        'static_stds': list(_ds_train.static_stds),
+    }
+
+    def _release_dataloaders():
+        import gc
+        for name in ('train_loader', 'val_loader', 'test_loader'):
+            obj = globals().pop(name, None)
+            if obj is not None and hasattr(obj, '_iterator'):
+                obj._iterator = None
+            del obj
+        gc.collect()
+
     # Hindcast input windows: every 3-year window whose +5yr target is still observed.
     HINDCAST_WINDOWS = [
         (1990, 1995, 2000),
@@ -1506,29 +1531,40 @@ if __name__ == "__main__":
             horizon_years = list(target_years)
             quantile_names = ['lower', 'central', 'upper']  # Updated to match independent heads terminology
             
-            # Create accumulators for each horizon-quantile combination
+            # Create accumulators for each horizon-quantile combination.
+            # float32 (not float64) and only for horizons that will actually be written:
+            # at the global extent each accumulator is 2.7 GB, and a hindcast window whose
+            # later horizons fall past the last observed year needs none of them.
+            active_horizons = [
+                h for h, y in zip(horizon_names, horizon_years)
+                if args.predict_max_target_year is None or y <= args.predict_max_target_year
+            ]
+            if not active_horizons:
+                print("⚠ No horizons within --predict_max_target_year; skipping this window.")
+                return infer_model
             accum_horizons = {}
-            for h in horizon_names:
+            for h in active_horizons:
                 for q in quantile_names:
                     key = f"{h}_{q}"
-                    accum_horizons[key] = np.zeros((Hwin, Wwin), dtype=np.float64)
-            
-            wsum = np.zeros((Hwin, Wwin), dtype=np.float64)
+                    accum_horizons[key] = np.zeros((Hwin, Wwin), dtype=np.float32)
+
+            wsum = np.zeros((Hwin, Wwin), dtype=np.float32)
             nodata_mask_total = np.zeros((Hwin, Wwin), dtype=bool)
 
-            # Stats and config from training dataset
-            ds_train = train_loader.dataset
-            hm_mean, hm_std = ds_train.hm_mean, ds_train.hm_std
-            elev_mean, elev_std = ds_train.elev_mean, ds_train.elev_std
-            include_components = bool(getattr(ds_train, 'include_components', True))
+            # Stats and config captured from the training dataset before it is released
+            # (see PREDICT_STATS below) — prediction must not keep the dataloaders and
+            # their worker processes alive, since the global accumulators need the RAM.
+            hm_mean, hm_std = PREDICT_STATS['hm_mean'], PREDICT_STATS['hm_std']
+            elev_mean, elev_std = PREDICT_STATS['elev_mean'], PREDICT_STATS['elev_std']
+            include_components = bool(PREDICT_STATS['include_components'])
             static_list_paths = list(static_files if args.static_channels is None else static_files[:int(args.static_channels)])
             t_idxs = [year_to_idx[y] for y in input_years]
-            
-            # CRITICAL: Get per-variable normalization stats (NOT pooled hm_mean/hm_std)
-            comp_means = ds_train.comp_means  # Dict: {var_name: mean}
-            comp_stds = ds_train.comp_stds    # Dict: {var_name: std}
-            static_means = ds_train.static_means  # List: [mean_0, mean_1, ...]
-            static_stds = ds_train.static_stds    # List: [std_0, std_1, ...]
+
+            # CRITICAL: per-variable normalization stats (NOT pooled hm_mean/hm_std)
+            comp_means = PREDICT_STATS['comp_means']  # Dict: {var_name: mean}
+            comp_stds = PREDICT_STATS['comp_stds']    # Dict: {var_name: std}
+            static_means = PREDICT_STATS['static_means']  # List: [mean_0, mean_1, ...]
+            static_stds = PREDICT_STATS['static_stds']    # List: [std_0, std_1, ...]
             # HM_VARS from module (not instance attribute)
             HM_VARS = ["AG", "BU", "EX", "FR", "HI", "NS", "PO", "TI", "gdp", "population"]
 
@@ -1746,6 +1782,8 @@ if __name__ == "__main__":
                         # Channel ordering: [lower_5yr, central_5yr, upper_5yr, lower_10yr, ...]
                         preds_horizons = {}
                         for h_idx, h_name in enumerate(horizon_names):
+                            if h_name not in active_horizons:
+                                continue
                             # Extract 3 quantiles for this horizon
                             pred_lower = batch_preds[tile_idx, 3*h_idx, :hi, :wj].detach().cpu().numpy()
                             pred_central = batch_preds[tile_idx, 3*h_idx+1, :hi, :wj].detach().cpu().numpy()
@@ -1796,7 +1834,7 @@ if __name__ == "__main__":
             print("Blending overlapping tiles for all horizons and quantiles...")
             m = wsum > 0
             out_horizons = {}
-            for h_name in horizon_names:
+            for h_name in active_horizons:
                 for q_name in quantile_names:
                     key = f"{h_name}_{q_name}"
                     out_h = np.full((Hwin, Wwin), np.nan, dtype=np.float32)
@@ -1834,7 +1872,7 @@ if __name__ == "__main__":
 
             out_paths = {}
             for h_name, h_year in zip(horizon_names, horizon_years):
-                if max_year is not None and h_year > max_year:
+                if h_name not in active_horizons:
                     print(f"  · {h_year}: skipped (> --predict_max_target_year {max_year})")
                     continue
                 for q_name in quantile_names:
@@ -1880,6 +1918,7 @@ if __name__ == "__main__":
 
     # Run prediction if requested
     if run_large_area_prediction:
+        _release_dataloaders()
         # Use provided checkpoint, or best from training
         pred_checkpoint = checkpoint_path if checkpoint_path else checkpoint_cb.best_model_path
         if pred_checkpoint and args.predict_all_windows:

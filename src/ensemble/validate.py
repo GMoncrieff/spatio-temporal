@@ -102,7 +102,10 @@ def compute_block_coverage(
         sum_ob = np.zeros((n_bi, n_bj), dtype=np.float64)
         cnt = np.zeros((n_bi, n_bj), dtype=np.int64)
 
-        stripe = max(1, stripe_blocks) * B
+        # Stripe height in rows, capped so the working set stays near 1 GB: at the global
+        # width a 1000 px block would otherwise pull 8000 rows x 40000 cols per read.
+        max_rows = max(B, int(4e8 / max(n_bj * B * 8, 1)) // B * B)
+        stripe = min(max(1, stripe_blocks) * B, max_rows)
         srcs = {
             "lo": rasterio.open(pred_lower_path),
             "hi": rasterio.open(pred_upper_path),
@@ -396,11 +399,16 @@ def compute_class_conditional_coverage(
                 below = -r > s_lo * wl
                 covered = ~(above | below)
 
-                key_arr = np.stack([d_idx, h_idx, b.astype(np.int64)], axis=1)
-                # Group identical keys to avoid a Python loop over every pixel.
-                uniq, inv = np.unique(key_arr, axis=0, return_inverse=True)
-                for u_i, key in enumerate(uniq):
+                # Group identical keys to avoid a Python loop over every pixel. The three
+                # components are packed into one int64 first: np.unique(axis=0) lexsorts a
+                # 2-D array, which is an order of magnitude slower at 40M pixels a block.
+                key_arr = (d_idx.astype(np.int64) * 100000
+                           + h_idx.astype(np.int64) * 10000
+                           + b.astype(np.int64))
+                uniq, inv = np.unique(key_arr, return_inverse=True)
+                for u_i, packed in enumerate(uniq):
                     sel = inv == u_i
+                    key = (int(packed) // 100000, (int(packed) // 10000) % 10, int(packed) % 10000)
                     cell = cells[(horizon, int(key[0]), int(key[1]), int(key[2]))]
                     cell.n += int(sel.sum())
                     cell.covered += int(covered[sel].sum())

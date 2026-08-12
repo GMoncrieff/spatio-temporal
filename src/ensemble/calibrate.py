@@ -226,17 +226,24 @@ def collect_conformal_scores(
                 b = biome[ok]
                 fo = folds[ok]
 
-                keys = np.stack([d_idx, h_idx, b, fo], axis=1)
-                uniq, inv = np.unique(keys, axis=0, return_inverse=True)
+                # Packed scalar key (see the note in validate.compute_class_conditional_coverage):
+                # dhat bin | HM bin | biome | fold.
+                keys = (d_idx.astype(np.int64) * 1_000_000
+                        + h_idx.astype(np.int64) * 100_000
+                        + b * 10
+                        + fo)
+                uniq, inv = np.unique(keys, return_inverse=True)
                 with np.errstate(divide="ignore", invalid="ignore"):
                     e_up = np.where(ok_up, r / np.maximum(wu, MIN_HALF_WIDTH), np.nan)
                     e_lo = np.where(ok_lo, -r / np.maximum(wl, MIN_HALF_WIDTH), np.nan)
                 take_up = (r > 0) & ok_up
                 take_lo = (r <= 0) & ok_lo
-                for u_i, k in enumerate(uniq):
+                for u_i, packed in enumerate(uniq):
                     sel = inv == u_i
-                    key = (horizon, int(k[0]), int(k[1]), int(k[2]))
-                    fold = int(k[3]) or None
+                    packed = int(packed)
+                    key = (horizon, packed // 1_000_000,
+                           (packed // 100_000) % 10, (packed // 10) % 10_000)
+                    fold = (packed % 10) or None
                     su = sel & take_up
                     sl = sel & take_lo
                     store.add(

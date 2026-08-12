@@ -177,7 +177,8 @@ def block_member_stats(zarr_store, horizon_idx, block_size, attrs=None, min_vali
     n_bi, n_bj = H // B, W // B
     sums = np.zeros((M, n_bi, n_bj), dtype=np.float64)
     cnt = np.zeros((n_bi, n_bj), dtype=np.int64)
-    stripe = max(1, stripe_blocks) * B
+    max_rows = max(B, int(4e8 / max(n_bj * B * 8, 1)) // B * B)
+    stripe = min(max(1, stripe_blocks) * B, max_rows)
     for r0 in range(0, n_bi * B, stripe):
         rr = min(stripe, n_bi * B - r0)
         for m in range(M):
@@ -204,7 +205,8 @@ def block_observed(observed_path, reference_profile, block_size, min_valid_frac=
     with rasterio.open(observed_path) as osrc:
         o_t = osrc.transform
         o_off = (int(round((p_t.f - o_t.f) / o_t.e)), int(round((p_t.c - o_t.c) / o_t.a)))
-        stripe = max(1, stripe_blocks) * B
+        max_rows = max(B, int(4e8 / max(n_bj * B * 8, 1)) // B * B)
+        stripe = min(max(1, stripe_blocks) * B, max_rows)
         for r0 in range(0, n_bi * B, stripe):
             rr = min(stripe, n_bi * B - r0)
             ob = osrc.read(1, window=Window(o_off[1], o_off[0] + r0, n_bj * B, rr),

@@ -110,10 +110,13 @@ def raster_paths(args, years):
 # --------------------------------------------------------------------------------------
 # T5 hard gates + ensemble percentile rasters
 # --------------------------------------------------------------------------------------
-def stage_gates(args, store, attrs, years, paths, out_dir, card, block_rows=512):
+def stage_gates(args, store, attrs, years, paths, out_dir, card, block_rows=None):
     """T5.1/T5.2/T5.3 in one streaming pass, which also writes the percentile rasters."""
     print("\n=== T5 · hard gates (median / tails / mask) ===")
     M, nH, H, W = store.shape
+    if block_rows is None:
+        # Every member of a block is held at once; cap the working set near 1.5 GB.
+        block_rows = int(np.clip(1.5e9 / max(M * W * 8, 1), 32, 512))
     tol_median = quantization_error_bound(float(attrs.get("scale", 1 / 32767)))
     # Monte-Carlo tolerance on the tails: with M members the 2.5th percentile sits between
     # order statistics, so its standard error is sqrt(p(1-p)/M) / f(x_p). Approximated with

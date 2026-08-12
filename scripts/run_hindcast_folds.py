@@ -184,6 +184,9 @@ def run_folds(args, folds, windows):
             cmd = build_fold_command(args, fold, windows)
             env = dict(os.environ)
             env["CUDA_VISIBLE_DEVICES"] = gpu
+            # Without this the child's stdout is block-buffered into the log file and the
+            # prediction progress lines only appear when the run is already over.
+            env["PYTHONUNBUFFERED"] = "1"
             log_path = log_dir / f"hindcast_fold{fold}.log"
             fh = open(log_path, "w")
             print(f"[orchestrator] fold {fold} -> GPU {gpu} | log {log_path}")
