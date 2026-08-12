@@ -56,6 +56,20 @@ def wilson_interval(k, n, z: float = 1.96):
     return lo, hi
 
 
+def _stripe_rows(block, n_block_cols, stripe_blocks=8, target_rows=1024, budget_bytes=4e8):
+    """Rows to read per pass: a whole number of blocks, big enough to amortize IO and
+    small enough to stay inside a memory budget.
+
+    Both ends matter at the global grid: with ``block=1`` a naive ``stripe_blocks * block``
+    reads 8 rows at a time (2000+ passes over a 40000-wide raster), while with
+    ``block=1000`` it would pull 8000 x 40000 pixels into memory at once.
+    """
+    B = int(block)
+    max_rows = max(B, int(budget_bytes / max(n_block_cols * B * 8, 1)) // B * B)
+    target = max(int(stripe_blocks) * B, int(target_rows))
+    return max(B, min(max_rows, max(B, target // B * B)))
+
+
 def biome_lut(lookup_csv, max_eco_id: int | None = None):
     """Array mapping ECO_ID -> BIOME_NUM (0 = unknown/ocean), plus the realm equivalent."""
     lut = pd.read_csv(lookup_csv)
@@ -102,10 +116,7 @@ def compute_block_coverage(
         sum_ob = np.zeros((n_bi, n_bj), dtype=np.float64)
         cnt = np.zeros((n_bi, n_bj), dtype=np.int64)
 
-        # Stripe height in rows, capped so the working set stays near 1 GB: at the global
-        # width a 1000 px block would otherwise pull 8000 rows x 40000 cols per read.
-        max_rows = max(B, int(4e8 / max(n_bj * B * 8, 1)) // B * B)
-        stripe = min(max(1, stripe_blocks) * B, max_rows)
+        stripe = _stripe_rows(B, n_bj, stripe_blocks)
         srcs = {
             "lo": rasterio.open(pred_lower_path),
             "hi": rasterio.open(pred_upper_path),
