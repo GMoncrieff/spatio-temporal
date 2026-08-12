@@ -38,6 +38,14 @@ if __name__ == "__main__":
     parser.add_argument("--val_mode", type=str, default="grid", choices=["random", "grid"], help="Sampling mode for validation")
     parser.add_argument("--stride", type=int, default=128, help="Stride for grid sampling (pixels)")
     parser.add_argument(
+        "--val_stride",
+        type=int,
+        default=None,
+        help="Stride for grid-mode val/test sampling (default: --stride). A larger value "
+             "subsamples the held-out geography, which keeps per-epoch validation cheap on "
+             "long runs without changing what is being validated.",
+    )
+    parser.add_argument(
         "--include_components",
         type=lambda x: (str(x).lower() == 'true'),
         nargs='?',
@@ -104,6 +112,95 @@ if __name__ == "__main__":
         default=2040,
         choices=[2020, 2040],
         help="Final prediction year for large-area GeoTIFF output: 2040 (inputs 2010/2015/2020) or 2020 (inputs 1990/1995/2000)",
+    )
+    # --- Hindcast / ensemble extensions (all additive; defaults reproduce today's behavior) ---
+    parser.add_argument(
+        "--predict_input_years",
+        type=str,
+        default=None,
+        help="Comma-separated 3 input years (e.g. '1995,2000,2005'). Overrides the legacy "
+             "--predict_final_year branch. Targets are base+5/10/15/20.",
+    )
+    parser.add_argument(
+        "--predict_all_windows",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?',
+        const=True,
+        default=False,
+        help="Loop prediction over all 4 hindcast input windows in one process/checkpoint load",
+    )
+    parser.add_argument(
+        "--predict_output_prefix",
+        type=str,
+        default=None,
+        help="Prefix prepended to output GeoTIFF filenames (default None = today's exact names)",
+    )
+    parser.add_argument(
+        "--predict_output_dir",
+        type=str,
+        default=None,
+        help="Directory for prediction GeoTIFFs (default: data/predictions)",
+    )
+    parser.add_argument(
+        "--predict_max_target_year",
+        type=int,
+        default=None,
+        help="Skip writing horizons whose target year exceeds this (e.g. 2020 for hindcasts)",
+    )
+    parser.add_argument(
+        "--predict_restrict_mask",
+        type=str,
+        default=None,
+        help="Raster mask; tiles not overlapping --predict_restrict_values are skipped. "
+             "Used to predict only a fold's held-out pixels (exact for those pixels, ~5x cheaper).",
+    )
+    parser.add_argument(
+        "--predict_restrict_values",
+        type=str,
+        default=None,
+        help="Comma-separated values of --predict_restrict_mask to keep",
+    )
+    parser.add_argument(
+        "--fold_mask",
+        type=str,
+        default=None,
+        help="Path to fold_mask_1000.tif; when set with --exclude_fold, replaces split_mask_1000.tif "
+             "for train/val chip selection",
+    )
+    parser.add_argument(
+        "--exclude_fold",
+        type=int,
+        default=None,
+        help="Fold id held out from training (its pixels never enter train or val)",
+    )
+    parser.add_argument(
+        "--val_fold",
+        type=int,
+        default=None,
+        help="Fold id used for validation during fold-CV training (default: (exclude_fold %% k) + 1)",
+    )
+    parser.add_argument(
+        "--n_folds",
+        type=int,
+        default=5,
+        help="Number of folds in --fold_mask (default: 5)",
+    )
+    parser.add_argument(
+        "--norm_stats_json",
+        type=str,
+        default=None,
+        help="JSON sidecar of normalization stats. Loaded if it exists, otherwise written "
+             "after the first dataset build (they are not persisted in the .ckpt).",
+    )
+    parser.add_argument("--wandb_project", type=str, default="spatio-temporal-convlstm")
+    parser.add_argument("--wandb_run_name", type=str, default=None)
+    parser.add_argument("--wandb_group", type=str, default=None)
+    parser.add_argument("--wandb_tags", type=str, default=None, help="Comma-separated W&B tags")
+    parser.add_argument(
+        "--devices",
+        type=str,
+        default="auto",
+        help="Lightning devices spec: 'auto', an int count, or a comma-separated device list",
     )
     parser.add_argument(
         "--use_location_encoder",
@@ -258,7 +355,38 @@ if __name__ == "__main__":
         print(f"WARNING: Split mask not found: {split_mask_file}")
         print("Training without train/val/test separation. Run scripts/create_validity_mask.py to create splits.")
         split_mask_file = None
-    
+
+    # Fold-CV mode: the fold mask replaces the 70/10/10/10 split mask. Fold `exclude_fold`
+    # is held out entirely (never seen in train or val) so its predictions are genuinely
+    # out-of-sample; one other fold serves as the validation set for checkpoint selection.
+    train_split_value, train_exclude = 1, None
+    val_split_value, test_split_value = 2, 3
+    if args.fold_mask is not None and args.exclude_fold is not None:
+        if not os.path.exists(args.fold_mask):
+            raise FileNotFoundError(f"--fold_mask not found: {args.fold_mask}")
+        split_mask_file = args.fold_mask
+        held_out = int(args.exclude_fold)
+        val_fold = int(args.val_fold) if args.val_fold is not None else (held_out % args.n_folds) + 1
+        if val_fold == held_out:
+            raise ValueError("--val_fold must differ from --exclude_fold")
+        train_split_value = None
+        train_exclude = [held_out, val_fold]
+        val_split_value = val_fold
+        test_split_value = val_fold
+        print("=" * 70)
+        print(f"FOLD-CV MODE: holding out fold {held_out} (out-of-sample), "
+              f"validating on fold {val_fold}")
+        print(f"  Training pool: all folds except {train_exclude}")
+        print(f"  Fold mask: {split_mask_file}")
+        print("=" * 70)
+
+    # Normalization-stat sidecar (they are plain attributes, absent from the .ckpt)
+    cached_norm_stats = None
+    if args.norm_stats_json and os.path.exists(args.norm_stats_json):
+        with open(args.norm_stats_json, 'r') as f:
+            cached_norm_stats = json.load(f)
+        print(f"Loaded normalization stats from {args.norm_stats_json}")
+
     # Data
     train_loader = get_dataloader(
         batch_size=args.batch_size,
@@ -275,8 +403,18 @@ if __name__ == "__main__":
         pin_memory=True if args.num_workers > 0 else False,
         persistent_workers=True if args.num_workers > 0 else False,
         split_mask_file=split_mask_file,
-        split_value=1,  # Train split
+        split_value=train_split_value,  # Train split (None in fold-CV mode)
+        exclude_split_values=train_exclude,
+        norm_stats=cached_norm_stats,
     )
+    # Persist the sidecar once so later inference entrypoints skip the raster-sampling cost
+    if args.norm_stats_json and cached_norm_stats is None:
+        cached_norm_stats = train_loader.dataset.norm_stats_dict()
+        Path(args.norm_stats_json).parent.mkdir(parents=True, exist_ok=True)
+        with open(args.norm_stats_json, 'w') as f:
+            json.dump(cached_norm_stats, f, indent=2)
+        print(f"✓ Wrote normalization stats sidecar: {args.norm_stats_json}")
+    val_stride = args.val_stride if args.val_stride is not None else args.stride
     # Validation uses fixed years (1990, 1995, 2000 -> 2005-2020) for consistent metrics
     val_loader = get_dataloader(
         batch_size=args.batch_size,
@@ -284,7 +422,7 @@ if __name__ == "__main__":
         timesteps=3,
         chips_per_epoch=args.val_chips,
         mode=args.val_mode,
-        stride=args.stride,
+        stride=val_stride,
         include_components=args.include_components,
         static_channels=args.static_channels,
         use_temporal_sampling=False,  # Fixed years for validation (Option A)
@@ -292,7 +430,8 @@ if __name__ == "__main__":
         pin_memory=True if args.num_workers > 0 else False,
         persistent_workers=True if args.num_workers > 0 else False,
         split_mask_file=split_mask_file,
-        split_value=2,  # Validation split
+        split_value=val_split_value,  # Validation split
+        norm_stats=cached_norm_stats,
     )
     # Test uses fixed years (1990, 1995, 2000 -> 2005-2020) for final evaluation
     test_loader = get_dataloader(
@@ -301,7 +440,7 @@ if __name__ == "__main__":
         timesteps=3,
         chips_per_epoch=args.val_chips,
         mode=args.val_mode,
-        stride=args.stride,
+        stride=val_stride,
         include_components=args.include_components,
         static_channels=args.static_channels,
         use_temporal_sampling=False,
@@ -309,7 +448,8 @@ if __name__ == "__main__":
         pin_memory=True if args.num_workers > 0 else False,
         persistent_workers=True if args.num_workers > 0 else False,
         split_mask_file=split_mask_file,
-        split_value=3,  # Test split
+        split_value=test_split_value,  # Test split
+        norm_stats=cached_norm_stats,
     )
 
     # Model
@@ -445,13 +585,44 @@ if __name__ == "__main__":
 
     # Wandb logger (optional)
     use_wandb = not args.disable_wandb
-    wandb_logger = False if not use_wandb else WandbLogger(project='spatio-temporal-convlstm', log_model=True)
+    wandb_tags = [t.strip() for t in args.wandb_tags.split(',')] if args.wandb_tags else None
+    wandb_logger = False if not use_wandb else WandbLogger(
+        project=args.wandb_project,
+        name=args.wandb_run_name,
+        group=args.wandb_group,
+        tags=wandb_tags,
+        log_model=True,
+    )
+    if use_wandb:
+        # Record the fold-CV context so hindcast runs are identifiable in the W&B UI
+        try:
+            wandb_logger.experiment.config.update(
+                {
+                    "cli_args": vars(args),
+                    "exclude_fold": args.exclude_fold,
+                    "val_fold": val_split_value if args.exclude_fold is not None else None,
+                    "fold_mask": args.fold_mask,
+                },
+                allow_val_change=True,
+            )
+        except Exception as e:
+            print(f"⚠ Could not log config to W&B: {e}")
+
+    # Devices: 'auto' keeps today's behavior; an explicit spec lets the fold orchestrator
+    # pin one process per GPU.
+    def _parse_devices(spec):
+        if spec is None or spec == "auto":
+            return "auto"
+        if ',' in spec:
+            return [int(x) for x in spec.split(',')]
+        return int(spec)
 
     # Trainer
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
         callbacks=[checkpoint_cb],
         accelerator='auto',
+        devices=_parse_devices(args.devices),
         default_root_dir=os.path.join(os.getcwd(), 'models', 'checkpoints'),
         logger=wandb_logger,
         log_every_n_steps=10,
@@ -1226,10 +1397,19 @@ if __name__ == "__main__":
             pass
 
     # -------------------- Large-area prediction to GeoTIFF --------------------
-    def _predict_region_and_write(best_ckpt_path: str):
+    # Hindcast input windows: every 3-year window whose +5yr target is still observed.
+    HINDCAST_WINDOWS = [
+        (1990, 1995, 2000),
+        (1995, 2000, 2005),
+        (2000, 2005, 2010),
+        (2005, 2010, 2015),
+    ]
+
+    def _predict_region_and_write(best_ckpt_path: str, input_years_override=None,
+                                  output_prefix=None, infer_model=None):
         import time
         start_time = time.time()
-        
+
         print("\n" + "="*70)
         print("LARGE-AREA PREDICTION")
         print("="*70)
@@ -1264,8 +1444,18 @@ if __name__ == "__main__":
         if not geoms:
             print("Empty geometry in region GeoJSON; skipping.")
             return
-        # Configure prediction years from CLI
-        if args.predict_final_year == 2040:
+        # Configure prediction years: explicit window (new) > --predict_input_years > legacy branch
+        window = input_years_override
+        if window is None and args.predict_input_years:
+            window = [int(y.strip()) for y in args.predict_input_years.split(',')]
+        if window is not None:
+            input_years = list(window)
+            if len(input_years) != 3:
+                raise ValueError(f"Prediction window needs exactly 3 input years, got {input_years}")
+            base_year = input_years[-1]
+            target_years = tuple(base_year + h for h in (5, 10, 15, 20))
+            print(f"Input window: {input_years} -> targets {list(target_years)}")
+        elif args.predict_final_year == 2040:
             # Use 2020 as base, predict 2025, 2030, 2035, 2040
             input_years = [2010, 2015, 2020]
             target_years = (2025, 2030, 2035, 2040)
@@ -1354,12 +1544,34 @@ if __name__ == "__main__":
             bbox_transform = ref_transform * Affine.translation(c0, r0)
             bbox_mask = rio_features.geometry_mask([mapping(region_geom)], out_shape=(Hwin, Wwin), transform=bbox_transform, invert=True)
 
-            # Load model for inference
-            print(f"\nLoading model from checkpoint: {best_ckpt_path}")
+            # Load model for inference (reused across windows when caller supplies it)
             device = next(model.parameters()).device
-            infer_model = SpatioTemporalLightningModule.load_from_checkpoint(best_ckpt_path, map_location=device)
-            infer_model.eval()
-            print(f"✓ Model loaded on device: {device}")
+            if device.type == 'cpu' and torch.cuda.is_available():
+                # Lightning may have returned the module to CPU after fit; prediction over a
+                # large region on CPU is orders of magnitude slower.
+                device = torch.device('cuda')
+            if infer_model is None:
+                print(f"\nLoading model from checkpoint: {best_ckpt_path}")
+                infer_model = SpatioTemporalLightningModule.load_from_checkpoint(best_ckpt_path, map_location=device)
+                infer_model.eval()
+                print(f"✓ Model loaded on device: {device}")
+            infer_model = infer_model.to(device)
+
+            # Optional restriction mask: skip tiles that do not overlap the requested values.
+            # Used for fold hindcasts, where only the held-out fold's pixels are consumed.
+            # Every tile overlapping a kept pixel is still processed, so kept pixels get
+            # exactly the same blended value as an unrestricted run.
+            restrict_win = None
+            restrict_values = None
+            if args.predict_restrict_mask:
+                if not args.predict_restrict_values:
+                    raise ValueError("--predict_restrict_mask requires --predict_restrict_values")
+                restrict_values = [int(v) for v in str(args.predict_restrict_values).split(',')]
+                with rasterio.open(args.predict_restrict_mask) as rsrc:
+                    restrict_win = rsrc.read(1, window=Window(c0, r0, Wwin, Hwin))
+                restrict_win = np.isin(restrict_win, restrict_values)
+                print(f"Restriction mask: {args.predict_restrict_mask} values={restrict_values} "
+                      f"({restrict_win.sum():,} of {restrict_win.size:,} px kept)")
             
             def lonlat_grid_for_window(i0: int, j0: int, hi: int, wj: int):
                 rows = np.arange(i0, i0 + hi)
@@ -1407,9 +1619,7 @@ if __name__ == "__main__":
             tiles_with_valid = 0
             last_percent = -1
             tile_start_time = time.time()
-            
-            import torch
-            
+
             # Process tiles in batches
             for batch_start in range(0, len(tile_coords), batch_size):
                 batch_end = min(batch_start + batch_size, len(tile_coords))
@@ -1431,6 +1641,11 @@ if __name__ == "__main__":
                     li1, lj1 = li0 + hi, lj0 + wj
                     submask = bbox_mask[li0:li1, lj0:lj1]
                     if not np.any(submask):
+                        tiles_processed += 1
+                        tiles_skipped += 1
+                        continue
+                    # Cheap pre-read rejection (before any raster IO) for restricted runs
+                    if restrict_win is not None and not restrict_win[li0:li1, lj0:lj1].any():
                         tiles_processed += 1
                         tiles_skipped += 1
                         continue
@@ -1610,14 +1825,21 @@ if __name__ == "__main__":
                 'dtype': 'float32',
                 'compress': 'deflate'
             })
-            out_dir = Path(os.getcwd()) / 'data' / 'predictions'
+            out_dir = Path(args.predict_output_dir) if args.predict_output_dir else (
+                Path(os.getcwd()) / 'data' / 'predictions'
+            )
             out_dir.mkdir(parents=True, exist_ok=True)
-            
+            prefix = output_prefix if output_prefix is not None else (args.predict_output_prefix or "")
+            max_year = args.predict_max_target_year
+
             out_paths = {}
             for h_name, h_year in zip(horizon_names, horizon_years):
+                if max_year is not None and h_year > max_year:
+                    print(f"  · {h_year}: skipped (> --predict_max_target_year {max_year})")
+                    continue
                 for q_name in quantile_names:
                     key = f"{h_name}_{q_name}"
-                    out_path = out_dir / f"prediction_{h_year}_{q_name}_blended.tif"
+                    out_path = out_dir / f"{prefix}prediction_{h_year}_{q_name}_blended.tif"
                     with rasterio.open(out_path, 'w', **out_profile) as dst:
                         dst.write(out_horizons[key], 1)
                     out_paths[key] = out_path
@@ -1633,12 +1855,15 @@ if __name__ == "__main__":
             print(f"  Tiles skipped (no data/outside region): {tiles_skipped:,}")
             print(f"Output dimensions: {Hwin} × {Wwin} pixels")
             print(f"Valid output pixels: {num_valid_pixels:,} ({valid_percent:.1f}%)")
-            print(f"\nOutput files (12 total: 3 quantiles × 4 horizons):")
+            print(f"\nOutput files ({len(out_paths)} written):")
             for h_name, h_year in zip(horizon_names, horizon_years):
+                if not any(f"{h_name}_{q}" in out_paths for q in quantile_names):
+                    continue
                 print(f"  {h_year}:")
                 for q_name in quantile_names:
                     key = f"{h_name}_{q_name}"
-                    print(f"    {q_name}: {out_paths[key]}")
+                    if key in out_paths:
+                        print(f"    {q_name}: {out_paths[key]}")
             print(f"\nTotal time: {int(elapsed_total//60):02d}:{int(elapsed_total%60):02d}")
             print("="*70 + "\n")
 
@@ -1651,11 +1876,27 @@ if __name__ == "__main__":
             for src in stat_srcs:
                 src.close()
 
+            return infer_model
+
     # Run prediction if requested
     if run_large_area_prediction:
         # Use provided checkpoint, or best from training
         pred_checkpoint = checkpoint_path if checkpoint_path else checkpoint_cb.best_model_path
-        if pred_checkpoint:
+        if pred_checkpoint and args.predict_all_windows:
+            # One checkpoint load, all 4 hindcast windows; prefix keeps outputs from colliding
+            # (the same target year is produced by several windows).
+            base_prefix = args.predict_output_prefix or ""
+            cached_model = None
+            for win in HINDCAST_WINDOWS:
+                win_prefix = f"{base_prefix}w{win[-1]}_"
+                print(f"\n{'#'*70}\n# WINDOW {win} -> prefix '{win_prefix}'\n{'#'*70}")
+                cached_model = _predict_region_and_write(
+                    pred_checkpoint,
+                    input_years_override=list(win),
+                    output_prefix=win_prefix,
+                    infer_model=cached_model,
+                )
+        elif pred_checkpoint:
             _predict_region_and_write(pred_checkpoint)
         else:
             print("\n⚠️  No checkpoint available for prediction!")

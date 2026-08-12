@@ -269,6 +269,53 @@ All training runs are logged to: **https://wandb.ai/glennwithtwons/spatio-tempor
 python scripts/train_lightning.py --disable_wandb
 ```
 
+## Spatiotemporal Residual Ensemble
+
+The quantile heads give per-pixel 2.5/97.5% intervals, but nothing in the model makes the
+errors spatially or temporally coherent. When forecasts are aggregated — ecoregion means,
+area above an HM threshold, 2025→2040 change — independent per-pixel noise cancels, so
+propagating pixel intervals into an aggregate badly understates its uncertainty.
+
+`src/ensemble/` adds a **post-hoc statistical layer** that fixes this without retraining:
+the frozen checkpoint's central forecast is preserved exactly (the ensemble median
+reproduces it), and correlated error fields calibrated from the model's own out-of-sample
+hindcast residuals are pushed through the per-pixel quantile marginals via a Gaussian
+copula. See `docs/ensemble_uncertainty_plan.md` for the full design and target metrics.
+
+```bash
+# Phase 1a — ecoregion raster (RESOLVE Ecoregions2017 -> the 1km grid). Runs on CPU,
+# start it alongside the fold retrainings.
+python scripts/prepare_ecoregions.py
+
+# Phase 0 — k=5 spatial folds, then fold-CV hindcast across both GPUs
+python scripts/create_validity_mask.py --folds_only --k 5
+python scripts/run_hindcast_folds.py --stage all --gpus 0,1 \
+    --region config/region_to_predict_large.geojson
+
+# Phase 1 + 1.5 — coverage diagnostics, variograms, class-conditional audit,
+# conformal recalibration decision, leave-one-fold-out coverage table
+python scripts/run_diagnostics.py
+python scripts/apply_recalibration.py --targets both
+
+# Phase 3 — 50-member ensemble on the recalibrated marginals (both GPUs)
+python scripts/generate_ensemble.py --members 50 --gpus 0,1
+
+# Phase 4 — score every target metric into one pass/fail scorecard
+python scripts/validate_ensemble.py --ensemble data/ensemble/hindcast_members.zarr \
+    --null_ensemble data/ensemble/hindcast_members_null.zarr
+```
+
+Every stage logs to W&B (project `spatio-temporal-convlstm`) under a shared run group, so
+fold trainings, diagnostics tables, calibration factors and the final scorecard sit
+together. Validate regionally first (`config/region_to_predict_small.geojson`) — it
+exercises the whole pipeline shape cheaply.
+
+**Ordering constraints** (both because the copula preserves whatever marginals it is
+given): the class-conditional audit must complete before the recalibration decision, and
+that decision must be final before the global ensemble run starts. Tune marginals first
+(Phase 1.5), correlation structure second (Phase 1c/2) — never fix an aggregate-scale miss
+by re-widening the marginals.
+
 ## Data: Human Modification (HM)
 
 We forecast the Human Modification (HM) index, a spatially explicit measure of anthropogenic modification across landscapes.

@@ -1,0 +1,151 @@
+"""Phase 4 tests — aggregation math, rank histograms, scores, and the scorecard logic."""
+
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from src.ensemble.aggregate import (  # noqa: E402
+    aggregate_region_statistic,
+    coverage_from_members,
+    dequantize_block,
+    energy_score,
+    open_ensemble,
+    rank_histogram,
+    rank_histogram_test,
+    sample_pairs,
+    summarize_ensemble,
+    variogram_score,
+)
+from src.ensemble.copula import DEFAULT_SCALE, INT16_SENTINEL, quantize  # noqa: E402
+
+M, H, W = 40, 32, 32
+
+
+def _make_store(tmp_path, values):
+    """values: (M, n_h, H, W) float array -> a quantized zarr store."""
+    import zarr
+
+    path = tmp_path / "ens.zarr"
+    z = zarr.open(str(path), mode="w", shape=values.shape, chunks=(10, 1, 16, 16),
+                  dtype="i2", fill_value=INT16_SENTINEL)
+    z[:] = quantize(values)
+    z.attrs.update({"scale": DEFAULT_SCALE, "offset": 0.0, "sentinel": INT16_SENTINEL})
+    return str(path)
+
+
+def test_summarize_ensemble_percentiles():
+    s = summarize_ensemble(np.linspace(0, 1, 101))
+    assert abs(s["median"] - 0.5) < 1e-9
+    assert abs(s["p2_5"] - 0.025) < 0.01
+    assert abs(s["p97_5"] - 0.975) < 0.01
+    assert s["n"] == 101
+
+
+def test_region_statistic_is_computed_per_member(tmp_path):
+    rng = np.random.default_rng(0)
+    truth = rng.uniform(0.1, 0.9, (M, 1, H, W)).astype(np.float32)
+    store_path = _make_store(tmp_path, truth)
+    store, attrs = open_ensemble(store_path)
+    mask = np.zeros((H, W), dtype=bool)
+    mask[:8, :8] = True
+    got = aggregate_region_statistic(store, mask, 0, attrs=attrs)
+    expected = truth[:, 0, :8, :8].reshape(M, -1).mean(axis=1)
+    assert np.allclose(got, expected, atol=DEFAULT_SCALE * 2)
+
+
+def test_area_above_threshold_statistic(tmp_path):
+    vals = np.zeros((M, 1, H, W), dtype=np.float32)
+    vals[:, 0, :16, :] = 0.5     # exactly half the pixels above 0.1
+    store_path = _make_store(tmp_path, vals)
+    store, attrs = open_ensemble(store_path)
+    mask = np.ones((H, W), dtype=bool)
+    got = aggregate_region_statistic(store, mask, 0, threshold=0.1, attrs=attrs)
+    assert np.allclose(got, 0.5)
+
+
+def test_coverage_from_members_is_a_two_sided_check():
+    members = np.random.default_rng(0).normal(0, 1, (200, 500))
+    obs = np.random.default_rng(1).normal(0, 1, 500)
+    r = coverage_from_members(members, obs)
+    assert 0.90 < r["coverage"] < 0.99
+    assert abs(r["frac_below"] - r["frac_above"]) < 0.05
+
+    biased = coverage_from_members(members, obs + 5)
+    assert biased["coverage"] == 0.0
+    assert biased["frac_above"] == 1.0
+
+
+def test_rank_histogram_is_flat_for_a_calibrated_ensemble():
+    rng = np.random.default_rng(0)
+    members = rng.normal(0, 1, (50, 4000))
+    obs = rng.normal(0, 1, 4000)
+    hist = rank_histogram(members, obs)
+    assert hist.size == 51
+    assert hist.sum() == 4000
+    assert rank_histogram_test(hist)["p_value"] > 0.01
+
+
+def test_rank_histogram_is_u_shaped_when_underdispersed():
+    rng = np.random.default_rng(0)
+    members = rng.normal(0, 0.3, (50, 4000))    # too narrow
+    obs = rng.normal(0, 1, 4000)
+    hist = rank_histogram(members, obs)
+    assert rank_histogram_test(hist)["p_value"] < 0.01
+    edges = hist[0] + hist[-1]
+    middle = hist[20:31].sum()
+    assert edges > middle
+
+
+def test_energy_score_prefers_the_truthful_ensemble():
+    rng = np.random.default_rng(0)
+    y = rng.normal(0, 1, 30)
+    good = rng.normal(0, 1, (60, 30)) * 0.2 + y
+    bad = rng.normal(5, 1, (60, 30))
+    assert energy_score(good, y) < energy_score(bad, y)
+
+
+def test_variogram_score_rewards_correct_spatial_structure():
+    """Same marginals, different correlation: the score must separate them."""
+    rng = np.random.default_rng(0)
+    n = 60
+    base = rng.normal(0, 1, n)
+    truth = base + 0.1 * rng.normal(0, 1, n)
+    # Correlated ensemble: members share the smooth structure of the truth.
+    corr = np.stack([base + 0.3 * rng.normal(0, 1, n) for _ in range(50)])
+    # Independent ensemble: identical marginal spread, no shared structure.
+    indep = np.stack([rng.normal(base.mean(), base.std(), n) for _ in range(50)])
+    pairs = sample_pairs(n, 400, rng=rng)
+    assert variogram_score(corr, truth, pairs) < variogram_score(indep, truth, pairs)
+
+
+def test_scorecard_flags_exactly_the_broken_target():
+    """A synthetic run failing one target must produce exactly one failed row."""
+    sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+    from validate_ensemble import Scorecard
+
+    card = Scorecard()
+    card.add("T2.1", "block coverage 10km", 0.951, "0.95 +/- 0.05", True)
+    card.add("T2.2", "ecoregion mean", 0.949, "0.95 +/- 0.05", True)
+    card.add("T2.3", "area>0.1", 0.55, "0.95 +/- 0.05", False, knob="T2_under")
+    card.add("T2.6", "biome (reported)", 0.93, "reported with CI", None)
+    df = card.df()
+    scored = df[df["pass"].notna()]
+    assert len(scored) == 3
+    assert int((~scored["pass"]).sum()) == 1
+    failed = scored[~scored["pass"]].iloc[0]
+    assert "long-range weight" in failed["diagnosis"]
+
+
+def test_dequantize_maps_sentinel_to_nan():
+    q = np.array([[INT16_SENTINEL, 1000]], dtype=np.int16)
+    out = dequantize_block(q, {"scale": DEFAULT_SCALE, "offset": 0.0})
+    assert np.isnan(out[0, 0])
+    assert abs(out[0, 1] - 1000 * DEFAULT_SCALE) < 1e-9
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
