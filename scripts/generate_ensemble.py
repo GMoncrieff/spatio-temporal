@@ -88,34 +88,51 @@ def resolve_paths(args, years):
     return out, used_recal
 
 
-def load_marginals(paths, years):
-    """Compact per-valid-pixel marginal parameters, plus the shared valid mask."""
-    loc, sl, sr = {}, {}, {}
+def load_marginals(paths, years, cache_dir):
+    """Compact per-valid-pixel marginal parameters, memory-mapped for the workers.
+
+    Two passes so no more than one year's three rasters are resident at a time (each is
+    2.7 GB at the global grid), and the compact arrays go to disk rather than being pickled
+    into every worker process.
+    """
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
     valid = None
     profile = None
     for y in years:
         with rasterio.open(paths[y]["central"]) as c:
             cen = c.read(1)
             profile = c.profile.copy()
-        with rasterio.open(paths[y]["lower"]) as s:
-            low = s.read(1)
-        with rasterio.open(paths[y]["upper"]) as s:
-            upp = s.read(1)
-        v = np.isfinite(cen) & np.isfinite(low) & np.isfinite(upp)
+        v = np.isfinite(cen)
+        del cen
+        for q in ("lower", "upper"):
+            with rasterio.open(paths[y][q]) as s:
+                v &= np.isfinite(s.read(1))
         valid = v if valid is None else (valid & v)
-        loc[y], sl[y], sr[y] = cen, low, upp
 
     idx = np.flatnonzero(valid.ravel()).astype(np.int64)
+    np.save(cache_dir / "idx.npy", idx)
+
     compact = {}
     for y in years:
-        cen = loc[y].ravel()[idx].astype(np.float32)
-        low = sl[y].ravel()[idx].astype(np.float32)
-        upp = sr[y].ravel()[idx].astype(np.float32)
-        compact[y] = {
+        with rasterio.open(paths[y]["central"]) as c:
+            cen = c.read(1).ravel()[idx].astype(np.float32)
+        with rasterio.open(paths[y]["lower"]) as s:
+            low = s.read(1).ravel()[idx].astype(np.float32)
+        with rasterio.open(paths[y]["upper"]) as s:
+            upp = s.read(1).ravel()[idx].astype(np.float32)
+        arrays = {
             "loc": cen,
             "scale_left": np.maximum((cen - low) / Z975, 1e-6).astype(np.float32),
             "scale_right": np.maximum((upp - cen) / Z975, 1e-6).astype(np.float32),
         }
+        compact[y] = {}
+        for name, arr in arrays.items():
+            p = cache_dir / f"{y}_{name}.npy"
+            np.save(p, arr)
+            compact[y][name] = str(p)
+        del arrays, cen, low, upp
     return compact, valid, idx, profile
 
 
@@ -179,12 +196,13 @@ def worker(worker_id, gpu, member_ids, cfg):
     device = f"cuda:{gpu}" if (gpu is not None and torch.cuda.is_available()) else "cpu"
 
     compact = cfg["compact"]
-    idx_np = cfg["idx"]
+    idx_np = np.load(cfg["idx"], mmap_mode="r")
     z_store = zarr.open(cfg["out"], mode="r+")
 
-    idx_t = torch.as_tensor(idx_np, device=device)
+    idx_arr = np.asarray(idx_np)
+    idx_t = torch.as_tensor(idx_arr, device=device)
     marg = {
-        y: {k: torch.as_tensor(v, device=device) for k, v in compact[y].items()}
+        y: {k: torch.as_tensor(np.load(v), device=device) for k, v in compact[y].items()}
         for y in years
     }
     scatter = np.full(H * W, INT16_SENTINEL, dtype=np.int16)
@@ -221,7 +239,7 @@ def worker(worker_id, gpu, member_ids, cfg):
             q = torch.clamp(torch.round(vals / cfg["scale"]), INT16_SENTINEL + 1, 32767)
             q = q.to(torch.int16).cpu().numpy()
             scatter[:] = INT16_SENTINEL
-            scatter[idx_np] = q
+            scatter[idx_arr] = q
             z_store[m, hi] = scatter.reshape(H, W)
         print(f"[worker {worker_id} gpu {gpu}] member {m} done in {time.time() - t0:.1f}s", flush=True)
 
@@ -237,7 +255,8 @@ def main(argv=None):
               "for those years. Phase 1.5 must be final before the production run.")
 
     print("Loading marginals ...")
-    compact, valid, idx, profile = load_marginals(paths, years)
+    cache_dir = Path(args.out).parent / (Path(args.out).stem + "_marginals")
+    compact, valid, idx, profile = load_marginals(paths, years, cache_dir)
     H, W = valid.shape
     print(f"  grid {H} x {W}, {idx.size:,} valid pixels ({100 * idx.size / valid.size:.1f}%)")
 
@@ -277,7 +296,7 @@ def main(argv=None):
 
     cfg = {
         "years": years, "horizons": horizons, "shape": (H, W), "compact": compact,
-        "idx": idx, "out": str(out_path), "field_params": fps, "rho": rho,
+        "idx": str(cache_dir / "idx.npy"), "out": str(out_path), "field_params": fps, "rho": rho,
         "seed": args.seed, "scale": DEFAULT_SCALE, "wrap_lon": bool(wrap),
         "independent": bool(args.independent),
     }
