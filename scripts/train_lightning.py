@@ -13,6 +13,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import WandbLogger
 from torch.utils.data import DataLoader
 from src.models.lightning_module import SpatioTemporalLightningModule
+from src.models.change_weights import N_CONTEXT_CHANNELS
 from torchgeo_dataloader import get_dataloader, hm_files, component_files, static_files, years
 
 # Geospatial imports for inference
@@ -202,6 +203,31 @@ if __name__ == "__main__":
         default="auto",
         help="Lightning devices spec: 'auto', an int count, or a comma-separated device list",
     )
+    # --- Quantile-head retraining (the T8/T6 root-cause fix) ---
+    parser.add_argument(
+        "--split_mask", type=str, default=None,
+        help="Override the split mask (e.g. a region-restricted one for development)",
+    )
+    parser.add_argument(
+        "--quantile_context",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=False,
+        help="Feed multi-scale past-change occupancy to the quantile heads. The trunk's "
+             "receptive field is ~10px and cannot see whether change occurred 30-100px "
+             "away, which is what decides whether change is possible at all.",
+    )
+    parser.add_argument(
+        "--quantile_class_weighting", type=str, default="none",
+        choices=["none", "distance"],
+        help="Balance the distance-to-past-change bands in the pinball loss (default: none)",
+    )
+    parser.add_argument(
+        "--freeze_trunk",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=False,
+        help="Train the quantile heads only; the trunk and central heads keep the frozen "
+             "checkpoint's weights exactly, so the central forecast cannot change.",
+    )
     parser.add_argument(
         "--use_location_encoder",
         type=lambda x: (str(x).lower() == 'true'),
@@ -350,7 +376,7 @@ if __name__ == "__main__":
     pl.seed_everything(args.seed, workers=True)
     
     # Split mask file
-    split_mask_file = "data/raw/hm_global/split_mask_1000.tif"
+    split_mask_file = args.split_mask or "data/raw/hm_global/split_mask_1000.tif"
     if not os.path.exists(split_mask_file):
         print(f"WARNING: Split mask not found: {split_mask_file}")
         print("Training without train/val/test separation. Run scripts/create_validity_mask.py to create splits.")
@@ -462,8 +488,39 @@ if __name__ == "__main__":
         print("\n" + "="*70)
         print(f"Loading model from checkpoint: {checkpoint_path}")
         print("="*70)
-        model = SpatioTemporalLightningModule.load_from_checkpoint(checkpoint_path)
-        print(f"✓ Checkpoint loaded successfully!")
+        overrides = dict(
+            quantile_context_channels=(N_CONTEXT_CHANNELS if args.quantile_context else 0),
+            quantile_class_weighting=args.quantile_class_weighting,
+            freeze_trunk=args.freeze_trunk,
+        )
+        if args.quantile_context:
+            # The quantile heads gain input channels, so their first conv no longer matches
+            # the checkpoint. Warm-start it: the trained weights are copied into the
+            # original channels and the new context channels start at zero, so the model
+            # initially reproduces the checkpoint exactly and then learns what the context
+            # adds. Random re-initialisation would throw away a trained head for nothing.
+            ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+            hp = dict(ckpt.get('hyper_parameters', {}))
+            hp.update(overrides)
+            model = SpatioTemporalLightningModule(**hp)
+            sd = dict(ckpt['state_dict'])
+            msd = model.state_dict()
+            grown = []
+            for k, v in list(sd.items()):
+                if k in msd and msd[k].shape != v.shape and v.dim() == 4:
+                    new_w = torch.zeros_like(msd[k])
+                    new_w[:, :v.shape[1]] = v
+                    sd[k] = new_w
+                    grown.append(k)
+            missing, unexpected = model.load_state_dict(sd, strict=False)
+            print(f"✓ Checkpoint loaded with {len(grown)} warm-started quantile-head convs")
+            if missing:
+                print(f"  (randomly initialised: {len(missing)} tensors)")
+            print("  Trunk and central heads keep the checkpoint's weights exactly.")
+        else:
+            model = SpatioTemporalLightningModule.load_from_checkpoint(
+                checkpoint_path, strict=not args.freeze_trunk, **overrides)
+            print(f"✓ Checkpoint loaded successfully!")
         print(f"\nModel configuration from checkpoint:")
         for key in ['hidden_dim', 'num_layers', 'kernel_size', 'num_static_channels', 
                     'num_dynamic_channels', 'use_location_encoder', 'locenc_out_channels']:
@@ -486,6 +543,9 @@ if __name__ == "__main__":
             histogram_weight=args.histogram_weight,
             histogram_lambda_w2=args.histogram_lambda_w2,
             histogram_warmup_epochs=args.histogram_warmup_epochs,
+            quantile_context_channels=(N_CONTEXT_CHANNELS if args.quantile_context else 0),
+            quantile_class_weighting=args.quantile_class_weighting,
+            freeze_trunk=args.freeze_trunk,
         )
     
     # Compute histogram bin weights from training data (per horizon)

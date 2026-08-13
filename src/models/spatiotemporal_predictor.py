@@ -35,7 +35,8 @@ class SpatioTemporalPredictor(nn.Module):
                  use_location_encoder: bool = True,
                  locenc_backbone=("sphericalharmonics", "siren"),
                  locenc_hparams=None,
-                 locenc_out_channels: int = 8):
+                 locenc_out_channels: int = 8,
+                 quantile_context_channels: int = 0):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_static_channels = int(num_static_channels)
@@ -66,6 +67,12 @@ class SpatioTemporalPredictor(nn.Module):
         # Central heads: Optimized for accuracy + spatial patterns (MSE, SSIM, Laplacian, Histogram)
         # Quantile heads: Optimized purely for uncertainty estimation (Pinball loss only)
         self.num_horizons = 4
+        # Extra channels handed to the *quantile* heads only. The trunk's receptive field
+        # is ~10 px, so it cannot see whether past change exists 30-100 px away — which is
+        # exactly the covariate that decides whether change is possible at all. Feeding it
+        # to the quantile heads supplies information no amount of retraining could recover
+        # from the trunk features, and leaves the central head's input untouched.
+        self.quantile_context_channels = int(quantile_context_channels)
         
         # Central prediction heads (one per horizon)
         # These produce the "best estimate" optimized for multiple objectives
@@ -82,7 +89,7 @@ class SpatioTemporalPredictor(nn.Module):
         # Smaller networks since quantile estimation is simpler than full prediction
         self.lower_heads = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(hidden_dim, hidden_dim // 2, kernel_size=3, padding=1, bias=True),
+                nn.Conv2d(hidden_dim + self.quantile_context_channels, hidden_dim // 2, kernel_size=3, padding=1, bias=True),
                 nn.ReLU(inplace=True),
                 nn.Conv2d(hidden_dim // 2, 1, kernel_size=1, bias=True),
             )
@@ -92,14 +99,14 @@ class SpatioTemporalPredictor(nn.Module):
         # Upper quantile heads (97.5%, one per horizon)
         self.upper_heads = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(hidden_dim, hidden_dim // 2, kernel_size=3, padding=1, bias=True),
+                nn.Conv2d(hidden_dim + self.quantile_context_channels, hidden_dim // 2, kernel_size=3, padding=1, bias=True),
                 nn.ReLU(inplace=True),
                 nn.Conv2d(hidden_dim // 2, 1, kernel_size=1, bias=True),
             )
             for _ in range(self.num_horizons)
         ])
 
-    def forward(self, input_dynamic, input_static, lonlat=None):
+    def forward(self, input_dynamic, input_static, lonlat=None, quantile_context=None):
         # input_dynamic: [B, T, C_d, H, W]
         # input_static: [B, C_s, H, W]
         # lonlat: [B, H, W, 2]
@@ -122,10 +129,19 @@ class SpatioTemporalPredictor(nn.Module):
         # Generate independent predictions for each horizon
         # Each horizon has 3 separate heads: lower, central, upper
         preds = []
+        q_input = last_hidden
+        if self.quantile_context_channels > 0:
+            if quantile_context is None:
+                q_input = torch.cat(
+                    [last_hidden,
+                     last_hidden.new_zeros(B, self.quantile_context_channels, H, W)], dim=1)
+            else:
+                q_input = torch.cat([last_hidden, quantile_context.to(last_hidden.dtype)], dim=1)
+
         for h_idx in range(self.num_horizons):
-            pred_lower = self.lower_heads[h_idx](last_hidden)    # [B, 1, H, W]
-            pred_central = self.central_heads[h_idx](last_hidden) # [B, 1, H, W]
-            pred_upper = self.upper_heads[h_idx](last_hidden)    # [B, 1, H, W]
+            pred_lower = self.lower_heads[h_idx](q_input)        # [B, 1, H, W]
+            pred_central = self.central_heads[h_idx](last_hidden) # [B, 1, H, W] (unchanged)
+            pred_upper = self.upper_heads[h_idx](q_input)        # [B, 1, H, W]
             
             # Append in order: lower, central, upper for this horizon
             preds.extend([pred_lower, pred_central, pred_upper])

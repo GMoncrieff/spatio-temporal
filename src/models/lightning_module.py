@@ -7,6 +7,12 @@ from .spatiotemporal_predictor import SpatioTemporalPredictor
 from .losses import LaplacianPyramidLoss
 from .histogram_loss import HistogramLoss
 from .pinball_loss import PinballLoss
+from .change_weights import (
+    N_CONTEXT_CHANNELS,
+    class_balanced_weights,
+    past_change_from_inputs,
+    quantile_context,
+)
 import wandb
 import numpy as np
 from matplotlib import cm
@@ -32,6 +38,10 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         histogram_weight: float = 0.67,
         histogram_lambda_w2: float = 0.1,
         histogram_warmup_epochs: int = 20,
+        quantile_class_weighting: str = 'none',
+        quantile_context_channels: int = 0,
+        quantile_weight_change_bins: bool = True,
+        freeze_trunk: bool = False,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -59,12 +69,21 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             locenc_backbone=locenc_backbone,
             locenc_hparams=locenc_hparams,
             locenc_out_channels=locenc_out_channels,
+            quantile_context_channels=quantile_context_channels,
         )
         self.loss_fn = nn.MSELoss(reduction='mean')
         self.mae_fn = nn.L1Loss(reduction='mean')
         # Quantile losses
         self.pinball_lower = PinballLoss(quantile=0.025, reduction='mean')
         self.pinball_upper = PinballLoss(quantile=0.975, reduction='mean')
+        # 'none' reproduces the pooled loss exactly. 'distance' balances the
+        # distance-to-past-change bands, which is what stops the upper head from claiming
+        # a possible large gain in country where change never happens.
+        self.quantile_class_weighting = quantile_class_weighting
+        self.quantile_weight_change_bins = bool(quantile_weight_change_bins)
+        self.freeze_trunk = bool(freeze_trunk)
+        self._quantile_weights = None
+        self.quantile_context_channels = int(quantile_context_channels)
         self.lr = lr
         self.ssim_weight = ssim_weight
         self.laplacian_weight = laplacian_weight
@@ -143,8 +162,11 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         mae = self.mae_fn(pred_central[mask_h], target_h[mask_h])
         
         # Pinball losses for quantiles (INDEPENDENT - only affect quantile heads)
-        pinball_lower = self.pinball_lower(pred_lower, target_h, mask=mask_h)
-        pinball_upper = self.pinball_upper(pred_upper, target_h, mask=mask_h)
+        qw = self._quantile_weights
+        if qw is not None and qw.shape != pred_lower.shape:
+            qw = None
+        pinball_lower = self.pinball_lower(pred_lower, target_h, mask=mask_h, weights=qw)
+        pinball_upper = self.pinball_upper(pred_upper, target_h, mask=mask_h, weights=qw)
         
         # SSIM on absolute images (CENTRAL ONLY - independent from quantiles)
         pred_sanitized = pred_central.clone()
@@ -185,11 +207,36 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             'total': total
         }
 
+
+    def _compute_quantile_weights(self, input_dynamic, target_h, mask):
+        """Per-pixel weights that balance the distance-to-past-change bands.
+
+        Returns None when weighting is off, which reproduces the pooled loss exactly.
+        """
+        if self.quantile_class_weighting in (None, 'none'):
+            return None
+        past = past_change_from_inputs(input_dynamic, hm_std=float(getattr(self, 'hm_std', 1.0)))
+        change = None
+        if self.quantile_weight_change_bins and target_h is not None:
+            last = input_dynamic[:, -1, 0:1]
+            change = (target_h - last) * float(getattr(self, 'hm_std', 1.0))
+        return class_balanced_weights(past, mask, target_change=change)
+
+    def _build_quantile_context(self, input_dynamic):
+        """Multi-scale past-change occupancy for the quantile heads (see change_weights)."""
+        if self.quantile_context_channels <= 0:
+            return None
+        hm_std = float(getattr(self, 'hm_std', 1.0))
+        past = past_change_from_inputs(input_dynamic, hm_std=hm_std)
+        hm_now = input_dynamic[:, -1, 0:1]
+        return quantile_context(past, hm_now=hm_now)
+
     def forward(self, input_dynamic, input_static, lonlat=None):
         # Ensure input_dynamic is [B, T, 1, H, W]
         if input_dynamic.dim() == 4:
             input_dynamic = input_dynamic.unsqueeze(2)
-        return self.model(input_dynamic, input_static, lonlat=lonlat)
+        ctx = self._build_quantile_context(input_dynamic)
+        return self.model(input_dynamic, input_static, lonlat=lonlat, quantile_context=ctx)
 
     def training_step(self, batch, batch_idx):
         # Get optimizer (manual optimization)
@@ -249,6 +296,9 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             pred_central[~mask_h] = float('nan')
             pred_upper[~mask_h] = float('nan')
             
+            # Class weights for the quantile heads (None reproduces the pooled loss)
+            self._quantile_weights = self._compute_quantile_weights(input_dynamic, target_h, mask_h)
+
             # Compute all losses for this horizon
             losses_h = self._compute_horizon_losses(pred_lower, pred_central, pred_upper, target_h, last_input, mask_h, h_name)
             horizon_losses.append(losses_h)
@@ -278,14 +328,23 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         if self.histogram_weight > 0 and self.current_epoch >= self.histogram_warmup_epochs:
             central_loss = central_loss + self.histogram_weight * avg_hist
         
+        self._quantile_weights = None
+
         # Pinball loss: Only affects quantile heads (lower_heads + upper_heads)
         pinball_loss = avg_pinball_lower + avg_pinball_upper
         
         # MANUAL BACKWARD PASS:
         # Step 1: Backprop central loss through all parameters
         opt.zero_grad()
-        self.manual_backward(central_loss, retain_graph=True)
-        
+        if self.freeze_trunk:
+            # Head-only retraining: the central objective is not optimised at all, so the
+            # trunk and the central heads keep the frozen checkpoint's weights exactly and
+            # the published central forecast is unchanged by construction. Only the
+            # quantile heads move.
+            central_loss = central_loss.detach()
+        else:
+            self.manual_backward(central_loss, retain_graph=True)
+
         # Step 2: Backprop pinball loss ONLY through quantile head parameters
         # First, zero out gradients for non-quantile parameters
         quantile_params = set()
@@ -302,6 +361,11 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         
         # Backprop pinball loss (no need to retain graph on second backward)
         self.manual_backward(pinball_loss)
+        if self.freeze_trunk:
+            # Nothing outside the quantile heads may carry a gradient in this mode.
+            for param in self.parameters():
+                if param not in quantile_params:
+                    param.grad = None
         
         # Restore gradients for non-quantile params (so pinball doesn't affect them)
         for name, param in self.named_parameters():
@@ -406,6 +470,11 @@ class SpatioTemporalLightningModule(pl.LightningModule):
                 coverage = within_interval / mask_h.sum().float() * 100.0  # Percentage
                 coverage_stats.append((h_name, coverage))
             
+            # Validation stays *unweighted* whatever the training objective is, so
+            # val_pinball_* and val_coverage_* stay comparable across runs and against
+            # the production checkpoint.
+            self._quantile_weights = None
+
             # Compute all losses for this horizon
             losses_h = self._compute_horizon_losses(pred_lower, pred_central, pred_upper, target_h, last_input, mask_h, h_name)
             horizon_losses.append(losses_h)
