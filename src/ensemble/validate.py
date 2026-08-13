@@ -96,11 +96,21 @@ def compute_block_coverage(
     min_valid_frac: float = 0.5,
     mask_path=None,
     stripe_blocks: int = 8,
+    pred_central_path=None,
 ):
-    """Coverage of block-mean HM at several aggregation scales.
+    """Coverage of block-mean HM at several aggregation scales, two ways.
 
-    A block scores as covered when ``block_mean(observed)`` lies inside
-    ``[block_mean(lower), block_mean(upper)]``. Block size is in pixels (~1 km each).
+    ``kind="mean-of-bounds"`` — the block mean of the published lower/upper rasters. This
+    is *perfectly dependent* propagation: it keeps the full pixel-scale width while the
+    observation's error averages down, so it can only over-cover as blocks grow.
+
+    ``kind="independent"`` — the same pixels propagated as if the per-pixel errors were
+    independent, ``half_width = sqrt(sum(hw_i^2)) / n``. This is the baseline that
+    collapses toward zero coverage at large scales, and the contrast between the two is
+    the motivating figure for the ensemble: the truth is neither, because real errors are
+    spatially correlated but not perfectly so.
+
+    Block size is in pixels (~1 km each).
     """
     rows = []
     with rasterio.open(pred_lower_path) as lo_src:
@@ -114,6 +124,8 @@ def compute_block_coverage(
         sum_lo = np.zeros((n_bi, n_bj), dtype=np.float64)
         sum_hi = np.zeros((n_bi, n_bj), dtype=np.float64)
         sum_ob = np.zeros((n_bi, n_bj), dtype=np.float64)
+        sum_cen = np.zeros((n_bi, n_bj), dtype=np.float64)
+        sum_hw2 = np.zeros((n_bi, n_bj), dtype=np.float64)
         cnt = np.zeros((n_bi, n_bj), dtype=np.int64)
 
         stripe = _stripe_rows(B, n_bj, stripe_blocks)
@@ -122,6 +134,7 @@ def compute_block_coverage(
             "hi": rasterio.open(pred_upper_path),
             "ob": rasterio.open(observed_path),
         }
+        cen_src = rasterio.open(pred_central_path) if pred_central_path else None
         # Observed rasters are global; predictions may be a sub-window.
         ob_t = srcs["ob"].transform
         col_off = int(round((lo_transform.c - ob_t.c) / ob_t.a))
@@ -152,10 +165,15 @@ def compute_block_coverage(
                 sum_lo[b0:b0 + rr // B] += blocksum(lo)
                 sum_hi[b0:b0 + rr // B] += blocksum(hi)
                 sum_ob[b0:b0 + rr // B] += blocksum(ob)
+                cen = 0.5 * (lo + hi) if cen_src is None else cen_src.read(1, window=win).astype(np.float64)
+                sum_cen[b0:b0 + rr // B] += blocksum(cen)
+                sum_hw2[b0:b0 + rr // B] += blocksum((0.5 * (hi - lo)) ** 2)
                 cnt[b0:b0 + rr // B] += valid.reshape(rr // B, B, n_bj, B).sum(axis=(1, 3))
         finally:
             for s in srcs.values():
                 s.close()
+            if cen_src is not None:
+                cen_src.close()
 
         ok = cnt >= max(1, int(min_valid_frac * B * B))
         n = int(ok.sum())
@@ -166,21 +184,30 @@ def compute_block_coverage(
             m_lo = sum_lo[ok] / cnt[ok]
             m_hi = sum_hi[ok] / cnt[ok]
             m_ob = sum_ob[ok] / cnt[ok]
-        covered = (m_ob >= m_lo) & (m_ob <= m_hi)
-        k = int(covered.sum())
-        wlo, whi = wilson_interval(k, n)
-        rows.append({
-            "scale_px": B,
-            "scale_km": B,
-            "n_blocks": n,
-            "n_covered": k,
-            "coverage": k / n,
-            "wilson_lo": float(wlo),
-            "wilson_hi": float(whi),
-            "mean_width": float(np.mean(m_hi - m_lo)),
-            "frac_below_lower": float(np.mean(m_ob < m_lo)),
-            "frac_above_upper": float(np.mean(m_ob > m_hi)),
-        })
+            m_cen = sum_cen[ok] / cnt[ok]
+            # Independent propagation: sd of the block mean of n independent errors.
+            hw_ind = np.sqrt(sum_hw2[ok]) / cnt[ok]
+
+        for kind, lo_b, hi_b in (
+            ("mean-of-bounds", m_lo, m_hi),
+            ("independent", m_cen - hw_ind, m_cen + hw_ind),
+        ):
+            covered = (m_ob >= lo_b) & (m_ob <= hi_b)
+            k = int(covered.sum())
+            wlo, whi = wilson_interval(k, n)
+            rows.append({
+                "scale_px": B,
+                "scale_km": B,
+                "kind": kind,
+                "n_blocks": n,
+                "n_covered": k,
+                "coverage": k / n,
+                "wilson_lo": float(wlo),
+                "wilson_hi": float(whi),
+                "mean_width": float(np.mean(hi_b - lo_b)),
+                "frac_below_lower": float(np.mean(m_ob < lo_b)),
+                "frac_above_upper": float(np.mean(m_ob > hi_b)),
+            })
     return pd.DataFrame(rows)
 
 
@@ -512,16 +539,28 @@ def plot_coverage_heatmap(audit: pd.DataFrame, out_path, target: float = 0.95):
 
 
 def plot_coverage_vs_scale(block_df, out_path, title="Coverage vs aggregation scale"):
+    """One line per (propagation kind, horizon), so the two baselines are contrasted."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(figsize=(7, 4.5))
-    for label, sub in block_df.groupby("label") if "label" in block_df else [("", block_df)]:
+    fig, ax = plt.subplots(figsize=(7.5, 4.8))
+    styles = {"mean-of-bounds": dict(marker="o", ls="-"),
+              "independent": dict(marker="s", ls="--"),
+              "ensemble": dict(marker="^", ls="-")}
+    if "kind" in block_df:
+        groups = block_df.groupby(["kind", "horizon"] if "horizon" in block_df else ["kind"])
+    elif "label" in block_df:
+        groups = block_df.groupby("label")
+    else:
+        groups = [("", block_df)]
+    for key, sub in groups:
+        kind = key[0] if isinstance(key, tuple) else key
+        sub = sub.groupby("scale_km", as_index=False)[["coverage", "wilson_lo", "wilson_hi"]].mean()
         ax.errorbar(
             sub["scale_km"], sub["coverage"],
             yerr=[sub["coverage"] - sub["wilson_lo"], sub["wilson_hi"] - sub["coverage"]],
-            marker="o", capsize=3, label=str(label),
+            capsize=3, label=str(key), **styles.get(str(kind), {"marker": "o"}),
         )
     ax.axhline(0.95, ls="--", c="k", lw=1, label="nominal 0.95")
     ax.set_xscale("log")

@@ -61,14 +61,16 @@ def stage_coverage(args, manifest, out_dir, run):
     for _, row in manifest.iterrows():
         tag = f"w{int(row['base_year'])}_h{int(row['horizon'])}"
         df = val.compute_block_coverage(
-            row["path_lower"], row["path_upper"], row["path_observed"], block_sizes=block_sizes,
+            row["path_lower"], row["path_upper"], row["path_observed"],
+            block_sizes=block_sizes, pred_central_path=row["path_central"],
         )
         df["label"] = tag
         df["horizon"] = int(row["horizon"])
         frames.append(df)
-        print(f"  {tag}: " + ", ".join(
-            f"{int(r.scale_px)}km={r.coverage:.3f}" for r in df.itertuples() if np.isfinite(r.coverage)
-        ))
+        for kind, sub in df.groupby("kind"):
+            print(f"  {tag} [{kind}]: " + ", ".join(
+                f"{int(r.scale_px)}km={r.coverage:.3f}"
+                for r in sub.itertuples() if np.isfinite(r.coverage)))
 
         if Path(args.ecoregion_raster).exists():
             z = val.compute_zonal_coverage(

@@ -61,10 +61,17 @@ def test_block_coverage_collapses_when_errors_are_spatially_correlated():
     hi_p = _write(with_tmp / "hi.tif", upper)
     ob_p = _write(with_tmp / "ob.tif", observed)
     df = compute_block_coverage(lo_p, hi_p, ob_p, block_sizes=(1, 64))
-    px = float(df[df.scale_px == 1]["coverage"].iloc[0])
-    blk = float(df[df.scale_px == 64]["coverage"].iloc[0])
-    assert px > 0.9
-    assert blk <= px, "aggregating correlated errors must not improve coverage"
+
+    def cov(kind, scale):
+        return float(df[(df.kind == kind) & (df.scale_px == scale)]["coverage"].iloc[0])
+
+    # Mean-of-bounds keeps the full pixel width, so it cannot lose coverage with scale.
+    assert cov("mean-of-bounds", 1) > 0.9
+    assert cov("mean-of-bounds", 64) >= cov("mean-of-bounds", 1) - 0.05
+    # Independent propagation shrinks the interval by sqrt(n) while the error is shared
+    # across the whole block, so it collapses — this is the motivating figure.
+    assert cov("independent", 64) < 0.5
+    assert cov("independent", 64) < cov("mean-of-bounds", 64)
     for p in with_tmp.glob("*.tif"):
         p.unlink()
     with_tmp.rmdir()
