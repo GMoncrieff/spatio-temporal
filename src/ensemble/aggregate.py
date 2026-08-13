@@ -300,6 +300,173 @@ def coverage_from_members(member_stats, observed, qs=(2.5, 97.5)):
     }
 
 
+# Thresholds for the change-sign realism target (T6). Negative HM change is real but
+# rare, and large negative change is ~30x rarer than the equivalent increase at +20yr.
+CHANGE_THRESHOLDS = (-0.15, -0.05, -0.01, -0.001, 0.001, 0.01, 0.05, 0.15)
+
+
+def change_distribution(zarr_store, horizon_idx, baseline_hm_path, reference_profile,
+                        attrs=None, thresholds=CHANGE_THRESHOLDS, members=None,
+                        block_rows: int = 512, observed_path=None):
+    """Tail fractions of ``member − HM_t0`` (and of the observation), for T6.
+
+    Scores whether the *members themselves* are plausible, which no coverage target does:
+    an interval can cover perfectly while being made of fields that collapse HM in places
+    the real world never does.
+    """
+    store, at = (zarr_store, attrs) if attrs is not None else open_ensemble(zarr_store)
+    M, _, H, W = store.shape
+    members = list(range(M)) if members is None else list(members)
+    p_t = reference_profile["transform"]
+
+    counts = np.zeros(len(thresholds), dtype=np.int64)
+    obs_counts = np.zeros(len(thresholds), dtype=np.int64)
+    n_tot = 0
+    n_obs = 0
+    quant_sample = []
+    obs_sample = []
+    rng = np.random.default_rng(0)
+
+    with rasterio.open(baseline_hm_path) as bsrc:
+        b_t = bsrc.transform
+        b_off = (int(round((p_t.f - b_t.f) / b_t.e)), int(round((p_t.c - b_t.c) / b_t.a)))
+        osrc = rasterio.open(observed_path) if observed_path else None
+        if osrc is not None:
+            o_t = osrc.transform
+            o_off = (int(round((p_t.f - o_t.f) / o_t.e)), int(round((p_t.c - o_t.c) / o_t.a)))
+        try:
+            for r0 in range(0, H, block_rows):
+                rr = min(block_rows, H - r0)
+                hm0 = bsrc.read(1, window=Window(b_off[1], b_off[0] + r0, W, rr),
+                                boundless=True, fill_value=np.nan).astype(np.float32)
+                hm0 = np.where(hm0 < 0, np.nan, hm0)
+                if not np.isfinite(hm0).any():
+                    continue
+                if osrc is not None:
+                    ob = osrc.read(1, window=Window(o_off[1], o_off[0] + r0, W, rr),
+                                   boundless=True, fill_value=np.nan).astype(np.float32)
+                    ob = np.where(ob < 0, np.nan, ob)
+                    d_ob = ob - hm0
+                    fin = np.isfinite(d_ob)
+                    n_obs += int(fin.sum())
+                    for k, t in enumerate(thresholds):
+                        obs_counts[k] += int((d_ob[fin] < t).sum() if t < 0 else (d_ob[fin] > t).sum())
+                    if fin.any() and len(obs_sample) < 40:
+                        v = d_ob[fin]
+                        obs_sample.append(v[rng.integers(0, v.size, min(v.size, 200_000))])
+                for m in members:
+                    v = dequantize_block(np.asarray(store[m, horizon_idx, r0:r0 + rr]), at)
+                    d = v - hm0
+                    fin = np.isfinite(d)
+                    n_tot += int(fin.sum())
+                    dv = d[fin]
+                    for k, t in enumerate(thresholds):
+                        counts[k] += int((dv < t).sum() if t < 0 else (dv > t).sum())
+                    if len(quant_sample) < 40 and dv.size:
+                        quant_sample.append(dv[rng.integers(0, dv.size, min(dv.size, 200_000))])
+        finally:
+            if osrc is not None:
+                osrc.close()
+
+    out = {"n_member_px": n_tot, "n_observed_px": n_obs,
+           "thresholds": list(thresholds),
+           "member_frac": (counts / max(n_tot, 1)).tolist(),
+           "observed_frac": (obs_counts / max(n_obs, 1)).tolist() if n_obs else None}
+    if quant_sample:
+        s = np.concatenate(quant_sample)
+        out["member_q01"], out["member_q05"] = float(np.quantile(s, 0.01)), float(np.quantile(s, 0.05))
+    if obs_sample:
+        s = np.concatenate(obs_sample)
+        out["observed_q01"], out["observed_q05"] = float(np.quantile(s, 0.01)), float(np.quantile(s, 0.05))
+    return out
+
+
+def interval_score(lower, upper, observed, alpha: float = 0.05):
+    """Winkler interval score; lower is better.
+
+    ``(u−l) + (2/α)(l−y)·1{y<l} + (2/α)(y−u)·1{y>u}``
+
+    A proper scoring rule, and the reason coverage is never scored alone here: widening is
+    only rewarded when it buys back more miscoverage penalty than it costs in width, so an
+    interval cannot win by being enormous.
+    """
+    l = np.asarray(lower, dtype=np.float64)
+    u = np.asarray(upper, dtype=np.float64)
+    y = np.asarray(observed, dtype=np.float64)
+    ok = np.isfinite(l) & np.isfinite(u) & np.isfinite(y)
+    if not ok.any():
+        return {"interval_score": np.nan, "width_term": np.nan, "penalty_term": np.nan, "n": 0}
+    l, u, y = l[ok], u[ok], y[ok]
+    width = u - l
+    penalty = (2.0 / alpha) * (np.maximum(l - y, 0.0) + np.maximum(y - u, 0.0))
+    return {
+        "interval_score": float(np.mean(width + penalty)),
+        "width_term": float(np.mean(width)),
+        "penalty_term": float(np.mean(penalty)),
+        "n": int(ok.sum()),
+    }
+
+
+def interval_score_from_members(member_stats, observed, alpha: float = 0.05, qs=(2.5, 97.5)):
+    m = np.asarray(member_stats, dtype=np.float64)
+    lo = np.nanpercentile(m, qs[0], axis=0)
+    hi = np.nanpercentile(m, qs[1], axis=0)
+    return interval_score(lo, hi, observed, alpha=alpha)
+
+
+def crps_from_members(member_stats, observed):
+    """CRPS estimated from a finite ensemble (fair/unbiased form); lower is better.
+
+    ``CRPS = mean|X_i − y| − 1/(2M(M−1)) * sum_ij |X_i − X_j|``
+    """
+    X = np.asarray(member_stats, dtype=np.float64)
+    y = np.asarray(observed, dtype=np.float64)
+    ok = np.isfinite(y) & np.isfinite(X).all(axis=0)
+    if not ok.any():
+        return np.nan
+    X, y = X[:, ok], y[ok]
+    M = X.shape[0]
+    term1 = np.mean(np.abs(X - y[None, :]), axis=0)
+    Xs = np.sort(X, axis=0)
+    # sum_ij |Xi - Xj| via the sorted-order identity, O(M log M) instead of O(M^2)
+    w = (2 * np.arange(1, M + 1) - M - 1).astype(np.float64)[:, None]
+    pair = 2.0 * (w * Xs).sum(axis=0)
+    term2 = pair / (2.0 * M * max(M - 1, 1))
+    return float(np.mean(term1 - term2))
+
+
+def spread_skill_ratio(member_stats, observed):
+    """Ensemble sd vs RMSE of the ensemble mean (T7.3). 1.0 means correctly dispersed."""
+    X = np.asarray(member_stats, dtype=np.float64)
+    y = np.asarray(observed, dtype=np.float64)
+    ok = np.isfinite(y) & np.isfinite(X).all(axis=0)
+    if ok.sum() < 2:
+        return {"spread": np.nan, "rmse": np.nan, "ratio": np.nan, "n": int(ok.sum())}
+    X, y = X[:, ok], y[ok]
+    M = X.shape[0]
+    spread = float(np.sqrt(np.mean(X.var(axis=0, ddof=1) * (M + 1) / M)))
+    rmse = float(np.sqrt(np.mean((X.mean(axis=0) - y) ** 2)))
+    return {"spread": spread, "rmse": rmse,
+            "ratio": float(spread / rmse) if rmse > 0 else np.nan, "n": int(ok.sum())}
+
+
+def member_diversity(member_fields):
+    """Mean pairwise correlation between members (T7.2); 1.0 means they are identical."""
+    X = np.asarray(member_fields, dtype=np.float64)
+    X = X.reshape(X.shape[0], -1)
+    ok = np.isfinite(X).all(axis=0)
+    X = X[:, ok]
+    if X.shape[1] < 10 or X.shape[0] < 2:
+        return {"mean_pairwise_corr": np.nan, "min": np.nan, "max": np.nan}
+    C = np.corrcoef(X)
+    iu = np.triu_indices_from(C, k=1)
+    v = C[iu]
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return {"mean_pairwise_corr": np.nan, "min": np.nan, "max": np.nan}
+    return {"mean_pairwise_corr": float(v.mean()), "min": float(v.min()), "max": float(v.max())}
+
+
 def rank_histogram(member_stats, observed, n_bins=None):
     """Rank of the observation among the members (M members -> M+1 bins).
 

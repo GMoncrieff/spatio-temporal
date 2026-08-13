@@ -44,6 +44,13 @@ KNOB_TABLE = {
     "T4.2": "Enforce monotone spread across horizons as a constraint on s in Phase 1.5.",
     "T5": "Hard gate: a failure here is a bug in generation, not a calibration issue.",
     "T1.5 sharpness": "Use a finer stratification in Phase 1.5 — NOT a larger global factor.",
+    "T6": "Truncate the marginal's left tail at a physical floor (Phase 3 marginal family) — "
+          "do NOT narrow the marginals globally, that breaks T1.",
+    "T2_width": "The interval is buying coverage with width; tighten the correlation "
+                "structure rather than accepting it because coverage passed.",
+    "T7.2": "Members too alike: nugget fraction too low or field seeds correlated.",
+    "T7.3": "Under-spread at aggregate scale: check the correlation structure before "
+            "widening pixel marginals.",
 }
 
 
@@ -88,7 +95,8 @@ def parse_args(argv=None):
                     help="Used for the T1.5 sharpness guard (width vs the original heads)")
     ap.add_argument("--block_sizes", default="10,100,1000")
     ap.add_argument("--score_points", type=int, default=1500)
-    ap.add_argument("--stages", default="gates,percentiles,aggregate,rank,spatial,temporal")
+    ap.add_argument("--stages",
+                    default="gates,percentiles,aggregate,rank,spatial,temporal,change,visual")
     ap.add_argument("--disable_wandb", action="store_true")
     ap.add_argument("--wandb_group", default=None)
     return ap.parse_args(argv)
@@ -224,20 +232,27 @@ def stage_aggregate(args, store, attrs, years, paths, out_dir, card, null_store=
                 continue
             res = agg.coverage_from_members(mem[:, ok], obs[ok])
             lo, hi_w = val.wilson_interval(res["n_covered"], res["n"])
+            # Coverage and width scored together: an interval cannot win by being huge.
+            isc = agg.interval_score_from_members(mem[:, ok], obs[ok])
+            crps = agg.crps_from_members(mem[:, ok], obs[ok])
             rows.append({"year": year, "scale_km": B, "kind": "ensemble", **res,
-                         "wilson_lo": float(lo), "wilson_hi": float(hi_w)})
+                         "wilson_lo": float(lo), "wilson_hi": float(hi_w),
+                         "interval_score": isc["interval_score"],
+                         "is_width_term": isc["width_term"], "is_penalty_term": isc["penalty_term"],
+                         "crps": crps})
             # Pixelwise-independent-propagation baseline at the same scale: the motivating
             # contrast, and the reason the ensemble exists.
             base = val.compute_block_coverage(paths[year]["lower"], paths[year]["upper"],
-                                              paths[year]["observed"], block_sizes=[B])
-            if not base.empty:
-                rows.append({"year": year, "scale_km": B, "kind": "pixelwise-propagated",
-                             "n": int(base.iloc[0]["n_blocks"]),
-                             "n_covered": int(base.iloc[0]["n_covered"]),
-                             "coverage": float(base.iloc[0]["coverage"]),
-                             "mean_width": float(base.iloc[0]["mean_width"]),
-                             "wilson_lo": float(base.iloc[0]["wilson_lo"]),
-                             "wilson_hi": float(base.iloc[0]["wilson_hi"])})
+                                              paths[year]["observed"], block_sizes=[B],
+                                              pred_central_path=paths[year]["central"])
+            for _, b in base.iterrows():
+                rows.append({"year": year, "scale_km": B, "kind": b.get("kind", "pixelwise"),
+                             "n": int(b["n_blocks"]), "n_covered": int(b["n_covered"]),
+                             "coverage": float(b["coverage"]), "mean_width": float(b["mean_width"]),
+                             "wilson_lo": float(b["wilson_lo"]), "wilson_hi": float(b["wilson_hi"]),
+                             "interval_score": float(b.get("interval_score", np.nan)),
+                             "is_width_term": float(b.get("width_term", np.nan)),
+                             "is_penalty_term": float(b.get("penalty_term", np.nan))})
             print(f"  {year} {B}km: ensemble {res['coverage']:.3f} "
                   f"vs pixelwise {float(base.iloc[0]['coverage']) if not base.empty else np.nan:.3f}")
 
@@ -291,7 +306,23 @@ def stage_aggregate(args, store, attrs, years, paths, out_dir, card, null_store=
     for _, r in block_df[block_df["kind"] == "ensemble"].iterrows():
         ok = abs(r["coverage"] - 0.95) <= 0.05
         card.add("T2.1", f"block coverage {int(r['scale_km'])}km ({r['year']})", r["coverage"],
-                 "0.95 +/- 0.05", ok, knob="T2_under" if r["coverage"] < 0.95 else "T2_over")
+                 "0.95 +/- 0.05", ok, knob="T2_under" if r["coverage"] < 0.95 else "T2_over",
+                 note=f"mean width {r['mean_width']:.4f}")
+        # T2.7/T2.8 — the interval score is the joint coverage-and-width verdict. Coverage
+        # alone can always be bought with width; this is what stops that.
+        peers = block_df[(block_df["year"] == r["year"]) & (block_df["scale_km"] == r["scale_km"])]
+        base_is = peers[peers["kind"] != "ensemble"]["interval_score"].dropna()
+        if np.isfinite(r.get("interval_score", np.nan)) and len(base_is):
+            beats = bool(r["interval_score"] <= base_is.min())
+            card.add("T2.7", f"interval score {int(r['scale_km'])}km ({r['year']})",
+                     r["interval_score"], f"<= best baseline ({base_is.min():.5f})", beats,
+                     note=f"width {r['is_width_term']:.4f} + penalty {r['is_penalty_term']:.4f}",
+                     knob="T2_width")
+        widest = peers[peers["kind"] == "mean-of-bounds"]["mean_width"]
+        if len(widest):
+            card.add("T2.8", f"aggregate width vs mean-of-bounds {int(r['scale_km'])}km ({r['year']})",
+                     r["mean_width"], f"<= {float(widest.iloc[0]):.4f}",
+                     bool(r["mean_width"] <= float(widest.iloc[0])), knob="T2_width")
     for _, r in zonal_df.iterrows():
         if "reported" in str(r["level"]):
             card.add("T2.6", f"{r['level']} {r['stat']} ({r['year']})", r["coverage"],
@@ -505,6 +536,186 @@ def stage_spatial(args, store, attrs, years, paths, out_dir, card, null_store=No
     return member_fit
 
 
+def stage_change(args, store, attrs, years, paths, out_dir, card, n_members: int = 8):
+    """T6 — are the members' *changes* physically plausible, not just well covered?
+
+    Large HM decreases are ~30x rarer than the equivalent increases at +20yr, but the
+    marginal has Gaussian tails on both sides, so widening the lower side to cover the
+    high-change classes mints decreases the real world does not produce.
+    """
+    print("\n=== T6 · change-sign realism ===")
+    base_hm = HM_DIR / f"HM_{args.base_year}_AA_1000.tiff"
+    rows = []
+    for hi, year in enumerate(years):
+        with rasterio.open(paths[year]["central"]) as c:
+            profile = c.profile.copy()
+        d = agg.change_distribution(
+            store, hi, str(base_hm), profile, attrs=attrs,
+            members=range(min(n_members, store.shape[0])),
+            observed_path=str(paths[year]["observed"]),
+        )
+        th = d["thresholds"]
+        mem = dict(zip(th, d["member_frac"]))
+        obs = dict(zip(th, d["observed_frac"])) if d["observed_frac"] else {}
+        rows.append({"year": year, "horizon": year - args.base_year,
+                     **{f"member_{t}": mem.get(t) for t in th},
+                     **{f"observed_{t}": obs.get(t) for t in th},
+                     "member_q01": d.get("member_q01"), "observed_q01": d.get("observed_q01"),
+                     "member_q05": d.get("member_q05"), "observed_q05": d.get("observed_q05")})
+
+        def ratio(t):
+            o = obs.get(t)
+            m = mem.get(t)
+            return (m / o) if (o and o > 0 and m is not None) else np.nan
+
+        print(f"  {year}: P(d<-0.01) mem {mem.get(-0.01):.4f} vs obs {obs.get(-0.01, np.nan):.4f} | "
+              f"P(d<-0.05) {mem.get(-0.05):.5f} vs {obs.get(-0.05, np.nan):.5f} | "
+              f"P(d<-0.15) {mem.get(-0.15):.6f} vs {obs.get(-0.15, np.nan):.6f}")
+
+        r01 = ratio(-0.01)
+        card.add("T6.1", f"P(change < -0.01) vs observed ({year})", r01, "ratio in [0.5, 2.0]",
+                 bool(np.isfinite(r01) and 0.5 <= r01 <= 2.0), knob="T6")
+        r05 = ratio(-0.05)
+        card.add("T6.2", f"P(change < -0.05) vs observed ({year})", r05, "ratio <= 3",
+                 bool(np.isfinite(r05) and r05 <= 3.0 and mem.get(-0.05, 1) <= 0.015), knob="T6")
+        r15 = ratio(-0.15)
+        card.add("T6.3", f"P(change < -0.15) vs observed ({year})", r15, "ratio <= 5",
+                 bool(np.isfinite(r15) and r15 <= 5.0 and mem.get(-0.15, 1) <= 0.002), knob="T6")
+        if obs.get(-0.15, 0) > 0 and mem.get(-0.15, 0) > 0:
+            asym_obs = obs.get(0.15, 0) / obs[-0.15]
+            asym_mem = mem.get(0.15, 0) / mem[-0.15]
+            card.add("T6.4", f"tail asymmetry vs observed ({year})", asym_mem,
+                     f">= {0.5 * asym_obs:.1f} (observed {asym_obs:.1f})",
+                     asym_mem >= 0.5 * asym_obs, knob="T6")
+        for q in ("q01", "q05"):
+            m, o = d.get(f"member_{q}"), d.get(f"observed_{q}")
+            if m is not None and o is not None and o != 0:
+                card.add("T6.5", f"change {q} vs observed ({year})", m / o, "within a factor of 2",
+                         0.5 <= (m / o) <= 2.0, note=f"member {m:.4f}, observed {o:.4f}", knob="T6")
+    pd.DataFrame(rows).to_csv(out_dir / "t6_change_distribution.csv", index=False)
+
+
+def stage_visual(args, store, attrs, years, paths, out_dir, card, run=None, n_members: int = 4):
+    """T7 — look at the members: are they spatially realistic, and are they diverse?"""
+    print("\n=== T7 · member realism and diversity ===")
+    hi = len(years) - 1
+    year = years[hi]
+    base_hm = HM_DIR / f"HM_{args.base_year}_AA_1000.tiff"
+    with rasterio.open(paths[year]["central"]) as c:
+        profile = c.profile.copy()
+        H, W = c.height, c.width
+
+    windows = _pick_windows(paths[year]["observed"], str(base_hm), profile, H, W)
+    figs = []
+    diversity_rows = []
+    for name, (r0, c0, hgt, wid) in windows.items():
+        with rasterio.open(base_hm) as b:
+            b_t = b.transform
+            p_t = profile["transform"]
+            off = (int(round((p_t.f - b_t.f) / b_t.e)), int(round((p_t.c - b_t.c) / b_t.a)))
+            hm0 = b.read(1, window=Window(off[1] + c0, off[0] + r0, wid, hgt)).astype(np.float32)
+        with rasterio.open(paths[year]["observed"]) as o:
+            o_t = o.transform
+            ooff = (int(round((p_t.f - o_t.f) / o_t.e)), int(round((p_t.c - o_t.c) / o_t.a)))
+            obs = o.read(1, window=Window(ooff[1] + c0, ooff[0] + r0, wid, hgt)).astype(np.float32)
+        hm0 = np.where(hm0 < 0, np.nan, hm0)
+        obs = np.where(obs < 0, np.nan, obs)
+        d_obs = obs - hm0
+        mem = np.stack([
+            agg.member_slice(store, attrs, m, hi, window=(r0, r0 + hgt, c0, c0 + wid)) - hm0
+            for m in range(min(n_members, store.shape[0]))
+        ])
+        div = agg.member_diversity(mem)
+        diversity_rows.append({"window": name, **div})
+        figs.append(_plot_members_vs_observed(mem, d_obs, out_dir / f"members_{name}.png", name, year))
+        print(f"  {name}: mean pairwise member correlation {div['mean_pairwise_corr']:.3f}")
+
+    div_df = pd.DataFrame(diversity_rows)
+    div_df.to_csv(out_dir / "t7_diversity.csv", index=False)
+    worst = float(np.nanmax(div_df["mean_pairwise_corr"])) if len(div_df) else np.nan
+    card.add("T7.2", "mean pairwise member correlation", worst, "< 0.98",
+             bool(np.isfinite(worst) and worst < 0.98), knob="T7.2")
+
+    # T7.3 spread-skill at ecoregion scale (aggregate, where the ensemble is meant to work)
+    if Path(args.ecoregion_raster).exists():
+        zm = agg.zonal_member_stats(store, hi, args.ecoregion_raster, attrs=attrs, thresholds=())
+        zo = agg.zonal_observed(paths[year]["observed"], args.ecoregion_raster, profile, thresholds=())
+        common, i_m, i_o = np.intersect1d(zm["zone_ids"], zo["zone_ids"], return_indices=True)
+        ss = agg.spread_skill_ratio(zm["mean"][:, i_m], zo["mean"][i_o])
+        print(f"  spread-skill ratio (ecoregion means): {ss['ratio']:.3f} "
+              f"(spread {ss['spread']:.4f}, rmse {ss['rmse']:.4f})")
+        card.add("T7.3", "spread-skill ratio (ecoregion)", ss["ratio"], "1.0 +/- 0.25",
+                 bool(np.isfinite(ss["ratio"]) and abs(ss["ratio"] - 1.0) <= 0.25), knob="T7.3")
+
+    if run is not None and figs:
+        import wandb
+        run.log({f"members/{Path(f).stem}": wandb.Image(str(f)) for f in figs if f})
+        run.log({"member_diversity": wandb.Table(dataframe=div_df)})
+    card.add("T7.1", "member vs observed change renders", len(figs), "visual inspection", None,
+             note="see W&B images and data/ensemble/validation/members_*.png")
+
+
+def _pick_windows(observed_path, base_hm_path, profile, H, W, size=768):
+    """A high-change window, a quiet window, and a global downsample."""
+    out = {"global": (0, 0, H, W)}
+    rng = np.random.default_rng(0)
+    best, quiet = None, None
+    with rasterio.open(observed_path) as o, rasterio.open(base_hm_path) as b:
+        p_t = profile["transform"]
+        o_t, b_t = o.transform, b.transform
+        o_off = (int(round((p_t.f - o_t.f) / o_t.e)), int(round((p_t.c - o_t.c) / o_t.a)))
+        b_off = (int(round((p_t.f - b_t.f) / b_t.e)), int(round((p_t.c - b_t.c) / b_t.a)))
+        for _ in range(40):
+            r0 = int(rng.integers(0, max(1, H - size)))
+            c0 = int(rng.integers(0, max(1, W - size)))
+            ob = o.read(1, window=Window(o_off[1] + c0, o_off[0] + r0, size, size)).astype(np.float32)
+            hm0 = b.read(1, window=Window(b_off[1] + c0, b_off[0] + r0, size, size)).astype(np.float32)
+            d = np.where((ob >= 0) & (hm0 >= 0), ob - hm0, np.nan)
+            if not np.isfinite(d).any():
+                continue
+            score = float(np.nanmean(np.abs(d)))
+            if best is None or score > best[0]:
+                best = (score, (r0, c0, size, size))
+            if quiet is None or score < quiet[0]:
+                quiet = (score, (r0, c0, size, size))
+    if best:
+        out["high_change"] = best[1]
+    if quiet:
+        out["quiet"] = quiet[1]
+    return out
+
+
+def _plot_members_vs_observed(members, d_obs, path, name, year):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    n = members.shape[0]
+    step = max(1, max(d_obs.shape) // 1200)
+    vmax = float(np.nanpercentile(np.abs(d_obs[::step, ::step]), 99.5)) or 0.05
+    vmax = max(vmax, 0.02)
+    fig, axes = plt.subplots(1, n + 2, figsize=(3.1 * (n + 2), 3.4))
+    axes[0].imshow(d_obs[::step, ::step], cmap="RdBu_r", vmin=-vmax, vmax=vmax, interpolation="nearest")
+    axes[0].set_title(f"observed Δ ({year})", fontsize=9)
+    for i in range(n):
+        axes[i + 1].imshow(members[i][::step, ::step], cmap="RdBu_r", vmin=-vmax, vmax=vmax,
+                           interpolation="nearest")
+        axes[i + 1].set_title(f"member {i} Δ", fontsize=9)
+    sd = np.nanstd(members, axis=0)
+    im = axes[-1].imshow(sd[::step, ::step], cmap="viridis", interpolation="nearest")
+    axes[-1].set_title("ensemble sd", fontsize=9)
+    fig.colorbar(im, ax=axes[-1], fraction=0.046)
+    for ax in axes:
+        ax.axis("off")
+    fig.suptitle(f"{name}: member change fields vs observed (blue = decrease, red = increase)",
+                 fontsize=10)
+    fig.tight_layout()
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+    return path
+
+
 def stage_temporal(args, store, attrs, years, paths, out_dir, card):
     print("\n=== T4 · temporal coherence ===")
     M, nH, H, W = store.shape
@@ -667,6 +878,10 @@ def main(argv=None):
         stage_spatial(args, store, attrs, years, paths, out_dir, card, null_store, null_attrs)
     if "temporal" in stages:
         stage_temporal(args, store, attrs, years, paths, out_dir, card)
+    if "change" in stages:
+        stage_change(args, store, attrs, years, paths, out_dir, card)
+    if "visual" in stages:
+        stage_visual(args, store, attrs, years, paths, out_dir, card, run=run)
 
     df = card.df()
     df.to_csv(out_dir / "scorecard.csv", index=False)

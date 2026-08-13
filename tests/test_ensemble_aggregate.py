@@ -185,5 +185,93 @@ def test_multi_scale_block_stats_match_per_scale_computation(tmp_path):
         assert np.allclose(om[B][0], ref, atol=1e-6, equal_nan=True)
 
 
+
+
+def test_interval_score_penalises_both_width_and_miscoverage():
+    """The joint metric: a huge interval must not beat a well-sized one."""
+    from src.ensemble.aggregate import interval_score
+
+    y = np.linspace(0, 1, 200)
+    tight_right = interval_score(y - 0.05, y + 0.05, y)
+    huge = interval_score(y - 5.0, y + 5.0, y)
+    tight_wrong = interval_score(y + 0.5, y + 0.6, y)
+    assert tight_right["interval_score"] < huge["interval_score"], "width must cost"
+    assert tight_right["interval_score"] < tight_wrong["interval_score"], "misses must cost"
+    assert huge["penalty_term"] == 0.0
+    assert tight_wrong["penalty_term"] > 0.0
+
+
+def test_crps_prefers_the_sharper_calibrated_ensemble():
+    from src.ensemble.aggregate import crps_from_members
+
+    rng = np.random.default_rng(0)
+    y = rng.normal(0, 1, 500)
+    sharp = np.stack([y + rng.normal(0, 0.2, 500) for _ in range(60)])
+    diffuse = np.stack([y + rng.normal(0, 3.0, 500) for _ in range(60)])
+    assert crps_from_members(sharp, y) < crps_from_members(diffuse, y)
+
+
+def test_spread_skill_ratio_detects_under_and_over_dispersion():
+    from src.ensemble.aggregate import spread_skill_ratio
+
+    rng = np.random.default_rng(0)
+    truth = rng.normal(0, 1, 2000)
+    # A correctly dispersed ensemble is centred on a *forecast* that misses the truth by
+    # the same sigma as the member spread — not on the truth itself.
+    forecast = truth + rng.normal(0, 1, 2000)
+    good = np.stack([forecast + rng.normal(0, 1, 2000) for _ in range(80)])
+    under = np.stack([forecast + rng.normal(0, 0.2, 2000) for _ in range(80)])
+    assert abs(spread_skill_ratio(good, truth)["ratio"] - 1.0) < 0.25
+    assert spread_skill_ratio(under, truth)["ratio"] < 0.75
+
+
+def test_member_diversity_flags_duplicate_members():
+    from src.ensemble.aggregate import member_diversity
+
+    rng = np.random.default_rng(0)
+    base = rng.normal(0, 1, (32, 32))
+    identical = np.stack([base] * 5)
+    diverse = np.stack([base + rng.normal(0, 1, (32, 32)) for _ in range(5)])
+    assert member_diversity(identical)["mean_pairwise_corr"] > 0.999
+    assert member_diversity(diverse)["mean_pairwise_corr"] < 0.9
+
+
+def test_change_distribution_sees_an_implausible_negative_tail(tmp_path):
+    """T6's job: catch members that manufacture HM collapses the world does not produce."""
+    import rasterio
+    from rasterio.transform import from_origin
+
+    from src.ensemble.aggregate import change_distribution
+
+    n, size = 12, 64
+    hm0 = np.full((size, size), 0.5, dtype=np.float32)
+    tr = from_origin(-180, 84, 0.009, 0.009)
+    base_p = tmp_path / "hm0.tif"
+    with rasterio.open(base_p, "w", driver="GTiff", height=size, width=size, count=1,
+                       dtype="float32", crs="EPSG:4326", transform=tr, nodata=np.nan) as d:
+        d.write(hm0, 1)
+
+    rng = np.random.default_rng(0)
+    # Members drift symmetrically; reality only ever increases.
+    members = (hm0[None, None] + rng.normal(0, 0.12, (n, 1, size, size))).astype(np.float32)
+    store_path = _make_store(tmp_path, np.clip(members, 0, 1))
+    store, attrs = open_ensemble(store_path)
+
+    obs = np.clip(hm0 + np.abs(rng.normal(0, 0.02, (size, size))), 0, 1).astype(np.float32)
+    obs_p = tmp_path / "obs.tif"
+    with rasterio.open(obs_p, "w", driver="GTiff", height=size, width=size, count=1,
+                       dtype="float32", crs="EPSG:4326", transform=tr, nodata=np.nan) as d:
+        d.write(obs, 1)
+
+    prof = {"height": size, "width": size, "transform": tr}
+    out = change_distribution(store, 0, str(base_p), prof, attrs=attrs, observed_path=str(obs_p))
+    th = out["thresholds"]
+    mem = dict(zip(th, out["member_frac"]))
+    ob = dict(zip(th, out["observed_frac"]))
+    assert mem[-0.15] > 0.05, "the planted symmetric ensemble must show a fat negative tail"
+    assert ob[-0.15] == 0.0, "the observation never decreases"
+    assert out["member_q01"] < out["observed_q01"]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

@@ -88,6 +88,38 @@ The reporting framing is **ecological** (user decision): ecoregion / biome / rea
 
 Polygons are spatially correlated, so effective `n` is below the polygon count and all of the above is optimistic. Mitigate by (a) attaching Wilson intervals at every level rather than bare point estimates, and (b) bootstrapping over ecoregions *within* biome to put an honest band on each biome-level number in T2.6.
 
+### Coverage and width are scored together, never coverage alone
+
+T1.5 guards sharpness at the *pixel* scale, and only on the global mean — which a
+stratified rescale can satisfy while inflating one class threefold, because the classes
+that narrow pay for the classes that widen. Nothing above scores width at the aggregate
+scale at all, so an ensemble could pass every T2 coverage target by being enormously wide.
+These close that hole:
+
+| id | Metric | Target |
+|---|---|---|
+| T1.5b | Per-class width ratio vs the original heads, every cell with `n_eff ≥ 100` | `≤ 2.5` (no class inflated without bound) |
+| T2.7 | **Interval score** (Winkler, α=0.05) of the aggregate interval at each block scale and at ecoregion level | lower than **both** pixelwise baselines |
+| T2.8 | Mean aggregate interval width, reported beside every coverage number | reported; must not exceed the mean-of-bounds baseline |
+| T2.9 | **CRPS** of the ensemble's aggregate distribution vs observed | lower than both baselines |
+
+The interval score `(u−l) + (2/α)(l−y)·1{y<l} + (2/α)(y−u)·1{y>u}` is a proper scoring
+rule: widening is only rewarded when it buys back more miscoverage penalty than it costs
+in width. It is the metric that makes "optimise coverage and width at the same time"
+operational, and it is why T2 coverage alone is never sufficient evidence.
+
+### T7 · Member realism and diversity — owner Phase 4
+
+Coverage and scores are aggregates; they can all pass while individual members look
+nothing like a plausible HM field. Members are therefore inspected directly, both by eye
+and by number.
+
+| id | Metric | Target |
+|---|---|---|
+| T7.1 | Rendered member change fields beside the observed change field, at global and regional extent, logged to W&B | visual: members show the same texture and spatial scale of change as the observation, no tiling, no isotropic blur where the truth is structured |
+| T7.2 | Mean pairwise correlation between member change fields | `< 0.98` — members must actually differ |
+| T7.3 | Spread-skill ratio: ensemble sd vs RMSE of the ensemble mean | `1.0 ± 0.25` (under-spread ensembles score < 1) |
+
 Always report the **pixelwise-independent-propagation baseline** at the same scales as the before/after — the expected baseline is collapse toward 0 coverage, and that contrast *is* the motivating figure for the whole project. Global-extent aggregation is `n=1` per horizon: report it, don't score it. T2.3 and T2.4 matter more than T2.1/T2.2 for the downstream use and are strictly more sensitive to spatial structure than a mean; T2.4 is the hardest case because it depends on getting the *between-horizon* error correlation right, which is exactly the AR(1) coupling's job.
 
 **Optional secondary (not scored, skip if it costs anything):** country-level (Natural Earth admin-0) coverage as a cross-check. The original brief named "country/ecoregion means", the zonal-stats code path is identical to the ecoregion one, and the download is small — so it is close to free once T2.2 works. Explicitly not a target metric, and not a reason to delay anything.
@@ -113,6 +145,43 @@ The **independent-pixel ensemble is the honest null** for T3.2/T3.3: same margin
 
 T4.2 is a physical sanity constraint that a per-horizon-independent recalibration can easily violate — worth checking explicitly after Phase 1.5, not just after Phase 2.
 
+### T6 · Change-sign realism — owner Phase 3, verified in Phase 4 (added after the global audit)
+
+The T1/T2 targets score whether the *observation* falls inside the interval. Nothing in
+them scores whether the members themselves are physically plausible, and there is a
+specific way this project can fail that test.
+
+HM decreases are real but rare, and the large decreases are very rare — measured on 300
+random 256×256 windows (5.8M valid px per horizon):
+
+| horizon | P(Δ<−0.01) | P(Δ<−0.05) | P(Δ<−0.15) | P(Δ>+0.15) | tail asymmetry |
+|---|---|---|---|---|---|
+| +5yr | 1.91% | 0.231% | 0.0132% | 0.05% | 3.8× |
+| +10yr | 2.13% | 0.335% | 0.0234% | 0.22% | 9.4× |
+| +15yr | 4.40% | 0.360% | 0.0285% | 0.58% | 20× |
+| +20yr | 4.48% | 0.399% | 0.0309% | 0.93% | **30×** |
+
+The Phase 1.5 audit found that the high-change classes miss almost entirely on the *lower*
+side (66% of misses at h=5 in the Δ̂>0.15 bin fall below the lower bound), so conformal
+recalibration widens σ_left exactly where change is large. The Phase 3 marginal is a
+median-spliced two-piece normal — Gaussian tails on both sides — so an inflated left scale
+mints large negative changes that the real world produces ~30× less often than the
+positive ones. Coverage targets alone would applaud this.
+
+| id | Metric | Target |
+|---|---|---|
+| T6.1 | `P(Δ_member < −0.01)` vs observed, per horizon | ratio in `[0.5, 2.0]` |
+| T6.2 | `P(Δ_member < −0.05)` vs observed | ratio `≤ 3`, and absolute `≤ 1.5%` |
+| T6.3 | `P(Δ_member < −0.15)` — the very rare tail | ratio `≤ 5`, and absolute `≤ 0.2%` |
+| T6.4 | Tail asymmetry `P(Δ>+0.15) / P(Δ<−0.15)` | `≥ 0.5 ×` the observed ratio |
+| T6.5 | 1st and 5th percentile of the member change distribution vs observed | within a factor of 2 |
+
+Δ is always `member − HM_t0` for the member, `observed − HM_t0` for the reference, on
+identical pixels. If T6 fails, the fix is **not** to narrow the marginals globally (that
+breaks T1) — it is to make the lower tail of the marginal respect the physical floor, e.g.
+truncating the left side at a horizon-dependent maximum plausible decrease, which changes
+the marginal family rather than its calibration.
+
 ### T5 · Consistency / regression gates — hard gates, owner Phase 3/4
 
 | id | Metric | Target |
@@ -134,6 +203,10 @@ The marginals and the correlation structure are **orthogonal** controls, and the
 | T4.1 fails | re-estimate AR(1) `ρ_h`; consider `ρ` varying by stratum | |
 | T4.2 fails | enforce monotone spread across horizons as a constraint on `ŝ` in Phase 1.5 | |
 | T1.5 sharpness blows out | use a finer stratification | use a larger global factor |
+| T6 fails (too many large decreases) | truncate the marginal's left tail at a physical floor (Phase 3 marginal family) | narrow the marginals globally — that breaks T1 |
+| T2 coverage passes but T2.7 interval score loses to a baseline | the interval is buying coverage with width; tighten the correlation structure | accept it because coverage passed |
+| T7.2 members nearly identical | nugget fraction too low / field seeds correlated | add width to compensate |
+| T7.3 spread-skill < 1 (under-spread) | marginals too narrow *for the aggregate* — check the correlation structure first | widen pixel marginals before checking T2 |
 
 ---
 
