@@ -145,7 +145,14 @@ def stage_gates(args, store, attrs, years, paths, out_dir, card, block_rows=None
     tiles = [(r0, min(tile_h, H - r0), c0, min(tile_w, W - c0))
              for r0 in range(0, H, tile_h) for c0 in range(0, W, tile_w)]
     print(f"  streaming {M} members on the chunk grid: {len(tiles)} tiles of {tile_h} x {tile_w}")
-    tol_median = quantization_error_bound(float(attrs.get("scale", 1 / 32767)))
+    quant_tol = quantization_error_bound(float(attrs.get("scale", 1 / 32767)))
+    # The copula makes the *distributional* median exactly the central forecast (z=0 maps
+    # to it). The *sample* median of M draws does not sit there: its standard error is
+    # 1.2533/sqrt(M) in z units, which at M=50 is 0.177 sigma — four orders of magnitude
+    # above int16 quantization. Scoring the sample median at quantization tolerance tests
+    # the sample size, not the construction, so the gate uses the MC scale and the exact
+    # fraction is reported alongside as information.
+    med_sigma_z = 1.2533 / np.sqrt(M)
     # Monte-Carlo tolerance on the tails: with M members the 2.5th percentile sits between
     # order statistics, so its standard error is sqrt(p(1-p)/M) / f(x_p). Approximated with
     # a normal density at the 2.5% point.
@@ -166,7 +173,7 @@ def stage_gates(args, store, attrs, years, paths, out_dir, card, block_rows=None
         dsts = {q: rasterio.open(v, "w", **profile) for q, v in outs.items()}
         pct_paths[year] = outs
 
-        n_valid = n_med_ok = n_lo_ok = n_hi_ok = 0
+        n_valid = n_med_ok = n_lo_ok = n_hi_ok = n_med_exact = 0
         n_mask_mismatch = 0
         sum_halfwidth = 0.0
         try:
@@ -201,8 +208,18 @@ def stage_gates(args, store, attrs, years, paths, out_dir, card, block_rows=None
                     dsts["p97_5"].write(p975, 1, window=win)
 
                     n_valid += int(ok.sum())
-                    n_med_ok += int((np.abs(med - cen)[ok] <= tol_median).sum())
                     half = np.maximum(upp - cen, 1e-9)
+                    # The marginal is two-piece: a sample median landing above the central
+                    # forecast is scaled by sigma_right, below it by sigma_left. Using
+                    # their average would mis-size the tolerance wherever the interval is
+                    # strongly asymmetric, which after class-conditional recalibration is
+                    # most of the high-change area.
+                    sig_r = np.maximum((upp - cen) / 1.959964, 1e-9)
+                    sig_l = np.maximum((cen - low) / 1.959964, 1e-9)
+                    sigma_local = np.where(med >= cen, sig_r, sig_l)
+                    tol_med = 3.0 * med_sigma_z * sigma_local + quant_tol
+                    n_med_ok += int((np.abs(med - cen)[ok] <= tol_med[ok]).sum())
+                    n_med_exact += int((np.abs(med - cen)[ok] <= quant_tol).sum())
                     sum_halfwidth += float(half[ok].sum())
                     tol_lo = mc_sigma_z * np.maximum(cen - low, 1e-9) / 1.96 * 3.0
                     tol_hi = mc_sigma_z * half / 1.96 * 3.0
@@ -213,15 +230,21 @@ def stage_gates(args, store, attrs, years, paths, out_dir, card, block_rows=None
                 d.close()
 
         f_med = n_med_ok / max(n_valid, 1)
+        f_med_exact = n_med_exact / max(n_valid, 1)
         f_lo = n_lo_ok / max(n_valid, 1)
         f_hi = n_hi_ok / max(n_valid, 1)
         summary.append({"year": year, "n_valid": n_valid, "frac_median_ok": f_med,
+                        "frac_median_exact": f_med_exact,
                         "frac_p2_5_ok": f_lo, "frac_p97_5_ok": f_hi,
                         "n_mask_mismatch": n_mask_mismatch})
-        print(f"  {year}: median≡central {100*f_med:.3f}% | p2.5 within MC {100*f_lo:.1f}% | "
-              f"p97.5 within MC {100*f_hi:.1f}% | mask mismatches {n_mask_mismatch:,}")
-        card.add("T5.1", f"median==central ({year})", f_med, "1.000 (hard gate)", f_med >= 0.9999,
-                 note=f"tolerance {tol_median:.2e}", knob="T5")
+        print(f"  {year}: median≡central {100*f_med:.3f}% within MC ({100*f_med_exact:.2f}% "
+              f"exact) | p2.5 {100*f_lo:.1f}% | p97.5 {100*f_hi:.1f}% | "
+              f"mask mismatches {n_mask_mismatch:,}")
+        card.add("T5.1", f"median==central ({year})", f_med, ">=0.995 (MC-scaled, hard gate)",
+                 f_med >= 0.995,
+                 note=f"{100*f_med_exact:.2f}% exact to quantization; the distributional "
+                      f"median is exact by construction, the sample median of M={M} is not",
+                 knob="T5")
         card.add("T5.2", f"tails within MC tolerance ({year})", min(f_lo, f_hi), ">=0.95 (MC-scaled)",
                  min(f_lo, f_hi) >= 0.95, note=f"M={M}, mc_sigma_z={mc_sigma_z:.3f}", knob="T5")
         card.add("T5.3", f"valid-mask identity ({year})", n_mask_mismatch, "0 pixels",
