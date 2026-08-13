@@ -200,9 +200,12 @@ def worker(worker_id, gpu, member_ids, cfg):
     z_store = zarr.open(cfg["out"], mode="r+")
 
     idx_arr = np.asarray(idx_np)
-    idx_t = torch.as_tensor(idx_arr, device=device)
-    marg = {
-        y: {k: torch.as_tensor(np.load(v), device=device) for k, v in compact[y].items()}
+    idx_t = torch.as_tensor(idx_arr.copy(), device=device)
+    # Marginals stay pinned on the host and only the horizon in flight is moved to the
+    # GPU: all four years at once is ~9 GB, which does not coexist with the FFT working
+    # set on a 24 GB card.
+    marg_cpu = {
+        y: {k: torch.from_numpy(np.load(v)) for k, v in compact[y].items()}
         for y in years
     }
     scatter = np.full(H * W, INT16_SENTINEL, dtype=np.int16)
@@ -224,7 +227,8 @@ def worker(worker_id, gpu, member_ids, cfg):
                 )
                 eps = field.reshape(-1)[idx_t].clone()
                 del field
-                torch.cuda.empty_cache() if device.startswith("cuda") else None
+                if device.startswith("cuda"):
+                    torch.cuda.empty_cache()
 
             if prev is None:
                 z = eps
@@ -233,11 +237,12 @@ def worker(worker_id, gpu, member_ids, cfg):
                 z = rho * prev + np.sqrt(max(0.0, 1 - rho ** 2)) * eps
             prev = z
 
-            vals = marginal_from_z_torch(
-                z, marg[y]["loc"], marg[y]["scale_left"], marg[y]["scale_right"]
-            )
+            mg = {k: v.to(device, non_blocking=True) for k, v in marg_cpu[y].items()}
+            vals = marginal_from_z_torch(z, mg["loc"], mg["scale_left"], mg["scale_right"])
+            del mg
             q = torch.clamp(torch.round(vals / cfg["scale"]), INT16_SENTINEL + 1, 32767)
             q = q.to(torch.int16).cpu().numpy()
+            del vals
             scatter[:] = INT16_SENTINEL
             scatter[idx_arr] = q
             z_store[m, hi] = scatter.reshape(H, W)

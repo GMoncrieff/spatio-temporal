@@ -107,11 +107,20 @@ def generate_correlated_field(
         gy = _spectrum_1d(Hp, ranges_px, backend, dev, torch.float64)
         gx = _spectrum_1d(Wp, ranges_px, backend, dev, torch.float64)
         half = Wp // 2 + 1
-        S = torch.full((Hp, half), float(nugget), device=dev, dtype=torch.float64)
+        # The spectrum is accumulated in float32 and the transforms are done in place:
+        # at the global grid every full-size temporary is ~1.5-3 GB, and holding one more
+        # than necessary is the difference between fitting on a 24 GB card and not.
+        S = torch.full((Hp, half), float(nugget), device=dev, dtype=torch.float32)
         for w, sy, sx in zip(weights, gy, gx):
-            S += w * torch.outer(sy, sx[:half])
-        S = torch.clamp(S, min=0.0).sqrt().to(torch.float32)
-        field = torch.fft.irfft2(torch.fft.rfft2(noise) * S, s=(Hp, Wp))
+            S.add_(torch.outer(sy, sx[:half]).to(torch.float32), alpha=float(w))
+        del gy, gx
+        S.clamp_(min=0.0).sqrt_()
+        spec = torch.fft.rfft2(noise)
+        del noise
+        spec.mul_(S)
+        del S
+        field = torch.fft.irfft2(spec, s=(Hp, Wp))
+        del spec
         field = field[pad_r:pad_r + H, :W] if Wp == W else field[pad_r:pad_r + H, pad_c:pad_c + W]
         # Circulant embedding gives unit variance analytically; renormalize against the
         # realized sample so the copula sees exactly standard-normal scores.

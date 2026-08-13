@@ -553,6 +553,7 @@ class ScaleFactorTable:
 
     def __init__(self, df: pd.DataFrame):
         self.df = df
+        self._dense_cache = {}
         self._map = {
             (int(r.horizon), int(r.dhat_bin_idx), int(r.hm_bin_idx), int(r.biome)):
                 (float(r.s_up), float(r.s_lo))
@@ -579,32 +580,44 @@ class ScaleFactorTable:
         self.df.to_csv(path, index=False)
         return path
 
+    def _dense(self, horizon, n_d, n_h, n_b):
+        """Dense (d_idx, hm_idx, biome) -> factor arrays, built once per horizon.
+
+        Applying the table means evaluating it at every pixel of a global raster; a Python
+        loop over the ~450 class combinations with a full-array mask each is what made
+        recalibration take minutes per block instead of seconds.
+        """
+        cached = self._dense_cache.get((horizon, n_d, n_h, n_b))
+        if cached is not None:
+            return cached
+        h = int(horizon)
+        fill_up, fill_lo = self._by_h.get(h, (1.0, 1.0))
+        up = np.full((n_d, n_h, n_b), float(fill_up))
+        lo = np.full((n_d, n_h, n_b), float(fill_lo))
+        # Primary stratum first, then the finer cells override where they exist.
+        for (hh, d), (u, l) in self._by_hd.items():
+            if int(hh) == h and 0 <= int(d) < n_d:
+                up[int(d)] = u
+                lo[int(d)] = l
+        for (hh, d, hm, b), (u, l) in self._map.items():
+            if int(hh) == h and 0 <= int(d) < n_d and 0 <= int(hm) < n_h and 0 <= int(b) < n_b:
+                up[int(d), int(hm), int(b)] = u
+                lo[int(d), int(hm), int(b)] = l
+        self._dense_cache[(horizon, n_d, n_h, n_b)] = (up, lo)
+        return up, lo
+
     def lookup(self, horizon, d_idx, h_idx, biome):
         d_idx = np.asarray(d_idx)
         h_idx = np.asarray(h_idx)
         biome = np.asarray(biome)
-        s_up = np.ones(d_idx.shape, dtype=np.float64)
-        s_lo = np.ones(d_idx.shape, dtype=np.float64)
-        keys = np.stack([d_idx.ravel(), h_idx.ravel(), biome.ravel()], axis=1)
-        uniq, inv = np.unique(keys, axis=0, return_inverse=True)
-        up_flat = np.ones(inv.shape)
-        lo_flat = np.ones(inv.shape)
-        for i, k in enumerate(uniq):
-            key = (int(horizon), int(k[0]), int(k[1]), int(k[2]))
-            if key in self._map:
-                u, l = self._map[key]
-            elif (int(horizon), int(k[0])) in self._by_hd:
-                u, l = self._by_hd[(int(horizon), int(k[0]))]
-            elif int(horizon) in self._by_h:
-                u, l = self._by_h[int(horizon)]
-            else:
-                u, l = 1.0, 1.0
-            sel = inv == i
-            up_flat[sel] = u
-            lo_flat[sel] = l
-        s_up = up_flat.reshape(d_idx.shape)
-        s_lo = lo_flat.reshape(d_idx.shape)
-        return s_up, s_lo
+        n_d = max(int(self.df["dhat_bin_idx"].max()) + 1, int(d_idx.max()) + 1, 1)
+        n_h = max(int(self.df["hm_bin_idx"].max()) + 1, int(h_idx.max()) + 1, 1)
+        n_b = max(int(self.df["biome"].max()) + 1, int(biome.max()) + 1, 1)
+        up, lo = self._dense(horizon, n_d, n_h, n_b)
+        di = np.clip(d_idx, 0, n_d - 1)
+        hi = np.clip(h_idx, 0, n_h - 1)
+        bi = np.clip(biome, 0, n_b - 1)
+        return up[di, hi, bi], lo[di, hi, bi]
 
     def as_scale_fn(self):
         """Adapter for ``compute_class_conditional_coverage(scale_factors=...)``."""
