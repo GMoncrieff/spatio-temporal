@@ -273,7 +273,11 @@ def stage_aggregate(args, store, attrs, years, paths, out_dir, card, null_store=
         # One pass over the members for all scales: at 50 members a global pass is ~68 GB
         # of reads, and the nested block sums aggregate upward for free.
         mem_by_b = agg.block_member_stats_multi(store, hi, usable, attrs=attrs)
-        obs_by_b = agg.block_observed_multi(paths[year]["observed"], profile, usable)
+        # The observed aggregate must be taken over exactly the pixels the ensemble
+        # covers; T5.3 proves the ensemble mask equals the central raster's, so that is
+        # the mask to apply.
+        obs_by_b = agg.block_observed_multi(paths[year]["observed"], profile, usable,
+                                            mask_path=str(paths[year]["central"]))
         for B in usable:
             mem, valid, _ = mem_by_b[B]
             obs, obs_valid = obs_by_b[B]
@@ -311,7 +315,8 @@ def stage_aggregate(args, store, attrs, years, paths, out_dir, card, null_store=
             zm = agg.zonal_member_stats(store, hi, args.ecoregion_raster, attrs=attrs,
                                         thresholds=thresholds)
             zo = agg.zonal_observed(paths[year]["observed"], args.ecoregion_raster, profile,
-                                    thresholds=thresholds)
+                                    thresholds=thresholds,
+                                    mask_path=str(paths[year]["central"]))
             common, i_m, i_o = np.intersect1d(zm["zone_ids"], zo["zone_ids"], return_indices=True)
             keep = zo["n_px"][i_o] >= 100
             zonal_members_by_year[year] = {
@@ -689,7 +694,8 @@ def stage_visual(args, store, attrs, years, paths, out_dir, card, run=None, n_me
     # T7.3 spread-skill at ecoregion scale (aggregate, where the ensemble is meant to work)
     if Path(args.ecoregion_raster).exists():
         zm = agg.zonal_member_stats(store, hi, args.ecoregion_raster, attrs=attrs, thresholds=())
-        zo = agg.zonal_observed(paths[year]["observed"], args.ecoregion_raster, profile, thresholds=())
+        zo = agg.zonal_observed(paths[year]["observed"], args.ecoregion_raster, profile,
+                                thresholds=(), mask_path=str(paths[year]["central"]))
         common, i_m, i_o = np.intersect1d(zm["zone_ids"], zo["zone_ids"], return_indices=True)
         ss = agg.spread_skill_ratio(zm["mean"][:, i_m], zo["mean"][i_o])
         print(f"  spread-skill ratio (ecoregion means): {ss['ratio']:.3f} "

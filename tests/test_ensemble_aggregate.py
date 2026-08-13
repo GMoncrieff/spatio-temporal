@@ -273,5 +273,43 @@ def test_change_distribution_sees_an_implausible_negative_tail(tmp_path):
     assert out["member_q01"] < out["observed_q01"]
 
 
+
+
+def test_observed_aggregation_respects_the_ensemble_mask(tmp_path):
+    """Aggregates are only comparable when both sides average the same pixels.
+
+    Without a shared mask the observed block mean includes pixels the ensemble never
+    covers (coastlines, prediction gaps), and the two aggregates differ for reasons that
+    have nothing to do with calibration — which reads as a coverage collapse.
+    """
+    import rasterio
+    from rasterio.transform import from_origin
+
+    from src.ensemble.aggregate import block_observed
+
+    size, B = 32, 16
+    tr = from_origin(-180, 84, 0.009, 0.009)
+    obs = np.ones((size, size), dtype="float32")
+    obs[:, :16] = 9.0                      # a region the ensemble does not cover
+    mask = np.full((size, size), np.nan, dtype="float32")
+    mask[:, 16:] = 0.5                     # ensemble covers only the right half
+
+    def w(name, arr):
+        p = tmp_path / name
+        with rasterio.open(p, "w", driver="GTiff", height=size, width=size, count=1,
+                           dtype="float32", crs="EPSG:4326", transform=tr, nodata=np.nan) as d:
+            d.write(arr, 1)
+        return str(p)
+
+    op, mp = w("obs.tif", obs), w("mask.tif", mask)
+    prof = {"height": size, "width": size, "transform": tr}
+
+    unmasked, _ = block_observed(op, prof, B, min_valid_frac=0.0)
+    masked, valid = block_observed(op, prof, B, min_valid_frac=0.0, mask_path=mp)
+    assert np.allclose(unmasked[:, 0], 9.0), "left blocks are all uncovered pixels"
+    assert not valid[:, 0].any(), "uncovered blocks must drop out entirely"
+    assert np.allclose(masked[:, 1], 1.0), "covered blocks average only covered pixels"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

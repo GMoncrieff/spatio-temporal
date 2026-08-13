@@ -133,8 +133,8 @@ def zonal_member_stats(zarr_store, horizon_idx, zone_raster, attrs=None, thresho
 
 
 def zonal_observed(observed_path, zone_raster, reference_profile, thresholds=(0.1, 0.3),
-                   block_rows: int = 1024):
-    """Observed zonal means / areas on exactly the same pixels."""
+                   block_rows: int = 1024, mask_path=None):
+    """Observed zonal means / areas on exactly the same pixels the ensemble covers."""
     with rasterio.open(zone_raster) as zsrc:
         n_zones = (65535 if zsrc.dtypes[0] == "uint16" else 4096) + 1
     cnt = np.zeros(n_zones, dtype=np.int64)
@@ -142,6 +142,7 @@ def zonal_observed(observed_path, zone_raster, reference_profile, thresholds=(0.
     s_area = {t: np.zeros(n_zones) for t in thresholds}
     H, W = reference_profile["height"], reference_profile["width"]
     p_t = reference_profile["transform"]
+    msrc = rasterio.open(mask_path) if mask_path else None
     with rasterio.open(observed_path) as osrc, rasterio.open(zone_raster) as zsrc:
         o_t, z_t = osrc.transform, zsrc.transform
         o_off = (int(round((p_t.f - o_t.f) / o_t.e)), int(round((p_t.c - o_t.c) / o_t.a)))
@@ -154,6 +155,8 @@ def zonal_observed(observed_path, zone_raster, reference_profile, thresholds=(0.
                            boundless=True, fill_value=0)
             ob = np.where(ob < 0, np.nan, ob)
             ok = np.isfinite(ob) & (zn > 0)
+            if msrc is not None:
+                ok &= np.isfinite(msrc.read(1, window=Window(0, r0, W, rr)).astype(np.float32))
             if not ok.any():
                 continue
             zf = zn[ok].astype(np.int64)
@@ -161,6 +164,8 @@ def zonal_observed(observed_path, zone_raster, reference_profile, thresholds=(0.
             s_mean += np.bincount(zf, weights=ob[ok], minlength=n_zones)
             for t in thresholds:
                 s_area[t] += np.bincount(zf, weights=(ob[ok] > t).astype(float), minlength=n_zones)
+    if msrc is not None:
+        msrc.close()
     keep = cnt > 0
     ids = np.nonzero(keep)[0]
     out = {"zone_ids": ids, "n_px": cnt[keep], "mean": s_mean[keep] / cnt[keep]}
@@ -224,12 +229,12 @@ def block_member_stats_multi(zarr_store, horizon_idx, block_sizes, attrs=None,
 
 
 def block_observed_multi(observed_path, reference_profile, block_sizes, min_valid_frac=0.5,
-                         stripe_blocks: int = 8):
+                         stripe_blocks: int = 8, mask_path=None):
     """Observed block means at nested scales, aggregated from the finest."""
     sizes = sorted(int(b) for b in block_sizes)
     base = sizes[0]
     mean, valid, cnt = block_observed(observed_path, reference_profile, base,
-                                      min_valid_frac=min_valid_frac,
+                                      min_valid_frac=min_valid_frac, mask_path=mask_path,
                                       stripe_blocks=stripe_blocks, return_counts=True)
     out = {base: (mean, valid)}
     sums = np.nan_to_num(mean) * cnt
@@ -244,13 +249,21 @@ def block_observed_multi(observed_path, reference_profile, block_sizes, min_vali
 
 
 def block_observed(observed_path, reference_profile, block_size, min_valid_frac=0.5,
-                   stripe_blocks: int = 8, return_counts: bool = False):
+                   stripe_blocks: int = 8, return_counts: bool = False, mask_path=None):
+    """Observed block means.
+
+    ``mask_path`` restricts the average to the pixels the ensemble actually covers. Without
+    it the observed mean is taken over a *different* pixel set than the member means —
+    coastal and prediction-gap pixels enter one and not the other — and the two aggregates
+    are then not comparable at all, which shows up as a spurious coverage collapse.
+    """
     B = int(block_size)
     H, W = reference_profile["height"], reference_profile["width"]
     p_t = reference_profile["transform"]
     n_bi, n_bj = H // B, W // B
     sums = np.zeros((n_bi, n_bj))
     cnt = np.zeros((n_bi, n_bj), dtype=np.int64)
+    msrc = rasterio.open(mask_path) if mask_path else None
     with rasterio.open(observed_path) as osrc:
         o_t = osrc.transform
         o_off = (int(round((p_t.f - o_t.f) / o_t.e)), int(round((p_t.c - o_t.c) / o_t.a)))
@@ -261,9 +274,14 @@ def block_observed(observed_path, reference_profile, block_size, min_valid_frac=
                            boundless=True, fill_value=np.nan).astype(np.float64)
             ob = np.where(ob < 0, np.nan, ob)
             ok = np.isfinite(ob)
+            if msrc is not None:
+                mk = msrc.read(1, window=Window(0, r0, n_bj * B, rr)).astype(np.float32)
+                ok &= np.isfinite(mk)
             sums[r0 // B: r0 // B + rr // B] += np.where(ok, ob, 0.0).reshape(
                 rr // B, B, n_bj, B).sum(axis=(1, 3))
             cnt[r0 // B: r0 // B + rr // B] += ok.reshape(rr // B, B, n_bj, B).sum(axis=(1, 3))
+    if msrc is not None:
+        msrc.close()
     valid = cnt >= max(1, int(min_valid_frac * B * B))
     with np.errstate(invalid="ignore", divide="ignore"):
         mean = sums / np.maximum(cnt, 1)
