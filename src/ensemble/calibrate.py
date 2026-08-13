@@ -131,8 +131,41 @@ class ScoreStore:
     def folds(self):
         return sorted({f for (_, f) in self.data if f is not None})
 
+    def pooled_by(self, key_fn, exclude_fold=None):
+        """Merge reservoirs under a coarser key, e.g. (horizon, dhat_bin) only.
+
+        The primary stratum is horizon x predicted-change; HM level and biome are
+        secondary. Fitting only at the full 4-way product fragments exactly the class the
+        exercise is about — the >0.15 change bin holds ~10k chips in total but only a few
+        dozen per (HM bin, biome) cell, so every cell gets shrunk back to the global
+        factor and the miscoverage survives.
+        """
+        out = defaultdict(lambda: {"up": [], "lo": [], "n_up": 0, "n_lo": 0, "chips": set()})
+        for (key, fold), s in self.data.items():
+            if exclude_fold is not None and fold == exclude_fold:
+                continue
+            o = out[key_fn(key)]
+            o["up"].extend(s.up)
+            o["lo"].extend(s.lo)
+            o["n_up"] += s.n_up
+            o["n_lo"] += s.n_lo
+            o["chips"].update(s.chips)
+        merged = {}
+        for key, o in out.items():
+            merged[key] = {
+                "up": np.concatenate(o["up"]) if o["up"] else np.empty(0, np.float32),
+                "lo": np.concatenate(o["lo"]) if o["lo"] else np.empty(0, np.float32),
+                "n_up": o["n_up"], "n_lo": o["n_lo"], "n_eff": len(o["chips"]),
+            }
+        return merged
+
     def save(self, path):
-        """Persist the reservoirs (npz) so refits do not require rereading rasters."""
+        """Persist the reservoirs (npz) so refits do not require rereading rasters.
+
+        Collecting the scores streams every residual and covariate raster; refitting with
+        different bins or shrinkage is milliseconds. Keeping the two apart is the
+        difference between iterating on the calibration in seconds and in an hour.
+        """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {}
@@ -140,10 +173,29 @@ class ScoreStore:
         for i, ((key, fold), s) in enumerate(self.data.items()):
             payload[f"up_{i}"] = np.concatenate(s.up) if s.up else np.empty(0, np.float32)
             payload[f"lo_{i}"] = np.concatenate(s.lo) if s.lo else np.empty(0, np.float32)
+            payload[f"chips_{i}"] = np.fromiter(s.chips, dtype=np.int64, count=len(s.chips))
             meta.append({"i": i, "key": list(key), "fold": fold, "n_up": s.n_up,
-                         "n_lo": s.n_lo, "n_eff": len(s.chips)})
-        np.savez_compressed(path, meta=json.dumps(meta), **payload)
+                         "n_lo": s.n_lo, "n_degenerate": s.n_degenerate, "n_total": s.n_total})
+        np.savez(path, meta=np.array(json.dumps(meta)), **payload)
         return path
+
+    @classmethod
+    def load(cls, path, cap: int = 8000, random_seed: int = 42):
+        z = np.load(path, allow_pickle=False)
+        meta = json.loads(str(z["meta"]))
+        store = cls(cap=cap, random_seed=random_seed)
+        for m in meta:
+            i = m["i"]
+            s = store.data[(tuple(m["key"]), m["fold"])]
+            up, lo = z[f"up_{i}"], z[f"lo_{i}"]
+            if up.size:
+                s.up.append(up)
+            if lo.size:
+                s.lo.append(lo)
+            s.n_up, s.n_lo = m["n_up"], m["n_lo"]
+            s.n_degenerate, s.n_total = m.get("n_degenerate", 0), m.get("n_total", 0)
+            s.chips.update(z[f"chips_{i}"].tolist())
+        return store
 
 
 def collect_conformal_scores(
@@ -331,7 +383,25 @@ def fit_scale_factors(
     for tail in ("up", "lo"):
         df[f"s_{tail}_raw"] = df[f"s_{tail}_raw"].clip(0.0, S_CEIL)
 
-    # --- global (per-horizon) factor: the shrinkage target -------------------------------
+    # --- primary-stratum factors: (horizon, Delta-hat bin), fitted on pooled scores -------
+    group = {}
+    for key, d in store.pooled_by(lambda k: (k[0], k[1]), exclude_fold=exclude_fold).items():
+        n_up, n_lo, n_eff = d["n_up"], d["n_lo"], d["n_eff"]
+        n_tot = n_up + n_lo
+        if n_tot == 0:
+            continue
+        if tail_level == "marginal":
+            lvl_up = 1.0 - (alpha / 2.0) * n_tot / max(n_up, 1)
+            lvl_lo = 1.0 - (alpha / 2.0) * n_tot / max(n_lo, 1)
+        else:
+            lvl_up = lvl_lo = 1.0 - alpha
+        group[key] = {
+            "s_up": float(np.clip(_conformal_quantile(d["up"], n_eff, lvl_up), 0.0, S_CEIL)),
+            "s_lo": float(np.clip(_conformal_quantile(d["lo"], n_eff, lvl_lo), 0.0, S_CEIL)),
+            "n_eff": n_eff,
+        }
+
+    # --- global (per-horizon) factor: the outermost shrinkage target ----------------------
     # Weighted *median*, not mean: the target must not be movable by one wild thin class.
     glob = {}
     for horizon, grp in df.groupby("horizon"):
@@ -343,11 +413,22 @@ def fit_scale_factors(
     df["s_up_global"] = [glob[(h, "up")] for h in df["horizon"]]
     df["s_lo_global"] = [glob[(h, "lo")] for h in df["horizon"]]
 
-    # --- guard 2: shrinkage --------------------------------------------------------------
+    # --- guard 2: hierarchical shrinkage cell -> primary stratum -> horizon ---------------
+    keys = list(zip(df["horizon"], df["dhat_bin_idx"]))
+    for tail in ("up", "lo"):
+        g_val = np.array([group.get(k, {}).get(f"s_{tail}", np.nan) for k in keys], dtype=float)
+        g_n = np.array([group.get(k, {}).get("n_eff", 0.0) for k in keys], dtype=float)
+        g_lam = g_n / (g_n + n0)
+        g_val = np.where(np.isfinite(g_val), g_val, df[f"s_{tail}_global"])
+        # The primary stratum itself is shrunk toward the per-horizon factor.
+        df[f"s_{tail}_group"] = g_lam * g_val + (1 - g_lam) * df[f"s_{tail}_global"]
+    df["lambda_group"] = np.array([group.get(k, {}).get("n_eff", 0.0) for k in keys]) / (
+        np.array([group.get(k, {}).get("n_eff", 0.0) for k in keys]) + n0)
+
     df["lambda"] = df["n_eff"] / (df["n_eff"] + n0)
     for tail in ("up", "lo"):
-        raw = df[f"s_{tail}_raw"].fillna(df[f"s_{tail}_global"])
-        df[f"s_{tail}_shrunk"] = df["lambda"] * raw + (1 - df["lambda"]) * df[f"s_{tail}_global"]
+        raw = df[f"s_{tail}_raw"].fillna(df[f"s_{tail}_group"])
+        df[f"s_{tail}_shrunk"] = df["lambda"] * raw + (1 - df["lambda"]) * df[f"s_{tail}_group"]
 
     # --- guard 3: smoothness across ordered Delta-hat bins -------------------------------
     if smooth:

@@ -91,6 +91,39 @@ def test_bounds_and_horizon_monotonicity_are_enforced():
     assert (f["s_up"] >= S_FLOOR - 1e-9).all()
 
 
+def test_thin_cells_follow_their_primary_stratum_not_the_global_factor():
+    """A rare change class fragments across HM bin x biome; it must still get its own factor.
+
+    This is the failure seen on the real global audit: the >0.15 change bin holds plenty of
+    chips in total but only a handful per (HM bin, biome) cell, so flat shrinkage pulled
+    every one of them back to the per-horizon factor and the miscoverage survived.
+    """
+    rng = np.random.default_rng(0)
+    store = ScoreStore(cap=20000, random_seed=0)
+    # dhat bin 0: common, well calibrated. dhat bin 4: rare, 3x too narrow, and split
+    # across 20 (hm_bin, biome) cells that are individually thin.
+    for fold in (1, 2, 3, 4, 5):
+        for hm in range(2):
+            for biome in range(10):
+                r = rng.normal(0, 1.0 / 1.959964, size=3000)
+                store.add((20, 0, hm, biome), fold, up=r[r > 0], lo=-r[r <= 0],
+                          chips=np.arange(300) + 100000 * fold + 137 * (hm * 10 + biome),
+                          n_total=3000)
+                r = rng.normal(0, 3.0 / 1.959964, size=60)
+                store.add((20, 4, hm, biome), fold, up=r[r > 0], lo=-r[r <= 0],
+                          chips=np.arange(6) + 900000 * fold + 977 * (hm * 10 + biome),
+                          n_total=60)
+
+    f = fit_scale_factors(store, n0=200.0, smooth=False)
+    rare = f[f.dhat_bin_idx == 4]
+    common = f[f.dhat_bin_idx == 0]
+    assert (common["s_up"] - 1.0).abs().mean() < 0.15
+    # Pooled over its cells the rare class has ample data, so its factor must approach 3,
+    # not sit near the ~1 the global factor would impose.
+    assert rare["s_up_group"].mean() > 2.0
+    assert rare["s_up"].mean() > 2.0
+
+
 def test_identity_case_is_a_true_no_op():
     store = _store_with({0: 1.0, 1: 1.0})
     f = fit_scale_factors(store)

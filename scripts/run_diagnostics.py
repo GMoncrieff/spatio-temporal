@@ -47,6 +47,8 @@ def parse_args(argv=None):
     ap.add_argument("--score_cap", type=int, default=8000)
     ap.add_argument("--alpha", type=float, default=0.05)
     ap.add_argument("--n0", type=float, default=200.0)
+    ap.add_argument("--refit_scores", action="store_true",
+                    help="Re-stream the residual rasters instead of using cached conformal scores")
     ap.add_argument("--stages", default="coverage,variogram,audit,calibrate")
     ap.add_argument("--disable_wandb", action="store_true")
     ap.add_argument("--wandb_group", default=None)
@@ -224,12 +226,22 @@ def stage_calibrate(args, manifest, out_dir, run, audit=None):
     out = out_dir / "calibration"
     out.mkdir(parents=True, exist_ok=True)
     eco = args.ecoregion_raster if Path(args.ecoregion_raster).exists() else None
-    store = cal.collect_conformal_scores(
-        manifest,
-        fold_mask_path=args.fold_mask if Path(args.fold_mask).exists() else None,
-        ecoregion_raster=eco, lookup_csv=args.lookup_csv if eco else None,
-        cap=args.score_cap,
-    )
+    # Collecting the scores streams every residual raster; refitting from the cached
+    # reservoirs is instantaneous, which is what makes iterating on the stratification
+    # practical at all.
+    store_path = out / "conformal_scores.npz"
+    if store_path.exists() and not args.refit_scores:
+        print(f"  loading cached conformal scores from {store_path}")
+        store = cal.ScoreStore.load(store_path, cap=args.score_cap)
+    else:
+        store = cal.collect_conformal_scores(
+            manifest,
+            fold_mask_path=args.fold_mask if Path(args.fold_mask).exists() else None,
+            ecoregion_raster=eco, lookup_csv=args.lookup_csv if eco else None,
+            cap=args.score_cap,
+        )
+        store.save(store_path)
+        print(f"  cached conformal scores -> {store_path}")
     factors = cal.fit_scale_factors(store, alpha=args.alpha, n0=args.n0)
     if factors.empty:
         print("  ⚠ no conformal scores collected; skipping")
