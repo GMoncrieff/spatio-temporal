@@ -118,13 +118,33 @@ def raster_paths(args, years):
 # --------------------------------------------------------------------------------------
 # T5 hard gates + ensemble percentile rasters
 # --------------------------------------------------------------------------------------
+def _tile_grid(store, H, W, budget_bytes=1.2e9):
+    """Chunk-aligned (row, col) tiles for streaming every member of a horizon.
+
+    The store is chunked (10, 1, 1024, 1024). Reading a short full-width slab decompresses
+    each 1024-row chunk once per slab it touches — an ~11x read amplification measured on
+    the global store. Tiling on the chunk grid instead reads every chunk exactly once, and
+    the column dimension is what gets traded for the memory budget.
+    """
+    M = store.shape[0]
+    ch = store.chunks
+    rows = int(ch[2]) if len(ch) >= 3 else 1024
+    cols = int(ch[3]) if len(ch) >= 4 else 1024
+    rows = min(rows, H)
+    per_col_chunk = M * rows * cols * 4  # float32 working copy
+    n_col_chunks = max(1, int(budget_bytes // max(per_col_chunk, 1)))
+    tile_w = min(W, n_col_chunks * cols)
+    return rows, tile_w
+
+
 def stage_gates(args, store, attrs, years, paths, out_dir, card, block_rows=None):
     """T5.1/T5.2/T5.3 in one streaming pass, which also writes the percentile rasters."""
     print("\n=== T5 · hard gates (median / tails / mask) ===")
     M, nH, H, W = store.shape
-    if block_rows is None:
-        # Every member of a block is held at once; cap the working set near 1.5 GB.
-        block_rows = int(np.clip(1.5e9 / max(M * W * 8, 1), 32, 512))
+    tile_h, tile_w = _tile_grid(store, H, W)
+    tiles = [(r0, min(tile_h, H - r0), c0, min(tile_w, W - c0))
+             for r0 in range(0, H, tile_h) for c0 in range(0, W, tile_w)]
+    print(f"  streaming {M} members on the chunk grid: {len(tiles)} tiles of {tile_h} x {tile_w}")
     tol_median = quantization_error_bound(float(attrs.get("scale", 1 / 32767)))
     # Monte-Carlo tolerance on the tails: with M members the 2.5th percentile sits between
     # order statistics, so its standard error is sqrt(p(1-p)/M) / f(x_p). Approximated with
@@ -138,7 +158,10 @@ def stage_gates(args, store, attrs, years, paths, out_dir, card, block_rows=None
     for hi, year in enumerate(years):
         with rasterio.open(paths[year]["central"]) as c:
             profile = c.profile.copy()
-        profile.update(dtype="float32", count=1, nodata=np.nan, compress="deflate", BIGTIFF="YES")
+        # Tiled output so the chunk-aligned windowed writes land on whole blocks rather
+        # than forcing a read-modify-write of full-width strips.
+        profile.update(dtype="float32", count=1, nodata=np.nan, compress="deflate",
+                       tiled=True, blockxsize=512, blockysize=512, BIGTIFF="YES")
         outs = {q: out_dir / f"ens_{year}_{q}.tif" for q in ("p2_5", "median", "p97_5")}
         dsts = {q: rasterio.open(v, "w", **profile) for q, v in outs.items()}
         pct_paths[year] = outs
@@ -150,28 +173,32 @@ def stage_gates(args, store, attrs, years, paths, out_dir, card, block_rows=None
             with rasterio.open(paths[year]["central"]) as csrc, \
                  rasterio.open(paths[year]["lower"]) as lsrc, \
                  rasterio.open(paths[year]["upper"]) as usrc:
-                for r0 in range(0, H, block_rows):
-                    rr = min(block_rows, H - r0)
-                    win = Window(0, r0, W, rr)
+                for r0, rr, c0, cw in tiles:
+                    win = Window(c0, r0, cw, rr)
                     cen = csrc.read(1, window=win).astype(np.float32)
                     low = lsrc.read(1, window=win).astype(np.float32)
                     upp = usrc.read(1, window=win).astype(np.float32)
-                    q = np.asarray(store[:, hi, r0:r0 + rr, :])
-                    ens = agg.dequantize_block(q, attrs)
-                    ens_valid = np.isfinite(ens).all(axis=0)
+                    q = np.asarray(store[:, hi, r0:r0 + rr, c0:c0 + cw])
+                    ens_valid = (q != INT16_SENTINEL).all(axis=0)
                     cen_valid = np.isfinite(cen)
                     n_mask_mismatch += int((ens_valid != cen_valid).sum())
                     ok = ens_valid & cen_valid
+                    empty = np.full((rr, cw), np.nan, np.float32)
                     if not ok.any():
-                        for name, arr in (("p2_5", low), ("median", cen), ("p97_5", upp)):
-                            dsts[name].write(np.full((rr, W), np.nan, np.float32), 1, window=win)
+                        for name in ("p2_5", "median", "p97_5"):
+                            dsts[name].write(empty, 1, window=win)
                         continue
-                    # One sort for all three quantiles; three separate calls sort the
-                    # (50, rows, 40000) block three times over.
-                    p25, med, p975 = np.nanpercentile(ens, [2.5, 50.0, 97.5], axis=0)
-                    dsts["median"].write(np.where(ok, med, np.nan).astype(np.float32), 1, window=win)
-                    dsts["p2_5"].write(np.where(ok, p25, np.nan).astype(np.float32), 1, window=win)
-                    dsts["p97_5"].write(np.where(ok, p975, np.nan).astype(np.float32), 1, window=win)
+                    # Every member shares one valid mask, so a pixel is valid in all of
+                    # them or none. Compacting to the valid pixels first lets plain
+                    # percentile (one sort, no NaN scan) replace nanpercentile over the
+                    # full tile — the NaN handling was the dominant cost of this stage.
+                    vals = agg.dequantize_block(q[:, ok], attrs)
+                    p25v, medv, p975v = np.percentile(vals, [2.5, 50.0, 97.5], axis=0)
+                    med, p25, p975 = empty.copy(), empty.copy(), empty.copy()
+                    med[ok], p25[ok], p975[ok] = medv, p25v, p975v
+                    dsts["median"].write(med, 1, window=win)
+                    dsts["p2_5"].write(p25, 1, window=win)
+                    dsts["p97_5"].write(p975, 1, window=win)
 
                     n_valid += int(ok.sum())
                     n_med_ok += int((np.abs(med - cen)[ok] <= tol_median).sum())
