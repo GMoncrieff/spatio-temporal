@@ -38,6 +38,13 @@ DHAT_LABELS = ["<=-0.01", "(-0.01,0.001]", "(0.001,0.01]", "(0.01,0.05]", "(0.05
 HM_BINS = [0.0, 0.01, 0.1, 0.3, 0.6, 1.0001]
 HM_LABELS = ["[0,0.01)", "[0.01,0.1)", "[0.1,0.3)", "[0.3,0.6)", "[0.6,1]"]
 
+# Distance (px ~ km) to the nearest pixel that changed by >0.01 in the previous decade.
+# Measured on southern Africa, P(future change > 0.05) runs 0.222 / 0.080 / 0.023 / 0.0068
+# / 0.0010 / 0.0000 across these bands — a 200x gradient ending in an exact zero. It is
+# computable from the input years alone, so it is admissible as a prediction-time stratum.
+DIST_BINS = [0.0, 1.0, 3.0, 10.0, 30.0, 100.0, np.inf]
+DIST_LABELS = ["0-1", "1-3", "3-10", "10-30", "30-100", ">100"]
+
 
 # --------------------------------------------------------------------------------------
 # Statistics helpers
@@ -388,6 +395,9 @@ def compute_class_conditional_coverage(
             "w_lo": rasterio.open(row["path_w_lo"]),
         }
         eco_src = rasterio.open(ecoregion_raster) if biome_map is not None else None
+        dist_col = row.get("path_dist_past_change")
+        dist_src = (rasterio.open(dist_col)
+                    if isinstance(dist_col, str) and Path(dist_col).exists() else None)
         H, W = srcs["res"].height, srcs["res"].width
         p_t = srcs["res"].transform
         if eco_src is not None:
@@ -410,7 +420,10 @@ def compute_class_conditional_coverage(
                     np.isfinite(w_up) & np.isfinite(w_lo)
                 if not ok.any():
                     continue
-                if eco_src is not None:
+                if dist_src is not None:
+                    dd = dist_src.read(1, window=Window(0, r0, W, rr)).astype(np.float64)
+                    biome = np.digitize(dd, DIST_BINS[1:-1]).astype(np.int16)
+                elif eco_src is not None:
                     eco = eco_src.read(1, window=Window(e_off[1], e_off[0] + r0, W, rr),
                                        boundless=True, fill_value=0)
                     biome = biome_map[np.clip(eco, 0, len(biome_map) - 1)]
@@ -458,6 +471,8 @@ def compute_class_conditional_coverage(
                 s.close()
             if eco_src is not None:
                 eco_src.close()
+            if dist_src is not None:
+                dist_src.close()
 
     rows = []
     for (horizon, d_i, h_i, b), c in cells.items():

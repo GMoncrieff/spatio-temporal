@@ -182,6 +182,44 @@ breaks T1) — it is to make the lower tail of the marginal respect the physical
 truncating the left side at a horizon-dependent maximum plausible decrease, which changes
 the marginal family rather than its calibration.
 
+### T8 · Change is clustered near past change — owner Phase 1.5/3, verified in Phase 4
+
+Measured on southern Africa (1.86M valid px), future change (2000→2020) as a function of
+distance to the nearest pixel that changed by more than 0.01 in the past (1990→2000):
+
+| distance | n_px | P(Δ>0.01) | P(Δ>0.05) | P(Δ>0.15) |
+|---|---|---|---|---|
+| 0–1 px | 91,164 | 0.676 | 0.222 | 0.0229 |
+| 1–3 px | 183,371 | 0.355 | 0.080 | 0.0069 |
+| 3–10 px | 332,821 | 0.116 | 0.023 | 0.0024 |
+| 10–30 px | 419,443 | 0.031 | 0.0068 | 0.0009 |
+| 30–100 px | 341,269 | 0.005 | 0.0010 | 0.0001 |
+| >100 px | 493,240 | **0.0000** | **0.0000** | **0.0000** |
+
+Beyond ~100 px from any past change, not one of 493,240 pixels moved by more than 0.01 in
+twenty years. Change is overwhelmingly a near-neighbour phenomenon: hard to place exactly,
+but scattered around where it has already happened.
+
+The ensemble has no mechanism that knows this. The correlated field is stationary and the
+per-pixel spread comes from classes defined by predicted change, HM level and biome — none
+of which encode proximity to past change — so members sprinkle change into remote stable
+country where the real world produces none.
+
+**Distance to past change is computable from the input years alone**, so it is admissible
+as a Phase 1.5 stratum under the same rule as every other class ("available at prediction
+time, never from the observation").
+
+| id | Metric | Target |
+|---|---|---|
+| T8.1 | `P(Δ_member > 0.05)` by distance-to-past-change band, vs observed | ratio in `[0.5, 2.0]` in every band with `n_eff ≥ 100` |
+| T8.2 | Remote band (>100 px): `P(Δ_member > 0.05)` | `≤ 0.002` (observed is 0) |
+| T8.3 | Ratio of `P(Δ>0.05)` between the nearest and remote bands | `≥ 20×` (observed: unbounded; the pixelwise heads must not flatten it) |
+| T8.4 | Same three, for the *lower* tail `P(Δ < −0.05)` | ratio in `[0.5, 3.0]` per band |
+
+If T8 fails, the fix is to add the distance band to the Phase 1.5 class definition so the
+conformal factors can collapse intervals in remote stable areas — not to shrink the
+correlation range, which would break T2.
+
 ### T5 · Consistency / regression gates — hard gates, owner Phase 3/4
 
 | id | Metric | Target |
@@ -522,6 +560,18 @@ Failures should print the diagnosis from the **"which knob fixes which failure"*
 6. **Thin classes are the whole point and also the weakest estimates.** The Δ̂ > 0.15 bin is ~1% of pixels and the HM > 0.6 bin is 0.9%; both will have modest `n_eff` after chip-level deduplication. The shrinkage in 1.5b keeps them from going wild, but the honest reading is that these cells have wide error bars on their coverage estimate — report Wilson intervals on the coverage table, not bare point estimates, or the audit will look more decisive than it is.
 7. **Recalibration changes a published product.** If the decision is "stratified rescale", the intervals in any existing figure, deposit, or draft become stale. Version the outputs (`recal/` directory, factors CSV committed) so the before/after is reconstructible, and budget for regenerating downstream figures.
 8. **The tightest coupling in the plan is Phase 1.5 → Phase 3.** The copula preserves whatever marginals it is handed, so a marginal change after the ensemble is generated means regenerating the ensemble. Do not start the global 50-member run until the recalibration decision is final.
+
+## Development scale (user decision, superseding the global-first reading)
+
+**All development and iteration happens on the southern-Africa subregion**
+(`config/region_to_predict_small.geojson`). Global runs happen only on explicit
+instruction. The global k=5 hindcast has already been produced and its residual and
+prediction rasters are on disk, so the regional working set is a *crop* of those artifacts
+(`scripts/make_region_subset.py`) rather than a retraining — the fold models are global and
+genuinely out-of-sample everywhere, so cropping loses nothing but wall-clock time.
+
+A full regional iteration of Phase 1 → Phase 4 takes minutes rather than the ~10 hours the
+global equivalent takes, which is the difference between testing a change and guessing at it.
 
 ## Verification plan (end-to-end)
 

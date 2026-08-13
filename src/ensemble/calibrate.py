@@ -43,6 +43,8 @@ from .validate import (
     CHIP_SIZE,
     DHAT_BINS,
     DHAT_LABELS,
+    DIST_BINS,
+    DIST_LABELS,
     HM_BINS,
     HM_LABELS,
     biome_lut,
@@ -225,6 +227,8 @@ def collect_conformal_scores(
         }
         eco_src = rasterio.open(ecoregion_raster) if biome_map is not None else None
         fold_src = rasterio.open(fold_mask_path) if fold_mask_path else None
+        dist_col = row.get("path_dist_past_change")
+        dist_src = rasterio.open(dist_col) if isinstance(dist_col, str) and Path(dist_col).exists() else None
         H, W = srcs["res"].height, srcs["res"].width
         p_t = srcs["res"].transform
         glob_row = int(round((p_t.f - 84.0) / p_t.e))
@@ -249,7 +253,12 @@ def collect_conformal_scores(
                       & np.isfinite(w_up) & np.isfinite(w_lo))
                 if not ok.any():
                     continue
-                if eco_src is not None:
+                if dist_src is not None:
+                    # Proximity to past change dominates where change can happen at all;
+                    # it replaces biome as the third class axis when available.
+                    dd = dist_src.read(1, window=Window(0, r0, W, rr)).astype(np.float64)
+                    biome = np.digitize(dd, DIST_BINS[1:-1]).astype(np.int64)
+                elif eco_src is not None:
                     eco = eco_src.read(1, window=Window(e_off[1], e_off[0] + r0, W, rr),
                                        boundless=True, fill_value=0)
                     biome = biome_map[np.clip(eco, 0, len(biome_map) - 1)].astype(np.int64)
@@ -313,6 +322,8 @@ def collect_conformal_scores(
                 eco_src.close()
             if fold_src is not None:
                 fold_src.close()
+            if dist_src is not None:
+                dist_src.close()
     return store
 
 
@@ -346,6 +357,7 @@ def fit_scale_factors(
     exclude_fold=None,
     smooth: bool = True,
     tail_level: str = "marginal",
+    primary_includes_dist: bool = True,
 ):
     """Per-class ŝ_up / ŝ_lo with shrinkage, smoothing, and monotonicity guards."""
     pooled = store.pooled(exclude_fold=exclude_fold)
@@ -383,9 +395,15 @@ def fit_scale_factors(
     for tail in ("up", "lo"):
         df[f"s_{tail}_raw"] = df[f"s_{tail}_raw"].clip(0.0, S_CEIL)
 
-    # --- primary-stratum factors: (horizon, Delta-hat bin), fitted on pooled scores -------
+    # --- primary-stratum factors, fitted on pooled scores ---------------------------------
+    # The primary stratum includes the distance-to-past-change band when one is present.
+    # It has to: the frozen upper head barely responds to proximity (w_up decays 1.9x from
+    # adjacent to >100 px while the observed rate of change falls to exactly zero), so if
+    # the far field is pooled with near-field low-change pixels its factor is dragged up by
+    # them and the interval never collapses where change is impossible.
+    primary = (lambda k: (k[0], k[1], k[3])) if primary_includes_dist else (lambda k: (k[0], k[1]))
     group = {}
-    for key, d in store.pooled_by(lambda k: (k[0], k[1]), exclude_fold=exclude_fold).items():
+    for key, d in store.pooled_by(primary, exclude_fold=exclude_fold).items():
         n_up, n_lo, n_eff = d["n_up"], d["n_lo"], d["n_eff"]
         n_tot = n_up + n_lo
         if n_tot == 0:
@@ -414,7 +432,8 @@ def fit_scale_factors(
     df["s_lo_global"] = [glob[(h, "lo")] for h in df["horizon"]]
 
     # --- guard 2: hierarchical shrinkage cell -> primary stratum -> horizon ---------------
-    keys = list(zip(df["horizon"], df["dhat_bin_idx"]))
+    keys = (list(zip(df["horizon"], df["dhat_bin_idx"], df["biome"]))
+            if primary_includes_dist else list(zip(df["horizon"], df["dhat_bin_idx"])))
     for tail in ("up", "lo"):
         g_val = np.array([group.get(k, {}).get(f"s_{tail}", np.nan) for k in keys], dtype=float)
         g_n = np.array([group.get(k, {}).get("n_eff", 0.0) for k in keys], dtype=float)

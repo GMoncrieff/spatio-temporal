@@ -51,6 +51,9 @@ KNOB_TABLE = {
     "T7.2": "Members too alike: nugget fraction too low or field seeds correlated.",
     "T7.3": "Under-spread at aggregate scale: check the correlation structure before "
             "widening pixel marginals.",
+    "T8": "Add the distance-to-past-change band to the Phase 1.5 class definition so the "
+          "conformal factors can collapse intervals in remote stable areas — do NOT shrink "
+          "the correlation range, that breaks T2.",
 }
 
 
@@ -111,7 +114,10 @@ def parse_args(argv=None):
     ap.add_argument("--block_sizes", default="10,100,1000")
     ap.add_argument("--score_points", type=int, default=1500)
     ap.add_argument("--stages",
-                    default="gates,percentiles,aggregate,rank,spatial,temporal,change,visual")
+                    default="gates,percentiles,aggregate,rank,spatial,temporal,change,"
+                            "visual,clustering")
+    ap.add_argument("--dist_raster", default=None,
+                    help="Distance-to-past-change raster for T8 (regional working set)")
     ap.add_argument("--disable_wandb", action="store_true")
     ap.add_argument("--wandb_group", default=None)
     return ap.parse_args(argv)
@@ -816,6 +822,89 @@ def _plot_members_vs_observed(members, d_obs, path, name, year):
     return path
 
 
+def stage_clustering(args, store, attrs, years, paths, out_dir, card, n_members: int = 8):
+    """T8 — is change concentrated near past change, as it is in reality?
+
+    Measured on southern Africa, P(future change > 0.05) falls 0.222 → 0.080 → 0.023 →
+    0.0068 → 0.0010 → 0.0000 across distance-to-past-change bands: beyond ~100 px, not one
+    of 493,240 pixels moved by more than 0.01 in twenty years. Members that sprinkle change
+    into remote stable country are wrong in a way no coverage target notices.
+    """
+    if not args.dist_raster or not Path(args.dist_raster).exists():
+        card.add("T8.1", "distance-to-past-change bands", "no raster",
+                 "requires --dist_raster", None,
+                 note="regional working set only; run scripts/make_region_subset.py")
+        return
+    print("\n=== T8 · change clustering near past change ===")
+    from src.ensemble.validate import DIST_BINS, DIST_LABELS
+
+    with rasterio.open(args.dist_raster) as s:
+        dist = s.read(1).astype(np.float32)
+    band = np.digitize(dist, DIST_BINS[1:-1])
+    base_hm = HM_DIR / f"HM_{args.base_year}_AA_1000.tiff"
+    hi = len(years) - 1
+    year = years[hi]
+    with rasterio.open(paths[year]["central"]) as c:
+        profile = c.profile.copy()
+        H, W = c.height, c.width
+    p_t = profile["transform"]
+    with rasterio.open(base_hm) as b:
+        b_t = b.transform
+        off = (int(round((p_t.f - b_t.f) / b_t.e)), int(round((p_t.c - b_t.c) / b_t.a)))
+        hm0 = b.read(1, window=Window(off[1], off[0], W, H)).astype(np.float32)
+    with rasterio.open(paths[year]["observed"]) as o:
+        o_t = o.transform
+        ooff = (int(round((p_t.f - o_t.f) / o_t.e)), int(round((p_t.c - o_t.c) / o_t.a)))
+        obs = o.read(1, window=Window(ooff[1], ooff[0], W, H)).astype(np.float32)
+    hm0 = np.where(hm0 < 0, np.nan, hm0)
+    obs = np.where(obs < 0, np.nan, obs)
+    d_obs = obs - hm0
+
+    rows = []
+    for bi, label in enumerate(DIST_LABELS):
+        sel = (band == bi) & np.isfinite(d_obs) & np.isfinite(hm0)
+        if sel.sum() < 100:
+            continue
+        obs_pos = float((d_obs[sel] > 0.05).mean())
+        obs_neg = float((d_obs[sel] < -0.05).mean())
+        mem_pos, mem_neg = [], []
+        for m in range(min(n_members, store.shape[0])):
+            v = agg.member_slice(store, attrs, m, hi) - hm0
+            ok = sel & np.isfinite(v)
+            if ok.sum():
+                mem_pos.append(float((v[ok] > 0.05).mean()))
+                mem_neg.append(float((v[ok] < -0.05).mean()))
+        mp, mn = float(np.mean(mem_pos)), float(np.mean(mem_neg))
+        rows.append({"band": label, "n_px": int(sel.sum()), "observed_pos": obs_pos,
+                     "member_pos": mp, "observed_neg": obs_neg, "member_neg": mn})
+        print(f"  {label:>7}: P(Δ>0.05) member {mp:.5f} vs observed {obs_pos:.5f} | "
+              f"P(Δ<-0.05) {mn:.5f} vs {obs_neg:.5f}  (n={sel.sum():,})")
+        if obs_pos > 0:
+            r = mp / obs_pos
+            card.add("T8.1", f"P(Δ>0.05) band {label}", r, "ratio in [0.5, 2.0]",
+                     0.5 <= r <= 2.0, knob="T8")
+        if obs_neg > 0:
+            rn = mn / obs_neg
+            card.add("T8.4", f"P(Δ<-0.05) band {label}", rn, "ratio in [0.5, 3.0]",
+                     0.5 <= rn <= 3.0, knob="T8")
+
+    df = pd.DataFrame(rows)
+    df.to_csv(out_dir / "t8_change_clustering.csv", index=False)
+    if not df.empty:
+        remote = df[df["band"] == DIST_LABELS[-1]]
+        if len(remote):
+            v = float(remote["member_pos"].iloc[0])
+            card.add("T8.2", "P(Δ>0.05) in the remote band", v, "<= 0.002", v <= 0.002,
+                     note=f"observed {float(remote['observed_pos'].iloc[0]):.6f}", knob="T8")
+        near = float(df["member_pos"].iloc[0])
+        far = float(df["member_pos"].iloc[-1])
+        ratio = near / far if far > 0 else np.inf
+        obs_ratio = (float(df["observed_pos"].iloc[0]) / float(df["observed_pos"].iloc[-1])
+                     if float(df["observed_pos"].iloc[-1]) > 0 else np.inf)
+        card.add("T8.3", "near/remote change ratio", ratio, ">= 20x",
+                 bool(ratio >= 20), note=f"observed ratio {obs_ratio}", knob="T8")
+
+
 def stage_temporal(args, store, attrs, years, paths, out_dir, card):
     print("\n=== T4 · temporal coherence ===")
     M, nH, H, W = store.shape
@@ -1001,6 +1090,7 @@ def main(argv=None):
     _run_stage("temporal", stage_temporal, args, store, attrs, years, paths, out_dir, card)
     _run_stage("change", stage_change, args, store, attrs, years, paths, out_dir, card)
     _run_stage("visual", stage_visual, args, store, attrs, years, paths, out_dir, card, run=run)
+    _run_stage("clustering", stage_clustering, args, store, attrs, years, paths, out_dir, card)
 
     df = card.df()
     df.to_csv(out_dir / "scorecard.csv", index=False)
