@@ -520,7 +520,9 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
                     sample["change_context"] = torch.from_numpy(context_arr).float()
                 sample.update(targets)  # Add all horizon targets
                 return sample
-        # If all attempts fail, return anyway (will be masked out in loss)
+        # If all attempts fail, return anyway (will be masked out in loss).
+        # It must carry exactly the same keys as the success path or the default collate
+        # fails as soon as one sample in a batch takes this branch.
         sample = {
             "input_dynamic": torch.from_numpy(input_dynamic).float(),
             "input_static": torch.from_numpy(input_static).float(),
@@ -531,6 +533,11 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
             "target_years": target_years,
             "end_year": end_year,
         }
+        if self.context_pattern is not None:
+            if context_arr is None:
+                context_arr = np.zeros((2, self.chip_size, self.chip_size), dtype=np.float32)
+                context_arr[1] = 1e4          # "no past change anywhere near"
+            sample["change_context"] = torch.from_numpy(context_arr).float()
         sample.update(targets)  # Add all horizon targets
         return sample
 
