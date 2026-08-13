@@ -539,9 +539,12 @@ def stage_spatial(args, store, attrs, years, paths, out_dir, card, null_store=No
             obs = o.read(1, window=Window(c_off, r_off, W, H), boundless=True,
                          fill_value=np.nan).astype(np.float32)
         ok = np.isfinite(obs) & np.isfinite(cen)
-        idx = np.flatnonzero(ok.ravel())
-        if idx.size > args.score_points:
-            idx = rng.choice(idx, args.score_points, replace=False)
+        # Points must be *clustered*, not scattered across the globe: these scores test
+        # spatial structure, so the sample has to contain pairs at the separations where
+        # the correlation lives. Sampling 1500 points uniformly over a 17111 x 40000 grid
+        # leaves ~26 of 20000 requested pairs within 500 px — the correlated ensemble and
+        # the independent null are then indistinguishable for want of nearby pairs.
+        idx = _clustered_sample(ok, args.score_points, rng, patch=512)
         rr, cc = np.unravel_index(idx, (H, W))
         coords = np.stack([rr, cc], axis=1).astype(float)
         y = obs.ravel()[idx]
@@ -709,6 +712,32 @@ def stage_visual(args, store, attrs, years, paths, out_dir, card, run=None, n_me
         run.log({"member_diversity": wandb.Table(dataframe=div_df)})
     card.add("T7.1", "member vs observed change renders", len(figs), "visual inspection", None,
              note="see W&B images and data/ensemble/validation/members_*.png")
+
+
+def _clustered_sample(valid, n_points, rng, patch=512, n_patches=12):
+    """Flat indices of valid pixels drawn from a handful of local patches.
+
+    Structure-sensitive scores (variogram, energy) need pairs separated by less than the
+    correlation range; a globally uniform sample contains almost none.
+    """
+    H, W = valid.shape
+    per_patch = max(10, n_points // n_patches)
+    out = []
+    for _ in range(n_patches * 4):
+        if sum(len(o) for o in out) >= n_points:
+            break
+        r0 = int(rng.integers(0, max(1, H - patch)))
+        c0 = int(rng.integers(0, max(1, W - patch)))
+        sub = valid[r0:r0 + patch, c0:c0 + patch]
+        loc = np.flatnonzero(sub.ravel())
+        if loc.size < per_patch:
+            continue
+        pick = rng.choice(loc, per_patch, replace=False)
+        pr, pc = np.unravel_index(pick, sub.shape)
+        out.append((r0 + pr) * W + (c0 + pc))
+    if not out:
+        return np.flatnonzero(valid.ravel())[:n_points]
+    return np.concatenate(out)[:n_points]
 
 
 def _pick_windows(observed_path, base_hm_path, profile, H, W, size=768):

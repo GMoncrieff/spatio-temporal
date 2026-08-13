@@ -311,5 +311,34 @@ def test_observed_aggregation_respects_the_ensemble_mask(tmp_path):
     assert np.allclose(masked[:, 1], 1.0), "covered blocks average only covered pixels"
 
 
+
+
+def test_clustered_sampling_yields_nearby_pairs():
+    """Structure scores need close pairs; a uniform global sample provides almost none."""
+    sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+    from validate_ensemble import _clustered_sample
+
+    from src.ensemble.aggregate import sample_pairs
+
+    H, W = 4000, 8000
+    valid = np.ones((H, W), dtype=bool)
+    rng = np.random.default_rng(0)
+
+    uniform = rng.choice(H * W, 1500, replace=False)
+    clustered = _clustered_sample(valid, 1500, rng, patch=512, n_patches=12)
+
+    def n_close(idx):
+        rr, cc = np.unravel_index(idx, (H, W))
+        coords = np.stack([rr, cc], axis=1).astype(float)
+        i, _ = sample_pairs(idx.size, 20000, rng=np.random.default_rng(1),
+                            coords=coords, max_dist=500)
+        return i.size
+
+    # The advantage grows with grid size: on this 4000x8000 test grid clustering buys
+    # ~4.5x, while on the real 17111x40000 grid uniform sampling yields 26 usable pairs
+    # out of 20000 requested and clustering yields thousands.
+    assert n_close(clustered) > 3 * max(n_close(uniform), 1)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
