@@ -55,15 +55,30 @@ KNOB_TABLE = {
 
 
 class Scorecard:
-    def __init__(self):
+    """Accumulates verdicts, flushing each to disk as it is added.
+
+    The stages take hours on the global grid; an exception in a late stage must not
+    discard what the earlier ones established.
+    """
+
+    def __init__(self, partial_path=None):
         self.rows = []
+        self.partial_path = Path(partial_path) if partial_path else None
+        if self.partial_path:
+            self.partial_path.parent.mkdir(parents=True, exist_ok=True)
+            if self.partial_path.exists():
+                self.partial_path.unlink()
 
     def add(self, tid, metric, value, target, passed, note="", knob=""):
-        self.rows.append({
+        row = {
             "id": tid, "metric": metric, "value": value, "target": target,
             "pass": bool(passed) if passed is not None else None, "note": note,
             "diagnosis": KNOB_TABLE.get(knob, "") if not passed and knob else "",
-        })
+        }
+        self.rows.append(row)
+        if self.partial_path:
+            header = not self.partial_path.exists()
+            pd.DataFrame([row]).to_csv(self.partial_path, mode="a", header=header, index=False)
 
     def df(self):
         df = pd.DataFrame(self.rows)
@@ -929,7 +944,20 @@ def main(argv=None):
     print(f"Ensemble: {args.ensemble} shape={store.shape} members={store.shape[0]}")
     print(f"Null:     {args.null_ensemble or '(none — T3.2/T3.3 will be skipped)'}")
 
-    card = Scorecard()
+    # The W&B run is opened *before* the stages so they can log figures as they produce
+    # them (T7 renders in particular), rather than only at the end.
+    run = None
+    if not args.disable_wandb:
+        try:
+            import wandb
+            run = wandb.init(project="spatio-temporal-convlstm",
+                             group=args.wandb_group or "ensemble-validation",
+                             job_type="ensemble-validation", tags=["ensemble", "phase4"],
+                             config=vars(args))
+        except Exception as e:
+            print(f"⚠ W&B unavailable ({e})")
+
+    card = Scorecard(out_dir / "scorecard_partial.csv")
     t0 = time.time()
 
     # T1.5 sharpness guard — inflating every interval until coverage passes is not a fix.
@@ -945,28 +973,34 @@ def main(argv=None):
                      "<= 1.25", wr <= 1.25,
                      note=f"{Path(o['upper']).name}", knob="T1.5 sharpness")
 
-    pct_paths = None
-    if "gates" in stages:
-        pct_paths = stage_gates(args, store, attrs, years, paths, out_dir, card)
-    if "percentiles" in stages:
-        if pct_paths is None:
-            pct_paths = {y: {q: out_dir / f"ens_{y}_{q}.tif"
-                             for q in ("p2_5", "median", "p97_5")} for y in years}
-        stage_percentiles(args, pct_paths, years, paths, out_dir, card)
-    zonal = {}
-    if "aggregate" in stages:
-        zonal = stage_aggregate(args, store, attrs, years, paths, out_dir, card,
-                                null_store, null_attrs)
-    if "rank" in stages and zonal:
-        stage_rank(args, zonal, out_dir, card)
-    if "spatial" in stages:
-        stage_spatial(args, store, attrs, years, paths, out_dir, card, null_store, null_attrs)
-    if "temporal" in stages:
-        stage_temporal(args, store, attrs, years, paths, out_dir, card)
-    if "change" in stages:
-        stage_change(args, store, attrs, years, paths, out_dir, card)
-    if "visual" in stages:
-        stage_visual(args, store, attrs, years, paths, out_dir, card, run=run)
+    def _run_stage(name, fn, *a, **kw):
+        """Run a stage, but never let one stage's failure discard the others."""
+        if name not in stages:
+            return None
+        try:
+            return fn(*a, **kw)
+        except Exception as e:
+            import traceback
+            print(f"\n✗ stage '{name}' failed: {e}")
+            traceback.print_exc()
+            card.add(name, f"stage '{name}' completed", "error", "no exception", False,
+                     note=str(e)[:200])
+            return None
+
+    pct_paths = _run_stage("gates", stage_gates, args, store, attrs, years, paths, out_dir, card)
+    if pct_paths is None:
+        pct_paths = {y: {q: out_dir / f"ens_{y}_{q}.tif"
+                         for q in ("p2_5", "median", "p97_5")} for y in years}
+    _run_stage("percentiles", stage_percentiles, args, pct_paths, years, paths, out_dir, card)
+    zonal = _run_stage("aggregate", stage_aggregate, args, store, attrs, years, paths,
+                       out_dir, card, null_store, null_attrs) or {}
+    if zonal:
+        _run_stage("rank", stage_rank, args, zonal, out_dir, card)
+    _run_stage("spatial", stage_spatial, args, store, attrs, years, paths, out_dir, card,
+               null_store, null_attrs)
+    _run_stage("temporal", stage_temporal, args, store, attrs, years, paths, out_dir, card)
+    _run_stage("change", stage_change, args, store, attrs, years, paths, out_dir, card)
+    _run_stage("visual", stage_visual, args, store, attrs, years, paths, out_dir, card, run=run)
 
     df = card.df()
     df.to_csv(out_dir / "scorecard.csv", index=False)
@@ -985,23 +1019,19 @@ def main(argv=None):
                 print(f"      → {r['diagnosis']}")
     print(f"\nScorecard: {out_dir / 'scorecard.csv'}")
 
-    if not args.disable_wandb:
+    if run is not None:
         try:
             import wandb
-            run = wandb.init(project="spatio-temporal-convlstm",
-                             group=args.wandb_group or "ensemble-validation",
-                             job_type="ensemble-validation", tags=["ensemble", "phase4"],
-                             config=vars(args))
             run.log({"scorecard": wandb.Table(dataframe=df.astype(str)),
                      "n_pass": n_pass, "n_scored": len(scored),
                      "pass_rate": n_pass / max(len(scored), 1)})
             for fig in ("rank_histograms.png", "member_field_render.png"):
-                p = out_dir / fig
-                if p.exists():
-                    run.log({fig.replace(".png", ""): wandb.Image(str(p))})
+                fp = out_dir / fig
+                if fp.exists():
+                    run.log({fig.replace(".png", ""): wandb.Image(str(fp))})
             run.finish()
         except Exception as e:
-            print(f"⚠ W&B unavailable ({e})")
+            print(f"⚠ W&B logging failed ({e})")
     return 0 if len(failed) == 0 else 0
 
 
