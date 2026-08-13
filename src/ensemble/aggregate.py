@@ -194,8 +194,57 @@ def block_member_stats(zarr_store, horizon_idx, block_size, attrs=None, min_vali
     return means, valid, cnt
 
 
+def block_member_stats_multi(zarr_store, horizon_idx, block_sizes, attrs=None,
+                             min_valid_frac=0.5, stripe_blocks: int = 8):
+    """Block means per member at several nested scales, in **one** pass over the members.
+
+    Reading a 50-member global ensemble costs ~68 GB per pass, so doing it once per block
+    size is the dominant cost of T2.1. When the sizes are nested (10, 100, 1000) the coarse
+    sums are just aggregates of the fine ones, and only the finest scale needs the data.
+    """
+    sizes = sorted(int(b) for b in block_sizes)
+    base = sizes[0]
+    for b in sizes[1:]:
+        if b % base:
+            raise ValueError(f"block sizes must be multiples of the smallest ({base}): {sizes}")
+
+    means, valid, cnt = block_member_stats(
+        zarr_store, horizon_idx, base, attrs=attrs, min_valid_frac=min_valid_frac,
+        stripe_blocks=stripe_blocks)
+    sums = means * cnt[None, :, :]
+    out = {base: (means, valid, cnt)}
+    for b in sizes[1:]:
+        f = b // base
+        n_bi, n_bj = sums.shape[1] // f, sums.shape[2] // f
+        s = sums[:, : n_bi * f, : n_bj * f].reshape(sums.shape[0], n_bi, f, n_bj, f).sum(axis=(2, 4))
+        c = cnt[: n_bi * f, : n_bj * f].reshape(n_bi, f, n_bj, f).sum(axis=(1, 3))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            out[b] = (s / np.maximum(c, 1), c >= max(1, int(min_valid_frac * b * b)), c)
+    return out
+
+
+def block_observed_multi(observed_path, reference_profile, block_sizes, min_valid_frac=0.5,
+                         stripe_blocks: int = 8):
+    """Observed block means at nested scales, aggregated from the finest."""
+    sizes = sorted(int(b) for b in block_sizes)
+    base = sizes[0]
+    mean, valid, cnt = block_observed(observed_path, reference_profile, base,
+                                      min_valid_frac=min_valid_frac,
+                                      stripe_blocks=stripe_blocks, return_counts=True)
+    out = {base: (mean, valid)}
+    sums = np.nan_to_num(mean) * cnt
+    for b in sizes[1:]:
+        f = b // base
+        n_bi, n_bj = sums.shape[0] // f, sums.shape[1] // f
+        s = sums[: n_bi * f, : n_bj * f].reshape(n_bi, f, n_bj, f).sum(axis=(1, 3))
+        c = cnt[: n_bi * f, : n_bj * f].reshape(n_bi, f, n_bj, f).sum(axis=(1, 3))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            out[b] = (s / np.maximum(c, 1), c > 0)
+    return out
+
+
 def block_observed(observed_path, reference_profile, block_size, min_valid_frac=0.5,
-                   stripe_blocks: int = 8):
+                   stripe_blocks: int = 8, return_counts: bool = False):
     B = int(block_size)
     H, W = reference_profile["height"], reference_profile["width"]
     p_t = reference_profile["transform"]
@@ -217,7 +266,8 @@ def block_observed(observed_path, reference_profile, block_size, min_valid_frac=
             cnt[r0 // B: r0 // B + rr // B] += ok.reshape(rr // B, B, n_bj, B).sum(axis=(1, 3))
     valid = cnt >= max(1, int(min_valid_frac * B * B))
     with np.errstate(invalid="ignore", divide="ignore"):
-        return sums / np.maximum(cnt, 1), valid
+        mean = sums / np.maximum(cnt, 1)
+    return (mean, valid, cnt) if return_counts else (mean, valid)
 
 
 # --------------------------------------------------------------------------------------

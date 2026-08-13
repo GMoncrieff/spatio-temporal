@@ -158,9 +158,9 @@ def stage_gates(args, store, attrs, years, paths, out_dir, card, block_rows=None
                         for name, arr in (("p2_5", low), ("median", cen), ("p97_5", upp)):
                             dsts[name].write(np.full((rr, W), np.nan, np.float32), 1, window=win)
                         continue
-                    med = np.nanmedian(ens, axis=0)
-                    p25 = np.nanpercentile(ens, 2.5, axis=0)
-                    p975 = np.nanpercentile(ens, 97.5, axis=0)
+                    # One sort for all three quantiles; three separate calls sort the
+                    # (50, rows, 40000) block three times over.
+                    p25, med, p975 = np.nanpercentile(ens, [2.5, 50.0, 97.5], axis=0)
                     dsts["median"].write(np.where(ok, med, np.nan).astype(np.float32), 1, window=win)
                     dsts["p2_5"].write(np.where(ok, p25, np.nan).astype(np.float32), 1, window=win)
                     dsts["p97_5"].write(np.where(ok, p975, np.nan).astype(np.float32), 1, window=win)
@@ -210,11 +210,15 @@ def stage_aggregate(args, store, attrs, years, paths, out_dir, card, null_store=
         with rasterio.open(paths[year]["central"]) as c:
             profile = c.profile.copy()
         # ---- T2.1 blocks --------------------------------------------------------------
-        for B in block_sizes:
-            if profile["height"] // B == 0 or profile["width"] // B == 0:
-                continue
-            mem, valid, _ = agg.block_member_stats(store, hi, B, attrs=attrs)
-            obs, obs_valid = agg.block_observed(paths[year]["observed"], profile, B)
+        usable = [B for B in block_sizes
+                  if profile["height"] // B > 0 and profile["width"] // B > 0]
+        # One pass over the members for all scales: at 50 members a global pass is ~68 GB
+        # of reads, and the nested block sums aggregate upward for free.
+        mem_by_b = agg.block_member_stats_multi(store, hi, usable, attrs=attrs)
+        obs_by_b = agg.block_observed_multi(paths[year]["observed"], profile, usable)
+        for B in usable:
+            mem, valid, _ = mem_by_b[B]
+            obs, obs_valid = obs_by_b[B]
             ok = valid & obs_valid
             if not ok.any():
                 continue
@@ -456,7 +460,11 @@ def stage_spatial(args, store, attrs, years, paths, out_dir, card, null_store=No
         coords = np.stack([rr, cc], axis=1).astype(float)
         y = obs.ravel()[idx]
         X = np.stack([agg.member_slice(store, attrs, m, hi).ravel()[idx] for m in range(M)])
-        Xn = np.stack([agg.member_slice(null_store, null_attrs, m, hi).ravel()[idx]
+        # The null only has to cover the horizon being scored; it is white noise and so
+        # compresses far worse than the correlated ensemble, and storing all four horizons
+        # of it buys nothing.
+        null_hi = min(hi, null_store.shape[1] - 1)
+        Xn = np.stack([agg.member_slice(null_store, null_attrs, m, null_hi).ravel()[idx]
                        for m in range(null_store.shape[0])])
         pairs = agg.sample_pairs(idx.size, 20000, rng=rng, coords=coords, max_dist=500)
         vs = agg.variogram_score(X, y, pairs)

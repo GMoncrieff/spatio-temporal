@@ -147,5 +147,43 @@ def test_dequantize_maps_sentinel_to_nan():
     assert abs(out[0, 1] - 1000 * DEFAULT_SCALE) < 1e-9
 
 
+
+
+def test_multi_scale_block_stats_match_per_scale_computation(tmp_path):
+    """Nested scales aggregated from the finest must equal computing each independently."""
+    from src.ensemble.aggregate import (
+        block_member_stats,
+        block_member_stats_multi,
+        block_observed,
+        block_observed_multi,
+    )
+    import rasterio
+    from rasterio.transform import from_origin
+
+    rng = np.random.default_rng(0)
+    vals = rng.uniform(0.05, 0.95, (8, 1, 32, 32)).astype(np.float32)
+    path = _make_store(tmp_path, vals)
+    store, attrs = open_ensemble(path)
+
+    multi = block_member_stats_multi(store, 0, [4, 8], attrs=attrs)
+    for B in (4, 8):
+        ref_mean, ref_valid, _ = block_member_stats(store, 0, B, attrs=attrs)
+        got_mean, got_valid, _ = multi[B]
+        assert np.allclose(got_mean, ref_mean, atol=1e-6, equal_nan=True)
+        assert np.array_equal(got_valid, ref_valid)
+
+    obs = rng.uniform(0, 1, (32, 32)).astype("float32")
+    op = tmp_path / "obs.tif"
+    with rasterio.open(op, "w", driver="GTiff", height=32, width=32, count=1,
+                       dtype="float32", crs="EPSG:4326",
+                       transform=from_origin(-180, 84, 0.009, 0.009), nodata=np.nan) as d:
+        d.write(obs, 1)
+    prof = {"height": 32, "width": 32, "transform": from_origin(-180, 84, 0.009, 0.009)}
+    om = block_observed_multi(str(op), prof, [4, 8])
+    for B in (4, 8):
+        ref, _ = block_observed(str(op), prof, B)
+        assert np.allclose(om[B][0], ref, atol=1e-6, equal_nan=True)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
