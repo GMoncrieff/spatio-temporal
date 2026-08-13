@@ -96,22 +96,40 @@ def test_weighting_moves_the_fitted_quantile_toward_the_rare_class():
     assert balanced > 0.5, balanced      # balanced, the classes weigh equally
 
 
-def test_quantile_context_sees_beyond_the_trunk_receptive_field():
-    """The head's new input must answer 'is there past change within 100 px', which the
-    ~10 px trunk receptive field cannot."""
-    from src.models.change_weights import CONTEXT_RADII, quantile_context
+def test_distance_context_is_exact_and_chip_independent():
+    """The production path: occupancy from a full-raster distance band, no pooling.
 
-    past = torch.zeros(1, 1, 256, 256)
-    past[0, 0, 128, 128] = 0.5
-    ctx = quantile_context(past, hm_now=torch.zeros_like(past))
-    assert ctx.shape[1] == len(CONTEXT_RADII) + 2
+    The chip-local fallback saturates — with one past-change pixel in a 128 px chip the
+    100 px radius reads ~0.75 mean occupancy, i.e. "is there any change in this chip".
+    Deriving occupancy from a precomputed distance instead is exact and unaffected by how
+    the chip happens to be framed.
+    """
+    from src.models.change_weights import (
+        CONTEXT_RADII,
+        N_CONTEXT_CHANNELS,
+        quantile_context,
+        quantile_context_from_distance,
+    )
 
-    # A pixel 60 px away is outside every radius below 100 and inside the 100 px one.
-    far = ctx[0, :, 128, 188]
+    # A chip whose only past change sits just outside it: true distance is 60 px.
+    dist = torch.full((1, 1, 128, 128), 60.0)
+    past = torch.zeros(1, 1, 128, 128)
+    ctx = quantile_context_from_distance(dist, past, hm_now=torch.zeros_like(past))
+    assert ctx.shape[1] == N_CONTEXT_CHANNELS
     for i, r in enumerate(CONTEXT_RADII):
-        assert (far[i] > 0) == (r >= 60), (r, float(far[i]))
-    # A pixel 200 px away sees nothing at all.
-    assert ctx[0, : len(CONTEXT_RADII), 128, 255].sum() == 0
+        expected = 1.0 if r >= 60 else 0.0
+        assert torch.allclose(ctx[0, i], torch.full_like(ctx[0, i], expected)), r
+
+    # The chip-local fallback cannot represent this at all: it sees no seed in the chip
+    # and reports zero occupancy at every radius, including the 100 px one that is true.
+    fallback = quantile_context(past, hm_now=torch.zeros_like(past))
+    assert fallback[0, len(CONTEXT_RADII) - 1].max() == 0.0
+
+    # And it saturates in the opposite direction when a seed *is* present.
+    seeded = torch.zeros(1, 1, 128, 128)
+    seeded[0, 0, 10, 10] = 0.5
+    sat = quantile_context(seeded, hm_now=torch.zeros_like(seeded))
+    assert sat[0, len(CONTEXT_RADII) - 1].mean() > 0.5, "the 100px radius saturates in a chip"
 
 
 def test_past_change_recovers_raw_units_from_normalised_inputs():

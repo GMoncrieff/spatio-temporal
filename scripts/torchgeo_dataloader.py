@@ -67,6 +67,7 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
         split_value=None,
         exclude_split_values=None,
         norm_stats=None,
+        context_pattern=None,
     ):
         self.hm_files = hm_files
         self.component_files = component_files
@@ -92,6 +93,12 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
         self._hm_files = list(hm_files)
         self._static_files = list(static_files if static_channels is None else static_files[:int(static_channels)])
         self._comp_files = {y: list(component_files.get(y, [])) for y in years} if self.include_components else {y: [] for y in years}
+        # Past-change context rasters, one per input window (band 1 = past change,
+        # band 2 = distance to the nearest past change). Computed on the full raster, so
+        # a 100 px radius means 100 km of geography rather than the edge of a 128 px chip.
+        self.context_pattern = context_pattern
+        self._ctx_srcs = None
+
         # Split mask for train/val/test separation
         self.split_mask_file = split_mask_file
         self.split_value = split_value  # 1=train, 2=val, 3=test, 4=calib
@@ -365,6 +372,12 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
             self._static_srcs = [rasterio.open(f) for f in self._static_files]
         if self._comp_srcs is None:
             self._comp_srcs = {y: [rasterio.open(f) for f in self._comp_files[y]] for y in years}
+        if self.context_pattern is not None and self._ctx_srcs is None:
+            self._ctx_srcs = {}
+            for y in years:
+                p = self.context_pattern.format(year=y)
+                if os.path.exists(p):
+                    self._ctx_srcs[y] = rasterio.open(p)
 
     def __len__(self):
         if self.mode == "grid":
@@ -482,6 +495,16 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
                 if not np.isnan(target_h).all():
                     all_valid = True
             
+            context_arr = None
+            if self.context_pattern is not None:
+                src = (self._ctx_srcs or {}).get(input_years[-1])
+                if src is not None:
+                    win = rasterio.windows.Window(j, i, self.chip_size, self.chip_size)
+                    context_arr = np.stack([
+                        np.nan_to_num(src.read(1, window=win, masked=True).filled(np.nan), nan=0.0),
+                        np.nan_to_num(src.read(2, window=win, masked=True).filled(np.nan), nan=1e4),
+                    ], axis=0).astype(np.float32)
+
             if all_valid:
                 sample = {
                     "input_dynamic": torch.from_numpy(input_dynamic).float(),
@@ -493,6 +516,8 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
                     "target_years": target_years,
                     "end_year": end_year,
                 }
+                if context_arr is not None:
+                    sample["change_context"] = torch.from_numpy(context_arr).float()
                 sample.update(targets)  # Add all horizon targets
                 return sample
         # If all attempts fail, return anyway (will be masked out in loss)
@@ -533,6 +558,7 @@ def get_dataloader(
     split_value=None,
     exclude_split_values=None,
     norm_stats=None,
+    context_pattern=None,
 ):
     """
     Create a DataLoader for the Human Footprint dataset.
@@ -565,6 +591,7 @@ def get_dataloader(
         split_value=split_value,
         exclude_split_values=exclude_split_values,
         norm_stats=norm_stats,
+        context_pattern=context_pattern,
     )
     return DataLoader(
         ds,

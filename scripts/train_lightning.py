@@ -217,6 +217,11 @@ if __name__ == "__main__":
              "away, which is what decides whether change is possible at all.",
     )
     parser.add_argument(
+        "--context_pattern", type=str,
+        default="data/raw/hm_global/change_context_w{year}_1000.tif",
+        help="Full-raster past-change context rasters (band 1 past change, band 2 distance)",
+    )
+    parser.add_argument(
         "--quantile_class_weighting", type=str, default="none",
         choices=["none", "distance"],
         help="Balance the distance-to-past-change bands in the pinball loss (default: none)",
@@ -429,6 +434,7 @@ if __name__ == "__main__":
         pin_memory=True if args.num_workers > 0 else False,
         persistent_workers=True if args.num_workers > 0 else False,
         split_mask_file=split_mask_file,
+        context_pattern=(args.context_pattern if args.quantile_context else None),
         split_value=train_split_value,  # Train split (None in fold-CV mode)
         exclude_split_values=train_exclude,
         norm_stats=cached_norm_stats,
@@ -456,6 +462,7 @@ if __name__ == "__main__":
         pin_memory=True if args.num_workers > 0 else False,
         persistent_workers=True if args.num_workers > 0 else False,
         split_mask_file=split_mask_file,
+        context_pattern=(args.context_pattern if args.quantile_context else None),
         split_value=val_split_value,  # Validation split
         norm_stats=cached_norm_stats,
     )
@@ -474,6 +481,7 @@ if __name__ == "__main__":
         pin_memory=True if args.num_workers > 0 else False,
         persistent_workers=True if args.num_workers > 0 else False,
         split_mask_file=split_mask_file,
+        context_pattern=(args.context_pattern if args.quantile_context else None),
         split_value=test_split_value,  # Test split
         norm_stats=cached_norm_stats,
     )
@@ -1632,6 +1640,14 @@ if __name__ == "__main__":
             hm_srcs = [rasterio.open(p) for p in hm_files]
             comp_srcs = {y: [rasterio.open(p) for p in component_files[y]] for y in years} if include_components else {y: [] for y in years}
             stat_srcs = [rasterio.open(p) for p in static_list_paths]
+            ctx_src = None
+            if args.quantile_context and args.context_pattern:
+                ctx_path = args.context_pattern.format(year=base_year)
+                if os.path.exists(ctx_path):
+                    ctx_src = rasterio.open(ctx_path)
+                    print(f"Quantile-head context: {ctx_path}")
+                else:
+                    print(f"⚠ context raster missing ({ctx_path}); heads will see zeros")
 
             tile = 128
             stride = int(args.predict_stride)
@@ -1649,6 +1665,12 @@ if __name__ == "__main__":
             if infer_model is None:
                 print(f"\nLoading model from checkpoint: {best_ckpt_path}")
                 infer_model = SpatioTemporalLightningModule.load_from_checkpoint(best_ckpt_path, map_location=device)
+                # The quantile-head context is derived from the normalized HM channel and
+                # rescaled by hm_std; these are plain attributes absent from the .ckpt, so
+                # without setting them here inference would build the context at a
+                # different scale than training did.
+                infer_model.hm_mean = PREDICT_STATS['hm_mean']
+                infer_model.hm_std = PREDICT_STATS['hm_std']
                 infer_model.eval()
                 print(f"✓ Model loaded on device: {device}")
             infer_model = infer_model.to(device)
@@ -1723,6 +1745,7 @@ if __name__ == "__main__":
                 
                 # Prepare batch data
                 batch_inputs_dyn = []
+                batch_contexts = []
                 batch_inputs_stat = []
                 batch_lonlats = []
                 batch_metadata = []  # Store (i, j, hi, wj, li0, lj0, li1, lj1, valid_mask, input_invalid_mask)
@@ -1820,6 +1843,17 @@ if __name__ == "__main__":
                         lonlat_padded[:hi, :wj, :] = lonlat_hw2
                         lonlat_hw2 = lonlat_padded
                     
+                    if ctx_src is not None:
+                        cx = np.stack([
+                            np.nan_to_num(ctx_src.read(1, window=win, masked=True).filled(np.nan), nan=0.0),
+                            np.nan_to_num(ctx_src.read(2, window=win, masked=True).filled(np.nan), nan=1e4),
+                        ], axis=0).astype(np.float32)
+                        if hi < tile or wj < tile:
+                            padded = np.zeros((2, tile, tile), dtype=np.float32)
+                            padded[1] = 1e4
+                            padded[:, :hi, :wj] = cx
+                            cx = padded
+                        batch_contexts.append(cx)
                     batch_inputs_dyn.append(in_dyn)
                     batch_inputs_stat.append(in_stat)
                     batch_lonlats.append(lonlat_hw2)
@@ -1832,8 +1866,14 @@ if __name__ == "__main__":
                     batch_stat_tensor = torch.from_numpy(np.stack(batch_inputs_stat, axis=0)).to(device)  # [B, C, H, W]
                     batch_lonlat_tensor = torch.from_numpy(np.stack(batch_lonlats, axis=0)).to(device)  # [B, H, W, 2]
                     
+                    batch_ctx_tensor = (
+                        torch.from_numpy(np.stack(batch_contexts, axis=0)).to(device)
+                        if batch_contexts else None
+                    )
                     with torch.no_grad():
-                        batch_preds = infer_model(batch_dyn_tensor, batch_stat_tensor, lonlat=batch_lonlat_tensor)  # [B, 12, H, W]
+                        batch_preds = infer_model(batch_dyn_tensor, batch_stat_tensor,
+                                                  lonlat=batch_lonlat_tensor,
+                                                  change_context=batch_ctx_tensor)  # [B, 12, H, W]
                     
                     # Process each tile in the batch
                     for tile_idx, (i, j, hi, wj, li0, lj0, li1, lj1, valid_mask, input_invalid_mask) in enumerate(batch_metadata):
@@ -1973,6 +2013,8 @@ if __name__ == "__main__":
                     src.close()
             for src in stat_srcs:
                 src.close()
+            if ctx_src is not None:
+                ctx_src.close()
 
             return infer_model
 

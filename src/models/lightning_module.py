@@ -12,6 +12,7 @@ from .change_weights import (
     class_balanced_weights,
     past_change_from_inputs,
     quantile_context,
+    quantile_context_from_distance,
 )
 import wandb
 import numpy as np
@@ -222,20 +223,29 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             change = (target_h - last) * float(getattr(self, 'hm_std', 1.0))
         return class_balanced_weights(past, mask, target_change=change)
 
-    def _build_quantile_context(self, input_dynamic):
-        """Multi-scale past-change occupancy for the quantile heads (see change_weights)."""
+    def _build_quantile_context(self, input_dynamic, change_context=None):
+        """Past-change occupancy for the quantile heads (see change_weights).
+
+        Prefers the precomputed full-raster context (band 1 past change, band 2 distance);
+        falls back to the chip-local dilation only when none is supplied, which is correct
+        just for chips much larger than the biggest radius.
+        """
         if self.quantile_context_channels <= 0:
             return None
+        hm_now = input_dynamic[:, -1, 0:1]
+        if change_context is not None:
+            past = change_context[:, 0:1]
+            dist = change_context[:, 1:2]
+            return quantile_context_from_distance(dist, past, hm_now=hm_now)
         hm_std = float(getattr(self, 'hm_std', 1.0))
         past = past_change_from_inputs(input_dynamic, hm_std=hm_std)
-        hm_now = input_dynamic[:, -1, 0:1]
         return quantile_context(past, hm_now=hm_now)
 
-    def forward(self, input_dynamic, input_static, lonlat=None):
+    def forward(self, input_dynamic, input_static, lonlat=None, change_context=None):
         # Ensure input_dynamic is [B, T, 1, H, W]
         if input_dynamic.dim() == 4:
             input_dynamic = input_dynamic.unsqueeze(2)
-        ctx = self._build_quantile_context(input_dynamic)
+        ctx = self._build_quantile_context(input_dynamic, change_context)
         return self.model(input_dynamic, input_static, lonlat=lonlat, quantile_context=ctx)
 
     def training_step(self, batch, batch_idx):
@@ -267,7 +277,8 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         input_static = torch.nan_to_num(input_static, nan=0.0)
         
         # Forward pass: get predictions for all 4 horizons × 3 quantiles [B, 12, H, W]
-        preds_all = self(input_dynamic, input_static, lonlat=lonlat)
+        preds_all = self(input_dynamic, input_static, lonlat=lonlat,
+                         change_context=batch.get('change_context'))
         
         # Use last timestep HM channel (0) as baseline
         last_input = input_dynamic[:, -1, 0:1, :, :]  # [B, 1, H, W]
@@ -434,7 +445,8 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         input_static = torch.nan_to_num(input_static, nan=0.0)
         
         # Forward pass: get predictions for all 4 horizons × 3 quantiles [B, 12, H, W]
-        preds_all = self(input_dynamic, input_static, lonlat=lonlat)
+        preds_all = self(input_dynamic, input_static, lonlat=lonlat,
+                         change_context=batch.get('change_context'))
         
         # Use last timestep HM channel (0) as baseline
         last_input = input_dynamic[:, -1, 0:1, :, :]  # [B, 1, H, W]

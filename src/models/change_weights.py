@@ -83,26 +83,44 @@ def class_balanced_weights(
 
 
 CONTEXT_RADII = (1, 3, 10, 30, 100)
-N_CONTEXT_CHANNELS = len(CONTEXT_RADII) + 2
+N_CONTEXT_CHANNELS = len(CONTEXT_RADII) + 3
+
+
+def quantile_context_from_distance(dist: torch.Tensor, past_change: torch.Tensor,
+                                   hm_now: torch.Tensor | None = None,
+                                   radii=CONTEXT_RADII):
+    """Context features from a *full-raster* distance-to-past-change band.
+
+    Occupancy within radius r is simply ``dist <= r``, so no pooling is involved and the
+    chip boundary plays no part. This is the whole reason the distance is precomputed on
+    the full raster (scripts/prepare_change_context.py): deriving it from a 128 px chip
+    made the 100 px radius saturate into "is there any change in this chip" — measured at
+    0.752 mean occupancy for a single past-change pixel — which is an artifact of framing,
+    not geography.
+
+    Returns [B, len(radii) + 3, H, W]: occupancy per radius, log1p distance, the signed
+    past change, and the current HM level.
+    """
+    feats = [(dist <= float(r)).to(dist.dtype) for r in radii]
+    feats.append(torch.log1p(dist.clamp(min=0.0)) / 10.0)
+    feats.append(past_change)
+    feats.append(hm_now if hm_now is not None else torch.zeros_like(past_change))
+    return torch.cat(feats, dim=1)
 
 
 def quantile_context(past_change: torch.Tensor, hm_now: torch.Tensor | None = None,
                      radii=CONTEXT_RADII, threshold: float = DEFAULT_CHANGE_THRESHOLD):
-    """Multi-scale 'is there past change within r pixels' features for the quantile heads.
+    """Chip-local fallback via max-pool dilations.
 
-    The trunk's receptive field is roughly 10 px, so nothing in its features can answer
-    "has anything changed within 100 px of here" — and that is the covariate that decides
-    whether change is possible at all (observed P(change > 0.05) falls from 0.222 adjacent
-    to past change to exactly 0.000 beyond 100 px). Max-pool dilations answer it directly
-    and cost one pooling op per radius.
-
-    Returns [B, len(radii) + 2, H, W]: one occupancy channel per radius, the signed past
-    change itself, and the current HM level.
+    Only correct when the chip is much larger than the biggest radius; retained for tests
+    and for callers with no precomputed context raster. Prefer
+    :func:`quantile_context_from_distance`.
     """
     seed = (past_change > threshold).float()
     feats = []
     for r in radii:
         feats.append(F.max_pool2d(seed, kernel_size=int(2 * r + 1), stride=1, padding=int(r)))
+    feats.append(torch.zeros_like(past_change))
     feats.append(past_change)
     feats.append(hm_now if hm_now is not None else torch.zeros_like(past_change))
     return torch.cat(feats, dim=1)
