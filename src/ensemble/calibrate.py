@@ -65,6 +65,8 @@ MIN_HALF_WIDTH = 1e-5
 class _Scores:
     up: list = field(default_factory=list)
     lo: list = field(default_factory=list)
+    w_up: list = field(default_factory=list)
+    w_lo: list = field(default_factory=list)
     n_up: int = 0
     n_lo: int = 0
     n_degenerate: int = 0
@@ -79,14 +81,27 @@ class ScoreStore:
     reporting coverage on the same residuals is circular and always looks good.
     """
 
-    def __init__(self, cap: int = 8000, random_seed: int = 42, class_keys=CLASS_KEYS):
+    def __init__(self, cap: int = 8000, random_seed: int = 42, class_keys=CLASS_KEYS,
+                 third_axis: str = "biome"):
         self.cap = cap
         self.rng = np.random.default_rng(random_seed)
         self.class_keys = tuple(class_keys)
+        # What the third class axis holds: "dist" (6 ordered distance-to-past-change bands)
+        # or "biome" (14 unordered categories). It decides whether that axis belongs in the
+        # primary stratum: ordered distance bands carry the signal that determines whether
+        # change is possible at all, while biome would merely re-fragment thin classes.
+        self.third_axis = third_axis
         self.data: dict = defaultdict(_Scores)
 
-    def add(self, key, fold, up=None, lo=None, chips=None, n_degenerate=0, n_total=0):
+    def add(self, key, fold, up=None, lo=None, chips=None, n_degenerate=0, n_total=0,
+            w_up=None, w_lo=None):
         s = self.data[(key, fold)]
+        # The half widths themselves are kept (subsampled) because the monotone-spread
+        # guard has to act on s * w, not on s alone.
+        if w_up is not None and w_up.size:
+            s.w_up.append(self._subsample(w_up))
+        if w_lo is not None and w_lo.size:
+            s.w_lo.append(self._subsample(w_lo))
         if up is not None and up.size:
             s.n_up += int(up.size)
             s.up.append(self._subsample(up))
@@ -119,14 +134,20 @@ class ScoreStore:
             o["n_lo"] += s.n_lo
             o["n_degenerate"] = o.get("n_degenerate", 0) + s.n_degenerate
             o["n_total"] = o.get("n_total", 0) + s.n_total
+            o.setdefault("w_up", []).extend(s.w_up)
+            o.setdefault("w_lo", []).extend(s.w_lo)
             o["chips"].update(s.chips)
         merged = {}
         for key, o in out.items():
+            wu = np.concatenate(o["w_up"]) if o.get("w_up") else np.empty(0, np.float32)
+            wl = np.concatenate(o["w_lo"]) if o.get("w_lo") else np.empty(0, np.float32)
             merged[key] = {
                 "up": np.concatenate(o["up"]) if o["up"] else np.empty(0, np.float32),
                 "lo": np.concatenate(o["lo"]) if o["lo"] else np.empty(0, np.float32),
                 "n_up": o["n_up"], "n_lo": o["n_lo"], "n_eff": len(o["chips"]),
                 "n_degenerate": o.get("n_degenerate", 0), "n_total": o.get("n_total", 0),
+                "w_up_med": float(np.median(wu)) if wu.size else np.nan,
+                "w_lo_med": float(np.median(wl)) if wl.size else np.nan,
             }
         return merged
 
@@ -178,14 +199,16 @@ class ScoreStore:
             payload[f"chips_{i}"] = np.fromiter(s.chips, dtype=np.int64, count=len(s.chips))
             meta.append({"i": i, "key": list(key), "fold": fold, "n_up": s.n_up,
                          "n_lo": s.n_lo, "n_degenerate": s.n_degenerate, "n_total": s.n_total})
-        np.savez(path, meta=np.array(json.dumps(meta)), **payload)
+        np.savez(path, meta=np.array(json.dumps(meta)),
+                 third_axis=np.array(self.third_axis), **payload)
         return path
 
     @classmethod
     def load(cls, path, cap: int = 8000, random_seed: int = 42):
         z = np.load(path, allow_pickle=False)
         meta = json.loads(str(z["meta"]))
-        store = cls(cap=cap, random_seed=random_seed)
+        third = str(z["third_axis"]) if "third_axis" in z else "biome"
+        store = cls(cap=cap, random_seed=random_seed, third_axis=third)
         for m in meta:
             i = m["i"]
             s = store.data[(tuple(m["key"]), m["fold"])]
@@ -211,7 +234,13 @@ def collect_conformal_scores(
 ):
     """Stream the hindcast residual rasters into a :class:`ScoreStore`."""
     df = manifest if isinstance(manifest, pd.DataFrame) else pd.read_csv(manifest)
-    store = ScoreStore(cap=cap, random_seed=random_seed)
+    has_dist = any(
+        isinstance(r.get("path_dist_past_change"), str)
+        and Path(r["path_dist_past_change"]).exists()
+        for _, r in (df.iterrows() if hasattr(df, "iterrows") else [])
+    )
+    store = ScoreStore(cap=cap, random_seed=random_seed,
+                       third_axis="dist" if has_dist else "biome")
     biome_map = None
     if ecoregion_raster is not None and lookup_csv is not None:
         biome_map, _, _ = biome_lut(lookup_csv)
@@ -314,6 +343,7 @@ def collect_conformal_scores(
                         chips=np.unique(chip_id[sel]),
                         n_degenerate=int((sel & (~ok_up | ~ok_lo)).sum()),
                         n_total=int(sel.sum()),
+                        w_up=wu[sel & ok_up], w_lo=wl[sel & ok_lo],
                     )
         finally:
             for s in srcs.values():
@@ -357,9 +387,11 @@ def fit_scale_factors(
     exclude_fold=None,
     smooth: bool = True,
     tail_level: str = "marginal",
-    primary_includes_dist: bool = True,
+    primary_includes_dist=None,
 ):
     """Per-class ŝ_up / ŝ_lo with shrinkage, smoothing, and monotonicity guards."""
+    if primary_includes_dist is None:
+        primary_includes_dist = getattr(store, "third_axis", "biome") == "dist"
     pooled = store.pooled(exclude_fold=exclude_fold)
     rows = []
     for key, d in pooled.items():
@@ -384,6 +416,7 @@ def fit_scale_factors(
             "s_lo_raw": _conformal_quantile(d["lo"], n_eff, lvl_lo),
             "median_e_up": float(np.median(d["up"])) if d["up"].size else np.nan,
             "median_e_lo": float(np.median(d["lo"])) if d["lo"].size else np.nan,
+            "w_up_med": d.get("w_up_med", np.nan), "w_lo_med": d.get("w_lo_med", np.nan),
         })
     df = pd.DataFrame(rows)
     if df.empty:
@@ -497,15 +530,35 @@ def _isotonic_smooth(df):
 
 
 def _enforce_horizon_monotonicity(df):
-    """ŝ non-decreasing in horizon within a class, so T4.2 (spread grows) is not violated."""
+    """Non-decreasing *spread* in horizon within a class — s * w, not s alone.
+
+    T4.2 requires the interval to widen with lead time. The published half width is
+    ``s * w``, and w already grows with horizon, so constraining s to grow as well is
+    doubly conservative: measured on southern Africa it more than doubled the far-field
+    factor at h=20 (conformal asked for 0.705, the s-only guard imposed 1.756) in exactly
+    the classes where the data says the interval should collapse.
+    """
     out = df.copy()
     keys = ["dhat_bin_idx", "hm_bin_idx", "biome"]
     for tail in ("up", "lo"):
-        col = f"s_{tail}"
+        col, wcol = f"s_{tail}", f"w_{tail}_med"
+        if wcol not in out:
+            for _, grp in out.groupby(keys):
+                g = grp.sort_values("horizon")
+                out.loc[g.index, col] = np.maximum.accumulate(g[col].to_numpy(float))
+            continue
         for _, grp in out.groupby(keys):
             g = grp.sort_values("horizon")
-            vals = np.maximum.accumulate(g[col].to_numpy(float))
-            out.loc[g.index, col] = vals
+            s_vals = g[col].to_numpy(float)
+            w_vals = g[wcol].to_numpy(float)
+            good = np.isfinite(w_vals) & (w_vals > 0)
+            if good.sum() < 2:
+                out.loc[g.index, col] = np.maximum.accumulate(s_vals)
+                continue
+            spread = np.where(good, s_vals * w_vals, np.nan)
+            filled = pd.Series(spread).ffill().bfill().to_numpy()
+            mono = np.maximum.accumulate(filled)
+            out.loc[g.index, col] = np.where(good, mono / np.where(good, w_vals, 1.0), s_vals)
     return out
 
 

@@ -168,5 +168,31 @@ def test_weighted_median_ignores_a_single_wild_class():
     assert abs(_weighted_median(v, w) - 1.0) < 0.1
 
 
+
+
+def test_horizon_guard_constrains_spread_not_the_factor():
+    """s*w must be non-decreasing in horizon; s itself may fall as the head widens.
+
+    Measured on southern Africa, guarding s alone forced the far-field h=20 factor from
+    the 0.705 the conformal fit asked for up to 1.756, inflating exactly the class where
+    the data says the interval should collapse.
+    """
+    df = pd.DataFrame({
+        "horizon": [5, 10, 15, 20], "dhat_bin_idx": [1] * 4, "hm_bin_idx": [0] * 4,
+        "biome": [4] * 4, "n_eff": [400] * 4,
+        # The head width doubles with lead time, so a falling factor still widens the
+        # published interval.
+        "w_up_med": [0.02, 0.04, 0.06, 0.08], "w_lo_med": [0.02, 0.04, 0.06, 0.08],
+        "s_up": [1.5, 1.2, 0.9, 0.7], "s_lo": [1.0, 1.0, 1.0, 1.0],
+    })
+    out = _enforce_horizon_monotonicity(df).sort_values("horizon")
+    spread = (out["s_up"] * out["w_up_med"]).to_numpy()
+    assert np.all(np.diff(spread) >= -1e-12), "published spread must not shrink with lead time"
+    # The factor is left free to fall, unlike the old s-only guard which would have
+    # ratcheted every horizon up to 1.5.
+    assert out["s_up"].iloc[-1] < 1.0
+    assert out["s_up"].iloc[-1] == pytest.approx(0.7, abs=1e-9)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
