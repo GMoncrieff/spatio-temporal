@@ -115,11 +115,17 @@ def fit_residual_shape(standardized_residual, n_knots: int = 512, min_count: int
     # Odd knot count so u = 0.5 lands exactly on a knot; the centre is then pinned to zero
     # rather than left to interpolation, because T5.1 is an exact-equality gate and a
     # 1e-5 offset there is a real (if tiny) violation of "median == central forecast".
-    n_knots = int(n_knots) | 1
-    u = np.linspace(EDGE_U, 1.0 - EDGE_U, n_knots)
+    # The three gate quantiles must be *knots*, not interpolated between them. A uniform
+    # grid does not contain 0.025/0.5/0.975, and because the quantile function is steep near
+    # the bounds the interpolation error there is a systematic bias, not noise — it does not
+    # shrink with member count. Caught by an M=400 run in which T5.2 got *worse* rather than
+    # better, which is only possible against an MC-scaled tolerance if a bias is present.
+    u = np.linspace(EDGE_U, 1.0 - EDGE_U, int(n_knots))
+    u = np.unique(np.concatenate([u, [0.025, 0.5, 0.975]]))
     q = np.quantile(ec, u)
     vals = np.where(q < 0, q / lo_ref * Z975, q / hi_ref * Z975)
-    vals[n_knots // 2] = 0.0
+    for anchor, target in ((0.025, -Z975), (0.5, 0.0), (0.975, Z975)):
+        vals[int(np.searchsorted(u, anchor))] = target
     vals = np.maximum.accumulate(vals)  # quantile functions are monotone; keep it exact
     return {"u": u.tolist(), "q": vals.tolist(), "n": int(e.size)}
 
@@ -186,10 +192,12 @@ def apply_shape_torch(z, shape, device=None, dtype=None):
     # Normal CDF without scipy, so this stays on the GPU.
     u = 0.5 * (1.0 + torch.erf(z / float(np.sqrt(2.0))))
 
-    # The grid is a uniform ramp on [u0, u1], so the bucket index is exact arithmetic.
-    pos = torch.clamp((u - u0) / (u1 - u0), 0.0, 1.0) * (n - 1)
-    i0 = torch.clamp(pos.floor().long(), 0, n - 2)
-    frac = pos - i0.to(pos.dtype)
+    # The grid is *not* uniform — the three gate quantiles are inserted as exact knots — so
+    # the bucket has to be searched rather than computed. Getting this wrong silently
+    # mis-maps every member on the GPU path while the numpy path stays correct.
+    i0 = torch.clamp(torch.searchsorted(ug, u.contiguous(), right=True) - 1, 0, n - 2)
+    du = ug[i0 + 1] - ug[i0]
+    frac = torch.clamp((u - ug[i0]) / torch.clamp(du, min=1e-30), 0.0, 1.0)
     out = qv[i0] + frac * (qv[i0 + 1] - qv[i0])
 
     # Outside the published bound, hand the normal score straight back — see apply_shape.

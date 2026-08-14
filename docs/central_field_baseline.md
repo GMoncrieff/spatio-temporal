@@ -502,6 +502,86 @@ remaining failure. The residual gaps are structural, not parametric: T1.1 is a g
 tension with T1.2/T1.3, and T3.2 is a target-threshold problem (§10). Keep identity
 recalibration, `long_weight = 0.40`, `nu = 0.5`.
 
+---
+
+## 12. The marginal family — built, measured, not adopted
+
+§11 established that no existing knob moves the remaining failures. The next question was
+*which* model-level change, and the data answered it differently from the obvious guess.
+
+### The guess was wrong: the widths are fine, the shape is not
+
+The intervals look too wide, so the natural move is to retrain the width heads tighter.
+The residual says otherwise. In units of the published 95% half-width:
+
+| | P(\|e\|>0.25) | P(\|e\|>0.5) | P(\|e\|>1) | P(\|e\|>1.96) | kurtosis |
+|---|---|---|---|---|---|
+| Gaussian (what the marginal assumes) | 0.803 | 0.617 | 0.317 | 0.050 | 3 |
+| observed h=5 | 0.342 | 0.194 | 0.088 | 0.034 | **20366** |
+| observed h=20 | 0.492 | 0.254 | 0.082 | 0.015 | **928** |
+
+At the 95% point the interval is close to nominal — that is T1.1's mild over-coverage. In
+the *body* the residual is three times more concentrated than the Gaussian the two-piece
+normal fills it with, and the members inherit exactly that. Narrowing the heads would fix
+the body by breaking the tails, which is precisely what §11's `k*` experiment demonstrated.
+
+### The fix, and what it achieved
+
+`fit_residual_shape` (`src/ensemble/copula.py`) replaces the *shape* only: the normal score
+is remapped through the residual's own standardized quantile function, normalized so
+u = 0.025/0.5/0.975 still land exactly on lower/central/upper. Strictly monotone, so the
+copula's rank structure and every spatial property are untouched; a genuinely Gaussian
+residual returns the identity. Enabled by `--marginal_shape` on `generate_ensemble.py`.
+
+| | overall | T6.1 ratios (target 0.5–2.0) | T6.5 | T5.2 |
+|---|---|---|---|---|
+| two-piece normal | **91/128 = 0.711** | 3.84 / 5.65 / 6.75 / 6.65 | 1/8 | **4/4** |
+| empirical shape | 84/126 = 0.667 | **1.74 / 2.88 / 4.36 / 4.55** | 2/8 | 0/4 |
+
+It halves the defect it was built for — h=5's T6.1 ratio passes for the first time — and
+costs every percentile-estimated row.
+
+### Why it is *not* the default
+
+The percentile rows degrade because a spiky marginal is harder to estimate percentiles from
+at fixed M: the mapping is steep near the bound and few members land there. Measured
+directly, as |ensemble percentile − published bound| in units of the interval width:
+
+| | M | lower | upper |
+|---|---|---|---|
+| two-piece | 100 | 0.0331 | 0.0518 |
+| shaped | 100 | 0.0461 | 0.0974 |
+| shaped | 400 | **0.0233** | 0.0665 |
+
+At M=400 the shaped marginal reproduces the lower bound *better* than the two-piece does at
+M=100. But T5.2's tolerance is MC-scaled as 1/√M under a Gaussian assumption the shaped
+family violates, so its pass fraction went *down* at M=400 (0.847 → 0.773) even as the
+absolute error halved. Scoring this family against that tolerance is not a fair test — and
+"the metric is unfair" is not sufficient grounds to adopt a change that loses 91/128 to
+84/126 as actually scored. **The two-piece normal remains the default; the shape stays
+behind the flag** until either T5.2's tolerance is made family-aware or the realism gain is
+shown to be worth the percentile cost on a decision-relevant metric.
+
+### Two bugs of mine, and how each was caught
+
+1. **Tail inherited the outliers.** The first version put the crossover back to unit slope
+   at z = 3.72 rather than at the 95% bound, so the mapping took the residual's extreme
+   standardized outliers at face value and sent z = 3 to **5.4 half-widths**. Those outliers
+   are mostly pixels whose *width* is near-degenerate — the ratio explodes because the
+   denominator collapsed. Cost: T8.2 crossed its gate, T7.3 1.28 → 1.66, T4.2 0.997 → 0.79.
+   Fixed by putting the crossover at the bound; the tail is then the two-piece normal
+   exactly (z = 3 → 1.53).
+2. **A bug created by fixing a non-bug.** Suspecting an interpolation bias at the gate
+   quantiles, I pinned them as exact knots — which made the u-grid non-uniform and broke the
+   *torch* path, which computed its bucket index by uniform-grid arithmetic. That is the GPU
+   path every ensemble is generated on, so it would have mis-mapped members silently while
+   numpy stayed right. Caught by the numpy/torch parity test.
+
+The bias hypothesis itself was **wrong**: with both fixes the ensembles differ by at most
+3e-4 HM and the scorecard is unchanged to three decimals. Worth recording because
+byte-identical scorecards are this project's signature for scoring the wrong artifact — here
+the artifacts were verified genuinely distinct first, and the null result is real.
+
 ### Measurement notes worth carrying forward
 
 - The `newheads` central rasters and the fold-stitched rasters are **not comparable

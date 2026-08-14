@@ -62,12 +62,19 @@ def test_median_is_exactly_the_central_forecast():
 
 
 def test_tails_are_exactly_the_published_bounds():
+    """Exactly, not approximately.
+
+    The quantile function is steep near the bounds, so interpolating between knots there
+    leaves a *bias* — it does not shrink with member count, and an M=400 run made T5.2
+    worse rather than better because the tolerance tightened while the bias did not. The
+    gate quantiles are therefore pinned as knots.
+    """
     shape = fit_residual_shape(spiky_residual())
     p = params_for(3, lower=-1.0, central=0.0, upper=2.0, shape=shape)
     lo = marginal_ppf(np.full(3, 0.025), p, clip=None)
     hi = marginal_ppf(np.full(3, 0.975), p, clip=None)
-    assert np.allclose(lo, -1.0, atol=2e-2), lo
-    assert np.allclose(hi, 2.0, atol=2e-2), hi
+    assert np.allclose(lo, -1.0, atol=1e-9), lo
+    assert np.allclose(hi, 2.0, atol=1e-9), hi
 
 
 def test_mapping_is_monotone_so_member_ranks_are_preserved():
