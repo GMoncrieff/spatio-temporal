@@ -441,6 +441,67 @@ Two implementation traps found while testing this, both fixed:
   only clips the live region is forced to make up the difference from zero-weight pixels —
   silently reintroducing the degenerate points. Candidates are now filtered before the draw.
 
+---
+
+## 11. Parameter sweeps before complexity — three knobs, all negative
+
+Before proposing any new machinery for the remaining failures (T1.1, T3.1, T3.2), every
+existing parameter that could plausibly move them was swept. None does.
+
+### Recalibration: identity is already the best of the three options
+
+| variant | overall | T1.1 | T1.2 | T1.3 | T8.4 | T7.3 |
+|---|---|---|---|---|---|---|
+| **identity (chosen)** | **91/128 = 0.711** | 0/4 | **13/16** | **3/3** | **4/5** | 1.275 |
+| global conformal | 83/127 = 0.654 | 0/4 | 13/15 | 2/2 | 2/5 | 2.129 |
+| empirical width multiplier | 85/125 = 0.680 | **4/4** | 8/15 | 0/2 | 0/5 | **1.185** |
+
+The third row is the interesting one. Coverage turns out to be remarkably *insensitive* to
+interval width, because the central-field fix left most pixels with near-zero error, so
+almost nothing sits near the interval boundary:
+
+| horizon | ×1.0 | ×0.8 | ×0.6 | ×0.4 | ×0.2 | multiplier for 0.95 |
+|---|---|---|---|---|---|---|
+| +5yr | 0.9659 | 0.9533 | 0.9297 | 0.8802 | 0.7579 | 0.76 |
+| +10yr | 0.9761 | 0.9661 | 0.9473 | 0.9061 | 0.7841 | 0.62 |
+| +15yr | 0.9820 | 0.9714 | 0.9454 | 0.8888 | 0.7500 | 0.63 |
+| +20yr | 0.9850 | 0.9732 | 0.9429 | 0.8742 | 0.6632 | 0.63 |
+
+Cutting width 20% buys about one point of coverage. Applying the multiplier that *does*
+reach 0.95 (24–38% narrowing) puts T1.1 at 4/4 — and costs class-conditional coverage
+(13/16 → 8/15), the high-change tail (3/3 → **0/2**) and lower-tail clustering (4/5 →
+**0/5**). That is exactly the trade T1.2 and T1.3 exist to guard. **T1.1's failure is the
+price of those passing, and no scalar fixes it.**
+
+Note also why the conformal global fit did *not* do this: its factors narrow the upper tail
+(s_up 0.61–0.92) while widening the lower (s_lo 1.03–1.21), so the two-sided coverage barely
+moves while realism degrades.
+
+### Field structure: neither `long_weight` nor Matérn `nu` moves T3.1 or T3.2
+
+`long_weight` over 0.15–0.70 (§ above) moves only the spread-skill ratio. Matérn smoothness
+over 0.5–1.5:
+
+| nu | T3.1 range error (≤0.25) | T3.1 nugget error (≤0.10) | T3.2 |
+|---|---|---|---|
+| **0.5** | **0.357** | 0.1185 | **16.5%** |
+| 1.0 | 0.417 | 0.1019 | 15.9% |
+| 1.5 | 0.447 | **0.1015** | 16.1% |
+
+Raising `nu` trades a marginally better nugget for a clearly worse range, and T3.2 is flat
+to within noise. Both T3.1 rows fail at every setting.
+
+Worth noting about T3.1's range row specifically: the reference it compares against is a
+fitted practical range whose variogram fits carry r² of 0.42–0.79, describing a field that
+§10 measured as **71% decorrelated by 5 px**. A single "practical range" is not a
+well-determined descriptor of a variogram that has already lost most of its structure inside
+the first few pixels, so this row is weak evidence either way.
+
+**Conclusion of the sweep.** Three independent knobs, eleven settings, no improvement on any
+remaining failure. The residual gaps are structural, not parametric: T1.1 is a genuine
+tension with T1.2/T1.3, and T3.2 is a target-threshold problem (§10). Keep identity
+recalibration, `long_weight = 0.40`, `nu = 0.5`.
+
 ### Measurement notes worth carrying forward
 
 - The `newheads` central rasters and the fold-stitched rasters are **not comparable

@@ -211,11 +211,15 @@ h=5's while covering 1.5× the error) and fixed structurally.
    pixels. The central field is under-trained, and run-to-run variance between identically
    configured folds is comparable to the effects being chased (h=5 RMSE 0.01347 vs 0.01478
    for the same architecture). Longer training is the cheapest untested lever.
-2. *T1.1 is the last marginal-calibration gap* (0.963/0.974/0.979/0.982 against 0.95±0.01).
-   The heads are 1.5–3 points too wide and identity recalibration won by a 0.03% margin on
-   held-out interval score (identity 0.09667, global 0.09670). A mild global rescale should
-   close T1.1 at almost no interval-score cost — worth re-running the decision with a
-   coverage-aware tie-break.
+2. *T1.1 is the last marginal-calibration gap* (0.963/0.974/0.979/0.982 against 0.95±0.01) —
+   and it is **not** closable by recalibration. All three options were scored: identity
+   91/128, global conformal 83/127, empirical width multiplier 85/125. The multiplier does
+   force T1.1 to 4/4, at the cost of class-conditional coverage (13/16 → 8/15), the
+   high-change tail (3/3 → 0/2) and lower-tail clustering (4/5 → 0/5). Coverage is nearly
+   insensitive to width — 20% narrower buys ~1 point, because the improved central field
+   leaves almost nothing near the interval boundary — so reaching 0.95 needs 24–38%
+   narrowing and that is what T1.2/T1.3 exist to prevent. Closing T1.1 needs a model-level
+   change to the width heads, not a scalar.
 3. *Near-field over-prediction* (T8 at 0–3 px) — the opposite error from the one we fixed,
    and now the largest T8 residual.
 4. *Receptive field.* Supplying long-range context as a raster worked; widening the trunk
