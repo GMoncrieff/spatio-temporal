@@ -223,6 +223,25 @@ Three separable effects:
 3. **Monotone width does not affect the central field** and flattens raw coverage across
    horizons, which is what it was for.
 
+### The k=5 result — like for like
+
+`e5_all_k5` runs the combined configuration through all five folds, so it is stitched over
+the whole region exactly as the original baseline was: 4,358,388 pixels at h=5 against the
+baseline's 4,366,544. No pixel-set caveat applies to this comparison.
+
+| horizon | baseline RMSE | k=5 winner | baseline MAE | k=5 MAE | baseline skill | k=5 skill | baseline slope | k=5 slope |
+|---|---|---|---|---|---|---|---|---|
+| +5yr | 0.01478 | **0.00947** (−36%) | 0.00759 | **0.00288** (−62%) | −1.227 | **+0.085** | 0.104 | **1.156** |
+| +10yr | 0.01746 | **0.01444** (−17%) | 0.00859 | **0.00505** (−41%) | −0.244 | **+0.148** | 0.282 | **0.928** |
+| +15yr | 0.02047 | **0.01855** (−9%) | 0.00988 | **0.00728** (−26%) | +0.006 | **+0.184** | 0.445 | **0.784** |
+| +20yr | 0.02416 | **0.02222** (−8%) | 0.01255 | **0.00939** (−25%) | +0.045 | **+0.191** | 0.500 | **0.840** |
+
+Correlation with observed change rises from 0.136 / 0.232 / 0.297 / 0.300 to
+0.266 / 0.340 / 0.385 / 0.380.
+
+The two-fold screening figures below are retained because they are what the flags were
+attributed on; they agree with the k=5 numbers to within a percent at every horizon.
+
 Scored on both held-out folds (1.54M px at h=5), against the original k=5 baseline:
 
 | horizon | baseline RMSE | e4 RMSE | baseline skill | e4 skill | baseline slope | e4 slope |
@@ -256,11 +275,67 @@ about this case — raise the long-range weight in the field, do not re-widen th
 It is a field-structure knob, not a model one, and `long_weight` was already flagged in
 `current_progress.md` as calibrated rather than derived.
 
-**T4.2's residual 2.4%** is measured from the *sample* standard deviation of M=20 members,
-which carries ~16% relative Monte-Carlo noise, so adjacent horizons of similar true spread
-invert by chance. The head widths are monotone by construction (asserted in
-`tests/test_central_head_parameterisation.py` and verified end-to-end through the real
-inference path at 100% of pixels). Re-score at larger M before reading 0.976 as a failure.
+**T4.2's residual 2.4%** was Monte-Carlo noise, now confirmed: it is measured from the
+*sample* standard deviation of the members, which at M=20 carries ~16% relative noise, so
+adjacent horizons of similar true spread invert by chance. Re-scored at M=100 the same
+ensemble gives **0.9997** — a pass, against 0.529 for the control and the 0.685 previously
+documented. The head widths are monotone by construction anyway (asserted in
+`tests/test_central_head_parameterisation.py` and verified through the real inference path
+at 100% of pixels).
+
+### The full scorecard, control vs the combined configuration at M=100
+
+| target | control | e4 (all three flags) |
+|---|---|---|
+| **T1.2** class-conditional coverage | 9/18 | **14/15** |
+| **T1.3** high-change tail | 0/1 | **2/2** |
+| **T4.2** monotone spread | 0.529 ✗ | **0.9997 ✓** |
+| **T3.3** energy score vs independent null | 0.769 vs null 0.754 ✗ | **0.738 vs null 0.792 ✓** |
+| **T6.2 / T6.3** change-sign realism | 0/4, 3/4 | **4/4, 4/4** |
+| **T8.2** remote band `P(Δ>0.05)` | NaN ✗ | **0.00000 ✓** |
+| **T8.4** lower-tail clustering by band | 3/5 | **4/5** |
+| T1.1 pooled coverage | 1/4 | 1/4 |
+| T2.1 block coverage | 9/12 | 8/12 |
+| **overall** | 69/131 = 0.527 | **88/126 = 0.698** |
+
+T1.2 is the target the whole revision was written around, and it goes from half-failing to
+14 of 15 cells. T3.3 beating the independent-pixel null is the first time that has happened:
+that null has identical marginals and no spatial structure, so the margin is attributable to
+the copula's correlation and nothing else.
+
+### What did *not* work, and why it is worth recording
+
+T1.1 stays at 1/4 (0.953 / 0.966 / 0.974 / 0.979) — coverage drifts wide with lead time. That
+is a recalibration matter, and none of these runs could decide it (see the single-fold note
+below); every one of them ran identity.
+
+The remaining T2 failures are **over**-coverage, not under: T2.2 sits at exactly 1.000 across
+all four horizons and every failing T2.1 row is a 100 km block at exactly 1.000. The plan's
+knob table prescribes raising the long-range field weight when T2 under-covers, so the
+opposite move was tested — `long_weight` 0.40 → 0.55 → 0.70:
+
+| long_weight | overall | T2.1 | T2.2 | T2.3 | T7.3 spread-skill | T1.1 values |
+|---|---|---|---|---|---|---|
+| 0.15 | 87/126 | 9/12 | 0/4 | 0/8 | 0.821 | 0.953 / 0.966 / 0.974 / 0.979 |
+| 0.25 | 88/126 | 9/12 | 0/4 | 1/8 | **0.936** | 0.953 / 0.966 / 0.974 / 0.979 |
+| 0.40 | 88/126 | 8/12 | 0/4 | 1/8 | 1.113 | 0.953 / 0.966 / 0.974 / 0.979 |
+| 0.55 | 87/126 | 8/12 | 0/4 | 1/8 | 1.304 | 0.953 / 0.966 / 0.975 / 0.979 |
+| 0.70 | 87/126 | 8/12 | 0/4 | 1/8 | 1.524 | 0.952 / 0.966 / 0.975 / 0.979 |
+
+Over a 4.7× range of the knob the overall score moves by one row and T1.1 is identical to
+three decimals. **The only thing `long_weight` actually controls in this scorecard is the
+spread-skill ratio** (0.821 → 1.524, monotone). T2.2 stays 0/4 throughout, pinned at 1.000.
+
+That is the finding: the T2 rows are **saturated and under-powered rather than mis-tuned**. A
+2-fold subset of the region leaves ~14 ecoregions and few 100 km blocks, and the plan's own
+power analysis says a ±0.05 target is undecidable at n=14 (Wilson half-width ±0.114). No
+setting of a field-structure knob can fix a metric that cannot resolve the difference it is
+being asked about; deciding these rows needs the full fold set.
+
+On the one thing it does control, `long_weight = 0.25` is marginally better than the
+incumbent 0.40 (spread-skill 0.936 vs 1.113, and T2.1 9/12 vs 8/12) — but the margin is a
+single scorecard row, so this is a weak preference, not a retune. Re-derive it on the full
+fold set before changing the default.
 
 ### Measurement notes worth carrying forward
 

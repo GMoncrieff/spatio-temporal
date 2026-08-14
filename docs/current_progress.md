@@ -5,6 +5,15 @@ Status as of 2026-08-14, branch `ensemble`. Companion to
 This document records what exists, what was learned, how we score against each target, and
 where the remaining leverage is.
 
+> **The central field was revisited and is substantially better.** See
+> `docs/central_field_baseline.md` for the measurement, the per-flag attribution and the
+> negative results. Headline, k=5 fold-stitched over the whole region in both cases:
+> RMSE −36% / −17% / −9% / −8% across horizons, MAE −62% / −41% / −26% / −25%, and skill
+> against persistence goes from **−1.23 / −0.24 / +0.01 / +0.05** to
+> **+0.09 / +0.15 / +0.18 / +0.19** — positive at every horizon for the first time, and
+> increasing with lead time rather than decreasing. The scorecard goes 73/137 to 91/128.
+> The h=10 anomaly is explained (non-monotone interval width) and fixed.
+
 **Development scale**: all iteration happens on the southern-Africa subregion by user
 instruction. The global k=5 hindcast is complete and on disk; global runs happen only on
 explicit instruction.
@@ -56,6 +65,22 @@ explicit instruction.
   frozen during retraining (verified live: both gradient norms exactly 0.000000).
 - `scripts/prepare_change_context.py` builds the context rasters on the full grid.
 
+### Central-field change (the central forecast is no longer sacred either)
+Three flags on `train_lightning.py`, attributed separately on held-out folds:
+- `--central_residual` — central heads predict change on top of HM_t0, output convolution
+  zero-initialised so training starts at exact persistence. The large effect.
+- `--central_context` — central heads read the same past-change context as the quantile
+  heads. This is what fixes h=20, which the residual head alone left fractionally worse.
+- `--monotone_quantile_width` — half-widths accumulate across horizons around the
+  *detached* central forecast, making spread non-decreasing in lead time and
+  `lower ≤ central ≤ upper` structural rather than a post-hoc clip.
+
+Supporting harness: `scripts/diagnose_central_field.py` (stratified central-field error),
+`scripts/compare_central_runs.py`, `scripts/run_central_experiment.sh` (one experiment:
+train held-out folds, predict the region, stitch) and `scripts/run_region_loop.sh`
+(Phase 1→4 for one experiment, re-deriving recalibration, spectrum and AR(1) from that
+model's own residuals).
+
 ### Tests
 101 ensemble/model tests pass. 7 failures in the pre-existing suite are stale (they assert a
 4-channel output from a model that has emitted 12 since the independent-heads work) and fail
@@ -86,6 +111,25 @@ identically with this branch's changes stashed.
 9. **Measurement bugs outnumbered model bugs.** Mismatched masks, a quantisation-scale
    tolerance on a sample median, globally-scattered sampling for structure scores, and two
    runs scoring the wrong checkpoint all produced plausible but meaningless numbers.
+10. **The central head was solving the wrong problem.** Predicting absolute HM means
+    reproducing HM_t0 through the trunk before anything useful can be added, and the cost of
+    that reproduction (sd ≈ 0.0075 HM on pixels that did not change) exceeded the entire
+    signal being predicted. Predicting change instead makes "nothing happens" — the answer
+    for 53–70% of the map — free.
+11. **Skill has to be scored against persistence, not against zero.** Pooled RMSE looked
+    unremarkable while the model was losing to "nothing will change" by a factor of 2.2 in
+    MSE at h=5. No coverage or interval metric could have surfaced that.
+12. **The ~10 px trunk radius limits the central head exactly as it limited the quantile
+    heads.** Supplying the same precomputed context is what turns h=20 from a regression
+    into the largest skill gain.
+13. **A metric pinned at 1.000 and insensitive to its own knob is under-powered, not
+    mis-tuned.** `long_weight` was swept 0.15→0.70 against failing T2 rows; they never
+    moved, while spread-skill ran 0.82→1.52. The rows needed more aggregation units, not a
+    different field.
+14. **Checkpoint selection couples the two heads.** `ModelCheckpoint` monitors
+    `val_total_loss`, which includes pinball, so a quantile-only change still selects a
+    different epoch and therefore a different central field. Central-only A/Bs should
+    monitor a central-only metric.
 
 ---
 
@@ -113,7 +157,36 @@ spectral+long-scale field unless noted. "—" means not re-scored in the final c
 | **T7.3** spread-skill | 1.0±0.25 | **pass** | 1.038 |
 | **T8.1–8.3** change clustering | ratio ≤ 2, remote ≈ 0 | **mostly pass** | remote band exactly 0.00000; near field 2.0–2.7× |
 
-Headline before/after on the two defects that motivated the model change:
+### After the central-field change (k=5, whole region, both configurations scored identically)
+
+Both columns are fold-stitched over the same 4.36M pixels and pushed through the same
+Phase 1→4 loop at M=100, with the recalibration, spectrum and AR(1) coupling re-derived
+from each model's own residuals.
+
+| | baseline | central-field winner |
+|---|---|---|
+| **scorecard rows passed** | 73/137 (0.533) | **91/128 (0.711)** |
+| **T1.2** class-conditional coverage | 6/21 | **13/16** |
+| **T1.3** high-change tail | 0/4 | **3/3** |
+| **T2.1** block coverage 1/10/100 km | 11/12 | **12/12** |
+| **T2.5** rank histogram | 2/4 | **4/4** |
+| **T4.2** monotone spread | fail | **0.9973** |
+| **T6.2** `P(Δ<−0.05)` realism | 2/4 | **4/4** |
+| **T8.2** remote band | 0/1 | **1/1** |
+| **T8.3** near/remote ratio | 0/1 | **1/1 (∞)** |
+| **T8.4** lower-tail clustering | 2/5 | **4/5** |
+| T1.1 pooled coverage | 2/4 | 0/4 (0.963–0.982, uniformly wide) |
+| T7.3 spread-skill | fail | 1.275 (just over the 1.25 gate) |
+
+T2.1 at 12/12 is the motivating problem of the project — aggregate coverage at every block
+scale. T8.3 at ∞ means remote stable country receives exactly zero invented change.
+
+The recalibration decision is **identity, and this time measured** (held-out interval score
+identity 0.09667 vs global 0.09670 vs stratified 0.09790): the new heads need no post-hoc
+rescaling. Note the identity/global margin is 0.03%, which is why T1.1 is the obvious next
+target rather than a deep problem.
+
+Headline before/after on the two defects that motivated the earlier head-only change:
 
 | | original heads | retrained heads |
 |---|---|---|
@@ -128,26 +201,36 @@ Headline before/after on the two defects that motivated the model change:
 
 ## 4. Where the remaining leverage is
 
+**Done since this list was written.** Items 1, 2 and 3 below are addressed — see
+`docs/central_field_baseline.md`. The central field now beats persistence at every horizon;
+the quantile heads are anchored to it; h=10 is explained (its interval was *narrower* than
+h=5's while covering 1.5× the error) and fixed structurally.
+
 **In the model (highest value).**
-1. *The central field itself.* Every uncertainty product is built on it and it has never been
-   revisited in this work. Its error is what the intervals must cover, so reducing it
-   improves every target at once.
-2. *Quantile heads beyond the current fix.* They now see past-change context, but only that.
-   Candidates: give them the same context at more scales or as a learned embedding; let them
-   see the central head's own output (the predicted change is a strong conditioner); train
-   them on the global split rather than one region.
-3. *h=10 is the weak horizon* (pooled 0.892 against ~0.95 elsewhere) and is unexplained.
-4. *Near-field over-prediction* (T8 at 0–3 px, 2.0–2.7×) — the opposite error from the one
-   we fixed, and now the largest T8 residual.
+1. *Training budget.* 150 epochs × 13 steps × 8 chips ≈ one pass over the globe's valid
+   pixels. The central field is under-trained, and run-to-run variance between identically
+   configured folds is comparable to the effects being chased (h=5 RMSE 0.01347 vs 0.01478
+   for the same architecture). Longer training is the cheapest untested lever.
+2. *T1.1 is the last marginal-calibration gap* (0.963/0.974/0.979/0.982 against 0.95±0.01).
+   The heads are 1.5–3 points too wide and identity recalibration won by a 0.03% margin on
+   held-out interval score (identity 0.09667, global 0.09670). A mild global rescale should
+   close T1.1 at almost no interval-score cost — worth re-running the decision with a
+   coverage-aware tie-break.
+3. *Near-field over-prediction* (T8 at 0–3 px) — the opposite error from the one we fixed,
+   and now the largest T8 residual.
+4. *Receptive field.* Supplying long-range context as a raster worked; widening the trunk
+   itself (dilated convolutions, or downsampled branches) is the general version and has not
+   been tried.
 
 **In the uncertainty layer.**
-5. *T4.2 monotone spread* (68.5%) — the guard now constrains ŝ·w, but the heads' own widths
-   are not monotone in horizon. Likely wants a constraint at the head level.
-6. *Block coverage at 10–100 km* (0.83–0.90) — falls between the fine structure and the
-   long-scale component; probably wants an intermediate term, fitted the same way the long
-   one was.
-7. *`long_weight = 0.40` is calibrated, not derived.* Re-tune per region and certainly before
-   any global run; it encodes how much systematic regional bias the model carries.
+5. ~~*T4.2 monotone spread* (68.5%)~~ — **done.** The constraint moved to the head level
+   (`--monotone_quantile_width`); T4.2 is now 0.9973 at M=100. The earlier 0.976 at M=20 was
+   Monte-Carlo noise in the sample sd, not a violated constraint.
+6. ~~*Block coverage at 10–100 km*~~ — **T2.1 now passes 12/12** at 1/10/100 km.
+7. *`long_weight = 0.40` is calibrated, not derived.* Swept 0.15–0.70 on the regional
+   scorecard: it moves **only** the spread-skill ratio (0.821 → 1.524, monotone) and nothing
+   else, so it is identifiable from T7.3 alone. At k=5 the winner scores T7.3 = 1.275
+   (just over the 1.25 gate), and the sweep points at ≈0.25. Re-derive before any global run.
 8. *M = 50 limits tail-sensitive per-pixel products.* Seeds are recorded, so extending to
    M ≥ 200 is cheap and would clear several T1 rows that are Monte-Carlo-limited rather than
    wrong.
