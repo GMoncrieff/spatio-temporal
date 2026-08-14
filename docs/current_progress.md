@@ -227,10 +227,13 @@ h=5's while covering 1.5× the error) and fixed structurally.
    (`--monotone_quantile_width`); T4.2 is now 0.9973 at M=100. The earlier 0.976 at M=20 was
    Monte-Carlo noise in the sample sd, not a violated constraint.
 6. ~~*Block coverage at 10–100 km*~~ — **T2.1 now passes 12/12** at 1/10/100 km.
-7. *`long_weight = 0.40` is calibrated, not derived.* Swept 0.15–0.70 on the regional
-   scorecard: it moves **only** the spread-skill ratio (0.821 → 1.524, monotone) and nothing
-   else, so it is identifiable from T7.3 alone. At k=5 the winner scores T7.3 = 1.275
-   (just over the 1.25 gate), and the sweep points at ≈0.25. Re-derive before any global run.
+7. *`long_weight = 0.40` is calibrated, not derived — and it survives a sweep.* Swept
+   0.15–0.70: it moves **only** the spread-skill ratio (0.821 → 1.524, monotone), so it is
+   identifiable from T7.3 alone. At k=5 the winner scores T7.3 = 1.275, just over the 1.25
+   gate, and dropping to 0.25 fixes that (1.065) — but at the cost of pushing T2.3's
+   *already near-nominal* rows from 0.944/0.889 down to 0.778/0.667, while the rows
+   saturated at 1.000 do not move. Keep 0.40; T7.3 is a recorded near-miss, not a knob
+   waiting to be turned. Re-derive before any global run.
 8. *M = 50 limits tail-sensitive per-pixel products.* Seeds are recorded, so extending to
    M ≥ 200 is cheap and would clear several T1 rows that are Monte-Carlo-limited rather than
    wrong.

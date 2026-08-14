@@ -332,10 +332,23 @@ power analysis says a ±0.05 target is undecidable at n=14 (Wilson half-width ±
 setting of a field-structure knob can fix a metric that cannot resolve the difference it is
 being asked about; deciding these rows needs the full fold set.
 
-On the one thing it does control, `long_weight = 0.25` is marginally better than the
-incumbent 0.40 (spread-skill 0.936 vs 1.113, and T2.1 9/12 vs 8/12) — but the margin is a
-single scorecard row, so this is a weak preference, not a retune. Re-derive it on the full
-fold set before changing the default.
+On the one thing it does control, `long_weight = 0.25` looked marginally better than the
+incumbent 0.40 in the two-fold sweep (spread-skill 0.936 vs 1.113, T2.1 9/12 vs 8/12).
+
+**The k=5 data reverses that.** Re-run on the full fold set:
+
+| | T7.3 spread-skill | T2.3 area-above-threshold, per row | overall |
+|---|---|---|---|
+| 0.40 | 1.275 (just over the gate) | 1.0 · 1.0 · 1.0 · 1.0 · **0.944** · 1.0 · **0.889** · **0.944** | 91/128 |
+| 0.25 | **1.065** (passes) | 1.0 · 1.0 · 1.0 · 1.0 · **0.778** · 1.0 · **0.667** · 0.889 | 90/129 |
+
+Lowering the weight buys spread-skill by pulling the *already near-nominal* T2.3 rows below
+target, while the rows saturated at 1.000 do not move at all. That is a real cost rather
+than the wash the under-powered two-fold sweep implied. **`long_weight` stays at 0.40**, and
+T7.3 = 1.275 is recorded as a near-miss with a known, undesirable remedy.
+
+The general lesson is the one already learned about coverage: a sweep judged on a total pass
+count hides which rows moved. Reading the per-row values is what made the trade-off visible.
 
 ### Measurement notes worth carrying forward
 
