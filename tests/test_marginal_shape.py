@@ -184,3 +184,14 @@ def test_shape_slope_recovers_unity_for_a_gaussian_residual():
 
     s = shape_slope(fit_residual_shape(e), np.array([-Z975, 0.0, Z975]))
     assert np.allclose(s, 1.0, atol=0.25), s
+
+
+def test_invert_shape_round_trips():
+    """The T3 diagnostics need z back, not S(z)."""
+    from src.ensemble.copula import invert_shape
+
+    shape = fit_residual_shape(spiky_residual())
+    z = np.linspace(-3.0, 3.0, 601)
+    assert np.allclose(invert_shape(apply_shape(z, shape), shape), z, atol=2e-2)
+    # And with no shape it must be exactly the identity.
+    assert np.allclose(invert_shape(z, None), z)

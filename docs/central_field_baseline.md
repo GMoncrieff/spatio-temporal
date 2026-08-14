@@ -589,12 +589,51 @@ T5.1's median tolerance tightens and h=5 now marginally fails at 0.9936 against 
 | shaped, Gaussian tol | 84/126 = 0.667 | 4/4 | 0/4 | 11/15 | 1/2 | **1.74 / 2.88 / 4.36 / 4.55** |
 | shaped, shape-aware tol | 87/126 = 0.690 | 3/4 | **4/4** | 11/15 | 1/2 | **1.74 / 2.88 / 4.36 / 4.55** |
 
-**The two-piece normal remains the default.** Fairly scored the shape closes most of the gap
-(0.667 → 0.690) and more than halves the realism defect it was built for, but still loses
-0.690 to 0.711. The residual gap is now concentrated in T1.2/T1.3, which are also estimated
-from the ensemble's own percentiles and are therefore subject to the same finite-M penalty
-that T5.2 was — testing that at M ≥ 400 is the obvious next check, and the one thing that
-could still flip the decision.
+Fairly scored the shape closes most of the gap (0.667 → 0.690) but still loses 0.690 to
+0.711 at M=100. The residual gap sat in T1.2/T1.3, which are also estimated from the
+ensemble's own percentiles and so carry the same finite-M penalty T5.2 did — so the
+comparison was run again with **both** families at M=400.
+
+### At matched M=400 the ordering reverses
+
+| | M=100 | M=400 |
+|---|---|---|
+| two-piece normal | 91/128 = 0.711 | 85/126 = 0.675 |
+| empirical shape | 87/126 = 0.690 | **90/126 = 0.714** |
+
+Net **+5 rows** to the shape at M=400: better on T1.1, T1.2, T2.1, T2.4, T2.5, T6.1, T6.5;
+worse on T5.1 (one horizon, 0.9936 against a 0.995 gate) and T7.3 (1.44 against 1.25).
+
+Note the two-piece gets *worse* at M=400 while the shape gets better. That is the same
+mechanism as T5.2: MC-scaled tolerances tighten as 1/√M, so a higher member count exposes
+error that a loose tolerance was hiding. **The M=100 comparison was itself confounded** — it
+scored one family at a member count where it is under-resolved.
+
+### Recommendation
+
+Adopt the empirical shape **together with M ≥ 400**; the two are a package, since at M=100
+the shape is worse. Cost is 3.1 min and 3.0 GB per ensemble against 0.7 min and 0.3 GB. This
+is left as a one-line change (`--marginal_shape` plus the member count in
+`run_region_loop.sh`) rather than applied silently, because it changes a published product
+and the plan asks for those to be versioned deliberately.
+
+Honest caveat on the margin: +5 of 126 rows, and scorecard rows are correlated. The stronger
+evidence is not the count but that the shape more than halves the defect it was built for
+(T6.1 ratios 3.84/5.65/6.75/6.65 → 1.74/2.88/4.36/4.55) while every hard gate still holds.
+
+### Three scoring bugs, all the same shape
+
+Each was a diagnostic that silently assumed the two-piece normal, and each was caught by a
+result that could not be true rather than by inspection:
+
+| bug | how it announced itself | effect |
+|---|---|---|
+| T5 tolerances assumed `dx/dz = sigma` | T5.2 got *worse* at M=400, impossible against an MC-scaled tolerance without a bias | tolerance 1.3–2.2× too tight at the bounds, 0.27–0.83× too loose at the median |
+| `recover_z` undid only the scaling | T3.1, a *field* property, moved under a rank-preserving transform | normal-score variance read 0.613 instead of 0.96; variogram measured `S(z)`, not `z` |
+| T3.2 sampled pairs to 500 px against a 50 px range | 1.0% improvement against a 30% target, with no plausible mechanism | score dominated by pairs where the two ensembles are identical by construction |
+
+All three fixes are exactly inert for the two-piece normal — asserted in tests and, for the
+T5 one, confirmed by rescoring the incumbent and getting bit-identical numbers.
 
 ### Two bugs of mine, and how each was caught
 

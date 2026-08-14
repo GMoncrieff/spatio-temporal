@@ -159,6 +159,26 @@ def apply_shape(z, shape):
     return np.where(np.abs(z) > Z975, z, out)
 
 
+def invert_shape(s, shape):
+    """Inverse of :func:`apply_shape` — recover the normal score from a shaped one.
+
+    The T3 diagnostics work on the member's *normal score*, recovered by undoing the
+    marginal. Undoing only the two-piece normal's scaling leaves ``S(z)`` rather than ``z``,
+    and since ``S`` is a strongly nonlinear monotone map that measures the variogram and
+    spectrum of a distorted field. Monotone, so the inverse is well defined.
+    """
+    if shape is None:
+        return np.asarray(s, dtype=np.float64)
+    s = np.asarray(s, dtype=np.float64)
+    ug = np.asarray(shape["u"], dtype=np.float64)
+    qv = np.asarray(shape["q"], dtype=np.float64)
+    u = np.interp(s, qv, ug)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        z = norm.ppf(np.clip(u, 1e-12, 1 - 1e-12))
+    # Outside the bound apply_shape is the identity, so its inverse is too.
+    return np.where(np.abs(s) > Z975, s, z)
+
+
 def shape_slope(shape, z, h: float = 1e-3):
     """d(shape)/dz at ``z`` — the factor a Monte-Carlo tolerance is missing.
 

@@ -513,7 +513,8 @@ def _marginal_arrays(paths, year, rows=None, cols=None):
     return cen, sl, sr
 
 
-def recover_z(member, cen, sl, sr, eps=1e-4, quant=1.0 / 32767.0, min_sigma_steps=5.0):
+def recover_z(member, cen, sl, sr, eps=1e-4, quant=1.0 / 32767.0, min_sigma_steps=5.0,
+              shape=None):
     """Invert the copula to get the member's normal score.
 
     Two classes of pixel are dropped, because at those the member carries no usable
@@ -529,6 +530,9 @@ def recover_z(member, cen, sl, sr, eps=1e-4, quant=1.0 / 32767.0, min_sigma_step
     sigma = np.where(d < 0, sl, sr)
     with np.errstate(invalid="ignore", divide="ignore"):
         z = d / sigma
+    # Dividing by sigma undoes the two-piece normal only. With a shape in play that leaves
+    # S(z), not z, and the T3 diagnostics would then describe a nonlinearly distorted field.
+    z = cop.invert_shape(z, shape)
     unusable = (
         (member <= eps) | (member >= 1.0 - eps)
         | (sigma < min_sigma_steps * quant)
@@ -543,7 +547,13 @@ def stage_spatial(args, store, attrs, years, paths, out_dir, card, null_store=No
     year = years[hi]
     cen, sl, sr = _marginal_arrays(paths, year)
     mem = agg.member_slice(store, attrs, 0, hi)
-    z = recover_z(mem, cen, sl, sr)
+    spatial_shape = None
+    if getattr(args, "marginal_shape", None) and Path(args.marginal_shape).exists():
+        spatial_shape = json.load(open(args.marginal_shape)).get(
+            "by_horizon", {}).get(str(int(year) - int(args.base_year)))
+        if spatial_shape:
+            print("  normal scores recovered through the empirical shape")
+    z = recover_z(mem, cen, sl, sr, shape=spatial_shape)
     frac_usable = float(np.isfinite(z).sum() / max(np.isfinite(cen).sum(), 1))
     print(f"  recovered normal scores at {100*frac_usable:.1f}% of valid pixels "
           f"(rest clipped at the [0,1] bounds)")
