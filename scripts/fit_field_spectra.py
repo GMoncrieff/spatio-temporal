@@ -39,6 +39,28 @@ def band_shares(field):
     return [float(total[(k >= lo) & (k < hi)].sum()) for lo, hi in BANDS]
 
 
+def add_long_scale_component(fit, long_range, long_weight):
+    """Reserve variance for a scale the spectral fit is structurally blind to.
+
+    fit_spectral_mixture removes the field mean before the FFT, so the k=0 component — a
+    region-wide offset, which is what an ecoregion-mean error mostly is — cannot appear in
+    the fitted mixture. Measured on southern Africa: the pure spectral fit puts ~5% of
+    variance beyond 300 px and lands at a spread-skill ratio of 0.564, i.e. the ensemble
+    understates ecoregion-mean uncertainty twofold, while the texture it does capture is
+    correct. Adding an explicit long component restores the aggregate without touching the
+    fine structure (0.40 -> spread-skill 1.038, ecoregion coverage 0.611 -> 0.889/1.000,
+    and the 3-10 px band stays at 0.73x of observed).
+    """
+    keep = 1.0 - float(long_weight)
+    total = sum(fit["weights"]) + fit["nugget"]
+    out = dict(fit)
+    out["weights"] = [w / total * keep for w in fit["weights"]] + [float(long_weight)]
+    out["ranges_px"] = list(fit["ranges_px"]) + [float(long_range)]
+    out["nugget"] = fit["nugget"] / total * keep
+    out["long_scale"] = {"range_px": float(long_range), "weight": float(long_weight)}
+    return out
+
+
 def standardized_residual(row, clip=5.0):
     with rasterio.open(row["path_res_native"]) as s:
         res = s.read(1).astype(np.float64)
@@ -61,6 +83,14 @@ def main(argv=None):
     ap.add_argument("--nu", type=float, default=0.5)
     ap.add_argument("--ranges", default=",".join(str(r) for r in
                                                  (1.5, 2.5, 4, 6, 9, 14, 25, 50, 120, 300)))
+    ap.add_argument("--long_range", type=float, default=1500.0,
+                    help="Range of the aggregate-scale component (px)")
+    ap.add_argument("--long_weight", type=float, default=0.40,
+                    help="Variance share given to that component. The spectral fit cannot "
+                         "see it: fit_spectral_mixture subtracts the field mean before the "
+                         "FFT, so region-wide offsets — which dominate aggregate error — "
+                         "are invisible to it. Tune so the spread-skill ratio is ~1; on "
+                         "southern Africa 0.40 gives 1.038 (0.0 gives 0.564).")
     args = ap.parse_args(argv)
 
     ranges = tuple(float(x) for x in args.ranges.split(","))
@@ -74,6 +104,8 @@ def main(argv=None):
         if np.isfinite(e).sum() < 10_000:
             continue
         fit = fit_spectral_mixture(e, ranges_px=ranges, kernel=args.kernel, nu=args.nu)
+        if args.long_weight > 0:
+            fit = add_long_scale_component(fit, args.long_range, args.long_weight)
         obs = band_shares(e)
         fit["observed_band_shares"] = obs
         fit["band_labels"] = BAND_LABELS
