@@ -370,7 +370,7 @@ def compute_residuals(
 MANIFEST_FIELDS = [
     "window", "base_year", "target_year", "horizon", "n_valid_px",
     "path_res_native", "path_res_z", "path_dhat", "path_hm_t0", "path_w_up", "path_w_lo",
-    "path_central", "path_lower", "path_upper", "path_observed",
+    "path_central", "path_lower", "path_upper", "path_observed", "path_dist_past_change",
 ]
 
 

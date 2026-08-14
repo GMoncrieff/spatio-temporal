@@ -31,7 +31,7 @@ from rasterio.windows import Window
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.ensemble.calibrate import ScaleFactorTable  # noqa: E402
-from src.ensemble.validate import DHAT_BINS, HM_BINS, biome_lut  # noqa: E402
+from src.ensemble.validate import DHAT_BINS, DIST_BINS, HM_BINS, biome_lut  # noqa: E402
 
 REPO = Path(__file__).parent.parent
 HM_DIR = REPO / "data" / "raw" / "hm_global"
@@ -51,13 +51,17 @@ def recalibrate_one(
     ecoregion_raster=None,
     lookup_csv=None,
     block_rows: int = 1024,
+    dist_raster=None,
 ):
     """Write ``{stem}_lower_recal.tif`` / ``{stem}_upper_recal.tif`` and copy central."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # The third class axis must be filled with whatever the factors were fit against.
+    # When the fit used distance-to-past-change (the default now), reading a biome number
+    # into that slot silently misses every cell and falls back to the coarse average.
     biome_map = None
-    if ecoregion_raster is not None and lookup_csv is not None:
+    if dist_raster is None and ecoregion_raster is not None and lookup_csv is not None:
         biome_map, _, _ = biome_lut(lookup_csv)
 
     with rasterio.open(central_path) as c:
@@ -76,6 +80,7 @@ def recalibrate_one(
         "hm0": rasterio.open(baseline_hm_path),
     }
     eco_src = rasterio.open(ecoregion_raster) if biome_map is not None else None
+    dist_src = rasterio.open(dist_raster) if dist_raster else None
 
     def _off(src):
         t = src.transform
@@ -83,6 +88,7 @@ def recalibrate_one(
 
     hm_off = _off(srcs["hm0"])
     e_off = _off(eco_src) if eco_src else None
+    d_off = _off(dist_src) if dist_src else None
 
     stats = {"n_valid": 0, "sum_width_before": 0.0, "sum_width_after": 0.0,
              "n_monotonicity_fixed": 0, "n_clipped": 0}
@@ -101,7 +107,11 @@ def recalibrate_one(
                 hm0 = np.where(hm0 < 0, np.nan, hm0)
                 valid = np.isfinite(cen) & np.isfinite(low) & np.isfinite(upp)
 
-                if eco_src is not None:
+                if dist_src is not None:
+                    dd = dist_src.read(1, window=Window(d_off[1], d_off[0] + r0, W, rr),
+                                       boundless=True, fill_value=1e4).astype(np.float64)
+                    biome = np.digitize(dd, DIST_BINS[1:-1]).astype(np.int64)
+                elif eco_src is not None:
                     eco = eco_src.read(1, window=Window(e_off[1], e_off[0] + r0, W, rr),
                                        boundless=True, fill_value=0)
                     biome = biome_map[np.clip(eco, 0, len(biome_map) - 1)].astype(np.int64)
@@ -141,6 +151,8 @@ def recalibrate_one(
             s.close()
         if eco_src is not None:
             eco_src.close()
+        if dist_src is not None:
+            dist_src.close()
 
     width_ratio = (stats["sum_width_after"] / stats["sum_width_before"]
                    if stats["sum_width_before"] > 0 else np.nan)
@@ -155,6 +167,8 @@ def main(argv=None):
     ap.add_argument("--factors", default="data/ensemble/calibration/scale_factors.csv")
     ap.add_argument("--targets", default="both", choices=["hindcast", "production", "both"])
     ap.add_argument("--hindcast_dir", default="data/ensemble/hindcast/stitched")
+    ap.add_argument("--hindcast_suffix", default="",
+                    help="Suffix before .tif on the hindcast rasters (e.g. '_blended')")
     ap.add_argument("--hindcast_out", default="data/ensemble/hindcast/recal")
     ap.add_argument("--production_dir", default="data/predictions")
     ap.add_argument("--production_out", default="data/predictions/recal")
@@ -163,6 +177,9 @@ def main(argv=None):
     ap.add_argument("--ecoregion_raster", default=str(ECO_RASTER))
     ap.add_argument("--lookup_csv", default=str(ECO_LOOKUP))
     ap.add_argument("--no_biome", action="store_true", help="Ignore the biome stratum")
+    ap.add_argument("--dist_raster", default=None,
+                    help="Distance-to-past-change raster; fills the third class axis when "
+                         "the factors were fit against distance rather than biome")
     args = ap.parse_args(argv)
 
     table = ScaleFactorTable.from_csv(args.factors)
@@ -172,19 +189,21 @@ def main(argv=None):
 
     if args.targets in ("hindcast", "both"):
         hd = Path(args.hindcast_dir)
-        for cen in sorted(hd.glob("*_prediction_*_central.tif")):
-            stem = cen.name.replace("_central.tif", "")
+        suf = args.hindcast_suffix
+        for cen in sorted(hd.glob(f"*_prediction_*_central{suf}.tif")):
+            stem = cen.name.replace(f"_central{suf}.tif", "")
             base = int(stem.split("_")[0][1:])          # "w2000_prediction_2020" -> 2000
             target_year = int(stem.split("_")[-1])
             horizon = target_year - base
-            low = hd / f"{stem}_lower.tif"
-            upp = hd / f"{stem}_upper.tif"
+            low = hd / f"{stem}_lower{suf}.tif"
+            upp = hd / f"{stem}_upper{suf}.tif"
             if not (low.exists() and upp.exists()):
                 continue
             print(f"Recalibrating hindcast {stem} (h={horizon}) ...")
             results.append(recalibrate_one(
                 cen, low, upp, HM_DIR / f"HM_{base}_AA_1000.tiff", table, horizon,
                 args.hindcast_out, stem, ecoregion_raster=eco, lookup_csv=lut,
+                dist_raster=args.dist_raster,
             ))
 
     if args.targets in ("production", "both"):
@@ -201,7 +220,8 @@ def main(argv=None):
             print(f"Recalibrating production {year} (h={horizon}) ...")
             results.append(recalibrate_one(
                 cen, low, upp, HM_DIR / f"HM_{base}_AA_1000.tiff", table, horizon,
-                args.production_out, f"prediction_{year}", ecoregion_raster=eco, lookup_csv=lut,
+                args.production_out, f"prediction_{year}", ecoregion_raster=eco,
+                lookup_csv=lut, dist_raster=args.dist_raster,
             ))
 
     out_manifest = Path(args.production_out if args.targets != "hindcast" else args.hindcast_out)
