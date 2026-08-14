@@ -194,5 +194,36 @@ def test_horizon_guard_constrains_spread_not_the_factor():
     assert out["s_up"].iloc[-1] == pytest.approx(0.7, abs=1e-9)
 
 
+
+
+def test_interval_score_rejects_a_rescale_that_only_buys_width():
+    """Coverage alone always prefers the wider interval; the interval score must not."""
+    from src.ensemble.calibrate import interval_score_of_factors, select_recalibration
+
+    # Perfectly calibrated heads: E is standard half-normal-ish with the 97.5th percentile
+    # at 1.0, so s = 1 is right and any widening is pure cost.
+    rng = np.random.default_rng(0)
+    store = ScoreStore(cap=20000, random_seed=0)
+    for fold in (1, 2, 3, 4, 5):
+        for d_idx in (0, 1, 2):
+            r = rng.normal(0, 1 / 1.959964, size=4000)
+            store.add((20, d_idx, 0, 0), fold, up=r[r > 0], lo=-r[r <= 0],
+                      chips=np.arange(400) + 10_000 * fold + 977 * d_idx,
+                      n_total=4000, w_up=np.full(2000, 0.05), w_lo=np.full(2000, 0.05))
+
+    base = fit_scale_factors(store, smooth=False)
+    ident = as_identity(base)
+    wide = base.copy()
+    wide["s_up"] = base["s_up"] * 3.0
+    wide["s_lo"] = base["s_lo"] * 3.0
+
+    is_ident = interval_score_of_factors(store, ident)
+    is_wide = interval_score_of_factors(store, wide)
+    assert is_wide > is_ident, (is_ident, is_wide)
+
+    choice = select_recalibration(store, smooth=False)
+    assert choice["decision"] == "identity", choice
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

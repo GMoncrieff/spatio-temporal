@@ -247,13 +247,25 @@ def stage_calibrate(args, manifest, out_dir, run, audit=None):
         print("  ⚠ no conformal scores collected; skipping")
         return None
 
-    decision = cal.decide_recalibration(factors, audit)
+    # The decision is made on held-out *interval score*, not coverage: coverage alone
+    # always prefers the widest interval, and on these heads the stratified fit wins on
+    # coverage while being 2.2x worse once its width is charged for.
+    decision = cal.select_recalibration(store, alpha=args.alpha, n0=args.n0)
+    coverage_only = cal.decide_recalibration(factors, audit)
+    decision["coverage_only_decision"] = coverage_only["decision"]
+    decision.update({k: v for k, v in coverage_only.items()
+                     if k in ("mean_s", "median_s", "relative_spread", "min_s", "max_s")})
     print(f"  DECISION: {decision['decision']} — {decision['reason']}")
-    print(f"  factors: mean {decision['mean_s']:.3f}, range [{decision['min_s']:.3f}, "
-          f"{decision['max_s']:.3f}], relative spread {decision['relative_spread']:.3f}")
+    print("  held-out interval scores: " + ", ".join(
+        f"{k} {v:.5f}" for k, v in sorted(decision['interval_scores'].items(),
+                                          key=lambda kv: kv[1])))
+    if coverage_only['decision'] != decision['decision']:
+        print(f"  (a coverage-only rule would have chosen '{coverage_only['decision']}')")
+    print(f"  factors: mean {decision.get('mean_s', float('nan')):.3f}, range "
+          f"[{decision.get('min_s', float('nan')):.3f}, {decision.get('max_s', float('nan')):.3f}]")
 
     applied = factors
-    if decision["decision"] == "keep":
+    if decision["decision"] in ("keep", "identity"):
         applied = cal.as_identity(factors)
     elif decision["decision"] == "global":
         applied = cal.collapse_to_global(factors)

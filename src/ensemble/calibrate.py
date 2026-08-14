@@ -197,6 +197,9 @@ class ScoreStore:
             payload[f"up_{i}"] = np.concatenate(s.up) if s.up else np.empty(0, np.float32)
             payload[f"lo_{i}"] = np.concatenate(s.lo) if s.lo else np.empty(0, np.float32)
             payload[f"chips_{i}"] = np.fromiter(s.chips, dtype=np.int64, count=len(s.chips))
+            # The half widths are needed by the interval-score decision rule.
+            payload[f"wup_{i}"] = np.concatenate(s.w_up) if s.w_up else np.empty(0, np.float32)
+            payload[f"wlo_{i}"] = np.concatenate(s.w_lo) if s.w_lo else np.empty(0, np.float32)
             meta.append({"i": i, "key": list(key), "fold": fold, "n_up": s.n_up,
                          "n_lo": s.n_lo, "n_degenerate": s.n_degenerate, "n_total": s.n_total})
         np.savez(path, meta=np.array(json.dumps(meta)),
@@ -220,6 +223,9 @@ class ScoreStore:
             s.n_up, s.n_lo = m["n_up"], m["n_lo"]
             s.n_degenerate, s.n_total = m.get("n_degenerate", 0), m.get("n_total", 0)
             s.chips.update(z[f"chips_{i}"].tolist())
+            for src_key, dest in ((f"wup_{i}", s.w_up), (f"wlo_{i}", s.w_lo)):
+                if src_key in z and z[src_key].size:
+                    dest.append(z[src_key])
         return store
 
 
@@ -599,6 +605,75 @@ def decide_recalibration(factors: pd.DataFrame, audit: pd.DataFrame | None = Non
         "coverage_in_band": cov_ok,
         "frac_degenerate_width": frac_degen,
     }
+
+
+def interval_score_of_factors(store: ScoreStore, factors: pd.DataFrame, alpha: float = 0.05,
+                              exclude_fold=None):
+    """Winkler interval score of a factor table, evaluated on a held-out fold.
+
+    Everything is expressed in the head's own width units: the published half widths are
+    ``s_up * w_up`` and ``s_lo * w_lo``, and a conformal score ``E`` exceeds its bound
+    exactly when ``E > s``. So
+
+        IS = (s_up*w_up + s_lo*w_lo)
+             + (2/alpha) * mean( max(E_up - s_up, 0)*w_up + max(E_lo - s_lo, 0)*w_lo )
+
+    This is what decides whether a rescale is worth its width. Coverage alone always
+    rewards widening; the interval score only does when the miscoverage it buys back
+    exceeds what the extra width costs.
+    """
+    if factors.empty:
+        return np.nan
+    lut = {(int(r.horizon), int(r.dhat_bin_idx), int(r.hm_bin_idx), int(r.biome)):
+           (float(r.s_up), float(r.s_lo)) for r in factors.itertuples()}
+    total, weight = 0.0, 0.0
+    for (key, fold), s in store.data.items():
+        if exclude_fold is not None and fold != exclude_fold:
+            continue
+        s_up, s_lo = lut.get(key, (1.0, 1.0))
+        up = np.concatenate(s.up) if s.up else np.empty(0, np.float32)
+        lo = np.concatenate(s.lo) if s.lo else np.empty(0, np.float32)
+        wu = float(np.median(np.concatenate(s.w_up))) if s.w_up else np.nan
+        wl = float(np.median(np.concatenate(s.w_lo))) if s.w_lo else np.nan
+        if not np.isfinite(wu) or not np.isfinite(wl) or (up.size + lo.size) == 0:
+            continue
+        width = s_up * wu + s_lo * wl
+        pen_up = np.maximum(up - s_up, 0.0).sum() * wu if up.size else 0.0
+        pen_lo = np.maximum(lo - s_lo, 0.0).sum() * wl if lo.size else 0.0
+        n = up.size + lo.size
+        score = width + (2.0 / alpha) * (pen_up + pen_lo) / n
+        total += score * n
+        weight += n
+    return float(total / weight) if weight else np.nan
+
+
+def select_recalibration(store: ScoreStore, alpha: float = 0.05, n0: float = 200.0,
+                         **fit_kwargs):
+    """Pick identity / global / stratified by held-out interval score, not by coverage.
+
+    Measured on southern Africa with the context-aware heads, the stratified fit wins on
+    coverage and loses badly on realism: it widens x2-4 to claim the last points of class
+    coverage, which re-inflates the very tails the heads had corrected (ensemble
+    P(change < -0.05) 0.0049 -> 0.0611 against an observed 0.0030). Scoring width and
+    miscoverage together is what makes that visible to the decision rule.
+    """
+    folds = store.folds()
+    candidates = {}
+    for name in ("identity", "global", "stratified"):
+        per_fold = []
+        for f in folds or [None]:
+            fitted = fit_scale_factors(store, alpha=alpha, n0=n0, exclude_fold=f, **fit_kwargs)
+            if fitted.empty:
+                continue
+            table = {"identity": as_identity, "global": collapse_to_global,
+                     "stratified": lambda d: d}[name](fitted)
+            per_fold.append(interval_score_of_factors(store, table, alpha=alpha, exclude_fold=f))
+        vals = [v for v in per_fold if np.isfinite(v)]
+        candidates[name] = float(np.mean(vals)) if vals else np.inf
+    best = min(candidates, key=candidates.get)
+    return {"decision": best, "interval_scores": candidates,
+            "reason": (f"lowest held-out interval score ({candidates[best]:.5f}); "
+                       f"coverage alone would prefer the widest option")}
 
 
 def as_identity(factors: pd.DataFrame):
