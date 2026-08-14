@@ -53,6 +53,11 @@ def parse_args(argv=None):
     ap.add_argument("--ranges_px", default=None, help="Override, e.g. '8,240'")
     ap.add_argument("--weights", default=None, help="Override, e.g. '0.5,0.4'")
     ap.add_argument("--nugget", type=float, default=None)
+    ap.add_argument("--marginal_shape", default=None,
+                    help="JSON of per-horizon empirical marginal shapes "
+                         "(scripts/fit_marginal_shape.py). Without it the marginal is the "
+                         "two-piece normal, whose body carries ~3x too much moderate "
+                         "change for this residual.")
     ap.add_argument("--spectral_fits", default=None,
                     help="JSON from scripts/fit_field_spectra.py. Matching the observed "
                          "power spectrum rather than the variogram is what gives members "
@@ -254,7 +259,8 @@ def worker(worker_id, gpu, member_ids, cfg):
             prev = z
 
             mg = {k: v.to(device, non_blocking=True) for k, v in marg_cpu[y].items()}
-            vals = marginal_from_z_torch(z, mg["loc"], mg["scale_left"], mg["scale_right"])
+            vals = marginal_from_z_torch(z, mg["loc"], mg["scale_left"], mg["scale_right"],
+                                         shape=cfg.get("shapes", {}).get(h))
             del mg
             q = torch.clamp(torch.round(vals / cfg["scale"]), INT16_SENTINEL + 1, 32767)
             q = q.to(torch.int16).cpu().numpy()
@@ -316,11 +322,20 @@ def main(argv=None):
         "sources": {str(y): {k: str(v) for k, v in paths[y].items()} for y in years},
     })
 
+    shapes = {}
+    if args.marginal_shape and Path(args.marginal_shape).exists():
+        blob = json.load(open(args.marginal_shape))
+        shapes = {int(k): v for k, v in blob.get("by_horizon", {}).items() if v}
+        print(f"  marginal shape: empirical, from {args.marginal_shape} "
+              f"(horizons {sorted(shapes)})")
+    else:
+        print("  marginal shape: two-piece normal (no --marginal_shape given)")
+
     cfg = {
         "years": years, "horizons": horizons, "shape": (H, W), "compact": compact,
         "idx": str(cache_dir / "idx.npy"), "out": str(out_path), "field_params": fps, "rho": rho,
         "seed": args.seed, "scale": DEFAULT_SCALE, "wrap_lon": bool(wrap),
-        "independent": bool(args.independent),
+        "independent": bool(args.independent), "shapes": shapes,
     }
 
     gpus = [int(g) for g in args.gpus.split(",") if g.strip() != ""] if args.gpus else [None]
