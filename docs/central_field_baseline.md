@@ -159,6 +159,109 @@ there is nothing to predict.
 All four are implemented behind separate flags (`--central_residual`, `--central_context`,
 `--monotone_quantile_width`) so they can be attributed individually.
 
+---
+
+## 8. Result — `--central_residual`, measured
+
+Round 1 held out fold 1, trained on the other four, predicted southern Africa, and scored
+the held-out fold's pixels only. Control and treatment differ in exactly one flag and are
+scored on identical pixels (931,776 at h=5), so the deltas are attributable.
+
+| horizon | RMSE control | RMSE residual | skill control | skill residual | slope control | slope residual |
+|---|---|---|---|---|---|---|
+| +5yr | 0.01347 | **0.00943** (−30%) | −0.875 | **+0.081** | 0.080 | **1.183** |
+| +10yr | 0.01682 | **0.01447** (−14%) | −0.139 | **+0.157** | 0.314 | **1.009** |
+| +15yr | 0.02028 | **0.01876** (−7%) | +0.041 | **+0.179** | 0.521 | 0.721 |
+| +20yr | 0.02334 | 0.02366 (+1%) | +0.088 | +0.063 | 0.563 | 0.523 |
+
+MAE falls 58% at h=5 and 39% at h=10. Skill against persistence is **positive at every
+horizon for the first time**, and the change signal is correctly scaled at short lead times
+where it was previously ten times too large.
+
+The mechanism is the predicted one, not a coincidence:
+
+| | reconstruction RMSE on unchanged pixels (h=5) | RMSE at 30–100 px from past change (h=5) |
+|---|---|---|
+| control | 0.00725 | 0.00529 |
+| residual | **0.00121** (−83%) | **0.00155** (−71%) |
+
+What disappeared is the invented change, in every distance band, most of all in the far
+field. The residual parameterisation removes the error the baseline attributed to it.
+
+**One regression.** Coverage at h=5 falls from 0.990 to 0.859. The quantile heads are
+unanchored and were trained against a central field that moved under them for the whole
+run, so their widths belong to a worse forecast than the one finally published. This is the
+case for `--monotone_quantile_width`, which anchors the interval to the (detached) central
+forecast rather than predicting bounds independently.
+
+Also worth recording: the control's own h=5 RMSE (0.01347) beats the k=5 stitched baseline's
+(0.01478) on the same architecture and budget. That gap is run-to-run variance between fold
+models, and it sets the noise floor for reading any of these deltas — the residual effect at
+h=5 is roughly three times it, the h=20 effect is well inside it.
+
+---
+
+## 9. Rounds 2 and 3 — attributing the rest
+
+Round 2 added one flag each on top of the residual head; round 3 combined all three and
+trained two folds instead of one. All configurations are scored on identical pixels
+(931,776 at h=5 for the fold-1 comparison).
+
+| | RMSE vs control, h=5/10/15/20 | skill h=20 | corr h=20 | raw coverage across horizons |
+|---|---|---|---|---|
+| `--central_residual` | 0.700 / 0.860 / 0.925 / **1.014** | +0.063 | 0.381 | 0.859 – 0.965 |
+| ` + --central_context` | 0.697 / 0.855 / 0.904 / 0.947 | **+0.183** | **0.414** | 0.997 (uniformly wide) |
+| ` + --monotone_quantile_width` | 0.704 / 0.858 / 0.944 / 0.951 | +0.176 | 0.373 | **0.965 – 0.971** |
+| all three (`e4_all`) | 0.700 / 0.878 / 0.936 / **0.933** | **+0.207** | 0.404 | 0.968 – 0.980 |
+
+Three separable effects:
+
+1. **The residual parameterisation is the large one** — 30% RMSE at h=5, reproduced in every
+   configuration that carries it. It leaves h=20 unimproved or fractionally worse.
+2. **The past-change context is what fixes h=20**, in both configurations that carry it
+   (1.014 → 0.947 and → 0.933), tripling h=20 skill. The trunk really cannot see that far.
+3. **Monotone width does not affect the central field** and flattens raw coverage across
+   horizons, which is what it was for.
+
+Scored on both held-out folds (1.54M px at h=5), against the original k=5 baseline:
+
+| horizon | baseline RMSE | e4 RMSE | baseline skill | e4 skill | baseline slope | e4 slope |
+|---|---|---|---|---|---|---|
+| +5yr | 0.01478 | **0.00938** (−37%) | −1.227 | **+0.086** | 0.104 | **0.831** |
+| +10yr | 0.01746 | **0.01458** (−17%) | −0.244 | **+0.137** | 0.282 | **0.743** |
+| +15yr | 0.02047 | **0.01881** (−8%) | +0.006 | **+0.170** | 0.445 | **0.728** |
+| +20yr | 0.02416 | **0.02188** (−9%) | +0.045 | **+0.198** | 0.500 | **0.825** |
+
+Skill is positive at every horizon and now *increases* with lead time, which is the sensible
+ordering — the baseline's ran the other way because its error was dominated by a
+horizon-independent noise floor rather than by forecast difficulty.
+
+### T1–T8 consequences
+
+Scored through the same regional loop for every configuration (M=20 members, identity
+recalibration — see the note below).
+
+| target | control | +residual | +residual +monotone |
+|---|---|---|---|
+| **T1.1** pooled coverage h=5/10/15/20 | 0.975 / 0.965 / 0.967 / 0.957 (1/4 pass) | 0.903 / 0.979 / 0.975 / 0.967 (0/4) | **0.940 / 0.950 / 0.942 / 0.953 (4/4)** |
+| **T4.2** monotone spread | 0.529 | 0.106 | **0.976** |
+| **T7.3** spread-skill | 1.233 | 1.178 | 0.920 |
+
+h=10 lands at 0.950 — the anomaly this document opened with is gone, and T1.1 passes at
+every horizon for the first time.
+
+The cost lands on **T2.1**: block coverage at 10–100 km falls to 0.71–0.86 on several rows,
+because the pixel intervals are now genuinely tighter. The plan's knob table is unambiguous
+about this case — raise the long-range weight in the field, do not re-widen the marginals.
+It is a field-structure knob, not a model one, and `long_weight` was already flagged in
+`current_progress.md` as calibrated rather than derived.
+
+**T4.2's residual 2.4%** is measured from the *sample* standard deviation of M=20 members,
+which carries ~16% relative Monte-Carlo noise, so adjacent horizons of similar true spread
+invert by chance. The head widths are monotone by construction (asserted in
+`tests/test_central_head_parameterisation.py` and verified end-to-end through the real
+inference path at 100% of pixels). Re-score at larger M before reading 0.976 as a failure.
+
 ### Measurement notes worth carrying forward
 
 - The `newheads` central rasters and the fold-stitched rasters are **not comparable
@@ -171,3 +274,18 @@ All four are implemented behind separate flags (`--central_residual`, `--central
   128², roughly one pass over the globe's valid pixels. Treat the central field as
   under-trained until shown otherwise, and expect run-to-run variance comparable to the
   effect sizes being chased.
+- **Checkpoint selection couples the two heads.** `ModelCheckpoint` monitors
+  `val_total_loss`, which includes pinball, so a change that touches only the quantile heads
+  still selects a different epoch and therefore a different central field. That is why
+  `e3_res_mono`'s central RMSE differs from `e1_residual`'s despite an identical central
+  path. Any future central-only A/B should monitor a central-only metric, or the comparison
+  carries a confound.
+- **Single-fold screening cannot make a recalibration decision.** Leave-one-fold-out has
+  nothing to hold out, so all three interval scores come back non-finite. `select_recalibration`
+  used to report `decision: identity` from that as though it were measured; it now says
+  explicitly that it is a fallback. Every screening run above therefore used identity, which
+  is at least uniform across configurations, so the comparisons hold — but the *decision*
+  needs the full k=5 residual set.
+- The regional loop for one configuration (`scripts/run_region_loop.sh`) is ~15 min end to
+  end at M=20; a fold's train-plus-regional-predict is ~25 min. Global prediction, not
+  training, was what made the original fold run take 121 min per fold.

@@ -671,7 +671,17 @@ def select_recalibration(store: ScoreStore, alpha: float = 0.05, n0: float = 200
         vals = [v for v in per_fold if np.isfinite(v)]
         candidates[name] = float(np.mean(vals)) if vals else np.inf
     best = min(candidates, key=candidates.get)
+    if not np.isfinite(candidates[best]):
+        # Every candidate scored non-finite, which means leave-one-fold-out had nothing to
+        # hold out — a single-fold screening run, not a tie between three options. Fall back
+        # to identity and say why, rather than reporting a decision that looks measured.
+        return {"decision": "identity", "interval_scores": candidates,
+                "reason": ("no held-out interval score was computable (leave-one-fold-out "
+                           f"had {len(folds)} fold(s) of residuals); falling back to "
+                           "identity — this is a fallback, not a measured decision"),
+                "measured": False}
     return {"decision": best, "interval_scores": candidates,
+            "measured": True,
             "reason": (f"lowest held-out interval score ({candidates[best]:.5f}); "
                        f"coverage alone would prefer the widest option")}
 

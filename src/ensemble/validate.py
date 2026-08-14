@@ -572,9 +572,13 @@ def plot_coverage_vs_scale(block_df, out_path, title="Coverage vs aggregation sc
     for key, sub in groups:
         kind = key[0] if isinstance(key, tuple) else key
         sub = sub.groupby("scale_km", as_index=False)[["coverage", "wilson_lo", "wilson_hi"]].mean()
+        # Averaging the Wilson bounds over horizons can put a bound fractionally the wrong
+        # side of the averaged point estimate — most visibly at coverage 1.000, where the
+        # interval is one-sided. Clip rather than let matplotlib reject the whole figure.
+        lo_err = np.clip(sub["coverage"] - sub["wilson_lo"], 0.0, None)
+        hi_err = np.clip(sub["wilson_hi"] - sub["coverage"], 0.0, None)
         ax.errorbar(
-            sub["scale_km"], sub["coverage"],
-            yerr=[sub["coverage"] - sub["wilson_lo"], sub["wilson_hi"] - sub["coverage"]],
+            sub["scale_km"], sub["coverage"], yerr=[lo_err, hi_err],
             capsize=3, label=str(key), **styles.get(str(kind), {"marker": "o"}),
         )
     ax.axhline(0.95, ls="--", c="k", lw=1, label="nominal 0.95")
