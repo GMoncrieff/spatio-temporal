@@ -558,9 +558,43 @@ M=100. But T5.2's tolerance is MC-scaled as 1/√M under a Gaussian assumption t
 family violates, so its pass fraction went *down* at M=400 (0.847 → 0.773) even as the
 absolute error halved. Scoring this family against that tolerance is not a fair test — and
 "the metric is unfair" is not sufficient grounds to adopt a change that loses 91/128 to
-84/126 as actually scored. **The two-piece normal remains the default; the shape stays
-behind the flag** until either T5.2's tolerance is made family-aware or the realism gain is
-shown to be worth the percentile cost on a decision-relevant metric.
+84/126 as actually scored. So the metric was fixed first — see below.
+
+### The T5 tolerances are now family-aware, and the incumbent is unaffected
+
+The standard error of a sample p-quantile is `sqrt(p(1-p)/M) / f(x_p)`. In normal-score
+units that is `sqrt(p(1-p)/M) / phi(z_p)`, and converting to value units costs `dx/dz`. For
+the two-piece normal `x = loc + sigma*z`, so that factor is exactly `sigma` — which is what
+the gates assumed. For any other marginal it is `sigma * S'(z_p)`, and the missing slope is
+large:
+
+| horizon | S'(−1.96) | S'(0) | S'(+1.96) |
+|---|---|---|---|
+| 5 | 1.91 | 0.27 | 2.05 |
+| 20 | 1.33 | 0.83 | 1.87 |
+| **two-piece normal** | **1.00** | **1.00** | **1.00** |
+
+So T5.2's tolerance was 1.3–2.2× too tight for the shaped family and T5.1's was up to 3.7×
+too *loose*. `shape_slope(None, ·)` returns exactly 1.0, so the incumbent is scored
+bit-for-bit as before — asserted in a test and confirmed empirically by rescoring it
+(99.820 / 99.785 / 99.696 / 99.694, identical to the previous run).
+
+Scored correctly, the shaped marginal's tail agreement is **99.8–100%**: T5.2 goes 0/4 → 4/4,
+and its apparent failure was entirely the wrong tolerance. The correction cuts both ways —
+T5.1's median tolerance tightens and h=5 now marginally fails at 0.9936 against 0.995.
+
+| | overall | T5.1 | T5.2 | T1.2 | T1.3 | T6.1 ratios |
+|---|---|---|---|---|---|---|
+| two-piece normal | **91/128 = 0.711** | 4/4 | 4/4 | 13/16 | 3/3 | 3.84 / 5.65 / 6.75 / 6.65 |
+| shaped, Gaussian tol | 84/126 = 0.667 | 4/4 | 0/4 | 11/15 | 1/2 | **1.74 / 2.88 / 4.36 / 4.55** |
+| shaped, shape-aware tol | 87/126 = 0.690 | 3/4 | **4/4** | 11/15 | 1/2 | **1.74 / 2.88 / 4.36 / 4.55** |
+
+**The two-piece normal remains the default.** Fairly scored the shape closes most of the gap
+(0.667 → 0.690) and more than halves the realism defect it was built for, but still loses
+0.690 to 0.711. The residual gap is now concentrated in T1.2/T1.3, which are also estimated
+from the ensemble's own percentiles and are therefore subject to the same finite-M penalty
+that T5.2 was — testing that at M ≥ 400 is the obvious next check, and the one thing that
+could still flip the decision.
 
 ### Two bugs of mine, and how each was caught
 

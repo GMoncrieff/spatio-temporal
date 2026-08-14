@@ -159,6 +159,25 @@ def apply_shape(z, shape):
     return np.where(np.abs(z) > Z975, z, out)
 
 
+def shape_slope(shape, z, h: float = 1e-3):
+    """d(shape)/dz at ``z`` — the factor a Monte-Carlo tolerance is missing.
+
+    The standard error of a sample p-quantile is ``sqrt(p(1-p)/M) / f(x_p)``. Written in
+    normal-score units that is ``sqrt(p(1-p)/M) / phi(z_p)``, and converting to value units
+    costs a factor ``dx/dz``. For the two-piece normal ``x = loc + sigma*z`` so that factor
+    is just ``sigma`` — which is what the T5 gates assume. For any other marginal it is
+    ``sigma * S'(z_p)``, and omitting ``S'`` makes the tolerance wrong by exactly that
+    amount: too tight where the marginal is steep (near the bounds of a spiky shape), too
+    loose where it is flat.
+
+    Returns 1.0 for ``shape=None``, so the two-piece normal is unaffected.
+    """
+    if shape is None:
+        return np.ones_like(np.asarray(z, dtype=np.float64))
+    z = np.asarray(z, dtype=np.float64)
+    return (apply_shape(z + h, shape) - apply_shape(z - h, shape)) / (2.0 * h)
+
+
 def copula_sample_member(z_field, marginal_params, clip=(0.0, 1.0)):
     """One ensemble member: push a correlated normal field through the pixel marginals.
 

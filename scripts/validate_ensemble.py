@@ -27,6 +27,7 @@ from rasterio.windows import Window
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.ensemble import aggregate as agg  # noqa: E402
+from src.ensemble import copula as cop  # noqa: E402
 from src.ensemble import fields as fld  # noqa: E402
 from src.ensemble import validate as val  # noqa: E402
 from src.ensemble import variogram as vgm  # noqa: E402
@@ -113,6 +114,10 @@ def parse_args(argv=None):
                     help="Used for the T1.5 sharpness guard (width vs the original heads)")
     ap.add_argument("--block_sizes", default="10,100,1000")
     ap.add_argument("--score_points", type=int, default=1500)
+    ap.add_argument("--marginal_shape", default=None,
+                    help="Empirical marginal shape the ensemble was generated with. The T5 "
+                         "Monte-Carlo tolerances assume dx/dz = sigma, which holds only for "
+                         "the two-piece normal; with a shape they need its local slope too.")
     ap.add_argument("--score_max_dist_px", type=float, default=None,
                     help="Cap on pair separation for T3.2. Defaults to half the member "
                          "variogram's fitted practical range — pairs beyond the "
@@ -186,9 +191,28 @@ def stage_gates(args, store, attrs, years, paths, out_dir, card, block_rows=None
     p = 0.025
     mc_sigma_z = np.sqrt(p * (1 - p) / M) / _norm.pdf(_norm.ppf(p))
 
+    # Both tolerances above turn a normal-score standard error into value units by
+    # multiplying by sigma, which is dx/dz for the two-piece normal and *only* for it. Any
+    # other marginal contributes a further factor S'(z), the local slope of its shape map at
+    # the quantile being estimated. Omitting it makes the gate wrong by exactly that amount:
+    # measured on the empirical shape, 1.33-2.18 at the bounds (tolerance far too tight) and
+    # 0.27-0.83 at the median (too loose). shape_slope returns 1.0 with no shape in play, so
+    # the two-piece normal is scored exactly as before.
+    shapes = {}
+    if getattr(args, "marginal_shape", None) and Path(args.marginal_shape).exists():
+        blob = json.load(open(args.marginal_shape))
+        shapes = {int(k): v for k, v in blob.get("by_horizon", {}).items() if v}
+        print(f"  T5 tolerances are shape-aware ({args.marginal_shape})")
+
+    def _slopes(year):
+        sh = shapes.get(int(year) - int(args.base_year))
+        a, b, c_ = cop.shape_slope(sh, np.array([-1.959964, 0.0, 1.959964]))
+        return float(a), float(b), float(c_)
+
     pct_paths = {}
     summary = []
     for hi, year in enumerate(years):
+        sl_lo, sl_med, sl_hi = _slopes(year)
         with rasterio.open(paths[year]["central"]) as c:
             profile = c.profile.copy()
         # Tiled output so the chunk-aligned windowed writes land on whole blocks rather
@@ -243,12 +267,12 @@ def stage_gates(args, store, attrs, years, paths, out_dir, card, block_rows=None
                     sig_r = np.maximum((upp - cen) / 1.959964, 1e-9)
                     sig_l = np.maximum((cen - low) / 1.959964, 1e-9)
                     sigma_local = np.where(med >= cen, sig_r, sig_l)
-                    tol_med = 3.0 * med_sigma_z * sigma_local + quant_tol
+                    tol_med = 3.0 * med_sigma_z * sigma_local * sl_med + quant_tol
                     n_med_ok += int((np.abs(med - cen)[ok] <= tol_med[ok]).sum())
                     n_med_exact += int((np.abs(med - cen)[ok] <= quant_tol).sum())
                     sum_halfwidth += float(half[ok].sum())
-                    tol_lo = mc_sigma_z * np.maximum(cen - low, 1e-9) / 1.96 * 3.0
-                    tol_hi = mc_sigma_z * half / 1.96 * 3.0
+                    tol_lo = mc_sigma_z * np.maximum(cen - low, 1e-9) / 1.96 * 3.0 * sl_lo
+                    tol_hi = mc_sigma_z * half / 1.96 * 3.0 * sl_hi
                     n_lo_ok += int((np.abs(p25 - low)[ok] <= tol_lo[ok]).sum())
                     n_hi_ok += int((np.abs(p975 - upp)[ok] <= tol_hi[ok]).sum())
         finally:
@@ -272,7 +296,9 @@ def stage_gates(args, store, attrs, years, paths, out_dir, card, block_rows=None
                       f"median is exact by construction, the sample median of M={M} is not",
                  knob="T5")
         card.add("T5.2", f"tails within MC tolerance ({year})", min(f_lo, f_hi), ">=0.95 (MC-scaled)",
-                 min(f_lo, f_hi) >= 0.95, note=f"M={M}, mc_sigma_z={mc_sigma_z:.3f}", knob="T5")
+                 min(f_lo, f_hi) >= 0.95,
+                 note=f"M={M}, mc_sigma_z={mc_sigma_z:.3f}, shape slope "
+                      f"{sl_lo:.2f}/{sl_hi:.2f} at the bounds", knob="T5")
         card.add("T5.3", f"valid-mask identity ({year})", n_mask_mismatch, "0 pixels",
                  n_mask_mismatch == 0, knob="T5")
 

@@ -147,3 +147,40 @@ def test_no_shape_reproduces_the_two_piece_normal_exactly():
 
 def test_thin_sample_returns_none_rather_than_a_bad_shape():
     assert fit_residual_shape(np.random.default_rng(0).normal(size=100)) is None
+
+
+# ------------------------------------------------------- Monte-Carlo tolerance correctness
+def test_shape_slope_is_one_for_the_two_piece_normal():
+    """The gate must score the incumbent family exactly as before."""
+    from src.ensemble.copula import shape_slope
+
+    z = np.linspace(-3, 3, 11)
+    assert np.allclose(shape_slope(None, z), 1.0)
+
+
+def test_shape_slope_is_large_at_the_bounds_and_small_at_the_median():
+    """This is the factor T5's tolerance was missing.
+
+    The standard error of a sample p-quantile is sqrt(p(1-p)/M)/f(x_p); converting from
+    normal-score units to value units costs dx/dz, which is sigma only when the shape map is
+    the identity. A spiky marginal is steep at the bounds and flat at the median, so a
+    Gaussian-derived tolerance is simultaneously too tight there and too loose here.
+    """
+    from src.ensemble.copula import shape_slope
+
+    shape = fit_residual_shape(spiky_residual())
+    lo, med, hi = shape_slope(shape, np.array([-Z975, 0.0, Z975]))
+    assert lo > 1.2, lo
+    assert hi > 1.2, hi
+    assert med < 0.9, med
+
+
+def test_shape_slope_recovers_unity_for_a_gaussian_residual():
+    rng = np.random.default_rng(2)
+    e = rng.normal(0.0, 1.0, 400_000)
+    lo_q, hi_q = np.quantile(e, [0.025, 0.975])
+    e = np.where(e < 0, e / abs(lo_q) * Z975, e / hi_q * Z975)
+    from src.ensemble.copula import shape_slope
+
+    s = shape_slope(fit_residual_shape(e), np.array([-Z975, 0.0, Z975]))
+    assert np.allclose(s, 1.0, atol=0.25), s
