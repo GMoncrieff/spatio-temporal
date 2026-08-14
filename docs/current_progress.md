@@ -237,8 +237,17 @@ h=5's while covering 1.5× the error) and fixed structurally.
 8. *M = 50 limits tail-sensitive per-pixel products.* Seeds are recorded, so extending to
    M ≥ 200 is cheap and would clear several T1 rows that are Monte-Carlo-limited rather than
    wrong.
-9. *T3.2's null comparison* needs spread-weighted sampling to be meaningful now that the far
-   field is near-degenerate.
+9. ~~*T3.2's null comparison* needs spread-weighted sampling~~ — **done, and the diagnosis
+   was corrected in doing it.** Pairs were being drawn out to 500 px against a fitted
+   practical range of 50.5 px, and beyond the correlation range the correlated ensemble and
+   its independent null produce the same variogram term, so those pairs cancelled in the
+   ratio while diluting it. Capping separation at half the fitted range took the improvement
+   from 1.0% to 10.5%; spread-weighted sampling took it to 16.5%. **The distance cap was the
+   dominant effect, not the far-field degeneracy.** T3.2 is now informative and still fails
+   (16.5% against 30%); the residual is most likely the nugget fraction (0.345 — a third of
+   member variance uncorrelated at zero lag), which is a Phase 2 field knob, and T3.1 agrees
+   the field structure is off. The uniform-sampled score is retained as `T3.2b` so the
+   change stays auditable.
 
 **Process.** Re-run the whole regional loop after any model change — it is ~20 minutes and it
 has repeatedly caught measurement errors that looked like findings.

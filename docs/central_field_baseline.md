@@ -350,6 +350,59 @@ T7.3 = 1.275 is recorded as a near-miss with a known, undesirable remedy.
 The general lesson is the one already learned about coverage: a sweep judged on a total pass
 count hides which rows moved. Reading the per-row values is what made the trade-off visible.
 
+---
+
+## 10. T3.2's scoring fix — and a corrected diagnosis
+
+`current_progress.md` recorded T3.2's null comparison as needing **spread-weighted
+sampling**, "now that the far field is near-degenerate". That was half right, and the
+smaller half.
+
+Two things were wrong with the scoring, both fixed:
+
+1. **Pairs were drawn out to 500 px against a fitted practical range of 50.5 px.** Beyond
+   the correlation range a correlated ensemble and an independent one produce the same
+   variogram term, so those pairs contribute an identical quantity to numerator and
+   denominator — they cancel in the ratio while diluting it. The cap is now half the member
+   variogram's own fitted range (`--score_max_dist_px` to override).
+2. **Points were drawn uniformly**, so the sample included pixels whose ensemble has no
+   spread to structure. Sampling is now weighted by the marginal scale — which the ensemble
+   and its null share *by construction*, so the weighting changes where both are measured
+   without favouring either.
+
+Measured on the k=5 ensemble:
+
+| sampling | improvement vs null | pairs carrying spread |
+|---|---|---|
+| uniform, 500 px (the old scoring) | **1.0%** | — |
+| uniform, 25 px | **10.5%** | 90.6% |
+| spread-weighted, 25 px | **16.5%** | 100.0% |
+
+**The distance cap did most of the work**, not the spread weighting: at 25 px with clustered
+patches, uniform sampling already draws 90.6% live pairs. The far-field degeneracy was a
+secondary effect, and the plan's stated diagnosis should be read as corrected.
+
+T3.2 is now an informative measurement and it still **fails**, at 16.5% against a 30%
+target. That residual is most likely real rather than procedural: the member variogram's
+**nugget fraction is 0.345**, so a third of the member variance is uncorrelated at zero lag,
+which directly bounds how far a correlated ensemble can pull away from an independent one at
+short lags. Lowering the nugget is the Phase 2 knob; T3.1 agrees that the field structure is
+off (practical range 0.357 relative error, nugget 0.119 absolute, both over target).
+
+Supporting changes: `variogram_score` now returns a weighted **mean** rather than a sum, so
+the value no longer depends on how many pairs survived the distance filter (ratios are
+unaffected); `informative_pair_fraction` reports the diluting share directly; and the
+uniform-sampled score is retained on the scorecard as `T3.2b` so the weighting's effect
+stays auditable rather than silently replacing a published number.
+
+Two implementation traps found while testing this, both fixed:
+- Thresholding "has spread" against the *median* spread collapses in exactly the regime it
+  is meant to detect, because the degenerate background is the majority and the median sits
+  inside it. It uses the 99th percentile.
+- `rng.choice(..., replace=False, p=w)` must return `n` distinct indices, so a patch that
+  only clips the live region is forced to make up the difference from zero-weight pixels —
+  silently reintroducing the degenerate points. Candidates are now filtered before the draw.
+
 ### Measurement notes worth carrying forward
 
 - The `newheads` central rasters and the fold-stitched rasters are **not comparable

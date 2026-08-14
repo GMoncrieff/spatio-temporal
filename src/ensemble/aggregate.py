@@ -536,14 +536,57 @@ def variogram_score(members, observation, pairs, p: float = 0.5, weights=None):
     Sensitive to the *correlation* structure rather than the marginals — which is exactly
     what separates the copula ensemble from an independent-pixel ensemble with identical
     marginals.
+
+    Reported as a weighted **mean** over pairs, not a sum. A sum makes the number depend on
+    how many of the requested pairs survived the distance filter, which varies between runs
+    and between weighting schemes; the mean is comparable across both. Ratios between two
+    ensembles scored on identical pairs are unaffected either way.
     """
     X = np.asarray(members, dtype=np.float64)
     y = np.asarray(observation, dtype=np.float64)
     i, j = pairs
+    if len(i) == 0:
+        return float("nan")
     obs_term = np.abs(y[i] - y[j]) ** p
     ens_term = np.mean(np.abs(X[:, i] - X[:, j]) ** p, axis=0)
-    w = 1.0 if weights is None else np.asarray(weights)
-    return float(np.sum(w * (obs_term - ens_term) ** 2))
+    sq = (obs_term - ens_term) ** 2
+    if weights is None:
+        return float(np.mean(sq))
+    w = np.asarray(weights, dtype=np.float64)
+    total = w.sum()
+    if not np.isfinite(total) or total <= 0:
+        return float(np.mean(sq))
+    return float(np.sum(w * sq) / total)
+
+
+def informative_pair_fraction(spread, pairs, rel_floor: float = 0.05):
+    """Share of pairs where the ensemble has enough spread to have a structure at all.
+
+    A pair whose two endpoints both carry near-zero spread contributes the same quantity to
+    a correlated ensemble and to an independent one — for both, the members collapse onto
+    the central forecast and the variogram term reduces to |central_i − central_j|^p. Such
+    pairs cancel in the ratio while still diluting it, so a variogram-score comparison is
+    only as informative as this fraction is large.
+
+    ``rel_floor`` is expressed relative to a high quantile of the non-zero spread, so the
+    threshold follows the ensemble rather than being an absolute HM number that stops
+    meaning the same thing when the marginals tighten. It has to be a *high* quantile: in
+    exactly the regime this function exists to detect, the degenerate background is the
+    large majority, so any central statistic — median, even the 90th percentile — sits
+    inside the dead part and the threshold collapses to "everything counts". The 99th
+    percentile tracks the live scale as long as the live region is more than ~1% of the
+    map, and the alternative (the bare maximum) would be at the mercy of one pixel.
+    """
+    s = np.asarray(spread, dtype=np.float64)
+    i, j = pairs
+    if len(i) == 0:
+        return float("nan")
+    pos = s[np.isfinite(s) & (s > 0)]
+    if pos.size == 0:
+        return 0.0
+    thresh = rel_floor * float(np.quantile(pos, 0.99))
+    live = np.isfinite(s) & (s > thresh)
+    return float(np.mean(live[i] & live[j]))
 
 
 def sample_pairs(n_points, n_pairs, rng=None, coords=None, max_dist=None):

@@ -113,6 +113,11 @@ def parse_args(argv=None):
                     help="Used for the T1.5 sharpness guard (width vs the original heads)")
     ap.add_argument("--block_sizes", default="10,100,1000")
     ap.add_argument("--score_points", type=int, default=1500)
+    ap.add_argument("--score_max_dist_px", type=float, default=None,
+                    help="Cap on pair separation for T3.2. Defaults to half the member "
+                         "variogram's fitted practical range — pairs beyond the "
+                         "correlation range score identically under the correlated "
+                         "ensemble and its independent null, so they only dilute.")
     ap.add_argument("--stages",
                     default="gates,percentiles,aggregate,rank,spatial,temporal,change,"
                             "visual,clustering")
@@ -565,28 +570,69 @@ def stage_spatial(args, store, attrs, years, paths, out_dir, card, null_store=No
         # the correlation lives. Sampling 1500 points uniformly over a 17111 x 40000 grid
         # leaves ~26 of 20000 requested pairs within 500 px — the correlated ensemble and
         # the independent null are then indistinguishable for want of nearby pairs.
-        idx = _clustered_sample(ok, args.score_points, rng, patch=512)
-        rr, cc = np.unravel_index(idx, (H, W))
-        coords = np.stack([rr, cc], axis=1).astype(float)
-        y = obs.ravel()[idx]
-        X = np.stack([agg.member_slice(store, attrs, m, hi).ravel()[idx] for m in range(M)])
-        # The null only has to cover the horizon being scored; it is white noise and so
-        # compresses far worse than the correlated ensemble, and storing all four horizons
-        # of it buys nothing.
+        # Marginal spread, shared identically by the ensemble and its independent-pixel
+        # null. This is the sampling weight for T3.2 — see _clustered_sample.
+        spread = np.where(np.isfinite(sl) & np.isfinite(sr), (sl + sr) * 0.5, np.nan)
         null_hi = min(hi, null_store.shape[1] - 1)
-        Xn = np.stack([agg.member_slice(null_store, null_attrs, m, null_hi).ravel()[idx]
-                       for m in range(null_store.shape[0])])
-        pairs = agg.sample_pairs(idx.size, 20000, rng=rng, coords=coords, max_dist=500)
-        vs = agg.variogram_score(X, y, pairs)
-        vs_null = agg.variogram_score(Xn, y, pairs)
-        es = agg.energy_score(X, y)
-        es_null = agg.energy_score(Xn, y)
-        es_degen = agg.energy_score(np.repeat(cen.ravel()[idx][None, :], 2, axis=0), y)
-        improve = 1.0 - vs / max(vs_null, 1e-12)
-        print(f"  variogram score {vs:.4g} vs null {vs_null:.4g} ({100*improve:.1f}% lower)")
+
+        # Pairs must sit *inside* the correlation range or the comparison is scored where
+        # the two ensembles are identical by construction. Measured on synthetic fields
+        # with a known range: sampling out to 500 px against a ~50 px range gives a 0.00
+        # improvement, the same pairs restricted to half the range give 0.57. The default
+        # 500 px was far beyond the member variogram's fitted practical range (50.5 px on
+        # the k=5 run), so most pairs were carrying no signal.
+        max_dist = args.score_max_dist_px
+        if max_dist is None:
+            max_dist = max(8.0, 0.5 * float(member_fit["practical_range_px"]))
+        print(f"  pair separation capped at {max_dist:.0f} px "
+              f"(member practical range {member_fit['practical_range_px']:.1f} px)")
+
+        def _score(idx, tag):
+            rr, cc = np.unravel_index(idx, (H, W))
+            coords = np.stack([rr, cc], axis=1).astype(float)
+            y = obs.ravel()[idx]
+            X = np.stack([agg.member_slice(store, attrs, m, hi).ravel()[idx]
+                          for m in range(M)])
+            # The null only has to cover the horizon being scored; it is white noise and so
+            # compresses far worse than the correlated ensemble, and storing all four
+            # horizons of it buys nothing.
+            Xn = np.stack([agg.member_slice(null_store, null_attrs, m, null_hi).ravel()[idx]
+                           for m in range(null_store.shape[0])])
+            pairs = agg.sample_pairs(idx.size, 200000, rng=rng, coords=coords,
+                                     max_dist=max_dist)
+            vs = agg.variogram_score(X, y, pairs)
+            vs_null = agg.variogram_score(Xn, y, pairs)
+            live = agg.informative_pair_fraction(spread.ravel()[idx], pairs)
+            improve = 1.0 - vs / max(vs_null, 1e-12)
+            print(f"  [{tag}] variogram score {vs:.4g} vs null {vs_null:.4g} "
+                  f"({100*improve:.1f}% lower); {100*live:.1f}% of pairs carry spread")
+            return dict(vs=vs, vs_null=vs_null, improve=improve, live=live,
+                        X=X, Xn=Xn, y=y, idx=idx)
+
+        # Uniform sampling is retained and reported so the effect of the weighting is
+        # visible rather than a silent replacement of a previously published number.
+        uni = _score(_clustered_sample(ok, args.score_points, rng, patch=512), "uniform")
+        wtd = _score(_clustered_sample(ok, args.score_points, rng, patch=512, spread=spread),
+                     "spread-weighted")
+
+        card.add("T3.2", "variogram score vs independent-pixel null (spread-weighted)",
+                 wtd["improve"], ">= 0.30 lower", wtd["improve"] >= 0.30, knob="T3",
+                 note=f"{100*wtd['live']:.1f}% of pairs carry spread; "
+                      f"uniform sampling gives {100*uni['improve']:.1f}% "
+                      f"at {100*uni['live']:.1f}% live pairs")
+        card.add("T3.2b", "variogram score vs null (uniform sampling, reference)",
+                 uni["improve"], "reported, not gated", None,
+                 note="retained so the weighting's effect is auditable")
+
+        # The energy score is a whole-vector quantity, so it is scored on the uniform
+        # sample: reweighting the points would change what distribution it is an
+        # expectation over, and T3.3's comparison to the degenerate baseline assumes the
+        # same footing as before.
+        es = agg.energy_score(uni["X"], uni["y"])
+        es_null = agg.energy_score(uni["Xn"], uni["y"])
+        es_degen = agg.energy_score(
+            np.repeat(cen.ravel()[uni["idx"]][None, :], 2, axis=0), uni["y"])
         print(f"  energy score {es:.4g} vs null {es_null:.4g}, degenerate {es_degen:.4g}")
-        card.add("T3.2", "variogram score vs independent-pixel null", improve, ">= 0.30 lower",
-                 improve >= 0.30, knob="T3")
         card.add("T3.3", "energy score beats null and degenerate", es,
                  f"< min(null {es_null:.4g}, degenerate {es_degen:.4g})",
                  es < es_null and es < es_degen, knob="T3")
@@ -745,25 +791,85 @@ def stage_visual(args, store, attrs, years, paths, out_dir, card, run=None, n_me
              note="see W&B images and data/ensemble/validation/members_*.png")
 
 
-def _clustered_sample(valid, n_points, rng, patch=512, n_patches=12):
+def _clustered_sample(valid, n_points, rng, patch=512, n_patches=12, spread=None,
+                      spread_power=1.0):
     """Flat indices of valid pixels drawn from a handful of local patches.
 
     Structure-sensitive scores (variogram, energy) need pairs separated by less than the
     correlation range; a globally uniform sample contains almost none.
+
+    ``spread`` optionally biases both the patch choice and the within-patch draw toward
+    pixels where the ensemble actually has variance. Without it, most of a well-behaved
+    ensemble's map is near-degenerate — the whole point of the change-context fix is that
+    remote stable country now gets essentially no spread — and pairs drawn there score
+    identically under a correlated ensemble and an independent one, so they cancel in the
+    ratio while still diluting it.
+
+    The weight must be something the two ensembles **share**, or the sampling would favour
+    one of them. The marginal scale is exactly that: the independent-pixel null is built
+    from identical marginals by construction, so weighting by marginal spread changes
+    *where* both are measured without changing which is favoured.
     """
     H, W = valid.shape
     per_patch = max(10, n_points // n_patches)
+
+    w_full = None
+    if spread is not None:
+        w_full = np.where(np.isfinite(spread) & valid, np.maximum(spread, 0.0), 0.0)
+        if w_full.sum() <= 0:
+            w_full = None
+        elif spread_power != 1.0:
+            w_full = w_full ** spread_power
+
+    # Patch origins proportional to the spread they contain, on a coarse grid so the draw
+    # is cheap. Falls back to uniform when no spread raster is supplied or it is degenerate.
+    origins = None
+    if w_full is not None:
+        step = max(patch // 2, 1)
+        rs = np.arange(0, max(1, H - patch) + 1, step)
+        cs = np.arange(0, max(1, W - patch) + 1, step)
+        if rs.size and cs.size:
+            cum = w_full.cumsum(axis=0).cumsum(axis=1)
+            cum = np.pad(cum, ((1, 0), (1, 0)))
+            r1 = np.minimum(rs + patch, H)
+            c1 = np.minimum(cs + patch, W)
+            block = (cum[np.ix_(r1, c1)] - cum[np.ix_(rs, c1)]
+                     - cum[np.ix_(r1, cs)] + cum[np.ix_(rs, cs)])
+            flat = block.ravel()
+            if flat.sum() > 0:
+                pick = rng.choice(flat.size, size=n_patches * 4, replace=True,
+                                  p=flat / flat.sum())
+                pr, pc = np.unravel_index(pick, block.shape)
+                origins = list(zip(rs[pr].tolist(), cs[pc].tolist()))
+
     out = []
-    for _ in range(n_patches * 4):
+    for k in range(n_patches * 4):
         if sum(len(o) for o in out) >= n_points:
             break
-        r0 = int(rng.integers(0, max(1, H - patch)))
-        c0 = int(rng.integers(0, max(1, W - patch)))
+        if origins is not None:
+            r0, c0 = origins[k]
+        else:
+            r0 = int(rng.integers(0, max(1, H - patch)))
+            c0 = int(rng.integers(0, max(1, W - patch)))
         sub = valid[r0:r0 + patch, c0:c0 + patch]
         loc = np.flatnonzero(sub.ravel())
+        p = None
+        if w_full is not None:
+            sw = w_full[r0:r0 + patch, c0:c0 + patch].ravel()[loc]
+            if sw.sum() > 0:
+                # Drop the near-zero-weight pixels *before* drawing. `replace=False` has to
+                # return `per_patch` distinct indices, so a patch that only clips the live
+                # region would be forced to make up the difference from pixels whose
+                # probability is nominally zero — silently reintroducing exactly the
+                # degenerate points the weighting exists to avoid.
+                live = sw > 1e-3 * sw.max()
+                if live.sum() >= per_patch:
+                    loc = loc[live]
+                    sw = sw[live]
+                p = sw / sw.sum()
         if loc.size < per_patch:
             continue
-        pick = rng.choice(loc, per_patch, replace=False)
+        pick = rng.choice(loc, per_patch, replace=False, p=p)
         pr, pc = np.unravel_index(pick, sub.shape)
         out.append((r0 + pr) * W + (c0 + pc))
     if not out:
