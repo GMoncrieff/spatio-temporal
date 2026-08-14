@@ -57,7 +57,11 @@ def main(argv=None):
     ap.add_argument("--split_mask", default="data/raw/hm_global/split_mask_region_1000.tif")
     ap.add_argument("--transform_json", default="data/ensemble/rank_gaussian.json")
     ap.add_argument("--keep_splits", default="2,3,4",
-                    help="Split values to evaluate on (default: everything except train)")
+                    help="Split values to evaluate on (default: everything except train). "
+                         "Use 'all' when the rasters are already restricted to held-out "
+                         "geography, as fold-CV predictions are.")
+    ap.add_argument("--pred_suffix", default="_blended",
+                    help="Filename suffix before .tif; fold-stitched rasters have none")
     args = ap.parse_args(argv)
 
     pred = Path(args.pred_dir)
@@ -69,7 +73,8 @@ def main(argv=None):
 
     tr = (RankGaussianTransform.from_json(args.transform_json)
           if Path(args.transform_json).exists() else None)
-    keep_values = tuple(int(v) for v in args.keep_splits.split(","))
+    keep_values = None if args.keep_splits.strip().lower() == "all" \
+        else tuple(int(v) for v in args.keep_splits.split(","))
 
     for window in WINDOWS:
         base = window[-1]
@@ -77,7 +82,7 @@ def main(argv=None):
             year = base + h
             if year > MAX_YEAR:
                 continue
-            trio = {q: pred / f"w{base}_prediction_{year}_{q}_blended.tif"
+            trio = {q: pred / f"w{base}_prediction_{year}_{q}{args.pred_suffix}.tif"
                     for q in ("central", "lower", "upper")}
             if not all(p.exists() for p in trio.values()):
                 continue
@@ -91,9 +96,12 @@ def main(argv=None):
             )
             with rasterio.open(trio["central"]) as c:
                 profile = c.profile.copy()
-            kept, dropped = mask_training_pixels(
-                [v for k, v in info.items() if k.startswith("path_")],
-                args.split_mask, profile, keep_values=keep_values)
+            if keep_values is None:
+                dropped = 0
+            else:
+                kept, dropped = mask_training_pixels(
+                    [v for k, v in info.items() if k.startswith("path_")],
+                    args.split_mask, profile, keep_values=keep_values)
             ctx = Path(args.covariate_dir) / f"w{base}_dist_past_change.tif"
             row = {"window": "-".join(str(y) for y in window), "base_year": base,
                    "target_year": year, "horizon": h,

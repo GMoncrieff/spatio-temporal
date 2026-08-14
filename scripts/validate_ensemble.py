@@ -685,6 +685,9 @@ def stage_visual(args, store, attrs, years, paths, out_dir, card, run=None, n_me
         H, W = c.height, c.width
 
     windows = _pick_windows(paths[year]["observed"], str(base_hm), profile, H, W)
+    # Render every horizon, not just the longest: the failure this project cares about is
+    # how change *grows* with lead time, and one horizon cannot show that.
+    horizons = list(range(len(years)))
     figs = []
     diversity_rows = []
     for name, (r0, c0, hgt, wid) in windows.items():
@@ -693,21 +696,28 @@ def stage_visual(args, store, attrs, years, paths, out_dir, card, run=None, n_me
             p_t = profile["transform"]
             off = (int(round((p_t.f - b_t.f) / b_t.e)), int(round((p_t.c - b_t.c) / b_t.a)))
             hm0 = b.read(1, window=Window(off[1] + c0, off[0] + r0, wid, hgt)).astype(np.float32)
-        with rasterio.open(paths[year]["observed"]) as o:
-            o_t = o.transform
-            ooff = (int(round((p_t.f - o_t.f) / o_t.e)), int(round((p_t.c - o_t.c) / o_t.a)))
-            obs = o.read(1, window=Window(ooff[1] + c0, ooff[0] + r0, wid, hgt)).astype(np.float32)
         hm0 = np.where(hm0 < 0, np.nan, hm0)
-        obs = np.where(obs < 0, np.nan, obs)
-        d_obs = obs - hm0
-        mem = np.stack([
-            agg.member_slice(store, attrs, m, hi, window=(r0, r0 + hgt, c0, c0 + wid)) - hm0
-            for m in range(min(n_members, store.shape[0]))
-        ])
-        div = agg.member_diversity(mem)
-        diversity_rows.append({"window": name, **div})
-        figs.append(_plot_members_vs_observed(mem, d_obs, out_dir / f"members_{name}.png", name, year))
-        print(f"  {name}: mean pairwise member correlation {div['mean_pairwise_corr']:.3f}")
+        for h_idx in horizons:
+            y_h = years[h_idx]
+            with rasterio.open(paths[y_h]["observed"]) as o:
+                o_t = o.transform
+                ooff = (int(round((p_t.f - o_t.f) / o_t.e)), int(round((p_t.c - o_t.c) / o_t.a)))
+                obs = o.read(1, window=Window(ooff[1] + c0, ooff[0] + r0, wid, hgt)).astype(np.float32)
+            obs = np.where(obs < 0, np.nan, obs)
+            d_obs = obs - hm0
+            with rasterio.open(paths[y_h]["central"]) as c:
+                cen = c.read(1, window=Window(c0, r0, wid, hgt)).astype(np.float32)
+            d_cen = np.where(np.isfinite(cen), cen - hm0, np.nan)
+            mem = np.stack([
+                agg.member_slice(store, attrs, m, h_idx, window=(r0, r0 + hgt, c0, c0 + wid)) - hm0
+                for m in range(min(n_members, store.shape[0]))
+            ])
+            div = agg.member_diversity(mem)
+            diversity_rows.append({"window": name, "target_year": y_h, **div})
+            figs.append(_plot_members_vs_observed(
+                mem, d_obs, out_dir / f"members_{name}_{y_h}.png", name, y_h, d_central=d_cen))
+            print(f"  {name} {y_h}: mean pairwise member correlation "
+                  f"{div['mean_pairwise_corr']:.3f}")
 
     div_df = pd.DataFrame(diversity_rows)
     div_df.to_csv(out_dir / "t7_diversity.csv", index=False)
@@ -791,7 +801,16 @@ def _pick_windows(observed_path, base_hm_path, profile, H, W, size=768):
     return out
 
 
-def _plot_members_vs_observed(members, d_obs, path, name, year):
+def _plot_members_vs_observed(members, d_obs, path, name, year, d_central=None):
+    """Members beside the observation, the central forecast, and their Δ distributions.
+
+    The central panel is what makes this diagnostic rather than decorative: members are
+    the central forecast plus correlated noise, so a member that looks unlike the truth is
+    either the noise field's fault or the central field's, and the two are only separable
+    with the central field in the same picture. The histogram carries the part the eye
+    cannot judge — HM change is overwhelmingly zero and its tails are rare, so a panel
+    that looks plausible can still have the wrong tail mass by an order of magnitude.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -800,21 +819,48 @@ def _plot_members_vs_observed(members, d_obs, path, name, year):
     step = max(1, max(d_obs.shape) // 1200)
     vmax = float(np.nanpercentile(np.abs(d_obs[::step, ::step]), 99.5)) or 0.05
     vmax = max(vmax, 0.02)
-    fig, axes = plt.subplots(1, n + 2, figsize=(3.1 * (n + 2), 3.4))
-    axes[0].imshow(d_obs[::step, ::step], cmap="RdBu_r", vmin=-vmax, vmax=vmax, interpolation="nearest")
-    axes[0].set_title(f"observed Δ ({year})", fontsize=9)
-    for i in range(n):
-        axes[i + 1].imshow(members[i][::step, ::step], cmap="RdBu_r", vmin=-vmax, vmax=vmax,
-                           interpolation="nearest")
-        axes[i + 1].set_title(f"member {i} Δ", fontsize=9)
-    sd = np.nanstd(members, axis=0)
-    im = axes[-1].imshow(sd[::step, ::step], cmap="viridis", interpolation="nearest")
-    axes[-1].set_title("ensemble sd", fontsize=9)
-    fig.colorbar(im, ax=axes[-1], fraction=0.046)
-    for ax in axes:
+
+    panels = [("observed Δ", d_obs)]
+    if d_central is not None:
+        panels.append(("central forecast Δ", d_central))
+    panels += [(f"member {i} Δ", members[i]) for i in range(n)]
+
+    ncol = len(panels) + 2  # + ensemble sd + histogram
+    fig, axes = plt.subplots(1, ncol, figsize=(3.1 * ncol, 3.6))
+    for ax, (title, arr) in zip(axes, panels):
+        ax.imshow(arr[::step, ::step], cmap="RdBu_r", vmin=-vmax, vmax=vmax,
+                  interpolation="nearest")
+        ax.set_title(title, fontsize=9)
         ax.axis("off")
-    fig.suptitle(f"{name}: member change fields vs observed (blue = decrease, red = increase)",
-                 fontsize=10)
+
+    sd = np.nanstd(members, axis=0)
+    ax_sd = axes[len(panels)]
+    im = ax_sd.imshow(sd[::step, ::step], cmap="viridis", interpolation="nearest")
+    ax_sd.set_title("ensemble sd", fontsize=9)
+    ax_sd.axis("off")
+    fig.colorbar(im, ax=ax_sd, fraction=0.046)
+
+    ax_h = axes[-1]
+    bins = np.linspace(-vmax * 3, vmax * 3, 81)
+    for arr, label, style in ((d_obs, "observed", dict(color="k", lw=1.8)),
+                              (members.ravel(), "members", dict(color="C3", lw=1.4)),
+                              (d_central, "central", dict(color="C0", lw=1.2, ls="--"))):
+        if arr is None:
+            continue
+        v = arr[np.isfinite(arr)]
+        if v.size == 0:
+            continue
+        h, edges = np.histogram(v, bins=bins, density=True)
+        ax_h.step(0.5 * (edges[1:] + edges[:-1]), np.maximum(h, 1e-6), where="mid",
+                  label=label, **style)
+    ax_h.set_yscale("log")
+    ax_h.set_xlabel("Δ HM", fontsize=8)
+    ax_h.set_title("Δ distribution (log density)", fontsize=9)
+    ax_h.legend(fontsize=7, frameon=False)
+    ax_h.tick_params(labelsize=7)
+
+    fig.suptitle(f"{name} · target {year}: member change fields vs observed "
+                 f"(blue = decrease, red = increase)", fontsize=10)
     fig.tight_layout()
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=130)

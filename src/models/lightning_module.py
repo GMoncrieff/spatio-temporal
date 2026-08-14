@@ -43,6 +43,9 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         quantile_context_channels: int = 0,
         quantile_weight_change_bins: bool = True,
         freeze_trunk: bool = False,
+        central_context_channels: int = 0,
+        central_residual: bool = False,
+        monotone_quantile_width: bool = False,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -71,6 +74,9 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             locenc_hparams=locenc_hparams,
             locenc_out_channels=locenc_out_channels,
             quantile_context_channels=quantile_context_channels,
+            central_context_channels=central_context_channels,
+            central_residual=central_residual,
+            monotone_quantile_width=monotone_quantile_width,
         )
         self.loss_fn = nn.MSELoss(reduction='mean')
         self.mae_fn = nn.L1Loss(reduction='mean')
@@ -85,6 +91,9 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         self.freeze_trunk = bool(freeze_trunk)
         self._quantile_weights = None
         self.quantile_context_channels = int(quantile_context_channels)
+        self.central_context_channels = int(central_context_channels)
+        self.central_residual = bool(central_residual)
+        self.monotone_quantile_width = bool(monotone_quantile_width)
         self.lr = lr
         self.ssim_weight = ssim_weight
         self.laplacian_weight = laplacian_weight
@@ -229,8 +238,12 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         Prefers the precomputed full-raster context (band 1 past change, band 2 distance);
         falls back to the chip-local dilation only when none is supplied, which is correct
         just for chips much larger than the biggest radius.
+
+        The same tensor feeds the central heads when they are configured to take it — the
+        features answer the same question ("can change happen here at all"), so there is no
+        reason to compute two of them.
         """
-        if self.quantile_context_channels <= 0:
+        if self.quantile_context_channels <= 0 and self.central_context_channels <= 0:
             return None
         hm_now = input_dynamic[:, -1, 0:1]
         if change_context is not None:

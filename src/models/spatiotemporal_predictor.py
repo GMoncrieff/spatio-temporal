@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from ..locationencoder import LocationEncoder
 from .convlstm import ConvLSTM
 
@@ -36,7 +37,11 @@ class SpatioTemporalPredictor(nn.Module):
                  locenc_backbone=("sphericalharmonics", "siren"),
                  locenc_hparams=None,
                  locenc_out_channels: int = 8,
-                 quantile_context_channels: int = 0):
+                 quantile_context_channels: int = 0,
+                 central_context_channels: int = 0,
+                 central_residual: bool = False,
+                 monotone_quantile_width: bool = False,
+                 initial_width_normalized: float = 0.065):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_static_channels = int(num_static_channels)
@@ -73,18 +78,41 @@ class SpatioTemporalPredictor(nn.Module):
         # to the quantile heads supplies information no amount of retraining could recover
         # from the trunk features, and leaves the central head's input untouched.
         self.quantile_context_channels = int(quantile_context_channels)
-        
+        # The central head can be handed the same context. The trunk's ~10 px radius cannot
+        # see past change 30-100 px away either, and beyond 100 px from past change not one
+        # of 493,240 measured pixels moved by more than 0.01 in twenty years — so this is
+        # the covariate that tells the central head where the answer is exactly zero.
+        self.central_context_channels = int(central_context_channels)
+        # Predict change on top of HM_t0 instead of the absolute level. Measured motivation:
+        # on the 53-70% of pixels whose observed 5-20yr change is below 0.001, the absolute
+        # parameterisation still emits change of sd ~0.0075 HM, because reproducing HM_t0
+        # through the trunk is not free. With the skip it is free, and "nothing happens" —
+        # the answer for most of the map — costs the model nothing to say.
+        self.central_residual = bool(central_residual)
+        # Quantile heads emit *widths* around the central forecast that accumulate over
+        # horizons, so spread is non-decreasing in lead time by construction (T4.2) and
+        # lower <= central <= upper is structural rather than a post-hoc clip (T1.6).
+        self.monotone_quantile_width = bool(monotone_quantile_width)
+        self.initial_width_normalized = float(initial_width_normalized)
+
         # Central prediction heads (one per horizon)
         # These produce the "best estimate" optimized for multiple objectives
         self.central_heads = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, bias=True),
+                nn.Conv2d(hidden_dim + self.central_context_channels, hidden_dim, kernel_size=3, padding=1, bias=True),
                 nn.ReLU(inplace=True),
                 nn.Conv2d(hidden_dim, 1, kernel_size=1, bias=True),
             )
             for _ in range(self.num_horizons)
         ])
-        
+        if self.central_residual:
+            # Zero the output convolution so the model starts at exact persistence. The
+            # weight still receives gradient (its input activations are non-zero), so this
+            # is a starting point, not a dead branch.
+            for head in self.central_heads:
+                nn.init.zeros_(head[-1].weight)
+                nn.init.zeros_(head[-1].bias)
+
         # Lower quantile heads (2.5%, one per horizon)
         # Smaller networks since quantile estimation is simpler than full prediction
         self.lower_heads = nn.ModuleList([
@@ -105,6 +133,14 @@ class SpatioTemporalPredictor(nn.Module):
             )
             for _ in range(self.num_horizons)
         ])
+        if self.monotone_quantile_width:
+            # Each head's raw output passes through softplus and is accumulated, so bias
+            # the output conv to make the *first* increment a sensible interval rather than
+            # softplus(0) = 0.69 normalized units (~0.11 HM), which starts absurdly wide.
+            import math
+            b0 = math.log(math.expm1(max(self.initial_width_normalized, 1e-4)))
+            for head in list(self.lower_heads) + list(self.upper_heads):
+                nn.init.constant_(head[-1].bias, b0)
 
     def forward(self, input_dynamic, input_static, lonlat=None, quantile_context=None):
         # input_dynamic: [B, T, C_d, H, W]
@@ -129,23 +165,50 @@ class SpatioTemporalPredictor(nn.Module):
         # Generate independent predictions for each horizon
         # Each horizon has 3 separate heads: lower, central, upper
         preds = []
-        q_input = last_hidden
-        if self.quantile_context_channels > 0:
+
+        def _with_context(n_channels):
+            if n_channels <= 0:
+                return last_hidden
             if quantile_context is None:
-                q_input = torch.cat(
-                    [last_hidden,
-                     last_hidden.new_zeros(B, self.quantile_context_channels, H, W)], dim=1)
+                ctx = last_hidden.new_zeros(B, n_channels, H, W)
             else:
-                q_input = torch.cat([last_hidden, quantile_context.to(last_hidden.dtype)], dim=1)
+                ctx = quantile_context.to(last_hidden.dtype)
+            return torch.cat([last_hidden, ctx], dim=1)
+
+        q_input = _with_context(self.quantile_context_channels)
+        c_input = _with_context(self.central_context_channels)
+
+        # HM at the last input timestep, in the same normalized space as the targets, so a
+        # zero head output is exactly "no change".
+        hm_t0 = input_dynamic[:, -1, 0:1]
+
+        # Cumulative half-widths, so spread cannot shrink with lead time.
+        w_lo_cum = None
+        w_up_cum = None
 
         for h_idx in range(self.num_horizons):
-            pred_lower = self.lower_heads[h_idx](q_input)        # [B, 1, H, W]
-            pred_central = self.central_heads[h_idx](last_hidden) # [B, 1, H, W] (unchanged)
-            pred_upper = self.upper_heads[h_idx](q_input)        # [B, 1, H, W]
-            
+            pred_central = self.central_heads[h_idx](c_input)     # [B, 1, H, W]
+            if self.central_residual:
+                pred_central = hm_t0 + pred_central
+
+            if self.monotone_quantile_width:
+                # Anchor the interval to the central forecast, detached so the pinball loss
+                # still cannot reach the trunk or the central heads — the same gradient
+                # isolation as before, expressed structurally instead of by zeroing grads.
+                anchor = pred_central.detach()
+                step_lo = F.softplus(self.lower_heads[h_idx](q_input))
+                step_up = F.softplus(self.upper_heads[h_idx](q_input))
+                w_lo_cum = step_lo if w_lo_cum is None else w_lo_cum + step_lo
+                w_up_cum = step_up if w_up_cum is None else w_up_cum + step_up
+                pred_lower = anchor - w_lo_cum
+                pred_upper = anchor + w_up_cum
+            else:
+                pred_lower = self.lower_heads[h_idx](q_input)     # [B, 1, H, W]
+                pred_upper = self.upper_heads[h_idx](q_input)     # [B, 1, H, W]
+
             # Append in order: lower, central, upper for this horizon
             preds.extend([pred_lower, pred_central, pred_upper])
-        
+
         # Stack predictions: [B, 12, H, W] (4 horizons × 3 predictions)
         # Channel ordering: [lower_5yr, central_5yr, upper_5yr, lower_10yr, central_10yr, upper_10yr, ...]
         pred = torch.cat(preds, dim=1)

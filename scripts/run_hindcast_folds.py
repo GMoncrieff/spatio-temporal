@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -101,6 +102,12 @@ def parse_args(argv=None):
     p.add_argument("--wandb_group", default=None, help="W&B group (default: hindcast-<timestamp>)")
     p.add_argument("--keep_fold_rasters", action="store_true",
                    help="Keep per-fold prediction rasters after stitching (they are large)")
+    p.add_argument("--extra_train_args", default="",
+                   help="Extra flags appended verbatim to every train_lightning.py call, "
+                        "e.g. '--central_residual True'. Appended last, so they win.")
+    p.add_argument("--tag", default="",
+                   help="Suffix for per-fold log filenames so concurrent variants do not "
+                        "overwrite each other's logs")
     p.add_argument("--dry_run", action="store_true", help="Print the fold commands and exit")
     return p.parse_args(argv)
 
@@ -154,12 +161,15 @@ def build_fold_command(args, fold, windows):
         ]
     for k, v in PRODUCTION_HPARAMS.items():
         cmd += [f"--{k}", str(v)]
+    # Architecture variants under test are appended last so they override anything above.
+    if getattr(args, "extra_train_args", ""):
+        cmd += shlex.split(args.extra_train_args)
     if args.disable_wandb:
         cmd += ["--disable_wandb"]
     else:
         cmd += [
             "--wandb_group", args.wandb_group,
-            "--wandb_run_name", f"hindcast-fold{fold}",
+            "--wandb_run_name", f"hindcast-fold{fold}{args.tag}",
             "--wandb_tags", f"ensemble,hindcast,fold{fold}",
         ]
     return cmd
@@ -187,7 +197,7 @@ def run_folds(args, folds, windows):
             # Without this the child's stdout is block-buffered into the log file and the
             # prediction progress lines only appear when the run is already over.
             env["PYTHONUNBUFFERED"] = "1"
-            log_path = log_dir / f"hindcast_fold{fold}.log"
+            log_path = log_dir / f"hindcast_fold{fold}{args.tag}.log"
             fh = open(log_path, "w")
             print(f"[orchestrator] fold {fold} -> GPU {gpu} | log {log_path}")
             proc = subprocess.Popen(cmd, cwd=str(REPO), env=env, stdout=fh, stderr=subprocess.STDOUT)

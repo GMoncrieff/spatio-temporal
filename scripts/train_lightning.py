@@ -14,6 +14,15 @@ from pytorch_lightning.loggers import WandbLogger
 from torch.utils.data import DataLoader
 from src.models.lightning_module import SpatioTemporalLightningModule
 from src.models.change_weights import N_CONTEXT_CHANNELS
+
+
+def _wants_context(args):
+    """True when any head is configured to read the past-change context rasters.
+
+    The quantile heads were the first consumer, but the central heads can take the same
+    tensor, so the dataset must load it whenever either asks for it.
+    """
+    return bool(getattr(args, "quantile_context", False) or getattr(args, "central_context", False))
 from torchgeo_dataloader import get_dataloader, hm_files, component_files, static_files, years
 
 # Geospatial imports for inference
@@ -227,6 +236,30 @@ if __name__ == "__main__":
         help="Balance the distance-to-past-change bands in the pinball loss (default: none)",
     )
     parser.add_argument(
+        "--central_context",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=False,
+        help="Feed the same past-change context to the central heads. Beyond 100px from "
+             "past change, no measured pixel moved by >0.01 in 20 years, and the trunk "
+             "cannot see that far.",
+    )
+    parser.add_argument(
+        "--central_residual",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=False,
+        help="Central heads predict change on top of HM_t0 rather than the absolute level, "
+             "starting from exact persistence. Measured: with the absolute parameterisation "
+             "the model emits change of sd ~0.0075 HM on pixels that did not change.",
+    )
+    parser.add_argument(
+        "--monotone_quantile_width",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=False,
+        help="Quantile heads emit half-widths around the (detached) central forecast that "
+             "accumulate across horizons, making spread non-decreasing in lead time and "
+             "lower<=central<=upper structural.",
+    )
+    parser.add_argument(
         "--freeze_trunk",
         type=lambda x: (str(x).lower() == 'true'),
         nargs='?', const=True, default=False,
@@ -434,7 +467,7 @@ if __name__ == "__main__":
         pin_memory=True if args.num_workers > 0 else False,
         persistent_workers=True if args.num_workers > 0 else False,
         split_mask_file=split_mask_file,
-        context_pattern=(args.context_pattern if args.quantile_context else None),
+        context_pattern=(args.context_pattern if _wants_context(args) else None),
         split_value=train_split_value,  # Train split (None in fold-CV mode)
         exclude_split_values=train_exclude,
         norm_stats=cached_norm_stats,
@@ -462,7 +495,7 @@ if __name__ == "__main__":
         pin_memory=True if args.num_workers > 0 else False,
         persistent_workers=True if args.num_workers > 0 else False,
         split_mask_file=split_mask_file,
-        context_pattern=(args.context_pattern if args.quantile_context else None),
+        context_pattern=(args.context_pattern if _wants_context(args) else None),
         split_value=val_split_value,  # Validation split
         norm_stats=cached_norm_stats,
     )
@@ -481,7 +514,7 @@ if __name__ == "__main__":
         pin_memory=True if args.num_workers > 0 else False,
         persistent_workers=True if args.num_workers > 0 else False,
         split_mask_file=split_mask_file,
-        context_pattern=(args.context_pattern if args.quantile_context else None),
+        context_pattern=(args.context_pattern if _wants_context(args) else None),
         split_value=test_split_value,  # Test split
         norm_stats=cached_norm_stats,
     )
@@ -500,8 +533,11 @@ if __name__ == "__main__":
             quantile_context_channels=(N_CONTEXT_CHANNELS if args.quantile_context else 0),
             quantile_class_weighting=args.quantile_class_weighting,
             freeze_trunk=args.freeze_trunk,
+            central_context_channels=(N_CONTEXT_CHANNELS if args.central_context else 0),
+            central_residual=args.central_residual,
+            monotone_quantile_width=args.monotone_quantile_width,
         )
-        if args.quantile_context:
+        if args.quantile_context or args.central_context:
             # The quantile heads gain input channels, so their first conv no longer matches
             # the checkpoint. Warm-start it: the trained weights are copied into the
             # original channels and the new context channels start at zero, so the model
@@ -554,8 +590,11 @@ if __name__ == "__main__":
             quantile_context_channels=(N_CONTEXT_CHANNELS if args.quantile_context else 0),
             quantile_class_weighting=args.quantile_class_weighting,
             freeze_trunk=args.freeze_trunk,
+            central_context_channels=(N_CONTEXT_CHANNELS if args.central_context else 0),
+            central_residual=args.central_residual,
+            monotone_quantile_width=args.monotone_quantile_width,
         )
-    
+
     # Compute histogram bin weights from training data (per horizon)
     if args.histogram_weight > 0 and hasattr(model, 'histogram_loss_fn'):
         print("\nComputing histogram bin weights for each horizon from 10 training batches...")
@@ -1641,7 +1680,7 @@ if __name__ == "__main__":
             comp_srcs = {y: [rasterio.open(p) for p in component_files[y]] for y in years} if include_components else {y: [] for y in years}
             stat_srcs = [rasterio.open(p) for p in static_list_paths]
             ctx_src = None
-            if args.quantile_context and args.context_pattern:
+            if _wants_context(args) and args.context_pattern:
                 ctx_path = args.context_pattern.format(year=base_year)
                 if os.path.exists(ctx_path):
                     ctx_src = rasterio.open(ctx_path)
