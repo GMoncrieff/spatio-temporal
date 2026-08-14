@@ -383,11 +383,49 @@ patches, uniform sampling already draws 90.6% live pairs. The far-field degenera
 secondary effect, and the plan's stated diagnosis should be read as corrected.
 
 T3.2 is now an informative measurement and it still **fails**, at 16.5% against a 30%
-target. That residual is most likely real rather than procedural: the member variogram's
-**nugget fraction is 0.345**, so a third of the member variance is uncorrelated at zero lag,
-which directly bounds how far a correlated ensemble can pull away from an independent one at
-short lags. Lowering the nugget is the Phase 2 knob; T3.1 agrees that the field structure is
-off (practical range 0.357 relative error, nugget 0.119 absolute, both over target).
+target. The obvious next move is to tune the field's short-scale content down until it
+passes. That move is wrong, and the reason is measurable.
+
+### T3.2 and T3.4 are in direct conflict, and T3.4 is the one grounded in data
+
+An ensemble calibrated to the residual reproduces the residual's correlation structure, so
+it can differ from an independent-pixel ensemble only in the variance still *correlated* at
+the separation being scored. `scripts/t32_structure_budget.py` reads that off the
+standardized residual's own empirical variogram as `gamma(d)/sill`:
+
+| separation | residual variance already decorrelated | structure budget T3.2 can reward |
+|---|---|---|
+| 5 px | 71.1% | 28.9% |
+| 10 px | 81.5% | 18.5% |
+| **25 px** (where T3.2 is scored) | **86.0%** | **14.0%** |
+| 50 px | 90.1% | 9.9% |
+
+Consistent across all ten (window, horizon) pairs. **A 30% reduction in variogram score
+against an independent-pixel null asks the ensemble to be better structured than the data it
+is calibrated to.** The measured 16.5% is a reasonable showing against a 14% budget, not a
+shortfall.
+
+The confirming check: refitting the spectrum with the sub-4 px basis ranges deleted does not
+remove the short-scale content, it relocates it — the explicit nugget goes 0.103 → 0.262,
+because the power is in the data. The observed residual carries 12% of its spectral power at
+1–3 px and 37–41% at 3–10 px. Passing T3.2 would mean generating a field markedly smoother
+than the residual, which is precisely the failure T3.4 (spectrum within 1.5×) exists to
+catch. **Do not tune the field to pass T3.2**; the target's 30% threshold was set a priori
+and should be re-scoped — scored at short lags where structure exists, or set from the
+residual's own correlation budget.
+
+**A negative result recorded rather than buried.** The first attempt at this question built
+a synthetic ensemble from the fitted spectrum and scored T3.2 on it to estimate an
+achievable ceiling. It returned 2.9%, then 1.6% after the geometry was corrected to share a
+common central forecast between truth, members and null — both far *below* the 16.5% that
+production actually scores. A ceiling the real system exceeds is not a ceiling, so the
+synthetic model was not a valid stand-in and its numbers were discarded rather than
+reported. The variogram of the real residual answers the same question with no stand-in at
+all, which is why the script that survives measures instead of simulating.
+
+T3.1 separately says the field structure is imperfect (practical range 0.357 relative error,
+nugget 0.119 absolute, both over target) — that remains worth attention on its own terms,
+but it is not what T3.2 is measuring.
 
 Supporting changes: `variogram_score` now returns a weighted **mean** rather than a sum, so
 the value no longer depends on how many pairs survived the distance filter (ratios are

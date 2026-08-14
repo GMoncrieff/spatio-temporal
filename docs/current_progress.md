@@ -147,7 +147,7 @@ spectral+long-scale field unless noted. "—" means not re-scored in the final c
 | **T2.2** ecoregion coverage | 0.95±0.05 | **pass** | 0.889 / 1.000 |
 | **T2.7** interval score | beat both baselines | used as the decision rule | identity 0.089 vs stratified 0.194 |
 | **T3.1** member variogram | sill/range/nugget vs fitted | partial | variance 0.40 (clipping-limited) |
-| **T3.2/3.3** vs independent null | ≥30% lower / beat null | **fail / pass** | variogram score uninformative once the far field is near-degenerate |
+| **T3.2/3.3** vs independent null | ≥30% lower / beat null | **fail / pass** | 16.5% after the sampling fix, against a measured 14.0% structure budget — the threshold conflicts with T3.4 |
 | **T3.4** spectrum 10–1000 km | within 1.5× | **near** | 3–10 px 0.73×, 1–3 px 0.92×, >50 px 2.44× |
 | **T4.1** between-horizon corr | ±0.10 | **pass** | 0.724/0.939/0.916 vs 0.737/0.943/0.922 |
 | **T4.2** monotone spread | ≥99% | **fail** | 68.5% |
@@ -244,10 +244,16 @@ h=5's while covering 1.5× the error) and fixed structurally.
    ratio while diluting it. Capping separation at half the fitted range took the improvement
    from 1.0% to 10.5%; spread-weighted sampling took it to 16.5%. **The distance cap was the
    dominant effect, not the far-field degeneracy.** T3.2 is now informative and still fails
-   (16.5% against 30%); the residual is most likely the nugget fraction (0.345 — a third of
-   member variance uncorrelated at zero lag), which is a Phase 2 field knob, and T3.1 agrees
-   the field structure is off. The uniform-sampled score is retained as `T3.2b` so the
-   change stays auditable.
+   (16.5% against 30%) — but that gap is **not** a field-structure defect. Measured on the
+   standardized residual's own variogram, 86.0% of its variance is already decorrelated at
+   the 25 px separation T3.2 scores at, leaving a 14.0% structure budget; 16.5% against that
+   is a reasonable showing, not a shortfall. A 30% reduction asks the ensemble to be better
+   structured than the data it is calibrated to, and reaching it means generating a field
+   markedly smoother than the residual — which is exactly what T3.4 exists to catch.
+   **T3.2 and T3.4 conflict, and T3.4 is the one grounded in data.** Re-scope T3.2's
+   threshold (or score it at short lags) rather than tuning the field to pass it; see
+   `scripts/t32_structure_budget.py`. The uniform-sampled score is retained as `T3.2b` so
+   the sampling change stays auditable.
 
 **Process.** Re-run the whole regional loop after any model change — it is ~20 minutes and it
 has repeatedly caught measurement errors that looked like findings.
