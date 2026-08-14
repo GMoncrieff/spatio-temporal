@@ -53,6 +53,11 @@ def parse_args(argv=None):
     ap.add_argument("--ranges_px", default=None, help="Override, e.g. '8,240'")
     ap.add_argument("--weights", default=None, help="Override, e.g. '0.5,0.4'")
     ap.add_argument("--nugget", type=float, default=None)
+    ap.add_argument("--spectral_fits", default=None,
+                    help="JSON from scripts/fit_field_spectra.py. Matching the observed "
+                         "power spectrum rather than the variogram is what gives members "
+                         "the right texture: the variogram fit leaves the 3-10px band, "
+                         "which holds ~40%% of the observed variance, half empty.")
     ap.add_argument("--gpus", default="0,1")
     ap.add_argument("--seed", type=int, default=20260812)
     ap.add_argument("--wrap_lon", type=lambda x: str(x).lower() == "true", default=None,
@@ -137,7 +142,17 @@ def load_marginals(paths, years, cache_dir):
 
 
 def field_params(args, horizons):
-    """Correlation structure per horizon: from the fitted variogram unless overridden."""
+    """Correlation structure per horizon: spectral fit > CLI override > variogram fit."""
+    if args.spectral_fits and Path(args.spectral_fits).exists():
+        blob = json.load(open(args.spectral_fits))
+        by_h = blob.get("by_horizon", {})
+        out = {}
+        for h in horizons:
+            f = by_h.get(str(h)) or next(iter(by_h.values()))
+            out[h] = {"ranges_px": f["ranges_px"], "weights": f["weights"],
+                      "nugget": f["nugget"], "kernel": blob.get("kernel", "matern"),
+                      "nu": blob.get("nu", 0.5)}
+        return out
     if args.ranges_px and args.weights:
         ranges = [float(x) for x in args.ranges_px.split(",")]
         weights = [float(x) for x in args.weights.split(",")]
@@ -224,6 +239,7 @@ def worker(worker_id, gpu, member_ids, cfg):
                 field = generate_correlated_field(
                     H, W, fp["ranges_px"], fp["weights"], fp["nugget"],
                     wrap_lon=cfg["wrap_lon"], device=device, seed=seed, return_torch=True,
+                    kernel=fp.get("kernel", "gaussian"), nu=fp.get("nu", 0.5),
                 )
                 eps = field.reshape(-1)[idx_t].clone()
                 del field
@@ -272,8 +288,9 @@ def main(argv=None):
     rho = load_rho(args, horizons)
     print(f"  wrap_lon={wrap}  rho={rho}")
     for h in horizons:
-        print(f"  h={h}: ranges={[round(r, 1) for r in fps[h]['ranges_px']]} "
-              f"weights={[round(w, 3) for w in fps[h]['weights']]} nugget={fps[h]['nugget']:.3f}")
+        top = sorted(zip(fps[h]['ranges_px'], fps[h]['weights']), key=lambda t: -t[1])[:3]
+        print(f"  h={h}: kernel={fps[h].get('kernel','gaussian')} nugget={fps[h]['nugget']:.3f} "
+              f"top structures=" + " ".join(f"{r:g}px:{w:.3f}" for r, w in top if w > 0.004))
 
     import zarr
 

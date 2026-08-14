@@ -592,7 +592,7 @@ def stage_spatial(args, store, attrs, years, paths, out_dir, card, null_store=No
                  es < es_null and es < es_degen, knob="T3")
 
     # ---- T3.4 radial power spectrum ------------------------------------------------------
-    k, P = fld.radial_power_spectrum(z[:min(H, 2048), :min(W, 2048)])
+    k, P, _ = fld.radial_power_spectrum(z[:min(H, 2048), :min(W, 2048)])
     np.savetxt(out_dir / "t3_member_spectrum.csv", np.stack([k, P], axis=1),
                delimiter=",", header="wavenumber_per_px,power", comments="")
     card.add("T3.4", "radial power spectrum written", len(k), "reference comparison",

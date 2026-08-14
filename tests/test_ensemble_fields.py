@@ -81,7 +81,7 @@ def test_ar1_preserves_unit_variance():
 def test_radial_spectrum_peaks_at_low_wavenumber_for_smooth_fields():
     f = generate_correlated_field(256, 256, [50.0], [1.0], 0.0,
                                   rng=np.random.default_rng(4), wrap_lon=False)
-    k, P = radial_power_spectrum(f)
+    k, P, _ = radial_power_spectrum(f)
     assert P[0] > P[-1] * 10
 
 
@@ -94,6 +94,51 @@ def test_gpu_and_cpu_agree_statistically():
     _, gg, _ = empirical_variogram_from_field(g, max_lag_px=120, seed=0)
     _, gc, _ = empirical_variogram_from_field(c, max_lag_px=120, seed=0)
     assert np.allclose(gg, gc, rtol=0.25, atol=0.05)
+
+
+
+
+def test_spectral_fit_recovers_a_planted_texture():
+    """Fitting the spectrum must reproduce the scale distribution the variogram misses."""
+    from src.ensemble.fields import fit_spectral_mixture
+
+    truth = generate_correlated_field(512, 512, [3.0, 40.0], [0.5, 0.2], nugget=0.3,
+                                      rng=np.random.default_rng(0), wrap_lon=False,
+                                      kernel="matern", nu=0.5)
+    fit = fit_spectral_mixture(truth, kernel="matern", nu=0.5)
+    sim = generate_correlated_field(512, 512, fit["ranges_px"], fit["weights"], fit["nugget"],
+                                    rng=np.random.default_rng(1), wrap_lon=False,
+                                    kernel="matern", nu=fit["nu"])
+
+    def shares(f):
+        k, _, total = radial_power_spectrum(f)
+        total = total / total.sum()
+        return np.array([total[(k >= lo) & (k < hi)].sum()
+                         for lo, hi in [(0, 0.02), (0.02, 0.1), (0.1, 0.35), (0.35, 0.71)]])
+
+    a, b = shares(truth), shares(sim)
+    assert np.all(np.abs(b - a) < 0.06), (a, b)
+
+
+def test_matern_is_rougher_than_gaussian_at_the_same_ranges():
+    """The Gaussian spectrum dies as exp(-k^2) and cannot make fine texture; Matern's
+    power-law tail can, and the roughness is ordered by nu."""
+    args = dict(ranges_px=[4.0, 40.0], weights=[0.5, 0.5], nugget=0.0, wrap_lon=False)
+
+    def fine_power(**kw):
+        f = generate_correlated_field(512, 512, rng=np.random.default_rng(0), **args, **kw)
+        k, _, total = radial_power_spectrum(f)
+        total = total / total.sum()
+        return total[k >= 0.1].sum()          # everything finer than ~10 px
+
+    gauss = fine_power(kernel="gaussian")
+    rough = fine_power(kernel="matern", nu=0.5)
+    smooth = fine_power(kernel="matern", nu=1.5)
+    # nu = 0.5 is decisively rougher; nu = 1.5 is already close enough to Gaussian that
+    # the two are within a percent of each other, so only the large gap is asserted.
+    assert rough > 1.5 * gauss, (gauss, rough)
+    assert rough > 1.5 * smooth, (smooth, rough)
+    assert abs(smooth - gauss) < 0.1 * gauss, (gauss, smooth)
 
 
 if __name__ == "__main__":
