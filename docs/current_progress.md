@@ -201,6 +201,15 @@ Headline before/after on the two defects that motivated the earlier head-only ch
 
 ## 4. Where the remaining leverage is
 
+> **The current phase is `docs/next_phase_marginals.md`** — making the marginals hold
+> *within* individual members. Scored per member rather than pooled, the observation falls
+> inside the member 5–95% range in **20%** of (year × distance-band) cells against ~90% for a
+> calibrated ensemble, with ranks pinned at 0/100 (every member too hot, near/mid bands) or
+> 100/100 (every member too cold, beyond 30 px). Diagnosed as marginal *shape* rather than
+> the correlation field: widths are uniformly ~1.6× too generous, but the +0.05 threshold
+> sits at 0.32 half-widths in the 0–1 px band and 5.88 in the 30–100 px band, so one global
+> factor cannot fix both.
+
 **Done since this list was written.** Items 1, 2 and 3 below are addressed — see
 `docs/central_field_baseline.md`. The central field now beats persistence at every horizon;
 the quantile heads are anchored to it; h=10 is explained (its interval was *narrower* than
