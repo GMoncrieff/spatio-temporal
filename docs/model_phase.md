@@ -217,6 +217,7 @@ configuration; two seeds of it bracket every comparison. Judgement is on RMSE (f
 | **E5 Δ̂ to quantile heads** | .00930 | .01436 | .01845 | .02221 | **.681** | **.236** | **kept** |
 | E6b scale-norm pinball | .00942 | .01435 | .01844 | .02161 | .743 | .144 | **worse** |
 | E6a multiplicative width | .00935 | .01454 | .01885 | .02188 | .722 | .185 | marginal |
+| E7 dilated trunk (1,2,4,8) | .00940 | .01463 | .01886 | .02217 | .760 | .175 | **worse** |
 
 **Phase reference — adopted.** Better than all three incumbent seeds on five of six metrics
 with disjoint ranges. At two seeds against three the honest claim is "no worse, and it
@@ -265,6 +266,29 @@ lead-time ratio goes 0.308 / 0.209 → 0.133, if anything slightly worse. Its on
 band-level width calibration, `mean|ln k|` over (horizon × band) cells 0.604–0.747 → **0.527**,
 past floor; the leaf-level metric (0.722) and `within 20%` (0.185) both stay inside the
 reference band. Not a clear keep on its own.
+
+**E7 (dilated trunk, per-layer dilations 1/2/4/8) — worse, and the stratification says why.**
+RMSE regresses past floor at h=5, h=10 and h=15. By distance band at h=15:
+
+| band | ref s42 | ref s43 | E7 |
+|---|---|---|---|
+| 0–1 px | .03129 | .03119 | **.03278** (+4.8%) |
+| 1–3 px | .02146 | .02146 | .02183 |
+| 3–10 px | .01554 | .01554 | .01577 |
+| 10–30 px | .01034 | .01033 | .01041 |
+| 30–100 px | .00417 | .00418 | .00418 |
+
+**The far bands do not move at all** — the thing the wider receptive field was for — **and the
+near field gets worse**, which is where the error lives. The explanation is this project's own
+history: `scripts/prepare_change_context.py` already supplies the long-range information as a
+full-raster covariate at five radii, and both head families already read it. Once that is in
+the heads there is nothing left for a wider trunk to discover, while dilated kernels sample a
+sparse grid and cost local resolution exactly where change happens.
+
+**Both levers `docs/next_phase_model.md` §4 named as never tried are now tried and rejected**
+— training budget (null, E1) and trunk receptive field (worse, E7). Per this phase's own
+rejection rule the downsampled-branch variant was not run: the hypothesis under test was
+"receptive field is the binding limit", and it is not.
 
 ### 4.0 The far field is not a width-head problem
 
