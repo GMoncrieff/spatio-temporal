@@ -212,6 +212,9 @@ configuration; two seeds of it bracket every comparison. Judgement is on RMSE (f
 | E3b MSE only | .00939 | .01489 | .01853 | .02232 | .730 | .151 | **worse** |
 | E2 horizon weights | .00934 | .01449 | .01883 | .02228 | .690 | .173 | **no gain** |
 | E1 budget ×3 (450 ep) | .00931 | .01426 | .01842 | .02184 | .761 | .183 | **null** |
+| E3a loss on change | .00946 | .01478 | .01871 | .02231 | .676 | .188 | **worse** |
+| E4 cosine + clip | .00931 | .01434 | .01852 | .02188 | .764 | .157 | **null** |
+| **E5 Δ̂ to quantile heads** | .00930 | .01436 | .01845 | .02221 | **.681** | **.236** | **kept** |
 
 **Phase reference — adopted.** Better than all three incumbent seeds on five of six metrics
 with disjoint ranges. At two seeds against three the honest claim is "no worse, and it
@@ -224,6 +227,34 @@ sits entirely on one side from 0–1 to 8. Those terms earn their weight even co
 absolute HM, which is what makes E3a (moving them onto the change field) worth testing rather
 than assuming.
 
+**E5 (feed Δ̂ to the quantile heads) — the first positive, on its own mechanism.** The
+fraction of leaf classes whose width is within 20% of correct goes .181–.196 → **.236**,
+clearing its 0.033 floor; `mean|ln k|` beats both reference seeds but stays inside its floor,
+so it is not decisive alone. What makes the result readable is the axis it was built for:
+`k_up` spread across the predicted-change axis inside a fixed (horizon × band) cell falls
+from a median max/min of 1.408 to 1.226, worst case 3.308 → 2.751. The central field is
+unchanged within the floor, as a quantile-only change should be.
+
+### 4.1 A correctness check that could not be run, and the reason
+
+E5 was designed to carry its own check: a quantile-only change, at the same seed, under a
+central-only checkpoint monitor, should leave the central rasters **identical**. The trunk
+and central heads are constructed before the quantile heads so their initialisation cannot
+shift; the pinball gradients that reach the trunk are overwritten from the saved central
+gradients; Adam is per-parameter; and `val_central_loss` does not depend on the quantile
+heads. It failed — 100% of pixels differed, by up to 0.059.
+
+The premise was wrong, not the design. **Training here is not deterministic at a fixed
+seed.** Two runs with identical flags and `--seed 42`, three epochs each, differ in 54 of 62
+tensors with a worst weight difference of 2.1e-4 — cuDNN algorithm selection and
+non-deterministic atomics. Over 1,950 optimizer steps that compounds into the observed
+difference.
+
+Two things follow. The invariance check has to be **distributional** — a quantile-only change
+must leave the central metrics inside the run-to-run band, which E5's do — not bit-exact.
+And the "noise floor" of §2 is not seed variance but **run-to-run variance**, which is the
+right comparator anyway and makes the measured floor if anything conservative.
+
 **E1 (training budget) — null, as predicted in §2.1.** Three times the budget, 450 epochs
 against 150, at 52 min against 18: **every metric lands inside the two-seed reference band**,
 and h=5 and h=20 RMSE are identical to the reference's to five decimals. The selected epochs
@@ -234,6 +265,22 @@ it is now tried and rejected on evidence. `current_progress.md` item 1 ("the cen
 under-trained… longer training is the cheapest untested lever") should be revised: the model
 saturates within a handful of epochs on 15.6k chip presentations, and giving it three times
 as many changes nothing measurable. Whatever limits this model, it is not optimisation time.
+
+**E3a (SSIM and Laplacian on the change field) — worse, and the stratification localises it.**
+h=5 and h=10 RMSE regress by three to four times their floor. Every distance band is
+identical to the reference to five decimals **except 0–1 px**, which degrades 6.8% at h=10
+and 5.0% at h=20 — so the damage is entirely in the high-change near field.
+
+The mechanism is SSIM's local normalisation. Against absolute HM the target carries real
+spatial structure and the local statistics are well posed. Against the change field the
+target is near-zero almost everywhere with rare spikes, so most windows have σ ≈ 0, the
+score collapses onto its stabilising constants, and the gradient pushes toward smoothness
+exactly where change concentrates.
+
+**Taken with E3b, the loss composition is at a local optimum.** Both directions out of it —
+removing the two terms, and moving them onto the change field — cost h=10 RMSE. The weights
+were tuned for a central head that predicted absolute HM, and they survive the change to a
+residual head.
 
 **E2 (horizon loss weights) — negative, with a reason.** Compensating the measured 4:3:2:1
 exposure with weights 1 / 1.33 / 2 / 4 made h=10 and h=15 worse (both just past floor) and
