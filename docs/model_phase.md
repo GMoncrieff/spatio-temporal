@@ -88,6 +88,52 @@ the data and evaluated on a single window.
 pre-edit code (`41f8a7e~1`) directly: same 56 parameter tensors, bit-identical
 initialisation under a common seed, and `max |old − new| = 0.0` on a forward pass.
 
+### 2.1 Where the variance actually comes from — and a standing hypothesis that is wrong
+
+The first explanation tried was checkpoint selection, and the first measurement of it was
+**wrong**: the selected epoch was read off the per-epoch printed "Total Loss", which is the
+batch-0 print for the 20 yr horizon, not the epoch-aggregated quantity `ModelCheckpoint`
+monitors. The real selected epochs, taken from the checkpoint filenames:
+
+| run | fold 1 | fold 2 | monitor |
+|---|---|---|---|
+| e5_all_k5 | 85 | 68 | `val_total_loss` |
+| nf_s43 | 134 | 138 | `val_total_loss` |
+| nf_s44 | 145 | 81 | `val_total_loss` |
+| ref_s42 | 137 | 75 | `val_central_loss` |
+| ref_s43 | 139 | **17** | `val_central_loss` |
+
+Selection really is spread over almost the whole run — 17 to 145. But the conclusion drawn
+from that was also wrong, and the check that broke it is the one that matters:
+
+**Epoch 17 and epoch 75 produce the same regional error.** Scored per fold, `ref_s43` fold 2
+(epoch 17) against `ref_s42` fold 2 (epoch 75): h=5 0.00930 vs 0.00929, h=10 0.01441 vs
+0.01416, h=15 0.01848 vs 0.01833, h=20 0.02204 vs 0.02208.
+
+The validation curve says why. h=20 validation MSE, by epoch:
+
+| run · fold | ep 5 | ep 10 | ep 20 | ep 40 | ep 60 | ep 100 | ep 149 | argmin |
+|---|---|---|---|---|---|---|---|---|
+| ref_s42 · f1 | 0.00430 | 0.00457 | 0.00474 | 0.00399 | 0.00581 | 0.00386 | 0.00598 | ep 146 |
+| ref_s43 · f1 | 0.00435 | 0.00401 | 0.00454 | 0.00536 | 0.00432 | 0.00422 | 0.00354 | ep 33 |
+| nf_s43 · f1 | 0.00395 | 0.00352 | 0.00344 | 0.00330 | 0.00408 | 0.00342 | 0.00406 | ep 51 |
+| ref_s42 · f2 | 0.08871 | 0.08716 | 0.08246 | 0.09947 | 0.07560 | 0.08317 | 0.07138 | ep 75 |
+
+**There is no downward trend after epoch 5.** The model reaches a plateau almost immediately
+and then oscillates on it for 145 epochs, and `save_top_k=1` selects the luckiest draw from
+that oscillation on 34 validation chips — which is selection on noise, and does not transfer.
+
+Two consequences.
+
+1. **`docs/next_phase_model.md` §4 and `current_progress.md` item 1 say the central field is
+   under-trained and that training budget is "the cheapest untested lever". That is not what
+   the data shows.** The budget experiment is still being run, as the direct test of this,
+   but the prediction is now that it does nothing.
+2. **The variance is in the training trajectory, not in the selection.** Averaging the tail
+   epochs of an oscillating plateau is the natural response, which is what
+   `--weight_avg_last` does — better motivated by this measurement than by the wrong one it
+   replaced.
+
 ---
 
 ## 3. The measurement instruments
@@ -126,8 +172,61 @@ far-field width grows far too fast with lead time.
 
 `mean|ln k|` = 0.762, with only 15% of 92 leaf classes within 20% of correct.
 
+### 3.1 A sharper statement of the width defect, and a prediction registered before the test
+
+`k_up(h=20) / k_up(h=5)` is the factor by which the model's interval growth over lead time
+is wrong, with the published widths cancelling out:
+
+| band | 0–1 px | 1–3 px | 3–10 px | 10–30 px | 30–100 px |
+|---|---|---|---|---|---|
+| ratio | 0.82 | 0.92 | 0.85 | **0.27** | **0.11** |
+
+In the near field the model's width grows with lead time about correctly. **In the far field
+it grows 3.7× to 8.9× too fast.** Under `--monotone_quantile_width` the width is a cumulative
+sum of per-horizon softplus increments, each head initialised so its increment is ≈0.065; the
+far field's increments should collapse toward zero after h=5 and evidently do not.
+
+The mechanism this points at is the pinball gradient. `d(loss)/d(raw)` is a constant times
+`sigmoid(raw)`, which at the far field's width is ~0.0085 against ~0.14 in the near field —
+so the far-field width parameters learn ~18× slower, on exactly the pixels furthest from
+right, and in a 150-epoch budget they barely leave their initialisation.
+
+**Registered prediction: E6b (scale-normalised pinball) is the experiment that should move
+the far field**, and E6a (multiplicative width) should not move it much on its own, because
+it changes `d(step)/d(raw)` in the same proportion as the loss it is divided into. Recorded
+before either was run so the result reads as a test rather than a story.
+
 ---
 
 ## 4. Results
+
+Screening: folds 1 and 2, scored on identical pixels (1,542,872 at h=5). The phase reference
+is `--histogram_weight 0 --checkpoint_monitor val_central_loss` on top of the shipped
+configuration; two seeds of it bracket every comparison. Judgement is on RMSE (floor 0.6% /
+0.7% / 2.2% / 4.2% by horizon) and on `mean|ln k|` (floor 0.028), never on skill.
+
+| run | RMSE h=5 | h=10 | h=15 | h=20 | mean\|ln k\| | within 20% | verdict |
+|---|---|---|---|---|---|---|---|
+| incumbent, 3 seeds | .00935–.00941 | .01437–.01447 | .01849–.01890 | .02168–.02259 | .762–.790 | .124–.157 | — |
+| **phase ref, 2 seeds** | **.00931–.00933** | **.01424–.01437** | **.01828–.01831** | .02184–.02185 | **.693–.746** | **.181–.196** | adopted |
+| E3b MSE only | .00939 | .01489 | .01853 | .02232 | .730 | .151 | **worse** |
+| E2 horizon weights | .00934 | .01449 | .01883 | .02228 | .690 | .173 | **no gain** |
+
+**Phase reference — adopted.** Better than all three incumbent seeds on five of six metrics
+with disjoint ranges. At two seeds against three the honest claim is "no worse, and it
+removes a confound", not "proven better": the histogram term carries no gradient, so nothing
+about the optimisation changed, only which epoch is selected.
+
+**E3b (MSE only) — the control fired.** Dropping SSIM and the Laplacian pyramid costs 4.4%
+of h=10 RMSE, six times its noise floor, and raises the number of leaf classes whose residual
+sits entirely on one side from 0–1 to 8. Those terms earn their weight even computed on
+absolute HM, which is what makes E3a (moving them onto the change field) worth testing rather
+than assuming.
+
+**E2 (horizon loss weights) — negative, with a reason.** Compensating the measured 4:3:2:1
+exposure with weights 1 / 1.33 / 2 / 4 made h=10 and h=15 worse (both just past floor) and
+h=20 no better, and pushed the far-field width defect further out (h=5, 30–100 px: k_up 1.83
+→ 2.10). The imbalance is not a deficiency to correct: h=20 is intrinsically harder, all four
+heads share one trunk, and upweighting the hardest horizon simply trades the near ones away.
 
 *(filled in as the slate completes)*
