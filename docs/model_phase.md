@@ -347,7 +347,51 @@ Note the central error is *larger* on Africa (RMSE h=5 0.01204 against 0.00947),
 central field has more room there, not less. The regional screening protocol is right for
 speed and wrong for target selection.
 
-### 5.5 Decision — adopt, narrowly
+### 5.5 The noise floor was under-estimated, and it withdraws the decision
+
+Round 2 began by running the E5 configuration twice more as its own base. Three runs of the
+**identical** configuration, same folds, same pixels:
+
+| run | RMSE h=15 | `mean\|ln k\|` | within 20% |
+|---|---|---|---|
+| `e5_dhat` (the screening run) | 0.01845 | **0.681** | **0.236** |
+| `r0_base_s42` | 0.01919 | 0.744 | 0.181 |
+| `r0_base_s43` | 0.01831 | 0.769 | 0.179 |
+| **spread** | **0.00087** | **0.088** | **0.057** |
+
+The floor in §2 was measured on three seeds of the *incumbent* and gave 0.028 and 0.033. **The
+E5 configuration's own spread is three times that**, and rmse15's is twice its earlier value.
+A floor is not a property of the harness; it is a property of the configuration, and one
+configuration's spread does not bound another's.
+
+Three consequences, all against the result:
+
+1. **E5's screening win was a lucky draw.** `e5_dhat` is the best of three runs of that
+   configuration, and the other two score *worse* on `mean|ln k|` than both reference seeds.
+2. **The k=5 gain (0.732 → 0.686, −0.046) is inside the 2-fold same-configuration spread of
+   0.088.** k=5 averages five fold models over four times the pixels so its floor is smaller,
+   but there is no k=5 replicate to say by how much.
+3. **The Africa-wide null becomes the most trustworthy single measurement** of E5's effect —
+   same k=5 protocol, eight times the pixels, −1.2%.
+
+### 5.6 Decision — withdrawn; E5 is not established
+
+**E5 is not adopted.** The claimed effect is smaller than the run-to-run spread of its own
+configuration, it does not reproduce Africa-wide, and it costs a hard gate. What survives is
+that it is cheap, harmless, and moved the downstream in the right direction on a single k=5
+run — enough to keep it as a candidate, not enough to make it the reference.
+
+What would settle it: two or three k=5 replicates of E5 and of the baseline, scored downstream,
+which is the only comparison at the scale the product is delivered at. That is ~105 min per
+replicate.
+
+**The general lesson, which is the more valuable output:** this phase's screening protocol —
+one run per configuration on two folds — cannot resolve effects of the size being chased. Every
+verdict in §4 that rests on a single run and a margin near the floor should be read as
+provisional. The clear results (E3b, E7, E1, E9) are the ones whose margins are several times
+the floor or whose stratification localises a mechanism; those stand.
+
+### 5.7 Superseded decision (kept for the record) — adopt, narrowly
 
 **E5 becomes the reference model.** It improves the delivered numbers in the scope the
 product is calibrated for (scorecard 101/127 → 104/128, per-member centring 115.6 → 103.3),
