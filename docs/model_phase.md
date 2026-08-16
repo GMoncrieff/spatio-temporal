@@ -311,6 +311,57 @@ is how far the observation sits from the member centre, 115.6 → 103.3. This is
 first time in this project that a change to **the model** rather than to the post-hoc layer has
 moved these numbers.
 
+### 5.4 Africa-wide — the gain does not generalise
+
+Trained k=5 on the Africa extent (35,650,217 px per window × horizon, 63.1 Mpx raster, 88.7
+min) and scored against the existing Africa-wide run of the shipped configuration.
+
+| | Africa | southern Africa |
+|---|---|---|
+| RMSE h=5 | **+0.16%** | −0.26% |
+| RMSE h=10 | −0.12% | −0.82% |
+| RMSE h=15 | −0.03% | −1.69% |
+| RMSE h=20 | **+0.81%** | −0.72% |
+| `mean\|ln k\|` | **−1.20%** | −6.31% |
+| within 20% | **−0.18%** | +3.76% |
+
+**Every Africa number is inside ±1.2%. E5's gain is southern-Africa-specific.**
+
+The absolute values say why. On Africa *both* configurations are far better width-calibrated
+than either is on southern Africa:
+
+| | `mean\|ln k\|` | within 20% |
+|---|---|---|
+| Africa, baseline | 0.391 | 0.421 |
+| Africa, E5 | 0.386 | 0.420 |
+| southern Africa, baseline | 0.732 | 0.186 |
+| southern Africa, E5 | 0.686 | 0.193 |
+
+**The width defect this whole phase optimised against is largely a southern-Africa
+artifact.** On a fairer sample of HM level the model's intervals are roughly twice as
+well calibrated to begin with, so there is much less for a Δ̂-conditional width to fix.
+CLAUDE.md's rule 14 — "a stratified finding measured only there is provisional" — has now
+cost a real result, and it should be read as applying to everything measured in this phase.
+
+Note the central error is *larger* on Africa (RMSE h=5 0.01204 against 0.00947), so the
+central field has more room there, not less. The regional screening protocol is right for
+speed and wrong for target selection.
+
+### 5.5 Decision — adopt, narrowly
+
+**E5 becomes the reference model.** It improves the delivered numbers in the scope the
+product is calibrated for (scorecard 101/127 → 104/128, per-member centring 115.6 → 103.3),
+its mechanism is confirmed rather than inferred, it costs two extra input channels on the
+quantile heads and nothing at inference, and it is neutral rather than worse on the fairer
+Africa sample.
+
+**It is not shippable as it stands.** T5.1, a hard gate, fails at one horizon (0.9888 against
+0.995). §5.3 gives an evidenced mechanism and predicts that rescoring at M ≥ 800 recovers it;
+that measurement should be made before this configuration is published.
+
+Honest summary of the size of the win: small, region-specific, and resting on a single k=5
+run per configuration.
+
 ## 4. Results
 
 Screening: folds 1 and 2, scored on identical pixels (1,542,872 at h=5). The phase reference
