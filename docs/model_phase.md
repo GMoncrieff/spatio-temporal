@@ -280,6 +280,31 @@ a plausible mechanism, not a demonstrated one — it rests on a single k=5 run. 
 failing at one horizon is the item to resolve before this ships**, most cheaply by rescoring at
 higher M.
 
+### 5.3 The two losses have an evidenced mechanism, not a story
+
+The finite-M explanation was checked rather than asserted. `shape_slope(shape, 0)` is the
+factor a Monte-Carlo tolerance needs at the median; a smaller value means a spikier marginal
+there and a noisier sample median in value units.
+
+| horizon | baseline `S'(0)` | E5 `S'(0)` | ratio |
+|---|---|---|---|
+| 5 | 0.2438 | 0.1383 | 0.567 |
+| 10 | 0.2608 | 0.1866 | 0.716 |
+| **15** | 0.3640 | 0.2411 | **0.662** |
+| 20 | 0.6200 | 0.4700 | 0.758 |
+
+**E5's residual is more concentrated at every horizon** — a sharper central field, which is
+what it was meant to be. Spikiness alone does not single out h=15 (h=5 is spikiest and passes),
+but h=15 was already the horizon closest to the gate in the baseline, 0.9958 against 0.995
+where the others sat at 0.9982 / 0.9985 / 0.9998. It is the one that crossed.
+
+**This means 104/128 probably understates E5.** Both configurations were scored at M=400, so
+the comparison is matched and fair — but E5 is *more* penalised by finite M than the baseline
+is, because the rows it loses are the ones its own sharper residual makes harder to estimate
+from 400 members. This is the same confound `docs/next_phase_marginals.md` hit when the M=100
+comparison between marginal families reversed at M=400. Rescoring both at M=800 would settle
+the hard gate and the row count together, and is the obvious next measurement.
+
 Honest scale of the result: +3 rows of 128, scorecard rows are correlated, and there is no k=5
 replicate to put a band on any of it. The per-member count is unchanged at 15/20; what moved
 is how far the observation sits from the member centre, 115.6 → 103.3. This is nonetheless the
