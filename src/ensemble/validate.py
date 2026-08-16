@@ -39,11 +39,51 @@ HM_BINS = [0.0, 0.01, 0.1, 0.3, 0.6, 1.0001]
 HM_LABELS = ["[0,0.01)", "[0.01,0.1)", "[0.1,0.3)", "[0.3,0.6)", "[0.6,1]"]
 
 # Distance (px ~ km) to the nearest pixel that changed by >0.01 in the previous decade.
-# Measured on southern Africa, P(future change > 0.05) runs 0.222 / 0.080 / 0.023 / 0.0068
-# / 0.0010 / 0.0000 across these bands — a 200x gradient ending in an exact zero. It is
+# Measured on southern Africa, P(future change > 0.05) runs 0.177 / 0.061 / 0.023 / 0.0078
+# / 0.0024 / 0.0000 across these bands — a 70x gradient ending in an exact zero. It is
 # computable from the input years alone, so it is admissible as a prediction-time stratum.
 DIST_BINS = [0.0, 1.0, 3.0, 10.0, 30.0, 100.0, np.inf]
 DIST_LABELS = ["0-1", "1-3", "3-10", "10-30", "30-100", ">100"]
+
+
+def distance_band(dist):
+    """Band index of a distance-to-past-change raster. The one definition; use it.
+
+    ``right=True`` is load-bearing rather than cosmetic. The distance comes from an exact
+    Euclidean transform, so ``dist == 1.0`` and ``dist == 3.0`` are not measure-zero events
+    but two of the most populated values on the raster, and the convention decides which
+    side of a band edge they fall on. Scored the other way the 0-1 px band's observed
+    P(change > 0.05) reads 0.222 rather than 0.177 — a 26% difference in the number the
+    marginal is being fitted to reproduce. Half the call sites in this repository used each
+    convention, so the primary per-member judge and the T8 clustering stage were scoring
+    different pixels as "near".
+    """
+    return np.digitize(np.asarray(dist), DIST_BINS[1:-1], right=True).astype(np.int8)
+
+
+N_MARGINAL_CLASS = len(HM_LABELS) * len(DIST_LABELS)
+
+
+def marginal_class(dist, hm0):
+    """Joint (HM level x distance band) index, for a marginal conditioned on both.
+
+    The two axes fail differently and cannot substitute for each other. Distance decides
+    whether a tail is representable at all — beyond 100 px it is not, and the bound has to
+    come back down or remote stable country stops being exactly zero (T8.2/T8.3). HM level
+    decides how much change the land can absorb: near-pristine ground at 3-10 px produces
+    2.8x too much change under a bound tuned on distance alone, and 1.07x under one tuned on
+    the pair. Applying either bound across the other axis overshoots — at 10-30 px the same
+    correction takes pristine land to 0.32x.
+
+    Flattened to one integer so the existing gather path is unchanged: ``stack_shapes`` and
+    the GPU row-gather are already generic over the number of classes, so widening from 6 to
+    30 costs nothing but the index.
+    """
+    d = distance_band(dist).astype(np.int16)
+    # NaN digitizes to len(bins); clip so a nodata pixel lands in a real class rather than
+    # indexing past the end of the stacked grids, which on the GPU is a device-side assert.
+    h = np.clip(np.digitize(np.asarray(hm0), HM_BINS[1:-1]), 0, len(HM_LABELS) - 1)
+    return (h.astype(np.int16) * len(DIST_LABELS) + d).astype(np.int16)
 
 
 # --------------------------------------------------------------------------------------
@@ -422,7 +462,7 @@ def compute_class_conditional_coverage(
                     continue
                 if dist_src is not None:
                     dd = dist_src.read(1, window=Window(0, r0, W, rr)).astype(np.float64)
-                    biome = np.digitize(dd, DIST_BINS[1:-1]).astype(np.int16)
+                    biome = distance_band(dd).astype(np.int16)
                 elif eco_src is not None:
                     eco = eco_src.read(1, window=Window(e_off[1], e_off[0] + r0, W, rr),
                                        boundless=True, fill_value=0)

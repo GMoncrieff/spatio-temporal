@@ -22,6 +22,11 @@ from scipy.stats import norm
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.ensemble.copula import (  # noqa: E402
+    apply_shape_torch,
+    invert_shape,
+    read_shape_artifact,
+    shape_bounds,
+    stack_shapes,
     Z975,
     apply_shape,
     fit_marginal_two_piece_normal,
@@ -195,3 +200,121 @@ def test_invert_shape_round_trips():
     assert np.allclose(invert_shape(apply_shape(z, shape), shape), z, atol=2e-2)
     # And with no shape it must be exactly the identity.
     assert np.allclose(invert_shape(z, None), z)
+
+
+# --------------------------------------------------------------------------------------
+# The tail bound, and the per-band shape it exists for
+# --------------------------------------------------------------------------------------
+def test_default_bound_is_bit_identical_to_the_two_piece_tail():
+    """The regression guard for every existing artifact and every existing scorecard row.
+
+    u_bound became a knob so the far field's real tail could survive. The default has to
+    stay exactly what it was, or every number this project has recorded moves underneath
+    it. Equality, not allclose: the continuation is written as a shift of z precisely so
+    the default offset is 0.0 and this holds bit for bit.
+    """
+    shape = fit_residual_shape(spiky_residual())
+    z = np.random.default_rng(3).normal(size=200_000) * 1.7
+    old = np.where(np.abs(z) > Z975, z,
+                   np.interp(norm.cdf(z), shape["u"], shape["q"]))
+    assert np.array_equal(apply_shape(z, shape), old)
+    assert shape_bounds(shape)[2] == 0.0  # offset_hi
+    assert shape_bounds(shape)[3] == 0.0  # offset_lo
+
+
+@pytest.mark.parametrize("u_bound", [0.975, 0.99, 0.999])
+def test_bound_keeps_the_map_monotone_continuous_and_invertible(u_bound):
+    shape = fit_residual_shape(spiky_residual(), u_bound=u_bound)
+    zb = float(norm.ppf(u_bound))
+    # The bound and its mirror must be knots, for the same reason the gates are: the
+    # mapping changes definition there, and interpolating across it is a standing bias.
+    u = np.asarray(shape["u"])
+    assert u[np.searchsorted(u, u_bound)] == u_bound
+    assert np.diff(u).min() > 1e-12, "near-duplicate knots divide by ~0 on the GPU path"
+
+    z = np.sort(np.concatenate([np.linspace(-6.0, 6.0, 100_001), [zb, -zb]]))
+    s = apply_shape(z, shape)
+    assert np.all(np.diff(s) > 0), "strict monotonicity is what keeps the copula's ranks"
+    eps = 1e-7
+    assert abs(apply_shape(zb + eps, shape) - apply_shape(zb - eps, shape)) < 1e-5
+    assert np.allclose(invert_shape(s, shape), z, atol=1e-9)
+
+
+def test_gates_stay_exact_at_every_bound():
+    for u_bound in (0.975, 0.99, 0.999):
+        shape = fit_residual_shape(spiky_residual(), u_bound=u_bound)
+        u, q = np.asarray(shape["u"]), np.asarray(shape["q"])
+        for anchor, target in ((0.025, -Z975), (0.5, 0.0), (0.975, Z975)):
+            i = int(np.searchsorted(u, anchor))
+            assert u[i] == anchor and q[i] == target
+
+
+def test_raising_the_bound_only_extends_the_tail():
+    """It must not touch the body — that is the division of labour with the width level."""
+    e = spiky_residual()
+    lo = fit_residual_shape(e, u_bound=0.975)
+    hi = fit_residual_shape(e, u_bound=0.999)
+    body = np.linspace(-1.5, 1.5, 2001)
+    assert np.allclose(apply_shape(body, lo), apply_shape(body, hi), atol=1e-12)
+    assert apply_shape(3.0, hi) > apply_shape(3.0, lo)
+
+
+def test_stacked_shapes_match_the_per_band_numpy_path():
+    torch = pytest.importorskip("torch")
+    e = spiky_residual()
+    shapes = [fit_residual_shape(e * (1.0 + 0.4 * k), u_bound=0.99) for k in range(3)]
+    shapes.append(None)  # a band too sparse to fit
+    stacked = stack_shapes(shapes)
+    rng = np.random.default_rng(5)
+    z = rng.normal(size=50_000) * 1.6
+    band = rng.integers(0, len(shapes), size=z.size)
+
+    got = apply_shape_torch(torch.as_tensor(z, dtype=torch.float64), stacked,
+                            band=torch.as_tensor(band), dtype=torch.float64).numpy()
+    for k, s in enumerate(shapes):
+        m = band == k
+        want = z[m] if s is None else apply_shape(z[m], s)
+        assert np.allclose(got[m], want, atol=1e-10)
+    # An unfitted band must be the two-piece normal exactly, not an interpolated ppf.
+    assert np.array_equal(got[band == 3], z[band == 3])
+
+
+def test_read_shape_artifact_handles_all_three_layouts(tmp_path):
+    import json
+
+    shape = fit_residual_shape(spiky_residual())
+    flat = tmp_path / "flat.json"
+    flat.write_text(json.dumps({"by_horizon": {"20": shape}}))
+    table, banded = read_shape_artifact(flat, 6)
+    assert not banded and len(table) == 6 and table[(20, 3)] == shape
+
+    banded_path = tmp_path / "banded.json"
+    other = fit_residual_shape(spiky_residual(seed=1), u_bound=0.999)
+    banded_path.write_text(json.dumps(
+        {"by_horizon": {"20": {"pooled": shape, "by_band": {"0": other}}}}))
+    table, banded = read_shape_artifact(banded_path, 6)
+    assert banded
+    assert table[(20, 0)]["u_bound"] == 0.999
+    # Bands with no fit of their own inherit pooled, never the identity.
+    assert table[(20, 5)]["u_bound"] == 0.975
+
+
+def test_the_two_tail_bounds_are_independent():
+    """The upper tail is too thin and the lower already too hot; one knob cannot serve both.
+
+    Raising both together is what took T6.2/T6.3/T6.5/T8.4 down while T8.1 improved, so the
+    asymmetry is the whole point of carrying two bounds rather than one.
+    """
+    e = spiky_residual()
+    sym = fit_residual_shape(e, u_bound=0.999)
+    asym = fit_residual_shape(e, u_bound=0.999, u_bound_lo=0.025)
+    z_hi, z_lo, off_hi, off_lo = shape_bounds(asym)
+    assert off_hi == shape_bounds(sym)[2], "upper side must be untouched by the lower bound"
+    assert off_lo == 0.0, "lower bound at 0.025 is the two-piece normal's own tail"
+    # Upper tail extended, lower tail exactly the two-piece normal's.
+    assert apply_shape(3.5, asym) > apply_shape(3.5, fit_residual_shape(e))
+    assert apply_shape(-3.5, asym) == -3.5
+    assert apply_shape(-3.5, sym) < -3.5
+    z = np.sort(np.concatenate([np.linspace(-6, 6, 100_001), [z_hi, z_lo]]))
+    assert np.all(np.diff(apply_shape(z, asym)) > 0)
+    assert np.allclose(invert_shape(apply_shape(z, asym), asym), z, atol=1e-9)

@@ -12,6 +12,18 @@
 #
 # Expects data/ensemble/exp/<name>/stitched/w{base}_prediction_{year}_{q}.tif, which
 # scripts/run_central_experiment.sh produces.
+#
+# Environment overrides:
+#   SHAPE=none|measured|<u_bound>
+#                          marginal shape, re-fitted from this run's own residuals.
+#                          "none"     the two-piece normal.
+#                          "measured" the configuration this phase settled on: pooled body,
+#                                     upper tail bound 0.999 out to 100 px and 0.975 beyond,
+#                                     lower bound held at 0.025. See docs/next_phase_marginals.md
+#                                     section 5.8 for why each of those three is what it is.
+#                          <number>   a single symmetric bound, for sweeping.
+#   SUFFIX=<tag>           suffix the ensemble/validation outputs, so two marginal
+#                          families can sit side by side under one experiment.
 
 set -euo pipefail
 
@@ -26,6 +38,23 @@ BLOCKS="${BLOCKS:-1,10,100}"
 PAIRS="${PAIRS:-80000}"
 MAXLAG="${MAXLAG:-256}"
 DIST_RASTER="${REGION_ROOT}/covariates/w2000_dist_past_change.tif"
+SHAPE="${SHAPE:-none}"
+WIDTHS="${WIDTHS:-none}"
+SUFFIX="${SUFFIX:-}"
+MEMBERS_ZARR="${ROOT}/members${SUFFIX}.zarr"
+NULL_ZARR="${ROOT}/null${SUFFIX}.zarr"
+VALIDATION_DIR="${ROOT}/validation${SUFFIX}"
+SHAPE_JSON="${ROOT}/marginal_shape${SUFFIX}.json"
+WIDTH_JSON="${ROOT}/width_factors${SUFFIX}.json"
+# Narrowing writes its own recal and residual dirs so the base pair stays intact for
+# comparison; without it, everything downstream reads the base pair.
+if [ "$WIDTHS" != "none" ]; then
+  RECAL_DIR="${ROOT}/recal_w${SUFFIX}"; RESID_DIR="${ROOT}/residuals_w${SUFFIX}"
+else
+  RECAL_DIR="${ROOT}/recal"; RESID_DIR="${ROOT}/residuals"
+fi
+SHAPE_ARGS=()      # for generate_ensemble, which has no --dist_raster of its own
+VAL_SHAPE_ARGS=()  # for validate_ensemble, which already passes --dist_raster
 
 test -d "${ROOT}/stitched" || { echo "no stitched rasters under ${ROOT}" >&2; exit 2; }
 
@@ -61,48 +90,84 @@ $PY -u scripts/apply_recalibration.py --targets hindcast \
     --ecoregion_raster "${REGION_ROOT}/ecoregion.tif" \
     --dist_raster "$DIST_RASTER"
 
+if [ "$WIDTHS" != "none" ]; then
+  echo "=== ${NAME} · Phase 1.5d: per-class half-width factors ==="
+  # The marginal shape normalizes to the published bounds (that is what pins T5.2), so it
+  # re-injects whatever width error they carry and cannot fix it itself. This is the lever
+  # that can. Residuals are rebuilt against the narrowed bounds because the shape is fitted
+  # on them next — fitting to one width and generating from another breaks T5.2 silently.
+  $PY -u scripts/fit_width_factors.py \
+      --manifest "${ROOT}/residuals/manifest.csv" --out "$WIDTH_JSON"
+  $PY -u scripts/apply_recalibration.py --targets hindcast \
+      --factors "${ROOT}/calibration/scale_factors.csv" \
+      --hindcast_dir "${ROOT}/stitched" --hindcast_suffix "" \
+      --hindcast_out "$RECAL_DIR" \
+      --ecoregion_raster "${REGION_ROOT}/ecoregion.tif" \
+      --dist_raster "$DIST_RASTER" --width_factors "$WIDTH_JSON"
+  $PY -u scripts/build_region_residuals.py \
+      --pred_dir "$RECAL_DIR" --pred_suffix _recal --keep_splits all \
+      --out_dir "$RESID_DIR" --covariate_dir "${REGION_ROOT}/covariates"
+fi
+
 echo "=== ${NAME} · Phase 2: fit the field spectrum to *this* model's residuals ==="
 $PY -u scripts/fit_field_spectra.py \
     --manifest "${ROOT}/residuals/manifest.csv" \
     --out "${ROOT}/spectral_fits.json"
 
+if [ "$SHAPE" != "none" ]; then
+  echo "=== ${NAME} · Phase 2b: fit the marginal shape to *this* model's residuals ==="
+  # Re-derived per configuration for the same reason the recalibration and the spectrum
+  # are: a shape fitted to another model's residuals describes another model's error.
+  if [ "$SHAPE" = "measured" ]; then
+    FIT_ARGS=(--by_band true --pooled_body true
+              --u_bound 0.999,0.999,0.999,0.999,0.999,0.975 --u_bound_lo 0.025)
+  else
+    FIT_ARGS=(--u_bound "$SHAPE")
+  fi
+  $PY -u scripts/fit_marginal_shape.py \
+      --manifest "${RESID_DIR}/manifest.csv" \
+      --out "$SHAPE_JSON" "${FIT_ARGS[@]}"
+  SHAPE_ARGS=(--marginal_shape "$SHAPE_JSON" --dist_raster "$DIST_RASTER")
+  VAL_SHAPE_ARGS=(--marginal_shape "$SHAPE_JSON")
+fi
+
 echo "=== ${NAME} · Phase 3: ensemble on the recalibrated marginals ==="
 $PY -u scripts/generate_ensemble.py \
-    --central_dir "${ROOT}/recal" --recal_dir "${ROOT}/recal" \
+    --central_dir "$RECAL_DIR" --recal_dir "$RECAL_DIR" \
     --central_pattern 'w2000_prediction_{year}_central_recal.tif' \
     --recal_pattern 'w2000_prediction_{year}_{q}_recal.tif' \
     --years 2005,2010,2015,2020 --base_year 2000 --members "$MEMBERS" \
     --spectral_fits "${ROOT}/spectral_fits.json" \
     --variogram_fits "${ROOT}/diagnostics/variogram_fits.csv" \
     --rho_json "${ROOT}/residuals/horizon_autocorrelation.json" \
-    --wrap_lon False \
-    --out "${ROOT}/members.zarr" --gpus "$GPUS" \
+    --wrap_lon False "${SHAPE_ARGS[@]+"${SHAPE_ARGS[@]}"}" \
+    --out "$MEMBERS_ZARR" --gpus "$GPUS" \
     --wandb_group "central-${NAME}"
 
 echo "=== ${NAME} · Phase 3: independent-pixel null (same marginals, no spatial structure) ==="
 $PY -u scripts/generate_ensemble.py \
-    --central_dir "${ROOT}/recal" --recal_dir "${ROOT}/recal" \
+    --central_dir "$RECAL_DIR" --recal_dir "$RECAL_DIR" \
     --central_pattern 'w2000_prediction_{year}_central_recal.tif' \
     --recal_pattern 'w2000_prediction_{year}_{q}_recal.tif' \
     --years 2005,2010,2015,2020 --base_year 2000 --members "$MEMBERS" --independent \
     --spectral_fits "${ROOT}/spectral_fits.json" \
     --variogram_fits "${ROOT}/diagnostics/variogram_fits.csv" \
     --rho_json "${ROOT}/residuals/horizon_autocorrelation.json" \
-    --wrap_lon False \
-    --out "${ROOT}/null.zarr" --gpus "$GPUS" --disable_wandb
+    --wrap_lon False "${SHAPE_ARGS[@]+"${SHAPE_ARGS[@]}"}" \
+    --out "$NULL_ZARR" --gpus "$GPUS" --disable_wandb
 
 echo "=== ${NAME} · Phase 4: T1-T8 scorecard ==="
 $PY -u scripts/validate_ensemble.py \
-    --ensemble "${ROOT}/members.zarr" --null_ensemble "${ROOT}/null.zarr" \
-    --recal_dir "${ROOT}/recal" \
+    --ensemble "$MEMBERS_ZARR" --null_ensemble "$NULL_ZARR" \
+    --recal_dir "$RECAL_DIR" \
     --ecoregion_raster "${REGION_ROOT}/ecoregion.tif" \
     --variogram_fits "${ROOT}/diagnostics/variogram_fits.csv" \
     --rho_json "${ROOT}/residuals/horizon_autocorrelation.json" \
-    --recal_manifest "${ROOT}/recal/recal_manifest.json" \
-    --dist_raster "$DIST_RASTER" \
-    --block_sizes "$BLOCKS" --out_dir "${ROOT}/validation" \
+    --recal_manifest "${RECAL_DIR}/recal_manifest.json" \
+    --dist_raster "$DIST_RASTER" "${VAL_SHAPE_ARGS[@]+"${VAL_SHAPE_ARGS[@]}"}" \
+    --block_sizes "$BLOCKS" --out_dir "$VALIDATION_DIR" \
     --wandb_group "central-${NAME}"
 
 echo
-echo "Scorecard: ${ROOT}/validation/scorecard.csv"
+echo "Scorecard: ${VALIDATION_DIR}/scorecard.csv"
 echo "Central diagnostics: ${ROOT}/central_diag/"

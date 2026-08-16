@@ -33,9 +33,9 @@ from rasterio.windows import Window
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.ensemble import aggregate as agg  # noqa: E402
+from src.ensemble.validate import distance_band  # noqa: E402
 
 HM_DIR = Path("data/raw/hm_global")
-DIST_EDGES = [0.0, 1.0, 3.0, 10.0, 30.0, 100.0, np.inf]
 DIST_LABELS = ["0-1 px", "1-3 px", "3-10 px", "10-30 px", "30-100 px", ">100 px"]
 MIN_PX = 2000
 
@@ -119,7 +119,7 @@ def main(argv=None):
 
         d_obs = (obs - hm0)[valid]
         d_cen = (cen - hm0)[valid]
-        dband = np.digitize(dist, DIST_EDGES[1:-1], right=True)[valid]
+        dband = distance_band(dist)[valid]
 
         o_hi, o_lo = band_stats(d_obs, dband, nb)
         c_hi, c_lo = band_stats(d_cen, dband, nb)

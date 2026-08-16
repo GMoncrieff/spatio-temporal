@@ -24,10 +24,9 @@ from rasterio.windows import Window
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.ensemble import aggregate as agg  # noqa: E402
+from src.ensemble.validate import DIST_LABELS, distance_band  # noqa: E402
 
 HM_DIR = Path("data/raw/hm_global")
-DIST_EDGES = [0.0, 1.0, 3.0, 10.0, 30.0, 100.0, np.inf]
-DIST_LABELS = ["0-1", "1-3", "3-10", "10-30", "30-100", ">100"]
 
 
 def read_like(path, ref, band=1):
@@ -119,7 +118,7 @@ def main(argv=None):
         dist = read_like(args.dist_raster, ref, band=1)
         if not np.isfinite(dist).any():
             dist = read_like(args.dist_raster, ref, band=2)
-        idx = np.digitize(dist, DIST_EDGES[1:-1], right=True)
+        idx = distance_band(dist)
         print(f"\n{'band(px)':>9} {'n':>10} {'obs P(Δ>.05)':>13} {'mem P(Δ>.05)':>13} {'ratio':>7}"
               f" {'obs P(Δ<-.01)':>14} {'mem P(Δ<-.01)':>14} {'ratio':>7}")
         for b, lbl in enumerate(DIST_LABELS):

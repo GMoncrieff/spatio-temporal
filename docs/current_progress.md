@@ -209,6 +209,18 @@ Headline before/after on the two defects that motivated the earlier head-only ch
 > the correlation field: widths are uniformly ~1.6× too generous, but the +0.05 threshold
 > sits at 0.32 half-widths in the 0–1 px band and 5.88 in the 30–100 px band, so one global
 > factor cannot fix both.
+>
+> **H1 measured, and it is a negative result — see §5 of that document.** Conditioning the
+> shape on distance band does not help (7/20 cells inside at M=400, against the shipped
+> 7/20). The marginal's *tail bound*, exposed while testing it, does: **9/20**, mid bands
+> un-pinned from rank 400/400, and T8.1's far band 0.0997 → 1.2508 — the only configuration
+> that passes it. The bound has to be asymmetric (the upper tail is too thin, the lower
+> already 3–28× too hot) and held at 0.975 beyond 100 px (or remote stable country stops
+> being exactly zero). Settled as `SHAPE=measured` in `run_region_loop.sh`: scorecard 88/126
+> against 90/126, four rows moving, one of them T4.2 at 0.998 → 0.882 and the rest noise or
+> the target. The near bands stay pinned because T5.2's normalization stretches the residual
+> 1.3–3.3× to fill the published interval, which makes H2 (the width level) forced rather
+> than optional.
 
 **Done since this list was written.** Items 1, 2 and 3 below are addressed — see
 `docs/central_field_baseline.md`. The central field now beats persistence at every horizon;
@@ -220,8 +232,13 @@ h=5's while covering 1.5× the error) and fixed structurally.
    pixels. The central field is under-trained, and run-to-run variance between identically
    configured folds is comparable to the effects being chased (h=5 RMSE 0.01347 vs 0.01478
    for the same architecture). Longer training is the cheapest untested lever.
-2. *T1.1 is the last marginal-calibration gap* (0.963/0.974/0.979/0.982 against 0.95±0.01) —
-   and it is **not** closable by recalibration. All three options were scored: identity
+2. ~~*T1.1 is the last marginal-calibration gap* — and it is **not** closable by
+   recalibration.~~ **Superseded 2026-08-15: it was closable.** A per-(distance band ×
+   predicted-change) width factor closed it at three of four horizons
+   (0.972/0.979/0.982 → 0.956/0.956/0.954) with no change to the heads. The earlier reading
+   below was correct only for a *global* factor.
+   Original entry: T1.1 (0.963/0.974/0.979/0.982 against 0.95±0.01) is **not** closable by
+   recalibration. All three options were scored: identity
    91/128, global conformal 83/127, empirical width multiplier 85/125. The multiplier does
    force T1.1 to 4/4, at the cost of class-conditional coverage (13/16 → 8/15), the
    high-change tail (3/3 → 0/2) and lower-tail clustering (4/5 → 0/5). Coverage is nearly

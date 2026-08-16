@@ -48,6 +48,7 @@ from .validate import (
     HM_BINS,
     HM_LABELS,
     biome_lut,
+    distance_band,
     wilson_interval,
 )
 
@@ -292,7 +293,7 @@ def collect_conformal_scores(
                     # Proximity to past change dominates where change can happen at all;
                     # it replaces biome as the third class axis when available.
                     dd = dist_src.read(1, window=Window(0, r0, W, rr)).astype(np.float64)
-                    biome = np.digitize(dd, DIST_BINS[1:-1]).astype(np.int64)
+                    biome = distance_band(dd).astype(np.int64)
                 elif eco_src is not None:
                     eco = eco_src.read(1, window=Window(e_off[1], e_off[0] + r0, W, rr),
                                        boundless=True, fill_value=0)

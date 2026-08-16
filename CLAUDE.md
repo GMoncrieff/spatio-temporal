@@ -28,9 +28,20 @@ results, which are load-bearing.
 | Phase 1→4 for one experiment | `./scripts/run_region_loop.sh <name> <members>` | ~15 min at M=20, ~45 min at M=400 |
 | central-field error, stratified | `scripts/diagnose_central_field.py --stitched_dir …` | seconds |
 | compare configurations | `scripts/compare_central_runs.py label=dir …` | seconds |
+| **score a marginal without generating anything** | `scripts/predict_change_rates.py --manifest … [--sweep_u_bound …]` | ~30 s |
+| per-member realism (the honest marginal test) | `scripts/member_distance_relationship.py --ensembles label=path … --members 400` | ~10 min |
 
 `run_region_loop.sh` re-derives the recalibration, spectrum and AR(1) coupling from *that
-model's own* residuals. Never carry them over between configurations.
+model's own* residuals. Never carry them over between configurations. `SHAPE=<u_bound>`
+adds the empirical marginal, re-fitted from those same residuals; `SUFFIX=<tag>` keeps two
+marginal families side by side under one experiment.
+
+**Never sweep a marginal by generating ensembles.** The member *mean* of `P(Δ > thr)` is
+available in closed form — the field's correlation moves the members' scatter, not their
+mean — so `predict_change_rates.py` answers in 30 s what a generate-and-validate cycle
+answers in 35 min. It agreed with three M=400 ensembles to 1–11%. Its second job is being a
+second implementation: it shares no code with the GPU sampler, so agreement is evidence and
+disagreement localises the bug to the generation path.
 
 ## Rules learned the hard way
 
@@ -58,6 +69,24 @@ model's own* residuals. Never carry them over between configurations.
    field. Central-only A/Bs need a central-only monitor.
 8. **Any long-range covariate must be precomputed on the full raster**, never derived inside
    a 128 px chip (radii ≥ 30 px saturate against the chip boundary).
+9. **A binning convention is a measurement.** `right=True` vs `right=False` on the distance
+   bands lived at four call sites each; the distance is an exact Euclidean transform, so
+   `dist == 1.0` is one of the most populated values on the map and the 0–1 px band's
+   observed `P(Δ>0.05)` reads 0.222 one way and 0.177 the other. One definition now:
+   `src.ensemble.validate.distance_band`. Use it; do not re-derive the edges.
+10. **When a change has two parts, build the control that separates them.** Conditioning the
+    marginal on distance band and raising its tail bound were introduced together and looked
+    like a win. The pooled fit at the *same* raised bound beat both, so the band axis was
+    carrying nothing.
+
+11. **A width factor must not be centred on the residual median.** `fit_residual_shape`
+    centres because T5.1 pins the shape's median to zero; a *width* is centred on the
+    central forecast and must cover the residual's bias too. Copying the centring cost a
+    full cycle: class coverage fell 0.95 → 0.73 with every miss on the low side.
+12. **The centre is RMSE-optimal; do not move it to fix a quantile problem.** This residual
+    is strongly right-skewed, so a median bias-shift overshoots the mean and gives back
+    skill (0.191 → 0.171 at h=20). Make the interval asymmetric about the unmoved centre
+    instead — an uncentred width factor does exactly that, at no cost to the central field.
 
 ## Conventions
 

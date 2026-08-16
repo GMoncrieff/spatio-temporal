@@ -3,8 +3,9 @@
 
 Reads ``scale_factors.csv`` plus the class covariates (predicted change, baseline HM level,
 biome) and writes recalibrated lower/upper rasters. **Central rasters are copied byte for
-byte, never regenerated**, so "the central forecast is unchanged" is structural rather than
-something to verify afterwards.
+byte** unless ``--central_bias`` is given, so "the central forecast is unchanged" is
+structural rather than something to verify afterwards — and when it is not true, the
+manifest records ``central_regenerated: true`` next to the outputs.
 
 Applies to the hindcast rasters (so Phase 4 can re-score them) and to the production
 2025–2040 rasters (so the ensemble is built on recalibrated marginals).
@@ -31,7 +32,9 @@ from rasterio.windows import Window
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.ensemble.calibrate import ScaleFactorTable  # noqa: E402
-from src.ensemble.validate import DHAT_BINS, DIST_BINS, HM_BINS, biome_lut  # noqa: E402
+from src.ensemble.validate import (  # noqa: E402
+    DHAT_BINS, DIST_BINS, HM_BINS, biome_lut, distance_band,
+)
 
 REPO = Path(__file__).parent.parent
 HM_DIR = REPO / "data" / "raw" / "hm_global"
@@ -52,8 +55,21 @@ def recalibrate_one(
     lookup_csv=None,
     block_rows: int = 1024,
     dist_raster=None,
+    width_factors=None,
+    central_bias=None,
 ):
-    """Write ``{stem}_lower_recal.tif`` / ``{stem}_upper_recal.tif`` and copy central."""
+    """Write ``{stem}_lower_recal.tif`` / ``{stem}_upper_recal.tif`` and copy central.
+
+    ``width_factors`` is an extra per-(horizon x distance band) multiplier on the half-width,
+    applied on top of whatever the conformal table says.
+
+    It has to act *here*, on the published bounds, rather than inside the ensemble. T5.2
+    requires the ensemble's 2.5/97.5 percentiles to equal the published lower/upper, and the
+    marginal shape is normalized to those same bounds — narrowing the members without
+    narrowing the rasters would fail the gate by construction, and narrowing the rasters
+    without refitting the shape would fit the shape to widths generation does not use.
+    Rebuild the residuals against this output before refitting the shape.
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -71,7 +87,8 @@ def recalibrate_one(
     profile.update(dtype="float32", count=1, nodata=np.nan, compress="deflate", BIGTIFF="YES")
 
     central_out = out_dir / f"{out_stem}_central_recal.tif"
-    shutil.copyfile(central_path, central_out)
+    if central_bias is None:
+        shutil.copyfile(central_path, central_out)
 
     srcs = {
         "c": rasterio.open(central_path),
@@ -94,6 +111,7 @@ def recalibrate_one(
              "n_monotonicity_fixed": 0, "n_clipped": 0}
     lo_out = out_dir / f"{out_stem}_lower_recal.tif"
     up_out = out_dir / f"{out_stem}_upper_recal.tif"
+    dcen = rasterio.open(central_out, "w", **profile) if central_bias is not None else None
     try:
         with rasterio.open(lo_out, "w", **profile) as dlo, rasterio.open(up_out, "w", **profile) as dup:
             for r0 in range(0, H, block_rows):
@@ -110,7 +128,7 @@ def recalibrate_one(
                 if dist_src is not None:
                     dd = dist_src.read(1, window=Window(d_off[1], d_off[0] + r0, W, rr),
                                        boundless=True, fill_value=1e4).astype(np.float64)
-                    biome = np.digitize(dd, DIST_BINS[1:-1]).astype(np.int64)
+                    biome = distance_band(dd).astype(np.int64)
                 elif eco_src is not None:
                     eco = eco_src.read(1, window=Window(e_off[1], e_off[0] + r0, W, rr),
                                        boundless=True, fill_value=0)
@@ -120,8 +138,51 @@ def recalibrate_one(
 
                 dhat = np.where(np.isfinite(hm0), cen - hm0, 0.0)
                 d_idx = np.digitize(dhat, DHAT_BINS[1:-1])
+
+                if central_bias is not None:
+                    # Shift the whole interval, so the width factors below still act on the
+                    # width and not on the displacement. The class index is deliberately the
+                    # one computed above, from the *uncorrected* central: the correction is
+                    # a function of what the model predicted, and letting the assignment
+                    # move under its own output would make it circular.
+                    by_d = central_bias.get(str(int(horizon)), {})
+                    shift = np.zeros_like(cen)
+                    for d_str, v in by_d.items():
+                        shift[d_idx == int(d_str)] = v
+                    cen = cen + shift
+                    low = low + shift
+                    upp = upp + shift
                 h_idx = np.digitize(np.nan_to_num(hm0, nan=0.0), HM_BINS[1:-1])
                 s_up, s_lo = table.lookup(horizon, d_idx, h_idx, biome)
+
+                if width_factors is not None:
+                    # Keyed horizon -> distance band -> dhat bin -> HM bin, and each level
+                    # is optional, so older two- and one-level artifacts still read. All
+                    # three axes were measured to carry signal the others do not: the band
+                    # is where the marginal fails, the dhat bin is where *coverage* fails
+                    # (a band-only factor over-narrows the high-change class by ~24%, which
+                    # is what T1.2/T1.3 measure), and within a fixed (band x dhat) cell the
+                    # factor still varies 1.4-81x across HM level.
+                    k_up = np.ones_like(s_up, dtype=np.float64)
+                    k_lo = np.ones_like(s_lo, dtype=np.float64)
+
+                    def _walk(entry, axes, sel):
+                        if not isinstance(entry, dict):
+                            ku, kl = entry
+                            k_up[sel] = ku
+                            k_lo[sel] = kl
+                            return
+                        if not axes:
+                            return
+                        for key, sub in entry.items():
+                            s = sel & (axes[0] == int(key))
+                            if s.any():
+                                _walk(sub, axes[1:], s)
+
+                    _walk(width_factors.get(str(int(horizon)), {}),
+                          [biome, d_idx, h_idx], np.ones_like(k_up, dtype=bool))
+                    s_up = s_up * k_up
+                    s_lo = s_lo * k_lo
 
                 w_up = np.maximum(upp - cen, 0.0)
                 w_lo = np.maximum(cen - low, 0.0)
@@ -137,6 +198,10 @@ def recalibrate_one(
                 stats["n_clipped"] += int((pre_clip & valid).sum())
                 new_lo = np.clip(new_lo, 0.0, 1.0)
                 new_up = np.clip(new_up, 0.0, 1.0)
+
+                if dcen is not None:
+                    dcen.write(np.where(valid, np.clip(cen, 0.0, 1.0), np.nan
+                                        ).astype(np.float32), 1, window=win)
 
                 new_lo = np.where(valid, new_lo, np.nan)
                 new_up = np.where(valid, new_up, np.nan)
@@ -177,12 +242,40 @@ def main(argv=None):
     ap.add_argument("--ecoregion_raster", default=str(ECO_RASTER))
     ap.add_argument("--lookup_csv", default=str(ECO_LOOKUP))
     ap.add_argument("--no_biome", action="store_true", help="Ignore the biome stratum")
+    ap.add_argument("--central_bias", default=None,
+                    help="JSON of per-(horizon x predicted-change class) shifts "
+                         "(scripts/fit_central_bias.py). REGENERATES the central raster "
+                         "instead of copying it, which the rest of the pipeline assumes it "
+                         "never does — pass it only deliberately. The whole interval is "
+                         "shifted, so a width factor still acts on width alone.")
+    ap.add_argument("--width_factors", default=None,
+                    help="JSON of per-(horizon x distance band) half-width multipliers "
+                         "(scripts/predict_change_rates.py --out_width_json), applied on "
+                         "top of the conformal table. Requires --dist_raster, since the "
+                         "band is the class axis. Rebuild residuals against the output "
+                         "before refitting the marginal shape.")
     ap.add_argument("--dist_raster", default=None,
                     help="Distance-to-past-change raster; fills the third class axis when "
                          "the factors were fit against distance rather than biome")
     args = ap.parse_args(argv)
 
     table = ScaleFactorTable.from_csv(args.factors)
+    central_bias = None
+    if args.central_bias:
+        central_bias = json.load(open(args.central_bias)).get("by_horizon", {})
+        n = sum(1 for d in central_bias.values() for v in d.values() if v)
+        print(f"  ⚠ central bias from {args.central_bias}: {n} classes corrected — "
+              f"the central raster is REGENERATED, not copied")
+    width_factors = None
+    if args.width_factors:
+        if not args.dist_raster:
+            raise SystemExit("--width_factors needs --dist_raster: the distance band is the "
+                             "class axis the factors are keyed on")
+        width_factors = json.load(open(args.width_factors)).get("by_horizon", {})
+        n = sum(len(v) if isinstance(v, dict) else 1
+                for d in width_factors.values() for v in d.values())
+        print(f"  width factors from {args.width_factors}: "
+              f"{len(width_factors)} horizons, {n} classes")
     eco = None if args.no_biome else args.ecoregion_raster
     lut = None if args.no_biome else args.lookup_csv
     results = []
@@ -203,7 +296,8 @@ def main(argv=None):
             results.append(recalibrate_one(
                 cen, low, upp, HM_DIR / f"HM_{base}_AA_1000.tiff", table, horizon,
                 args.hindcast_out, stem, ecoregion_raster=eco, lookup_csv=lut,
-                dist_raster=args.dist_raster,
+                dist_raster=args.dist_raster, width_factors=width_factors,
+                central_bias=central_bias,
             ))
 
     if args.targets in ("production", "both"):
@@ -221,13 +315,18 @@ def main(argv=None):
             results.append(recalibrate_one(
                 cen, low, upp, HM_DIR / f"HM_{base}_AA_1000.tiff", table, horizon,
                 args.production_out, f"prediction_{year}", ecoregion_raster=eco,
-                lookup_csv=lut, dist_raster=args.dist_raster,
+                lookup_csv=lut, dist_raster=args.dist_raster, width_factors=width_factors,
+                central_bias=central_bias,
             ))
 
     out_manifest = Path(args.production_out if args.targets != "hindcast" else args.hindcast_out)
     out_manifest.mkdir(parents=True, exist_ok=True)
     manifest = {
         "factors": str(args.factors),
+        "width_factors": str(args.width_factors) if args.width_factors else None,
+        "central_bias": str(args.central_bias) if args.central_bias else None,
+        "central_regenerated": bool(args.central_bias),
+        "width_factors_applied": width_factors,
         "stationarity_assumption": (
             "scale factors fit on 2000-2020 hindcast residuals and applied to later "
             "forecasts; assumes the error structure is stationary in time and cannot be "

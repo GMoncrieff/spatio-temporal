@@ -32,6 +32,9 @@ from src.ensemble import fields as fld  # noqa: E402
 from src.ensemble import validate as val  # noqa: E402
 from src.ensemble import variogram as vgm  # noqa: E402
 from src.ensemble.copula import INT16_SENTINEL, quantization_error_bound  # noqa: E402
+from src.ensemble.validate import DIST_LABELS, distance_band  # noqa: E402
+
+N_BANDS = len(DIST_LABELS)
 
 REPO = Path(__file__).parent.parent
 HM_DIR = REPO / "data" / "raw" / "hm_global"
@@ -198,21 +201,43 @@ def stage_gates(args, store, attrs, years, paths, out_dir, card, block_rows=None
     # measured on the empirical shape, 1.33-2.18 at the bounds (tolerance far too tight) and
     # 0.27-0.83 at the median (too loose). shape_slope returns 1.0 with no shape in play, so
     # the two-piece normal is scored exactly as before.
-    shapes = {}
+    # With a per-band shape the slope is per band too, so the tolerance stops being a
+    # scalar and becomes a raster. Scoring a band-conditional marginal with one horizon's
+    # average slope would report a false T5 failure in exactly the bands the shape changed
+    # most — the far field, where the slope ratio between bands reaches 4x.
+    shapes, banded = {}, False
     if getattr(args, "marginal_shape", None) and Path(args.marginal_shape).exists():
-        blob = json.load(open(args.marginal_shape))
-        shapes = {int(k): v for k, v in blob.get("by_horizon", {}).items() if v}
-        print(f"  T5 tolerances are shape-aware ({args.marginal_shape})")
+        shapes, banded = cop.read_shape_artifact(args.marginal_shape, N_BANDS)
+        banded = banded and bool(getattr(args, "dist_raster", None))
+        print(f"  T5 tolerances are shape-aware ({args.marginal_shape}"
+              f"{', per distance band' if banded else ''})")
+
+    band_full = None
+    if banded:
+        with rasterio.open(args.dist_raster) as s:
+            band_full = distance_band(s.read(1).astype(np.float64))
 
     def _slopes(year):
-        sh = shapes.get(int(year) - int(args.base_year))
-        a, b, c_ = cop.shape_slope(sh, np.array([-1.959964, 0.0, 1.959964]))
-        return float(a), float(b), float(c_)
+        """(3, N_BANDS) slopes at the lower bound, the median and the upper bound."""
+        h = int(year) - int(args.base_year)
+        zs = np.array([-1.959964, 0.0, 1.959964])
+        out = np.ones((3, N_BANDS))
+        for b in range(N_BANDS):
+            out[:, b] = cop.shape_slope(shapes.get((h, b)), zs)
+        return out
+
+    def _tile_slopes(tbl, win):
+        """The three slopes over a tile: rasters when per-band, scalars otherwise."""
+        if band_full is None:
+            return tbl[0, 0], tbl[1, 0], tbl[2, 0]
+        bw = band_full[win.row_off:win.row_off + win.height,
+                       win.col_off:win.col_off + win.width]
+        return tbl[0][bw], tbl[1][bw], tbl[2][bw]
 
     pct_paths = {}
     summary = []
     for hi, year in enumerate(years):
-        sl_lo, sl_med, sl_hi = _slopes(year)
+        slope_tbl = _slopes(year)
         with rasterio.open(paths[year]["central"]) as c:
             profile = c.profile.copy()
         # Tiled output so the chunk-aligned windowed writes land on whole blocks rather
@@ -232,6 +257,7 @@ def stage_gates(args, store, attrs, years, paths, out_dir, card, block_rows=None
                  rasterio.open(paths[year]["upper"]) as usrc:
                 for r0, rr, c0, cw in tiles:
                     win = Window(c0, r0, cw, rr)
+                    sl_lo, sl_med, sl_hi = _tile_slopes(slope_tbl, win)
                     cen = csrc.read(1, window=win).astype(np.float32)
                     low = lsrc.read(1, window=win).astype(np.float32)
                     upp = usrc.read(1, window=win).astype(np.float32)
@@ -297,8 +323,11 @@ def stage_gates(args, store, attrs, years, paths, out_dir, card, block_rows=None
                  knob="T5")
         card.add("T5.2", f"tails within MC tolerance ({year})", min(f_lo, f_hi), ">=0.95 (MC-scaled)",
                  min(f_lo, f_hi) >= 0.95,
-                 note=f"M={M}, mc_sigma_z={mc_sigma_z:.3f}, shape slope "
-                      f"{sl_lo:.2f}/{sl_hi:.2f} at the bounds", knob="T5")
+                 note=f"M={M}, mc_sigma_z={mc_sigma_z:.3f}, shape slope at the bounds "
+                      + (f"{slope_tbl[0].min():.2f}-{slope_tbl[0].max():.2f} / "
+                         f"{slope_tbl[2].min():.2f}-{slope_tbl[2].max():.2f} over bands"
+                         if band_full is not None else
+                         f"{slope_tbl[0, 0]:.2f}/{slope_tbl[2, 0]:.2f}"), knob="T5")
         card.add("T5.3", f"valid-mask identity ({year})", n_mask_mismatch, "0 pixels",
                  n_mask_mismatch == 0, knob="T5")
 
@@ -513,8 +542,28 @@ def _marginal_arrays(paths, year, rows=None, cols=None):
     return cen, sl, sr
 
 
+def _shape_context(args, year):
+    """``(shapes_by_band, band_raster)`` for one year, or ``(None, None)``.
+
+    ``band_raster`` is None when the shape does not depend on the band, in which case
+    ``shapes_by_band`` holds one shape under every key and recover_z takes the fast path.
+    """
+    path = getattr(args, "marginal_shape", None)
+    if not (path and Path(path).exists()):
+        return None, None
+    table, banded = cop.read_shape_artifact(path, N_BANDS)
+    h = int(year) - int(args.base_year)
+    by_band = {b: table.get((h, b)) for b in range(N_BANDS)}
+    if not any(v is not None for v in by_band.values()):
+        return None, None
+    if not (banded and getattr(args, "dist_raster", None)):
+        return by_band.get(0), None
+    with rasterio.open(args.dist_raster) as s:
+        return by_band, distance_band(s.read(1).astype(np.float64))
+
+
 def recover_z(member, cen, sl, sr, eps=1e-4, quant=1.0 / 32767.0, min_sigma_steps=5.0,
-              shape=None):
+              shape=None, band=None):
     """Invert the copula to get the member's normal score.
 
     Two classes of pixel are dropped, because at those the member carries no usable
@@ -532,7 +581,17 @@ def recover_z(member, cen, sl, sr, eps=1e-4, quant=1.0 / 32767.0, min_sigma_step
         z = d / sigma
     # Dividing by sigma undoes the two-piece normal only. With a shape in play that leaves
     # S(z), not z, and the T3 diagnostics would then describe a nonlinearly distorted field.
-    z = cop.invert_shape(z, shape)
+    if band is None:
+        z = cop.invert_shape(z, shape)
+    else:
+        # A per-band shape needs a per-band inverse; one shape applied to the whole raster
+        # would leave a differently distorted field in every band.
+        out = np.array(z, dtype=np.float64)
+        for b, sh in shape.items():
+            m = band == b
+            if sh is not None and m.any():
+                out[m] = cop.invert_shape(z[m], sh)
+        z = out
     unusable = (
         (member <= eps) | (member >= 1.0 - eps)
         | (sigma < min_sigma_steps * quant)
@@ -547,13 +606,11 @@ def stage_spatial(args, store, attrs, years, paths, out_dir, card, null_store=No
     year = years[hi]
     cen, sl, sr = _marginal_arrays(paths, year)
     mem = agg.member_slice(store, attrs, 0, hi)
-    spatial_shape = None
-    if getattr(args, "marginal_shape", None) and Path(args.marginal_shape).exists():
-        spatial_shape = json.load(open(args.marginal_shape)).get(
-            "by_horizon", {}).get(str(int(year) - int(args.base_year)))
-        if spatial_shape:
-            print("  normal scores recovered through the empirical shape")
-    z = recover_z(mem, cen, sl, sr, shape=spatial_shape)
+    spatial_shape, spatial_band = _shape_context(args, year)
+    if spatial_shape is not None:
+        print("  normal scores recovered through the empirical shape"
+              + (", per distance band" if spatial_band is not None else ""))
+    z = recover_z(mem, cen, sl, sr, shape=spatial_shape, band=spatial_band)
     frac_usable = float(np.isfinite(z).sum() / max(np.isfinite(cen).sum(), 1))
     print(f"  recovered normal scores at {100*frac_usable:.1f}% of valid pixels "
           f"(rest clipped at the [0,1] bounds)")
@@ -1024,11 +1081,11 @@ def stage_clustering(args, store, attrs, years, paths, out_dir, card, n_members:
                  note="regional working set only; run scripts/make_region_subset.py")
         return
     print("\n=== T8 · change clustering near past change ===")
-    from src.ensemble.validate import DIST_BINS, DIST_LABELS
+    from src.ensemble.validate import DIST_LABELS, distance_band
 
     with rasterio.open(args.dist_raster) as s:
         dist = s.read(1).astype(np.float32)
-    band = np.digitize(dist, DIST_BINS[1:-1])
+    band = distance_band(dist)
     base_hm = HM_DIR / f"HM_{args.base_year}_AA_1000.tiff"
     hi = len(years) - 1
     year = years[hi]
@@ -1103,10 +1160,17 @@ def stage_temporal(args, store, attrs, years, paths, out_dir, card):
     zs = {}
     for hi, year in enumerate(years):
         cen, sl, sr = _marginal_arrays(paths, year, rows, cols)
+        # T4 measures the AR(1) coupling of the *normal scores*, so it has to undo the
+        # shape for the same reason T3 does. This call omitted it, which meant the
+        # between-horizon correlation was being read off a nonlinearly distorted field
+        # whenever a shape was in play — the one recover_z site that was not shape-aware.
+        shape, band = _shape_context(args, year)
+        if band is not None:
+            band = band[np.ix_(rows, cols)]
         stack = []
         for m in range(M):
             v = agg.member_slice(store, attrs, m, hi)[np.ix_(rows, cols)]
-            stack.append(recover_z(v, cen, sl, sr))
+            stack.append(recover_z(v, cen, sl, sr, shape=shape, band=band))
         zs[hi] = np.stack(stack)
 
     rho_target = {}

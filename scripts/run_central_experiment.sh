@@ -30,7 +30,11 @@ VAL_STRIDE="${VAL_STRIDE:-2048}"
 NUM_WORKERS="${NUM_WORKERS:-3}"
 BASE_ARGS="${BASE_ARGS:-}"
 ROOT="data/ensemble/exp/${NAME}"
-REGION="config/region_to_predict_small.geojson"
+# Southern Africa by default (CLAUDE.md: all iteration is regional). REGION= overrides it —
+# used for the Africa-wide run, whose point is that southern Africa is an unrepresentative
+# sample of HM level: the [0,0.01) stratum is 6% of it and 40% of Africa, and that stratum
+# carries the defect the class fits are chasing.
+REGION="${REGION:-config/region_to_predict_small.geojson}"
 
 mkdir -p "$ROOT"
 echo "=== ${NAME} | GPU ${GPU} | folds ${FOLDS} | ${EXTRA:-<production architecture>} ==="

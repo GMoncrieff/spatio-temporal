@@ -31,10 +31,14 @@ import rasterio
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.ensemble.copula import DEFAULT_SCALE, INT16_SENTINEL, Z975  # noqa: E402
+from src.ensemble.copula import (  # noqa: E402
+    DEFAULT_SCALE, INT16_SENTINEL, Z975, read_shape_artifact, shape_bounds, stack_shapes,
+)
+from src.ensemble.validate import DIST_LABELS, distance_band  # noqa: E402
 
 REPO = Path(__file__).parent.parent
 MEMBER_CHUNK = 10
+N_BANDS = len(DIST_LABELS)
 
 
 def parse_args(argv=None):
@@ -53,6 +57,10 @@ def parse_args(argv=None):
     ap.add_argument("--ranges_px", default=None, help="Override, e.g. '8,240'")
     ap.add_argument("--weights", default=None, help="Override, e.g. '0.5,0.4'")
     ap.add_argument("--nugget", type=float, default=None)
+    ap.add_argument("--dist_raster", default=None,
+                    help="Distance-to-past-change raster. Required for a per-band marginal "
+                         "shape; without it a per-band artifact falls back to its pooled "
+                         "shape.")
     ap.add_argument("--marginal_shape", default=None,
                     help="JSON of per-horizon empirical marginal shapes "
                          "(scripts/fit_marginal_shape.py). Without it the marginal is the "
@@ -98,12 +106,15 @@ def resolve_paths(args, years):
     return out, used_recal
 
 
-def load_marginals(paths, years, cache_dir):
+def load_marginals(paths, years, cache_dir, dist_raster=None):
     """Compact per-valid-pixel marginal parameters, memory-mapped for the workers.
 
     Two passes so no more than one year's three rasters are resident at a time (each is
     2.7 GB at the global grid), and the compact arrays go to disk rather than being pickled
     into every worker process.
+
+    With ``dist_raster`` the pixel's distance band is cached the same way, in the same
+    order, so a per-band marginal shape can be applied by gathering rows.
     """
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -123,6 +134,12 @@ def load_marginals(paths, years, cache_dir):
 
     idx = np.flatnonzero(valid.ravel()).astype(np.int64)
     np.save(cache_dir / "idx.npy", idx)
+
+    if dist_raster:
+        # Same ordering as idx, so the worker can index it with the flat z vector directly.
+        with rasterio.open(dist_raster) as s:
+            band = distance_band(s.read(1).astype(np.float64)).ravel()[idx]
+        np.save(cache_dir / "band.npy", band.astype(np.int8))
 
     compact = {}
     for y in years:
@@ -144,6 +161,29 @@ def load_marginals(paths, years, cache_dir):
             compact[y][name] = str(p)
         del arrays, cen, low, upp
     return compact, valid, idx, profile
+
+
+def with_bounds(shape):
+    """Attach the continuation constants so the worker can hold the grids on the GPU."""
+    z_hi, z_lo, off_hi, off_lo = shape_bounds(shape)
+    return {**shape, "z_hi": z_hi, "z_lo": z_lo, "off_hi": off_hi, "off_lo": off_lo}
+
+
+def load_shapes(path, have_band):
+    """``{horizon: shape}`` for the worker — stacked per band when a raster is available.
+
+    Without a distance raster a per-band artifact collapses to band 0's shape, which for
+    these artifacts is the horizon's pooled fit.
+    """
+    table, banded = read_shape_artifact(path, N_BANDS)
+    horizons = sorted({h for h, _ in table})
+    if not (banded and have_band):
+        return {h: with_bounds(table[(h, 0)]) for h in horizons if (h, 0) in table}, banded
+    # One row per band the raster can produce, not per band the artifact happens to carry:
+    # the >100 px band is too sparse to fit region-wide but still occurs in the raster, and
+    # a short stack is an out-of-bounds gather on the GPU.
+    return ({h: stack_shapes([table.get((h, b)) for b in range(N_BANDS)])
+             for h in horizons}, banded)
 
 
 def field_params(args, horizons):
@@ -230,6 +270,19 @@ def worker(worker_id, gpu, member_ids, cfg):
     }
     scatter = np.full(H * W, INT16_SENTINEL, dtype=np.int16)
 
+    # The shape grids are the same for every member, so upload them once rather than on
+    # each of the M x n_horizons calls. torch.as_tensor inside apply_shape_torch is then a
+    # no-op because device and dtype already match.
+    band_t = None
+    if cfg.get("band"):
+        band_t = torch.as_tensor(np.load(cfg["band"]).astype(np.int64), device=device)
+    shapes_dev = {}
+    for h, sh in (cfg.get("shapes") or {}).items():
+        shapes_dev[h] = {k: (torch.as_tensor(np.asarray(v), device=device,
+                                             dtype=torch.float32)
+                             if k != "n" and np.ndim(v) > 0 else v)
+                         for k, v in sh.items()}
+
     for m in member_ids:
         t0 = time.time()
         prev = None
@@ -260,7 +313,7 @@ def worker(worker_id, gpu, member_ids, cfg):
 
             mg = {k: v.to(device, non_blocking=True) for k, v in marg_cpu[y].items()}
             vals = marginal_from_z_torch(z, mg["loc"], mg["scale_left"], mg["scale_right"],
-                                         shape=cfg.get("shapes", {}).get(h))
+                                         shape=shapes_dev.get(h), band=band_t)
             del mg
             q = torch.clamp(torch.round(vals / cfg["scale"]), INT16_SENTINEL + 1, 32767)
             q = q.to(torch.int16).cpu().numpy()
@@ -283,7 +336,8 @@ def main(argv=None):
 
     print("Loading marginals ...")
     cache_dir = Path(args.out).parent / (Path(args.out).stem + "_marginals")
-    compact, valid, idx, profile = load_marginals(paths, years, cache_dir)
+    compact, valid, idx, profile = load_marginals(paths, years, cache_dir, args.dist_raster)
+    band_path = (cache_dir / "band.npy") if args.dist_raster else None
     H, W = valid.shape
     print(f"  grid {H} x {W}, {idx.size:,} valid pixels ({100 * idx.size / valid.size:.1f}%)")
 
@@ -322,20 +376,46 @@ def main(argv=None):
         "sources": {str(y): {k: str(v) for k, v in paths[y].items()} for y in years},
     })
 
-    shapes = {}
+    shapes, banded = {}, False
     if args.marginal_shape and Path(args.marginal_shape).exists():
-        blob = json.load(open(args.marginal_shape))
-        shapes = {int(k): v for k, v in blob.get("by_horizon", {}).items() if v}
-        print(f"  marginal shape: empirical, from {args.marginal_shape} "
+        shapes, has_bands = load_shapes(args.marginal_shape, band_path is not None)
+        banded = has_bands and band_path is not None
+        kind = "per (horizon x distance band)" if banded else "per horizon"
+        print(f"  marginal shape: empirical {kind}, from {args.marginal_shape} "
               f"(horizons {sorted(shapes)})")
+        if has_bands and not banded:
+            print("  ⚠ the artifact carries per-band shapes but --dist_raster was not given, "
+                  "so the pooled shape is used — that is a different marginal family")
     else:
         print("  marginal shape: two-piece normal (no --marginal_shape given)")
+
+    # Which marginal produced this store is not recoverable from the values, and these
+    # families are routinely compared against each other on disk. Record it — including the
+    # tail bounds, since two artifacts can share a body and differ only there, and that
+    # difference is what moves T8.1 and T8.2.
+    prov = {
+        "source": str(args.marginal_shape) if args.marginal_shape else None,
+        "family": ("empirical, per (horizon x distance band)" if banded else
+                   "empirical, per horizon" if shapes else
+                   "median-spliced two-piece normal"),
+        "dist_raster": str(args.dist_raster) if args.dist_raster else None,
+    }
+    if args.marginal_shape and Path(args.marginal_shape).exists():
+        table, _ = read_shape_artifact(args.marginal_shape, N_BANDS)
+        bodies = {id(v) for v in table.values()}
+        prov["distinct_bodies"] = len(bodies)
+        h0 = min(h for h, _ in table)
+        prov["u_bound_by_band"] = [table[(h0, b)].get("u_bound") for b in range(N_BANDS)]
+        prov["u_bound_lo_by_band"] = [table[(h0, b)].get("u_bound_lo")
+                                      for b in range(N_BANDS)]
+    store.attrs["marginal_shape"] = prov
 
     cfg = {
         "years": years, "horizons": horizons, "shape": (H, W), "compact": compact,
         "idx": str(cache_dir / "idx.npy"), "out": str(out_path), "field_params": fps, "rho": rho,
         "seed": args.seed, "scale": DEFAULT_SCALE, "wrap_lon": bool(wrap),
         "independent": bool(args.independent), "shapes": shapes,
+        "band": str(band_path) if (band_path and banded) else None,
     }
 
     gpus = [int(g) for g in args.gpus.split(",") if g.strip() != ""] if args.gpus else [None]
