@@ -216,6 +216,7 @@ configuration; two seeds of it bracket every comparison. Judgement is on RMSE (f
 | E4 cosine + clip | .00931 | .01434 | .01852 | .02188 | .764 | .157 | **null** |
 | **E5 Δ̂ to quantile heads** | .00930 | .01436 | .01845 | .02221 | **.681** | **.236** | **kept** |
 | E6b scale-norm pinball | .00942 | .01435 | .01844 | .02161 | .743 | .144 | **worse** |
+| E6a multiplicative width | .00935 | .01454 | .01885 | .02188 | .722 | .185 | marginal |
 
 **Phase reference — adopted.** Better than all three incumbent seeds on five of six metrics
 with disjoint ranges. At two seeds against three the honest claim is "no worse, and it
@@ -257,6 +258,26 @@ different optima, and the second is not the published quantity.
 
 Recorded as a loss rather than reinterpreted, because the prediction was written down before
 the run.
+
+**E6a (multiplicative width head) — marginal, and it confirms the other half of the
+prediction.** §3.1 said E6a should *not* move the far field, and it does not: the 30–100 px
+lead-time ratio goes 0.308 / 0.209 → 0.133, if anything slightly worse. Its one real gain is
+band-level width calibration, `mean|ln k|` over (horizon × band) cells 0.604–0.747 → **0.527**,
+past floor; the leaf-level metric (0.722) and `within 20%` (0.185) both stay inside the
+reference band. Not a clear keep on its own.
+
+### 4.0 The far field is not a width-head problem
+
+Both width experiments leave the far-field lead-time defect exactly where it was, one having
+been predicted to fix it and one predicted not to. Neither the head's parameterisation nor
+the loss's scaling reaches it.
+
+That is worth stating positively. At h=5 in the 30–100 px band the residual is a near-zero
+body with rare large values, so a 95% interval fitted to it is **correctly** tiny — and the
++0.05 threshold `docs/next_phase_marginals.md` §5.5 measures at a median of 119 half-widths
+out is a statement about a two-bound product, not about a mis-trained head. The model is not
+obviously wrong there; the deliverable cannot express what it knows. The lever is a
+model-predicted tail quantity feeding the marginal's bound per pixel, not more width work.
 
 ### 4.1 A correctness check that could not be run, and the reason
 
