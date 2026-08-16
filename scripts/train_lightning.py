@@ -52,6 +52,7 @@ def _experiment_kwargs(args):
         lr_min_frac=args.lr_min_frac,
         weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,
+        weight_avg_last=args.weight_avg_last,
     )
 from torchgeo_dataloader import get_dataloader, hm_files, component_files, static_files, years
 
@@ -356,6 +357,20 @@ if __name__ == "__main__":
     parser.add_argument("--lr_warmup_frac", type=float, default=0.05)
     parser.add_argument("--lr_min_frac", type=float, default=0.01)
     parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument(
+        "--weight_avg_last", type=int, default=0,
+        help="Average the weights of the last N epochs instead of selecting one. On fold 1 "
+             "the epoch ModelCheckpoint picked was 140/85/60 across three seeds of the same "
+             "configuration while the best 10%% of epochs sat within 3%% of the minimum, so "
+             "the argmin is close to arbitrary among the candidates. Implies "
+             "--checkpoint_select final. 0 disables it.",
+    )
+    parser.add_argument(
+        "--checkpoint_select", type=str, default="best", choices=["best", "final"],
+        help="Which checkpoint prediction uses: the monitored best (default) or the state "
+             "at the end of training. 'final' is the coherent choice with an annealed "
+             "learning rate or with weight averaging.",
+    )
     parser.add_argument("--grad_clip", type=float, default=0.0,
                         help="Global grad-norm clip applied after the two backward passes, "
                              "0 disables it (today's behaviour)")
@@ -835,6 +850,16 @@ if __name__ == "__main__":
 
     # Train
     trainer.fit(model, train_loader, val_loader)
+
+    # Weight averaging rewrites the in-memory weights in on_train_end, so the epoch-best
+    # checkpoint on disk is not the model we mean to publish. Save the end state and point
+    # every downstream consumer at it.
+    if args.checkpoint_select == 'final' or args.weight_avg_last > 0:
+        _final = os.path.join(os.getcwd(), 'models', 'checkpoints',
+                              f'final_fold{args.exclude_fold}_{os.getpid()}.ckpt')
+        trainer.save_checkpoint(_final)
+        checkpoint_cb.best_model_path = _final
+        print(f"Prediction will use the end-of-training checkpoint: {_final}")
 
     # --- Log validation predictions/metrics from checkpoint to wandb (rank 0 only) ---
     import torch

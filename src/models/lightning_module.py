@@ -57,6 +57,7 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         lr_min_frac: float = 0.01,
         weight_decay: float = 0.0,
         grad_clip: float = 0.0,
+        weight_avg_last: int = 0,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -140,6 +141,15 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         self.lr_min_frac = float(lr_min_frac)
         self.weight_decay = float(weight_decay)
         self.grad_clip = float(grad_clip)
+        # Average the weights of the last N epochs instead of picking one of them.
+        # Measured motivation: on fold 1 the epoch ModelCheckpoint selected was 140, 85 and
+        # 60 across three seeds of the same configuration, while the best 10% of epochs sat
+        # within 3% of the minimum on the monitored metric — so the argmin is close to
+        # arbitrary among ~15 near-tied candidates, and those candidates produce materially
+        # different central fields. 0 (the default) keeps today's single-epoch selection.
+        self.weight_avg_last = int(weight_avg_last)
+        self._wa_sum = None
+        self._wa_count = 0
         self.lr = lr
         self.ssim_weight = ssim_weight
         self.laplacian_weight = laplacian_weight
@@ -654,6 +664,34 @@ class SpatioTemporalLightningModule(pl.LightningModule):
     
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+
+    def on_train_epoch_end(self):
+        """Accumulate the tail epochs' weights for averaging (no-op when disabled)."""
+        if self.weight_avg_last <= 0:
+            return
+        total = int(self.trainer.max_epochs or 0)
+        if self.current_epoch < total - self.weight_avg_last:
+            return
+        sd = self.state_dict()
+        if self._wa_sum is None:
+            # Only floating-point tensors are averaged; anything else (counters, integer
+            # buffers) is taken from the final epoch, where averaging would be meaningless.
+            self._wa_sum = {k: v.detach().double().clone()
+                            for k, v in sd.items() if v.is_floating_point()}
+            self._wa_count = 1
+        else:
+            for k, acc in self._wa_sum.items():
+                acc.add_(sd[k].detach().double())
+            self._wa_count += 1
+
+    def on_train_end(self):
+        if self.weight_avg_last <= 0 or not self._wa_count:
+            return
+        sd = self.state_dict()
+        for k, acc in self._wa_sum.items():
+            sd[k].copy_((acc / self._wa_count).to(sd[k].dtype))
+        print(f"[weight averaging] wrote the mean of the last {self._wa_count} epochs "
+              f"into {len(self._wa_sum)} tensors")
 
     def on_train_epoch_start(self):
         """Cosine schedule with linear warmup, stepped by hand.
