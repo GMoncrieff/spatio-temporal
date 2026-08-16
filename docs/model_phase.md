@@ -198,6 +198,94 @@ before either was run so the result reads as a test rather than a story.
 
 ---
 
+## 5. E5 at k=5, and the trade it makes
+
+Trained on all five folds and scored over the whole region (4,358,388 px at h=5), against the
+shipped configuration scored identically:
+
+| | baseline k=5 | E5 k=5 | Δ |
+|---|---|---|---|
+| RMSE h=5 | 0.00947 | 0.00945 | −0.3% |
+| RMSE h=10 | 0.01444 | 0.01432 | −0.8% |
+| RMSE h=15 | 0.01855 | 0.01823 | −1.7% |
+| RMSE h=20 | 0.02222 | 0.02206 | −0.7% |
+| **mean\|ln k\|** | 0.732 | **0.686** | **−6.3%** |
+| within 20% | 0.186 | 0.193 | +3.8% |
+
+The central moves are all in the right direction and all small; with no k=5 seed replicate they
+are not claimed past noise. The width metric reproduces the screening result.
+
+**The post-hoc layer is asked to do less**, which is the phase's actual objective. Over the
+same 360 leaf classes, the fitted half-width factors move from `mean|ln k|` 0.550 to 0.470,
+and the median upper factor from 0.540 to 0.693 — a third less narrowing demanded of the
+correction the model should not need.
+
+### 5.1 The trade, found before the scorecard by the closed-form predictor
+
+`scripts/predict_change_rates.py` shares no code with the GPU sampler and answers in 30 s.
+`P(Δ > +0.05)`, observed against predicted:
+
+| band, horizon | observed | baseline | E5 |
+|---|---|---|---|
+| 30–100 px, h=5 | 0.000155 | 0.000011 | **0.000000** |
+| 30–100 px, h=10 | 0.000776 | 0.000055 | **0.000003** |
+| 30–100 px, h=15 | 0.001107 | 0.000193 | **0.000044** |
+| 30–100 px, h=20 | 0.002356 | 0.001185 | **0.001622** ✓ |
+| 10–30 px, h=20 | 0.007747 | 0.020641 | **0.013339** ✓ |
+
+Mean \|log₁₀ ratio\| 0.300 baseline against **0.381** E5 — worse overall, and concentrated
+entirely in the far field at short lead.
+
+The mechanism is E5's own. The width now depends on Δ̂; in the far field at short lead Δ̂ ≈ 0,
+so the head narrows there and pushes the +0.05 threshold further out of reach. **E5 buys
+per-class width calibration across the many near and mid classes and pays for it in the
+far-field short-lead tail** — which §5.5 of `docs/next_phase_marginals.md` already measured as
+unreachable (median 119 half-widths) and §4.0 above identified as not a width-head problem.
+
+*Prediction registered before the scorecard: T1/T2 class-coverage rows improve, T6/T8 far-band
+rows at short lead regress.*
+
+### 5.2 Downstream — the decisive test
+
+`SHAPE=measured WIDTHS=measured run_region_loop.sh e5k5 400`, everything re-derived from E5's
+own residuals. Recalibration came back **identity**, as for the baseline.
+
+| | baseline | E5 |
+|---|---|---|
+| **scorecard** | 101/127 | **104/128** |
+| per-member cells inside the 5–95% range | 15/20 | 15/20 |
+| **mean \|rank − M/2\|** | 115.6 | **103.3** |
+
+Six rows moved, four up and two down:
+
+| row | baseline | E5 | |
+|---|---|---|---|
+| T2.3 area above threshold | 3/8 | **5/8** | +2 |
+| T3.1 member variogram | 1/3 | **2/3** | +1 |
+| T6.4 change-sign realism | 2/2 | **3/3** | +1 |
+| T8.1 change clustering by band | 4/5 | **5/5** | +1 |
+| T2.5 rank histogram | 4/4 | 3/4 | −1 |
+| **T5.1 median ≡ central (hard gate)** | 4/4 | **3/4** | −1 |
+
+**The registered prediction was wrong, in the favourable direction.** T8.1 and T6.4 — the
+far-band realism rows E5's narrowing was expected to damage — both *improved*, T8.1 to 5/5.
+The closed-form predictor's warning was real but did not reach the gates it was expected to.
+
+**Both losses are at the 2015 horizon and both are percentile-estimated from the member
+sample.** T5.1 goes 0.9958 → 0.9888 against a 0.995 hard gate; T2.5's chi-squared p goes 0.164
+→ 0.0075. h=15 is also where E5's central field improved most (−1.7% RMSE), and a sharper
+central field gives a more concentrated residual, hence a spikier fitted shape, which
+`docs/next_phase_marginals.md` measured as harder to read percentiles from at fixed M. That is
+a plausible mechanism, not a demonstrated one — it rests on a single k=5 run. **A hard gate
+failing at one horizon is the item to resolve before this ships**, most cheaply by rescoring at
+higher M.
+
+Honest scale of the result: +3 rows of 128, scorecard rows are correlated, and there is no k=5
+replicate to put a band on any of it. The per-member count is unchanged at 15/20; what moved
+is how far the observation sits from the member centre, 115.6 → 103.3. This is nonetheless the
+first time in this project that a change to **the model** rather than to the post-hoc layer has
+moved these numbers.
+
 ## 4. Results
 
 Screening: folds 1 and 2, scored on identical pixels (1,542,872 at h=5). The phase reference
@@ -307,6 +395,29 @@ E5 + multiplicative width gives `mean|ln k|` .877, the worst of the phase, again
 and .722 for E6a. E5 + weight averaging gives .741 / .189 against E5's .681 / .236. E5's gain
 is the head modulating its width with Δ̂, and it does not survive either changing how that
 modulation is expressed or averaging it over epochs.
+
+### 4.-1 Summary of the twelve screening runs
+
+Ordered by the phase's primary quantile metric. "Floor" columns mark whether the change
+clears the run-to-run band of §2 (RMSE 0.6 / 0.7 / 2.2 / 4.2% by horizon; `mean|ln k|` 0.028;
+`within 20%` 0.033).
+
+| # | what changed | central field | quantile widths | verdict |
+|---|---|---|---|---|
+| — | **phase ref** (histogram off, central-only monitor) | better than all 3 incumbent seeds, h=5/10/15 | `ln k` .693–.746, w20 .181–.196 | **adopted** |
+| E5 | **Δ̂ fed to the quantile heads** | unchanged within floor | **`ln k` .681, w20 .236**; Δ̂-axis spread 1.41 → 1.23 | **kept** |
+| E6a | multiplicative width head | h=10/15 worse past floor | band `ln k` .527 (best), leaf .722, w20 .185 | marginal |
+| E2 | horizon loss weights 1/1.33/2/4 | h=10, h=15 worse past floor | `ln k` .690, w20 .173 | no gain |
+| E1 | training budget ×3 (450 ep) | identical within floor at all four | `ln k` .761, w20 .183 | **null** |
+| E4 | cosine LR + gradient clip | inside floor at all four | `ln k` .764, w20 .157 | **null** |
+| E8 | weight averaging, last 20 | inside floor | `ln k` .782, **w20 .152** | null / worse |
+| E8b | weight averaging + cosine | best of the phase, all inside floor | `ln k` .740, **w20 .128** | null / worse |
+| E10 | E5 + weight averaging | inside floor | `ln k` .741, w20 .189 | worse than E5 |
+| E6b | scale-normalised pinball | h=5 worse | `ln k` .743, **w20 .144**; far field 1.83 → 3.82 | **worse** |
+| E7 | dilated trunk 1/2/4/8 | h=5/10/15 worse; 0–1 px +4.8% | `ln k` .760, w20 .175 | **worse** |
+| E3a | SSIM/Laplacian on the change field | h=5/10 worse; damage all in 0–1 px | `ln k` .676, w20 .188 | **worse** |
+| E3b | MSE only | **h=10 worse by 4.4%**, 6× floor | `ln k` .730, w20 .151 | **worse** |
+| E9 | E5 + multiplicative width | h=15 worse | **`ln k` .877 — worst of the phase** | **worse than either part** |
 
 ### 4.0 The far field is not a width-head problem
 
