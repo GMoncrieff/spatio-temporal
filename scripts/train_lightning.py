@@ -23,6 +23,36 @@ def _wants_context(args):
     tensor, so the dataset must load it whenever either asks for it.
     """
     return bool(getattr(args, "quantile_context", False) or getattr(args, "central_context", False))
+
+
+def _csv_floats(spec):
+    """'1,1.333,2,4' -> [1.0, 1.333, 2.0, 4.0]; None/'' -> None (today's behaviour)."""
+    if spec is None or str(spec).strip() == "":
+        return None
+    return [float(x) for x in str(spec).split(",")]
+
+
+def _csv_ints(spec):
+    if spec is None or str(spec).strip() == "":
+        return None
+    return [int(x) for x in str(spec).split(",")]
+
+
+def _experiment_kwargs(args):
+    """Model-phase flags, as constructor kwargs. Every default is today's behaviour."""
+    return dict(
+        quantile_dhat_context=args.quantile_dhat_context,
+        width_parameterisation=args.width_parameterisation,
+        convlstm_dilations=_csv_ints(args.convlstm_dilations),
+        horizon_loss_weights=_csv_floats(args.horizon_loss_weights),
+        loss_on_change=args.loss_on_change,
+        pinball_scale_norm=args.pinball_scale_norm,
+        lr_schedule=args.lr_schedule,
+        lr_warmup_frac=args.lr_warmup_frac,
+        lr_min_frac=args.lr_min_frac,
+        weight_decay=args.weight_decay,
+        grad_clip=args.grad_clip,
+    )
 from torchgeo_dataloader import get_dataloader, hm_files, component_files, static_files, years
 
 # Geospatial imports for inference
@@ -266,6 +296,69 @@ if __name__ == "__main__":
         help="Train the quantile heads only; the trunk and central heads keep the frozen "
              "checkpoint's weights exactly, so the central forecast cannot change.",
     )
+    # --- Model-phase experiment flags. All additive; defaults reproduce today's model. ---
+    parser.add_argument(
+        "--checkpoint_monitor", type=str, default="val_total_loss",
+        choices=["val_total_loss", "val_central_loss", "val_loss"],
+        help="Metric ModelCheckpoint selects on. val_total_loss (the default) includes "
+             "pinball and the histogram term, so a quantile-only change still selects a "
+             "different epoch and therefore a different central field; central-only A/Bs "
+             "need val_central_loss.",
+    )
+    parser.add_argument(
+        "--horizon_loss_weights", type=str, default=None,
+        help="Four comma-separated weights for h=5,10,15,20, renormalised to mean 1. "
+             "Training exposure is 4:3:2:1 across horizons (end_year is sampled from "
+             "2000/2005/2010/2015 and targets past 2020 are NaN), so h=20 gets a quarter "
+             "of h=5's gradient. '1,1.333,2,4' compensates exactly.",
+    )
+    parser.add_argument(
+        "--loss_on_change",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=False,
+        help="Compute SSIM and the Laplacian pyramid on the change field rather than on "
+             "absolute HM. Under --central_residual the absolute prediction is HM_t0 plus "
+             "a small change, so both terms mostly score the copy.",
+    )
+    parser.add_argument(
+        "--pinball_scale_norm",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=False,
+        help="Divide each pixel's pinball loss by its own detached half-width, making the "
+             "quantile objective relative rather than absolute. Not class weighting.",
+    )
+    parser.add_argument(
+        "--quantile_dhat_context",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=False,
+        help="Feed the detached predicted change (and its magnitude) to the quantile "
+             "heads. The needed width varies with predicted change and the heads have no "
+             "channel carrying it.",
+    )
+    parser.add_argument(
+        "--width_parameterisation", type=str, default="softplus",
+        choices=["softplus", "exp"],
+        help="How a raw quantile-head output becomes a positive half-width increment. "
+             "'exp' makes d(width)/d(raw) proportional to the width itself.",
+    )
+    parser.add_argument(
+        "--convlstm_dilations", type=str, default=None,
+        help="Comma-separated per-layer dilation for the ConvLSTM cells, e.g. '1,2,4,8'. "
+             "Widens the trunk's ~10 px receptive radius at zero parameter cost. Default "
+             "(None) is dilation 1 everywhere, i.e. today's trunk.",
+    )
+    parser.add_argument("--lr", type=float, default=1e-3, help="Adam learning rate")
+    parser.add_argument(
+        "--lr_schedule", type=str, default="none", choices=["none", "cosine"],
+        help="Learning-rate schedule. 'cosine' warms up linearly then anneals; stepped by "
+             "hand because manual optimization does not drive a Lightning scheduler.",
+    )
+    parser.add_argument("--lr_warmup_frac", type=float, default=0.05)
+    parser.add_argument("--lr_min_frac", type=float, default=0.01)
+    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--grad_clip", type=float, default=0.0,
+                        help="Global grad-norm clip applied after the two backward passes, "
+                             "0 disables it (today's behaviour)")
     parser.add_argument(
         "--use_location_encoder",
         type=lambda x: (str(x).lower() == 'true'),
@@ -536,6 +629,7 @@ if __name__ == "__main__":
             central_context_channels=(N_CONTEXT_CHANNELS if args.central_context else 0),
             central_residual=args.central_residual,
             monotone_quantile_width=args.monotone_quantile_width,
+            **_experiment_kwargs(args),
         )
         if args.quantile_context or args.central_context:
             # The quantile heads gain input channels, so their first conv no longer matches
@@ -574,7 +668,7 @@ if __name__ == "__main__":
     else:
         model = SpatioTemporalLightningModule(
             hidden_dim=args.hidden_dim,
-            lr=1e-3,
+            lr=args.lr,
             num_static_channels=num_static_channels,
             num_dynamic_channels=num_dynamic_channels,
             num_layers=args.num_layers,
@@ -593,6 +687,7 @@ if __name__ == "__main__":
             central_context_channels=(N_CONTEXT_CHANNELS if args.central_context else 0),
             central_residual=args.central_residual,
             monotone_quantile_width=args.monotone_quantile_width,
+            **_experiment_kwargs(args),
         )
 
     # Compute histogram bin weights from training data (per horizon)
@@ -687,7 +782,8 @@ if __name__ == "__main__":
             model.hm_std = ds.hm_std
 
     # Callbacks
-    checkpoint_cb = ModelCheckpoint(monitor='val_total_loss', save_top_k=1, mode='min')
+    checkpoint_cb = ModelCheckpoint(monitor=args.checkpoint_monitor, save_top_k=1, mode='min')
+    print(f"Checkpoint selection monitors: {args.checkpoint_monitor}")
     # No early stopping
 
     # Wandb logger (optional)

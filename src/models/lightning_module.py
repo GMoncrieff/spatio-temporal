@@ -46,6 +46,17 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         central_context_channels: int = 0,
         central_residual: bool = False,
         monotone_quantile_width: bool = False,
+        quantile_dhat_context: bool = False,
+        width_parameterisation: str = 'softplus',
+        convlstm_dilations=None,
+        horizon_loss_weights=None,
+        loss_on_change: bool = False,
+        pinball_scale_norm: bool = False,
+        lr_schedule: str = 'none',
+        lr_warmup_frac: float = 0.05,
+        lr_min_frac: float = 0.01,
+        weight_decay: float = 0.0,
+        grad_clip: float = 0.0,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -77,6 +88,9 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             central_context_channels=central_context_channels,
             central_residual=central_residual,
             monotone_quantile_width=monotone_quantile_width,
+            quantile_dhat_context=quantile_dhat_context,
+            width_parameterisation=width_parameterisation,
+            convlstm_dilations=convlstm_dilations,
         )
         self.loss_fn = nn.MSELoss(reduction='mean')
         self.mae_fn = nn.L1Loss(reduction='mean')
@@ -94,6 +108,38 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         self.central_context_channels = int(central_context_channels)
         self.central_residual = bool(central_residual)
         self.monotone_quantile_width = bool(monotone_quantile_width)
+        self.quantile_dhat_context = bool(quantile_dhat_context)
+        # Training exposure is *not* uniform across horizons. end_year is sampled from
+        # (2000, 2005, 2010, 2015) and targets past 2020 are NaN, so h=5 gets a target from
+        # all four windows, h=10 from three, h=15 from two and h=20 from one — a 4:3:2:1
+        # gradient budget, with the largest-error horizon getting the least. Validation
+        # uses fixed years and is balanced, so nothing in val_* shows this.
+        # None reproduces the uniform average exactly.
+        if horizon_loss_weights is None:
+            self.horizon_loss_weights = None
+        else:
+            w = [float(x) for x in horizon_loss_weights]
+            if len(w) != 4:
+                raise ValueError(f"horizon_loss_weights needs 4 entries, got {len(w)}")
+            # Renormalised to mean 1, so the loss scale — and the learning rate tuned
+            # against it — is unchanged; only the balance between horizons moves.
+            s = sum(w) / len(w)
+            self.horizon_loss_weights = [x / s for x in w]
+        # SSIM and the Laplacian pyramid are computed on absolute HM, which is what the
+        # central head used to predict. Under --central_residual the prediction is
+        # HM_t0 + a small change, so both terms are dominated by the copy. This computes
+        # them on the change field instead.
+        self.loss_on_change = bool(loss_on_change)
+        # Divide each pixel's pinball loss by that pixel's own (detached) interval width,
+        # so far-field calibration contributes gradient at all. NOT inverse-frequency class
+        # weighting, which is recorded in CLAUDE.md as backwards for this problem: this
+        # equalises loss magnitude per pixel, not per class.
+        self.pinball_scale_norm = bool(pinball_scale_norm)
+        self.lr_schedule = str(lr_schedule)
+        self.lr_warmup_frac = float(lr_warmup_frac)
+        self.lr_min_frac = float(lr_min_frac)
+        self.weight_decay = float(weight_decay)
+        self.grad_clip = float(grad_clip)
         self.lr = lr
         self.ssim_weight = ssim_weight
         self.laplacian_weight = laplacian_weight
@@ -162,6 +208,7 @@ class SpatioTemporalLightningModule(pl.LightningModule):
                 'hist': torch.tensor(0.0, device=pred_central.device),
                 'pinball_lower': torch.tensor(0.0, device=pred_central.device),
                 'pinball_upper': torch.tensor(0.0, device=pred_central.device),
+                'central': torch.tensor(0.0, device=pred_central.device),
                 'total': torch.tensor(0.0, device=pred_central.device)
             }
         
@@ -175,12 +222,30 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         qw = self._quantile_weights
         if qw is not None and qw.shape != pred_lower.shape:
             qw = None
-        pinball_lower = self.pinball_lower(pred_lower, target_h, mask=mask_h, weights=qw)
-        pinball_upper = self.pinball_upper(pred_upper, target_h, mask=mask_h, weights=qw)
-        
-        # SSIM on absolute images (CENTRAL ONLY - independent from quantiles)
-        pred_sanitized = pred_central.clone()
-        target_sanitized = target_h.clone()
+        w_lo = w_up = qw
+        if self.pinball_scale_norm:
+            # 1 / (that pixel's own half-width), detached. The pinball gradient with respect
+            # to a bound has constant magnitude, so in absolute HM units the far field —
+            # whose widths are ~18x smaller — contributes almost nothing to the loss and its
+            # calibration is never learned. Dividing by the width makes the objective a
+            # *relative* one. Detached, so it is a weight and creates no incentive to shrink.
+            floor = 1e-3
+            s_lo = (pred_central - pred_lower).detach().abs().clamp(min=floor)
+            s_up = (pred_upper - pred_central).detach().abs().clamp(min=floor)
+            w_lo = (1.0 / s_lo) if qw is None else qw / s_lo
+            w_up = (1.0 / s_up) if qw is None else qw / s_up
+        pinball_lower = self.pinball_lower(pred_lower, target_h, mask=mask_h, weights=w_lo)
+        pinball_upper = self.pinball_upper(pred_upper, target_h, mask=mask_h, weights=w_up)
+
+        # SSIM (CENTRAL ONLY - independent from quantiles). On absolute HM by default; on
+        # the change field when loss_on_change, since under --central_residual the absolute
+        # prediction is HM_t0 plus a small change and both terms mostly score the copy.
+        if self.loss_on_change:
+            pred_sanitized = delta_central.clone()
+            target_sanitized = delta_true.clone()
+        else:
+            pred_sanitized = pred_central.clone()
+            target_sanitized = target_h.clone()
         pred_sanitized[~mask_h] = 0.0
         target_sanitized[~mask_h] = 0.0
         ssim_val = ssim(pred_sanitized, target_sanitized, data_range=1.0)
@@ -202,10 +267,15 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         
         # Total loss for this horizon
         # INDEPENDENT GRADIENTS: central gets MSE+SSIM+Lap+Hist, quantiles get pinball only
-        total = mse + pinball_lower + pinball_upper + self.ssim_weight * ssim_loss + self.laplacian_weight * lap_loss
+        central = mse + self.ssim_weight * ssim_loss + self.laplacian_weight * lap_loss
+        total = central + pinball_lower + pinball_upper
         if self.histogram_weight > 0 and self.current_epoch >= self.histogram_warmup_epochs:
+            # Kept in `total` for backward compatibility of val_total_loss, and deliberately
+            # kept OUT of `central`: compute_histogram bins with boolean comparisons into a
+            # plain zeros buffer, so this term carries no gradient at all and has never
+            # trained anything. See tests/test_histogram_loss_gradient.py.
             total = total + self.histogram_weight * hist_loss
-        
+
         return {
             'mse': mse,
             'mae': mae,
@@ -214,9 +284,22 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             'hist': hist_loss,
             'pinball_lower': pinball_lower,
             'pinball_upper': pinball_upper,
+            'central': central,
             'total': total
         }
 
+
+    def _horizon_mean(self, horizon_losses, key):
+        """Average one loss component across horizons, optionally weighted.
+
+        ``horizon_loss_weights`` is renormalised to mean 1 in __init__, so with weights off
+        this is exactly ``.mean()`` and with them on the total loss scale is preserved.
+        """
+        vals = torch.stack([h[key] for h in horizon_losses])
+        if self.horizon_loss_weights is None:
+            return vals.mean()
+        w = torch.as_tensor(self.horizon_loss_weights, device=vals.device, dtype=vals.dtype)
+        return (vals * w).mean()
 
     def _compute_quantile_weights(self, input_dynamic, target_h, mask):
         """Per-pixel weights that balance the distance-to-past-change bands.
@@ -338,14 +421,14 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             self.log(f'train_pinball_upper_{h_name}', losses_h['pinball_upper'])
         
         # Average losses across horizons
-        avg_mse = torch.stack([h['mse'] for h in horizon_losses]).mean()
-        avg_mae = torch.stack([h['mae'] for h in horizon_losses]).mean()
-        avg_ssim = torch.stack([h['ssim'] for h in horizon_losses]).mean()
-        avg_lap = torch.stack([h['lap'] for h in horizon_losses]).mean()
-        avg_hist = torch.stack([h['hist'] for h in horizon_losses]).mean()
-        avg_pinball_lower = torch.stack([h['pinball_lower'] for h in horizon_losses]).mean()
-        avg_pinball_upper = torch.stack([h['pinball_upper'] for h in horizon_losses]).mean()
-        
+        avg_mse = self._horizon_mean(horizon_losses, 'mse')
+        avg_mae = self._horizon_mean(horizon_losses, 'mae')
+        avg_ssim = self._horizon_mean(horizon_losses, 'ssim')
+        avg_lap = self._horizon_mean(horizon_losses, 'lap')
+        avg_hist = self._horizon_mean(horizon_losses, 'hist')
+        avg_pinball_lower = self._horizon_mean(horizon_losses, 'pinball_lower')
+        avg_pinball_upper = self._horizon_mean(horizon_losses, 'pinball_upper')
+
         # Compute total losses separately for central vs quantile heads
         # Central loss: MSE + SSIM + Laplacian + Histogram (affects backbone + central heads)
         central_loss = avg_mse + self.ssim_weight * avg_ssim + self.laplacian_weight * avg_lap
@@ -395,7 +478,12 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         for name, param in self.named_parameters():
             if name in saved_grads:
                 param.grad = saved_grads[name]
-        
+
+        # Clipping happens after the restore, so it sees the gradients that will actually
+        # be applied rather than the pinball pass's intermediate state.
+        if self.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(self.parameters(), self.grad_clip)
+
         # Optimizer step
         opt.step()
         
@@ -519,14 +607,15 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             self.log(f'val_coverage_{h_name}', coverage, on_step=False, on_epoch=True)
         
         # Average losses across horizons
-        avg_mse = torch.stack([h['mse'] for h in horizon_losses]).mean()
-        avg_mae = torch.stack([h['mae'] for h in horizon_losses]).mean()
-        avg_ssim = torch.stack([h['ssim'] for h in horizon_losses]).mean()
-        avg_lap = torch.stack([h['lap'] for h in horizon_losses]).mean()
-        avg_hist = torch.stack([h['hist'] for h in horizon_losses]).mean()
-        avg_pinball_lower = torch.stack([h['pinball_lower'] for h in horizon_losses]).mean()
-        avg_pinball_upper = torch.stack([h['pinball_upper'] for h in horizon_losses]).mean()
-        avg_total = torch.stack([h['total'] for h in horizon_losses]).mean()
+        avg_mse = self._horizon_mean(horizon_losses, 'mse')
+        avg_mae = self._horizon_mean(horizon_losses, 'mae')
+        avg_ssim = self._horizon_mean(horizon_losses, 'ssim')
+        avg_lap = self._horizon_mean(horizon_losses, 'lap')
+        avg_hist = self._horizon_mean(horizon_losses, 'hist')
+        avg_pinball_lower = self._horizon_mean(horizon_losses, 'pinball_lower')
+        avg_pinball_upper = self._horizon_mean(horizon_losses, 'pinball_upper')
+        avg_central = self._horizon_mean(horizon_losses, 'central')
+        avg_total = self._horizon_mean(horizon_losses, 'total')
         avg_coverage = torch.stack([c for _, c in coverage_stats]).mean() if coverage_stats else torch.tensor(0.0)
         
         # Log averaged metrics (total)
@@ -539,6 +628,11 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         self.log('val_pinball_upper_total', avg_pinball_upper, on_step=False, on_epoch=True, prog_bar=True)
         self.log('val_coverage_total', avg_coverage, on_step=False, on_epoch=True, prog_bar=True)
         self.log('val_total_loss', avg_total, on_step=False, on_epoch=True, prog_bar=True)
+        # Exactly the objective the trunk and the central heads are trained on: no pinball,
+        # no histogram. ModelCheckpoint monitors val_total_loss by default, which includes
+        # both — so a quantile-only change selects a different epoch and therefore a
+        # different central field, and a central-only A/B carries a confound without this.
+        self.log('val_central_loss', avg_central, on_step=False, on_epoch=True)
         
         # Print validation metrics (only for 20yr horizon for brevity)
         if batch_idx == 0:
@@ -559,4 +653,28 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         return avg_total
     
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.lr)
+        return torch.optim.Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+
+    def on_train_epoch_start(self):
+        """Cosine schedule with linear warmup, stepped by hand.
+
+        Under manual optimization Lightning does not drive a returned lr_scheduler, so the
+        learning rate is written into the param groups directly. 'none' (the default) never
+        touches them, which is today's behaviour exactly.
+        """
+        if self.lr_schedule != 'cosine':
+            return
+        import math
+        total = max(int(self.trainer.max_epochs or 1), 1)
+        warm = max(int(round(self.lr_warmup_frac * total)), 1)
+        e = int(self.current_epoch)
+        if e < warm:
+            scale = (e + 1) / warm
+        else:
+            prog = (e - warm) / max(total - warm, 1)
+            scale = self.lr_min_frac + (1.0 - self.lr_min_frac) * 0.5 * (1.0 + math.cos(math.pi * min(prog, 1.0)))
+        lr = self.lr * scale
+        for opt in self.trainer.optimizers:
+            for g in opt.param_groups:
+                g['lr'] = lr
+        self.log('lr', lr, on_step=False, on_epoch=True)

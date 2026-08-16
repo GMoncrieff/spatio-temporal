@@ -4,18 +4,23 @@ import torch
 import torch.nn as nn
 
 class ConvLSTMCell(nn.Module):
-    def __init__(self, input_dim, hidden_dim, kernel_size, bias):
+    def __init__(self, input_dim, hidden_dim, kernel_size, bias, dilation=1):
         super().__init__()
-        padding = kernel_size[0] // 2, kernel_size[1] // 2
+        # A dilated 3x3 kernel spans 2*dilation+1 pixels for the same parameter count, so
+        # this widens the receptive field without adding weights or an interpolation seam.
+        # dilation=1 reproduces the original cell exactly.
+        padding = dilation * (kernel_size[0] // 2), dilation * (kernel_size[1] // 2)
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.kernel_size = kernel_size
+        self.dilation = int(dilation)
         self.bias = bias
         self.conv = nn.Conv2d(
             in_channels=input_dim + hidden_dim,
             out_channels=4 * hidden_dim,
             kernel_size=kernel_size,
             padding=padding,
+            dilation=dilation,
             bias=bias)
 
     def forward(self, input_tensor, cur_state):
@@ -40,15 +45,17 @@ class ConvLSTMCell(nn.Module):
 
 class ConvLSTM(nn.Module):
     def __init__(self, input_dim, hidden_dim, kernel_size, num_layers,
-                 batch_first=False, bias=True, return_all_layers=False):
+                 batch_first=False, bias=True, return_all_layers=False, dilation=1):
         super().__init__()
         kernel_size = self._extend_for_multilayer(kernel_size, num_layers)
         hidden_dim = self._extend_for_multilayer(hidden_dim, num_layers)
-        if not len(kernel_size) == len(hidden_dim) == num_layers:
+        dilation = self._extend_for_multilayer(dilation, num_layers)
+        if not len(kernel_size) == len(hidden_dim) == len(dilation) == num_layers:
             raise ValueError('Inconsistent list length.')
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.kernel_size = kernel_size
+        self.dilation = dilation
         self.num_layers = num_layers
         self.batch_first = batch_first
         self.bias = bias
@@ -60,7 +67,8 @@ class ConvLSTM(nn.Module):
                 input_dim=cur_input_dim,
                 hidden_dim=self.hidden_dim[i],
                 kernel_size=self.kernel_size[i],
-                bias=self.bias))
+                bias=self.bias,
+                dilation=self.dilation[i]))
         self.cell_list = nn.ModuleList(cell_list)
 
     def forward(self, input_tensor, hidden_state=None):

@@ -41,6 +41,9 @@ class SpatioTemporalPredictor(nn.Module):
                  central_context_channels: int = 0,
                  central_residual: bool = False,
                  monotone_quantile_width: bool = False,
+                 quantile_dhat_context: bool = False,
+                 width_parameterisation: str = 'softplus',
+                 convlstm_dilations=None,
                  initial_width_normalized: float = 0.065):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -59,6 +62,19 @@ class SpatioTemporalPredictor(nn.Module):
             self.location_encoder = LocationEncoder(locenc_backbone[0], locenc_backbone[1], locenc_hparams)
         else:
             self.location_encoder = None
+        # Per-layer dilation widens the trunk's ~10 px receptive radius — the binding
+        # structural limit for both head families — at zero parameter cost. None (the
+        # default) means dilation 1 everywhere, i.e. the original trunk.
+        if convlstm_dilations is None:
+            self.convlstm_dilations = [1] * int(num_layers)
+        elif isinstance(convlstm_dilations, int):
+            self.convlstm_dilations = [int(convlstm_dilations)] * int(num_layers)
+        else:
+            self.convlstm_dilations = [int(d) for d in convlstm_dilations]
+            if len(self.convlstm_dilations) != int(num_layers):
+                raise ValueError(
+                    f"convlstm_dilations has {len(self.convlstm_dilations)} entries for "
+                    f"{num_layers} layers")
         self.convlstm = ConvLSTM(
             input_dim=self.num_dynamic_channels + self.num_static_channels + (self.locenc_out_channels if (self.use_location_encoder and self.locenc_out_channels > 0) else 0),  # C_d dynamic + C_s static + C_loc
             hidden_dim=hidden_dim,
@@ -66,7 +82,8 @@ class SpatioTemporalPredictor(nn.Module):
             num_layers=num_layers,
             batch_first=True,
             bias=True,
-            return_all_layers=False
+            return_all_layers=False,
+            dilation=self.convlstm_dilations,
         )
         # Multi-horizon prediction with independent heads for central and quantile predictions
         # Central heads: Optimized for accuracy + spatial patterns (MSE, SSIM, Laplacian, Histogram)
@@ -93,6 +110,22 @@ class SpatioTemporalPredictor(nn.Module):
         # horizons, so spread is non-decreasing in lead time by construction (T4.2) and
         # lower <= central <= upper is structural rather than a post-hoc clip (T1.6).
         self.monotone_quantile_width = bool(monotone_quantile_width)
+        # The width the residual needs varies with the *predicted* change (measured factor
+        # 0.75 for dhat in (0.01,0.05] against 0.95 for (0.05,0.15] inside one distance
+        # band), and the quantile heads have no channel carrying it: the interval is built
+        # around a detached central forecast that is never an input. These two extra
+        # channels are derived from tensors the head already has upstream — nothing new is
+        # read from disk. Scaled to O(1) because sd(dhat) is ~0.09 in normalized units.
+        self.quantile_dhat_context = bool(quantile_dhat_context)
+        self.dhat_context_scale = 10.0
+        n_dhat = 2 if self.quantile_dhat_context else 0
+        # 'softplus': step = softplus(raw), today's behaviour.
+        # 'exp':      step = w0 * exp(clamp(raw, -6, 6)) with the output conv zero-init, so
+        #             the head predicts a log-multiplier of a per-horizon reference width
+        #             and starts at exactly the same place softplus does.
+        if width_parameterisation not in ('softplus', 'exp'):
+            raise ValueError(f"unknown width_parameterisation {width_parameterisation!r}")
+        self.width_parameterisation = str(width_parameterisation)
         self.initial_width_normalized = float(initial_width_normalized)
 
         # Central prediction heads (one per horizon)
@@ -117,7 +150,7 @@ class SpatioTemporalPredictor(nn.Module):
         # Smaller networks since quantile estimation is simpler than full prediction
         self.lower_heads = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(hidden_dim + self.quantile_context_channels, hidden_dim // 2, kernel_size=3, padding=1, bias=True),
+                nn.Conv2d(hidden_dim + self.quantile_context_channels + n_dhat, hidden_dim // 2, kernel_size=3, padding=1, bias=True),
                 nn.ReLU(inplace=True),
                 nn.Conv2d(hidden_dim // 2, 1, kernel_size=1, bias=True),
             )
@@ -127,20 +160,42 @@ class SpatioTemporalPredictor(nn.Module):
         # Upper quantile heads (97.5%, one per horizon)
         self.upper_heads = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(hidden_dim + self.quantile_context_channels, hidden_dim // 2, kernel_size=3, padding=1, bias=True),
+                nn.Conv2d(hidden_dim + self.quantile_context_channels + n_dhat, hidden_dim // 2, kernel_size=3, padding=1, bias=True),
                 nn.ReLU(inplace=True),
                 nn.Conv2d(hidden_dim // 2, 1, kernel_size=1, bias=True),
             )
             for _ in range(self.num_horizons)
         ])
         if self.monotone_quantile_width:
-            # Each head's raw output passes through softplus and is accumulated, so bias
-            # the output conv to make the *first* increment a sensible interval rather than
-            # softplus(0) = 0.69 normalized units (~0.11 HM), which starts absurdly wide.
-            import math
-            b0 = math.log(math.expm1(max(self.initial_width_normalized, 1e-4)))
-            for head in list(self.lower_heads) + list(self.upper_heads):
-                nn.init.constant_(head[-1].bias, b0)
+            if self.width_parameterisation == 'exp':
+                # step = w0 * exp(raw); zero the output conv so every head starts at exactly
+                # w0, the same place the softplus bias below starts it.
+                for head in list(self.lower_heads) + list(self.upper_heads):
+                    nn.init.zeros_(head[-1].weight)
+                    nn.init.zeros_(head[-1].bias)
+            else:
+                # Each head's raw output passes through softplus and is accumulated, so bias
+                # the output conv to make the *first* increment a sensible interval rather than
+                # softplus(0) = 0.69 normalized units (~0.11 HM), which starts absurdly wide.
+                import math
+                b0 = math.log(math.expm1(max(self.initial_width_normalized, 1e-4)))
+                for head in list(self.lower_heads) + list(self.upper_heads):
+                    nn.init.constant_(head[-1].bias, b0)
+
+    def _width_step(self, raw):
+        """Raw head output -> a strictly positive half-width increment.
+
+        The pinball gradient with respect to the head's raw output is (a constant) times
+        d(step)/d(raw). Under softplus that derivative is sigmoid(raw), which is ~0.0085 at
+        the far field's width and ~0.14 at the near field's — so the far field's width
+        parameter learns ~18x slower than the near field's, on exactly the pixels the
+        measured width factors say are furthest from right. The multiplicative form makes
+        d(step)/d(raw) = step, which composes with a scale-normalised pinball into a
+        scale-free effective learning rate.
+        """
+        if self.width_parameterisation == 'exp':
+            return self.initial_width_normalized * torch.exp(raw.clamp(-6.0, 6.0))
+        return F.softplus(raw)
 
     def forward(self, input_dynamic, input_static, lonlat=None, quantile_context=None):
         # input_dynamic: [B, T, C_d, H, W]
@@ -191,20 +246,29 @@ class SpatioTemporalPredictor(nn.Module):
             if self.central_residual:
                 pred_central = hm_t0 + pred_central
 
+            # The predicted change, detached, as a head input. Detached and derived from
+            # hm_t0 (a plain input), so no gradient path to the trunk or the central heads
+            # is created — the isolation is unchanged.
+            if self.quantile_dhat_context:
+                dhat = (pred_central.detach() - hm_t0) * self.dhat_context_scale
+                q_input_h = torch.cat([q_input, dhat, dhat.abs()], dim=1)
+            else:
+                q_input_h = q_input
+
             if self.monotone_quantile_width:
                 # Anchor the interval to the central forecast, detached so the pinball loss
                 # still cannot reach the trunk or the central heads — the same gradient
                 # isolation as before, expressed structurally instead of by zeroing grads.
                 anchor = pred_central.detach()
-                step_lo = F.softplus(self.lower_heads[h_idx](q_input))
-                step_up = F.softplus(self.upper_heads[h_idx](q_input))
+                step_lo = self._width_step(self.lower_heads[h_idx](q_input_h))
+                step_up = self._width_step(self.upper_heads[h_idx](q_input_h))
                 w_lo_cum = step_lo if w_lo_cum is None else w_lo_cum + step_lo
                 w_up_cum = step_up if w_up_cum is None else w_up_cum + step_up
                 pred_lower = anchor - w_lo_cum
                 pred_upper = anchor + w_up_cum
             else:
-                pred_lower = self.lower_heads[h_idx](q_input)     # [B, 1, H, W]
-                pred_upper = self.upper_heads[h_idx](q_input)     # [B, 1, H, W]
+                pred_lower = self.lower_heads[h_idx](q_input_h)     # [B, 1, H, W]
+                pred_upper = self.upper_heads[h_idx](q_input_h)     # [B, 1, H, W]
 
             # Append in order: lower, central, upper for this horizon
             preds.extend([pred_lower, pred_central, pred_upper])
