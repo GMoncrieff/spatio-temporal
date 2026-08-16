@@ -218,6 +218,10 @@ configuration; two seeds of it bracket every comparison. Judgement is on RMSE (f
 | E6b scale-norm pinball | .00942 | .01435 | .01844 | .02161 | .743 | .144 | **worse** |
 | E6a multiplicative width | .00935 | .01454 | .01885 | .02188 | .722 | .185 | marginal |
 | E7 dilated trunk (1,2,4,8) | .00940 | .01463 | .01886 | .02217 | .760 | .175 | **worse** |
+| E8 weight avg (last 20) | .00934 | .01436 | .01838 | .02173 | .782 | .152 | null / worse |
+| E8b weight avg + cosine | .00931 | .01424 | .01827 | .02169 | .740 | .128 | null / worse |
+| E9 = E5 + E6a | .00932 | .01441 | .01912 | .02220 | .877 | .153 | **worse than either** |
+| E10 = E5 + weight avg | .00930 | .01421 | .01824 | .02172 | .741 | .189 | worse than E5 |
 
 **Phase reference — adopted.** Better than all three incumbent seeds on five of six metrics
 with disjoint ranges. At two seeds against three the honest claim is "no worse, and it
@@ -289,6 +293,20 @@ sparse grid and cost local resolution exactly where change happens.
 — training budget (null, E1) and trunk receptive field (worse, E7). Per this phase's own
 rejection rule the downsampled-branch variant was not run: the hypothesis under test was
 "receptive field is the binding limit", and it is not.
+
+**E8 / E8b (weight averaging) — null centrally, worse on width, in both variants.** The
+plateau of §2.1 motivated averaging the tail epochs rather than picking one of them. Centrally
+it does nothing: E8b matches or beats both reference seeds at all four horizons at once, which
+is mildly suggestive, but every margin is inside its floor. On the quantile side both variants
+regress past floor — `within 20%` .152 and **.128** against .181–.196, the two worst scores of
+the twelve runs. Averaging in parameter space is not averaging the widths, which are a
+softplus of an accumulating sum, but that is a hypothesis and it rests on two runs.
+
+**E9 and E10 (combinations) — both lose to E5 alone, and E9 loses to both its parts.**
+E5 + multiplicative width gives `mean|ln k|` .877, the worst of the phase, against .681 for E5
+and .722 for E6a. E5 + weight averaging gives .741 / .189 against E5's .681 / .236. E5's gain
+is the head modulating its width with Δ̂, and it does not survive either changing how that
+modulation is expressed or averaging it over epochs.
 
 ### 4.0 The far field is not a width-head problem
 
