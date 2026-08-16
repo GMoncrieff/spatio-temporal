@@ -58,6 +58,11 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         weight_decay: float = 0.0,
         grad_clip: float = 0.0,
         weight_avg_last: int = 0,
+        head_hidden_layers: int = 1,
+        width_head_mode: str = 'per_horizon',
+        central_target_transform: str = 'none',
+        quantile_loss: str = 'pinball',
+        histogram_soft: bool = False,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -92,6 +97,9 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             quantile_dhat_context=quantile_dhat_context,
             width_parameterisation=width_parameterisation,
             convlstm_dilations=convlstm_dilations,
+            head_hidden_layers=head_hidden_layers,
+            width_head_mode=width_head_mode,
+            central_target_transform=central_target_transform,
         )
         self.loss_fn = nn.MSELoss(reduction='mean')
         self.mae_fn = nn.L1Loss(reduction='mean')
@@ -150,6 +158,19 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         self.weight_avg_last = int(weight_avg_last)
         self._wa_sum = None
         self._wa_count = 0
+        # 'pinball' (default) fits the 2.5 and 97.5 percentiles independently. 'nll' instead
+        # treats (lower, central, upper) as a two-piece normal and fits it by log score, so
+        # the widths become scale parameters of a density rather than two quantiles — a
+        # different estimand, and one dominated by the body rather than the tails.
+        #
+        # NOT offered: the Winkler interval score. It equals 2/alpha times the sum of the
+        # two pinball losses exactly (checked algebraically and in
+        # tests/test_round2_flags.py), so at alpha = 0.05 it is the pinball objective with a
+        # 40x learning rate and cannot move the optimum.
+        if quantile_loss not in ('pinball', 'nll'):
+            raise ValueError(f"unknown quantile_loss {quantile_loss!r}")
+        self.quantile_loss = str(quantile_loss)
+        self.histogram_soft = bool(histogram_soft)
         self.lr = lr
         self.ssim_weight = ssim_weight
         self.laplacian_weight = laplacian_weight
@@ -244,8 +265,12 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             s_up = (pred_upper - pred_central).detach().abs().clamp(min=floor)
             w_lo = (1.0 / s_lo) if qw is None else qw / s_lo
             w_up = (1.0 / s_up) if qw is None else qw / s_up
-        pinball_lower = self.pinball_lower(pred_lower, target_h, mask=mask_h, weights=w_lo)
-        pinball_upper = self.pinball_upper(pred_upper, target_h, mask=mask_h, weights=w_up)
+        if self.quantile_loss == 'nll':
+            pinball_lower, pinball_upper = self._two_piece_nll(
+                pred_lower, pred_central, pred_upper, target_h, mask_h)
+        else:
+            pinball_lower = self.pinball_lower(pred_lower, target_h, mask=mask_h, weights=w_lo)
+            pinball_upper = self.pinball_upper(pred_upper, target_h, mask=mask_h, weights=w_up)
 
         # SSIM (CENTRAL ONLY - independent from quantiles). On absolute HM by default; on
         # the change field when loss_on_change, since under --central_residual the absolute
@@ -273,7 +298,9 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             # Extract horizon index from horizon_name (e.g., "5yr" -> 0)
             horizon_map = {'5yr': 0, '10yr': 1, '15yr': 2, '20yr': 3}
             h_idx = horizon_map.get(horizon_name, 0)
-            hist_loss, _, _ = self.histogram_loss_fn(delta_true_2d, delta_central_2d, mask=mask_2d, horizon_idx=h_idx)
+            hist_loss, _, _ = self.histogram_loss_fn(delta_true_2d, delta_central_2d,
+                                                     mask=mask_2d, horizon_idx=h_idx,
+                                                     soft=self.histogram_soft)
         
         # Total loss for this horizon
         # INDEPENDENT GRADIENTS: central gets MSE+SSIM+Lap+Hist, quantiles get pinball only
@@ -298,6 +325,40 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             'total': total
         }
 
+
+    # 1.96: the published bounds are the 2.5/97.5 percentiles, so half-width / Z975 is the
+    # scale of the normal that would place them there.
+    Z975 = 1.959963985
+
+    def _two_piece_nll(self, pred_lower, pred_central, pred_upper, target_h, mask_h):
+        """Negative log likelihood of the observation under a two-piece normal.
+
+        The published triple already *is* a two-piece normal's median and bounds, so fitting
+        it by log score is a strictly different objective on the same parameterisation
+        rather than a different product. The centre is detached: the central head keeps its
+        RMSE-optimal target, which docs/next_phase_marginals.md section 6.2 measured as
+        costing ~10% of skill to move.
+
+        Returned split in two so the existing per-side logging keeps working; the halves are
+        the below-centre and above-centre contributions.
+        """
+        c = pred_central.detach()
+        s_lo = ((c - pred_lower) / self.Z975).clamp(min=1e-4)
+        s_up = ((pred_upper - c) / self.Z975).clamp(min=1e-4)
+        e = target_h - c
+        below = e < 0
+        s = torch.where(below, s_lo, s_up)
+        # Two-piece normal density: 2/(s_lo+s_up) * phi(e/s). The normaliser couples the two
+        # sides, which is what makes this a density rather than two independent quantiles.
+        nll = 0.5 * (e / s) ** 2 + torch.log(s_lo + s_up)
+        m = mask_h & torch.isfinite(nll)
+        if m.sum() == 0:
+            z = torch.zeros((), device=pred_central.device)
+            return z, z
+        lo_m = m & below
+        up_m = m & ~below
+        half = lambda sel: nll[sel].mean() if sel.sum() > 0 else torch.zeros((), device=nll.device)
+        return half(lo_m), half(up_m)
 
     def _horizon_mean(self, horizon_losses, key):
         """Average one loss component across horizons, optionally weighted.

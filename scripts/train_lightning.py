@@ -53,6 +53,11 @@ def _experiment_kwargs(args):
         weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,
         weight_avg_last=args.weight_avg_last,
+        head_hidden_layers=args.head_hidden_layers,
+        width_head_mode=args.width_head_mode,
+        central_target_transform=args.central_target_transform,
+        quantile_loss=args.quantile_loss,
+        histogram_soft=args.histogram_soft,
     )
 from torchgeo_dataloader import get_dataloader, hm_files, component_files, static_files, years
 
@@ -347,6 +352,41 @@ if __name__ == "__main__":
         help="Comma-separated per-layer dilation for the ConvLSTM cells, e.g. '1,2,4,8'. "
              "Widens the trunk's ~10 px receptive radius at zero parameter cost. Default "
              "(None) is dilation 1 everywhere, i.e. today's trunk.",
+    )
+    # --- Round-2 flags: substantial architecture and objective changes ---
+    parser.add_argument(
+        "--head_hidden_layers", type=int, default=1,
+        help="Depth of every prediction head. 1 (default) is Conv3x3 -> ReLU -> Conv1x1; "
+             "each extra stage adds a 3x3+ReLU and widens the head's own radius by 1 px.",
+    )
+    parser.add_argument(
+        "--width_head_mode", type=str, default="per_horizon",
+        choices=["per_horizon", "joint", "power"],
+        help="How the four horizons' half-widths are produced. 'joint' emits all four from "
+             "one module so the growth profile in lead time is learned coherently; 'power' "
+             "parameterises it as w(h) = w0 * (h/5)**gamma, two per-pixel parameters, which "
+             "is exactly the quantity measured to be wrong (the far field's width grows "
+             "3.7-8.9x too fast with lead time).",
+    )
+    parser.add_argument(
+        "--central_target_transform", type=str, default="none", choices=["none", "asinh"],
+        help="'asinh' gives the central head a variance-stabilised output space: the change "
+             "is scale*sinh(raw), linear near zero and reaching large values without large "
+             "weights. Zero-init still starts at exact persistence.",
+    )
+    parser.add_argument(
+        "--quantile_loss", type=str, default="pinball", choices=["pinball", "nll"],
+        help="'nll' fits (lower, central, upper) as a two-piece normal by log score instead "
+             "of fitting two independent percentiles — a different estimand on the same "
+             "parameterisation. The Winkler interval score is deliberately not offered: it "
+             "is exactly 2/alpha times the pinball sum, so it cannot move the optimum.",
+    )
+    parser.add_argument(
+        "--histogram_soft",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=False,
+        help="Use the differentiable soft-binned histogram. The default hard binning "
+             "carries no gradient at all, so the histogram term has never trained anything.",
     )
     parser.add_argument("--lr", type=float, default=1e-3, help="Adam learning rate")
     parser.add_argument(

@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -44,6 +46,10 @@ class SpatioTemporalPredictor(nn.Module):
                  quantile_dhat_context: bool = False,
                  width_parameterisation: str = 'softplus',
                  convlstm_dilations=None,
+                 head_hidden_layers: int = 1,
+                 width_head_mode: str = 'per_horizon',
+                 central_target_transform: str = 'none',
+                 central_transform_scale: float = 0.01,
                  initial_width_normalized: float = 0.065):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -127,15 +133,48 @@ class SpatioTemporalPredictor(nn.Module):
             raise ValueError(f"unknown width_parameterisation {width_parameterisation!r}")
         self.width_parameterisation = str(width_parameterisation)
         self.initial_width_normalized = float(initial_width_normalized)
+        # Depth of every prediction head. 1 (the default) is today's
+        # Conv3x3 -> ReLU -> Conv1x1; higher values insert more 3x3+ReLU stages, which also
+        # widens the head's own receptive field by 1 px per stage.
+        self.head_hidden_layers = max(int(head_hidden_layers), 1)
+        # How the four horizons' half-widths are produced.
+        #   'per_horizon' — one module per horizon, today's behaviour.
+        #   'joint'       — one module emitting all four increments from shared features, so
+        #                   the growth profile in lead time is learned coherently rather
+        #                   than by four modules that never see each other.
+        #   'power'       — w(h) = w0 * (h/5)**gamma, with w0 and gamma both per pixel. Two
+        #                   parameters instead of four, monotone by construction for
+        #                   gamma >= 0, and it parameterises *exactly* the quantity measured
+        #                   to be wrong: the far field's width grows 3.7-8.9x too fast with
+        #                   lead time (k_up(20)/k_up(5) = 0.27 and 0.11 against 0.82-0.92
+        #                   in the near field).
+        if width_head_mode not in ('per_horizon', 'joint', 'power'):
+            raise ValueError(f"unknown width_head_mode {width_head_mode!r}")
+        self.width_head_mode = str(width_head_mode)
+        # 'asinh' gives the central head a variance-stabilised output space: the change is
+        # scale * sinh(raw), so a raw output near zero is linear and small while large
+        # values are reachable without the head needing large weights. Zero-init still
+        # starts at exact persistence.
+        if central_target_transform not in ('none', 'asinh'):
+            raise ValueError(f"unknown central_target_transform {central_target_transform!r}")
+        self.central_target_transform = str(central_target_transform)
+        self.central_transform_scale = float(central_transform_scale)
+
+        def _head(in_ch, mid_ch, out_ch):
+            layers = [nn.Conv2d(in_ch, mid_ch, kernel_size=3, padding=1, bias=True),
+                      nn.ReLU(inplace=True)]
+            for _ in range(self.head_hidden_layers - 1):
+                layers += [nn.Conv2d(mid_ch, mid_ch, kernel_size=3, padding=1, bias=True),
+                           nn.ReLU(inplace=True)]
+            layers.append(nn.Conv2d(mid_ch, out_ch, kernel_size=1, bias=True))
+            return nn.Sequential(*layers)
+
+        self._head = _head
 
         # Central prediction heads (one per horizon)
         # These produce the "best estimate" optimized for multiple objectives
         self.central_heads = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(hidden_dim + self.central_context_channels, hidden_dim, kernel_size=3, padding=1, bias=True),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(hidden_dim, 1, kernel_size=1, bias=True),
-            )
+            _head(hidden_dim + self.central_context_channels, hidden_dim, 1)
             for _ in range(self.num_horizons)
         ])
         if self.central_residual:
@@ -146,40 +185,39 @@ class SpatioTemporalPredictor(nn.Module):
                 nn.init.zeros_(head[-1].weight)
                 nn.init.zeros_(head[-1].bias)
 
-        # Lower quantile heads (2.5%, one per horizon)
-        # Smaller networks since quantile estimation is simpler than full prediction
-        self.lower_heads = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(hidden_dim + self.quantile_context_channels + n_dhat, hidden_dim // 2, kernel_size=3, padding=1, bias=True),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(hidden_dim // 2, 1, kernel_size=1, bias=True),
-            )
-            for _ in range(self.num_horizons)
-        ])
-        
-        # Upper quantile heads (97.5%, one per horizon)
-        self.upper_heads = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(hidden_dim + self.quantile_context_channels + n_dhat, hidden_dim // 2, kernel_size=3, padding=1, bias=True),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(hidden_dim // 2, 1, kernel_size=1, bias=True),
-            )
-            for _ in range(self.num_horizons)
-        ])
+        # Quantile heads. 'per_horizon' keeps one module per horizon (today); 'joint' and
+        # 'power' use a single module per side emitting all horizons at once, so the shape
+        # of the width's growth in lead time is a learned function of shared features.
+        q_in = hidden_dim + self.quantile_context_channels + n_dhat
+        q_mid = hidden_dim // 2
+        n_out = {'per_horizon': 1, 'joint': self.num_horizons, 'power': 2}[self.width_head_mode]
+        n_modules = self.num_horizons if self.width_head_mode == 'per_horizon' else 1
+        self.lower_heads = nn.ModuleList([_head(q_in, q_mid, n_out) for _ in range(n_modules)])
+        self.upper_heads = nn.ModuleList([_head(q_in, q_mid, n_out) for _ in range(n_modules)])
         if self.monotone_quantile_width:
-            if self.width_parameterisation == 'exp':
+            heads = list(self.lower_heads) + list(self.upper_heads)
+            if self.width_head_mode == 'power':
+                # Channel 0 is w0, channel 1 is the growth exponent. Start at w(5) = w0 and
+                # gamma = 1, i.e. width linear in lead time — exactly what four equal
+                # cumulative increments give, so 'power' starts where 'per_horizon' does.
+                b_w0 = math.log(math.expm1(max(self.initial_width_normalized, 1e-4)))
+                b_g = math.log(math.expm1(1.0))
+                for head in heads:
+                    nn.init.zeros_(head[-1].weight)
+                    head[-1].bias.data[0] = b_w0
+                    head[-1].bias.data[1] = b_g
+            elif self.width_parameterisation == 'exp':
                 # step = w0 * exp(raw); zero the output conv so every head starts at exactly
                 # w0, the same place the softplus bias below starts it.
-                for head in list(self.lower_heads) + list(self.upper_heads):
+                for head in heads:
                     nn.init.zeros_(head[-1].weight)
                     nn.init.zeros_(head[-1].bias)
             else:
                 # Each head's raw output passes through softplus and is accumulated, so bias
                 # the output conv to make the *first* increment a sensible interval rather than
                 # softplus(0) = 0.69 normalized units (~0.11 HM), which starts absurdly wide.
-                import math
                 b0 = math.log(math.expm1(max(self.initial_width_normalized, 1e-4)))
-                for head in list(self.lower_heads) + list(self.upper_heads):
+                for head in heads:
                     nn.init.constant_(head[-1].bias, b0)
 
     def _width_step(self, raw):
@@ -237,38 +275,80 @@ class SpatioTemporalPredictor(nn.Module):
         # zero head output is exactly "no change".
         hm_t0 = input_dynamic[:, -1, 0:1]
 
-        # Cumulative half-widths, so spread cannot shrink with lead time.
-        w_lo_cum = None
-        w_up_cum = None
+        # Central forecasts first: the quantile heads may need the predicted change, and the
+        # joint and power width heads need it for every horizon at once.
+        centrals = []
+        for h_idx in range(self.num_horizons):
+            pc = self.central_heads[h_idx](c_input)               # [B, 1, H, W]
+            if self.central_target_transform == 'asinh':
+                # A variance-stabilised output space for the change: near zero the map is
+                # linear with slope `scale`, and large changes are reachable without the
+                # head carrying large weights. sinh(0) = 0, so a zero-initialised output
+                # convolution still starts at exact persistence.
+                pc = self.central_transform_scale * torch.sinh(pc.clamp(-8.0, 8.0))
+            if self.central_residual:
+                pc = hm_t0 + pc
+            centrals.append(pc)
+
+        def _q_input_for(central):
+            """Head input, optionally carrying the detached predicted change.
+
+            Detached and built from hm_t0, which is a plain input, so no gradient path to
+            the trunk or the central heads is created; the isolation is unchanged.
+            """
+            if not self.quantile_dhat_context:
+                return q_input
+            dhat = (central.detach() - hm_t0) * self.dhat_context_scale
+            return torch.cat([q_input, dhat, dhat.abs()], dim=1)
+
+        # Half-widths per horizon, non-decreasing in lead time by construction.
+        w_lo, w_up = [], []
+        if not self.monotone_quantile_width:
+            pass
+        elif self.width_head_mode == 'per_horizon':
+            cum_lo = cum_up = None
+            for h_idx in range(self.num_horizons):
+                qi = _q_input_for(centrals[h_idx])
+                step_lo = self._width_step(self.lower_heads[h_idx](qi))
+                step_up = self._width_step(self.upper_heads[h_idx](qi))
+                cum_lo = step_lo if cum_lo is None else cum_lo + step_lo
+                cum_up = step_up if cum_up is None else cum_up + step_up
+                w_lo.append(cum_lo)
+                w_up.append(cum_up)
+        else:
+            # One module per side sees shared features and emits every horizon, so the shape
+            # of the growth in lead time is learned coherently. Conditioned on the
+            # longest-lead predicted change, which is the most informative of the four.
+            qi = _q_input_for(centrals[-1])
+            raw_lo = self.lower_heads[0](qi)
+            raw_up = self.upper_heads[0](qi)
+            if self.width_head_mode == 'joint':
+                cum_lo = torch.cumsum(self._width_step(raw_lo), dim=1)
+                cum_up = torch.cumsum(self._width_step(raw_up), dim=1)
+                w_lo = [cum_lo[:, i:i + 1] for i in range(self.num_horizons)]
+                w_up = [cum_up[:, i:i + 1] for i in range(self.num_horizons)]
+            else:  # 'power': w(h) = w0 * (h/5) ** gamma
+                w0_lo, g_lo = F.softplus(raw_lo[:, 0:1]), F.softplus(raw_lo[:, 1:2])
+                w0_up, g_up = F.softplus(raw_up[:, 0:1]), F.softplus(raw_up[:, 1:2])
+                for h_idx in range(self.num_horizons):
+                    ratio = float(h_idx + 1)          # (5,10,15,20) / 5
+                    lr = math.log(ratio)
+                    w_lo.append(w0_lo * torch.exp((g_lo * lr).clamp(max=8.0)))
+                    w_up.append(w0_up * torch.exp((g_up * lr).clamp(max=8.0)))
 
         for h_idx in range(self.num_horizons):
-            pred_central = self.central_heads[h_idx](c_input)     # [B, 1, H, W]
-            if self.central_residual:
-                pred_central = hm_t0 + pred_central
-
-            # The predicted change, detached, as a head input. Detached and derived from
-            # hm_t0 (a plain input), so no gradient path to the trunk or the central heads
-            # is created — the isolation is unchanged.
-            if self.quantile_dhat_context:
-                dhat = (pred_central.detach() - hm_t0) * self.dhat_context_scale
-                q_input_h = torch.cat([q_input, dhat, dhat.abs()], dim=1)
-            else:
-                q_input_h = q_input
-
+            pred_central = centrals[h_idx]
             if self.monotone_quantile_width:
                 # Anchor the interval to the central forecast, detached so the pinball loss
                 # still cannot reach the trunk or the central heads — the same gradient
                 # isolation as before, expressed structurally instead of by zeroing grads.
                 anchor = pred_central.detach()
-                step_lo = self._width_step(self.lower_heads[h_idx](q_input_h))
-                step_up = self._width_step(self.upper_heads[h_idx](q_input_h))
-                w_lo_cum = step_lo if w_lo_cum is None else w_lo_cum + step_lo
-                w_up_cum = step_up if w_up_cum is None else w_up_cum + step_up
-                pred_lower = anchor - w_lo_cum
-                pred_upper = anchor + w_up_cum
+                pred_lower = anchor - w_lo[h_idx]
+                pred_upper = anchor + w_up[h_idx]
             else:
-                pred_lower = self.lower_heads[h_idx](q_input_h)     # [B, 1, H, W]
-                pred_upper = self.upper_heads[h_idx](q_input_h)     # [B, 1, H, W]
+                qi = _q_input_for(pred_central)
+                pred_lower = self.lower_heads[h_idx](qi)           # [B, 1, H, W]
+                pred_upper = self.upper_heads[h_idx](qi)           # [B, 1, H, W]
 
             # Append in order: lower, central, upper for this horizon
             preds.extend([pred_lower, pred_central, pred_upper])
