@@ -215,6 +215,7 @@ configuration; two seeds of it bracket every comparison. Judgement is on RMSE (f
 | E3a loss on change | .00946 | .01478 | .01871 | .02231 | .676 | .188 | **worse** |
 | E4 cosine + clip | .00931 | .01434 | .01852 | .02188 | .764 | .157 | **null** |
 | **E5 Δ̂ to quantile heads** | .00930 | .01436 | .01845 | .02221 | **.681** | **.236** | **kept** |
+| E6b scale-norm pinball | .00942 | .01435 | .01844 | .02161 | .743 | .144 | **worse** |
 
 **Phase reference — adopted.** Better than all three incumbent seeds on five of six metrics
 with disjoint ranges. At two seeds against three the honest claim is "no worse, and it
@@ -234,6 +235,28 @@ so it is not decisive alone. What makes the result readable is the axis it was b
 `k_up` spread across the predicted-change axis inside a fixed (horizon × band) cell falls
 from a median max/min of 1.408 to 1.226, worst case 3.308 → 2.751. The central field is
 unchanged within the floor, as a quantile-only change should be.
+
+**E6b (scale-normalised pinball) — the registered prediction was wrong, and it failed in the
+opposite direction.** §3.1 predicted this was *the* experiment that should move the far field.
+It moved it the other way:
+
+| | ref s42 | ref s43 | E6b |
+|---|---|---|---|
+| 30–100 px, `k_up` at h=5 | 1.834 | 2.534 | **3.824** |
+| 30–100 px, `k_up(20)/k_up(5)` | 0.308 | 0.209 | **0.164** |
+| 10–30 px, same ratio | 0.594 | 0.538 | **0.220** |
+| within 20% | .196 | .181 | **.144** |
+
+The gradient argument behind the prediction may still describe the optimisation correctly —
+`d(step)/d(raw) = sigmoid(raw)` really is ~18× smaller at the far field's width — but the fix
+does not follow from it. Dividing the pinball by the pixel's own detached half-width is not a
+learning-rate change: the weighted mean is renormalised, and the half-width varies *within*
+each class, so the objective stops being "the 97.5 percentile of the residual" and becomes
+"the 97.5 percentile of the residual-to-width ratio". Those are different estimands with
+different optima, and the second is not the published quantity.
+
+Recorded as a loss rather than reinterpreted, because the prediction was written down before
+the run.
 
 ### 4.1 A correctness check that could not be run, and the reason
 
