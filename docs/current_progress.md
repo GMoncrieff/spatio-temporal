@@ -201,26 +201,19 @@ Headline before/after on the two defects that motivated the earlier head-only ch
 
 ## 4. Where the remaining leverage is
 
-> **The current phase is `docs/next_phase_marginals.md`** — making the marginals hold
-> *within* individual members. Scored per member rather than pooled, the observation falls
-> inside the member 5–95% range in **20%** of (year × distance-band) cells against ~90% for a
-> calibrated ensemble, with ranks pinned at 0/100 (every member too hot, near/mid bands) or
-> 100/100 (every member too cold, beyond 30 px). Diagnosed as marginal *shape* rather than
-> the correlation field: widths are uniformly ~1.6× too generous, but the +0.05 threshold
-> sits at 0.32 half-widths in the 0–1 px band and 5.88 in the 30–100 px band, so one global
-> factor cannot fix both.
+> **The marginal phase is complete — see `docs/next_phase_marginals.md` §5-6 for the record,
+> and `docs/next_phase_model.md` for what comes next.** Scorecard **90/126 → 101/127**,
+> per-member primary metric **7/20 → 15/20**, central-field skill unchanged at 0.1909. All of
+> it post-hoc; the model was never retrained. Two things worked: the marginal's tail bound
+> (raised on the *upper* side only, held down in the remote band) and per-class half-width
+> factors on three axes (distance × predicted change × HM level), fitted **uncentred**, out to
+> 10 px only. Four things were tried and rejected on evidence — per-band marginal *shapes*
+> (the phase's own H1), a central-forecast bias correction, and an HM-conditional tail bound
+> (rejected twice, on temporal and spatial held-out protocols).
 >
-> **H1 measured, and it is a negative result — see §5 of that document.** Conditioning the
-> shape on distance band does not help (7/20 cells inside at M=400, against the shipped
-> 7/20). The marginal's *tail bound*, exposed while testing it, does: **9/20**, mid bands
-> un-pinned from rank 400/400, and T8.1's far band 0.0997 → 1.2508 — the only configuration
-> that passes it. The bound has to be asymmetric (the upper tail is too thin, the lower
-> already 3–28× too hot) and held at 0.975 beyond 100 px (or remote stable country stops
-> being exactly zero). Settled as `SHAPE=measured` in `run_region_loop.sh`: scorecard 88/126
-> against 90/126, four rows moving, one of them T4.2 at 0.998 → 0.882 and the rest noise or
-> the target. The near bands stay pinned because T5.2's normalization stretches the residual
-> 1.3–3.3× to fill the published interval, which makes H2 (the width level) forced rather
-> than optional.
+> **T1.1 was closable after all**, contradicting item 2 below: a per-class width factor closed
+> it at three of four horizons (0.972/0.979/0.982 → 0.956/0.956/0.954) with no change to the
+> heads. The original entry was correct only for a *global* factor.
 
 **Done since this list was written.** Items 1, 2 and 3 below are addressed — see
 `docs/central_field_baseline.md`. The central field now beats persistence at every horizon;

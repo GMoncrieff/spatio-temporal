@@ -5,9 +5,15 @@ and 2.5/97.5 quantile intervals at +5/+10/+15/+20 yr, plus a post-hoc ensemble l
 (`src/ensemble/`) that adds spatial and temporal coherence on top of the per-pixel
 marginals.
 
-Active branch: **`ensemble`**. Read `docs/current_progress.md` for status and
-`docs/central_field_baseline.md` for the measurement record — including the negative
+Active branch: **`ensemble`**. Read `docs/current_progress.md` for status,
+`docs/next_phase_model.md` for the current phase, and `docs/central_field_baseline.md` plus
+`docs/next_phase_marginals.md` §5-6 for the measurement record — including the negative
 results, which are load-bearing.
+
+**The post-hoc marginal phase is closed** (scorecard 90/126 → 101/127, per-member 7/20 →
+15/20, model untouched). The lever is exhausted structurally: T5.2 pins the marginal to the
+published bounds, so any shape re-injects their width error. The current phase improves the
+ConvLSTM itself.
 
 ## Environment and scale
 
@@ -78,6 +84,14 @@ disagreement localises the bug to the generation path.
     marginal on distance band and raising its tail bound were introduced together and looked
     like a win. The pooled fit at the *same* raised bound beat both, so the band axis was
     carrying nothing.
+13. **Hold something out before believing a class-conditional fit.** A correction fitted to
+    the metric it is scored on will look good and not generalise: per-class tail bounds beat a
+    flat bound in sample and lost on two independent held-out protocols. Quantile *estimates*
+    on 15k+ pixels survived the same test; *metric minimisations* over ~60 events did not.
+14. **Southern Africa changes 2-4x less than Africa at every HM level**, and its `[0,0.01)`
+    stratum is 6% of the region against 40% of Africa. Regional iteration is right for speed,
+    but a stratified finding measured only there is provisional. Only w2000 reaches +20 yr
+    whatever the geography, so every h=20 number is in-sample in time.
 
 11. **A width factor must not be centred on the residual median.** `fit_residual_shape`
     centres because T5.1 pins the shape's median to zero; a *width* is centred on the
