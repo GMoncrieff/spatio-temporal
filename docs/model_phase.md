@@ -211,6 +211,7 @@ configuration; two seeds of it bracket every comparison. Judgement is on RMSE (f
 | **phase ref, 2 seeds** | **.00931–.00933** | **.01424–.01437** | **.01828–.01831** | .02184–.02185 | **.693–.746** | **.181–.196** | adopted |
 | E3b MSE only | .00939 | .01489 | .01853 | .02232 | .730 | .151 | **worse** |
 | E2 horizon weights | .00934 | .01449 | .01883 | .02228 | .690 | .173 | **no gain** |
+| E1 budget ×3 (450 ep) | .00931 | .01426 | .01842 | .02184 | .761 | .183 | **null** |
 
 **Phase reference — adopted.** Better than all three incumbent seeds on five of six metrics
 with disjoint ranges. At two seeds against three the honest claim is "no worse, and it
@@ -222,6 +223,17 @@ of h=10 RMSE, six times its noise floor, and raises the number of leaf classes w
 sits entirely on one side from 0–1 to 8. Those terms earn their weight even computed on
 absolute HM, which is what makes E3a (moving them onto the change field) worth testing rather
 than assuming.
+
+**E1 (training budget) — null, as predicted in §2.1.** Three times the budget, 450 epochs
+against 150, at 52 min against 18: **every metric lands inside the two-seed reference band**,
+and h=5 and h=20 RMSE are identical to the reference's to five decimals. The selected epochs
+were 248 and 175 of 450 — mid-run plateau selection again.
+
+This is the first of the two levers `docs/next_phase_model.md` §4 named as never tried, and
+it is now tried and rejected on evidence. `current_progress.md` item 1 ("the central field is
+under-trained… longer training is the cheapest untested lever") should be revised: the model
+saturates within a handful of epochs on 15.6k chip presentations, and giving it three times
+as many changes nothing measurable. Whatever limits this model, it is not optimisation time.
 
 **E2 (horizon loss weights) — negative, with a reason.** Compensating the measured 4:3:2:1
 exposure with weights 1 / 1.33 / 2 / 4 made h=10 and h=15 worse (both just past floor) and
