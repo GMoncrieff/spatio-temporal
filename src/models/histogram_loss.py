@@ -30,7 +30,11 @@ def soft_histogram(changes, bin_edges, mask=None, tau=None):
         tau = float(interior.min()) / 5.0 if interior.numel() else 0.002
     tau = max(float(tau), 1e-6)
 
-    x = changes.reshape(B, -1, 1)                        # [B, N, 1]
+    # The hard version masks by *indexing*, so invalid pixels never reach the arithmetic.
+    # This one is dense, and NaN * 0 is still NaN — so the invalid values have to be
+    # neutralised before the sigmoid, not after it. Getting this wrong makes every
+    # prediction NaN, which is how it was found.
+    x = torch.nan_to_num(changes, nan=0.0, posinf=0.0, neginf=0.0).reshape(B, -1, 1)
     lo = torch.sigmoid((x - edges[:-1]) / tau)           # [B, N, num_bins]
     hi = torch.sigmoid((x - edges[1:]) / tau)
     memb = lo - hi

@@ -167,6 +167,22 @@ def test_soft_histogram_carries_a_gradient_and_tracks_the_hard_one():
     assert float((p_soft.detach() - p_hard).abs().max()) < 0.05
 
 
+def test_soft_histogram_survives_nan_pixels():
+    """The predictions carry NaN at invalid pixels. The hard version masks by indexing so
+    they never reach the arithmetic; the soft one is dense, and NaN * 0 is still NaN.
+    Getting this wrong made every prediction NaN after 35 minutes of training."""
+    bins = torch.tensor([-1.0, -0.005, 0.005, 0.02, 0.1, 0.2, 0.4, 0.6, 1.0])
+    x = (torch.randn(2, 16, 16) * 0.05)
+    mask = torch.ones(2, 16, 16, dtype=torch.bool)
+    mask[:, :4] = False
+    x[:, :4] = float('nan')
+    x = x.requires_grad_(True)
+    counts, props = soft_histogram(x, bins, mask=mask)
+    assert torch.isfinite(counts).all() and torch.isfinite(props).all()
+    props.sum().backward()
+    assert torch.isfinite(x.grad).all()
+
+
 def test_nll_quantile_loss_prefers_the_width_that_matches_the_spread():
     """The log score must be minimised near the scale that generated the data, or it is not
     fitting a density."""
