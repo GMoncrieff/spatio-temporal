@@ -553,6 +553,70 @@ support the same setting.
 `joint` with 3-layer heads: `mean|ln k|` .703, `within 20%` .210, both inside the base range.
 Extra head capacity does not rescue the joint parameterisation.
 
+## 8. The downstream verdict, and the phase conclusion
+
+`power_plus` promoted to k=5 and pushed through the full chain, against E5 and the shipped
+configuration scored identically.
+
+| | baseline | E5 | E5 + power_plus |
+|---|---|---|---|
+| **scorecard** | 101/127 | **104/128** | **97/128** |
+| T1 / T2 / T8 | 29 / 31 / 11 | 29 / 32 / **12** | 27 / 29 / 9 |
+| per-member cells inside | 15/20 | 15/20 | **16/20** |
+| mean \|rank − M/2\| | 115.6 | **103.3** | 106.6 |
+| `mean\|ln k\|` (k=5) | .732 | **.686** | .823 |
+| within 20% (k=5) | .186 | **.193** | .152 |
+| growth ratio, mid | .391 | .565 | **.875** |
+
+**The prediction registered in §7 is confirmed.** `power_plus` fixes the lead-time growth
+profile and loses four scorecard rows for it, because the growth error is what the per-horizon
+post-hoc factors already correct while the per-class calibration cost is what they cannot.
+`within 20%` and `mean|ln k|` predicted a 105-minute downstream result in 40 seconds, which is
+the instrument earning its place.
+
+### 8.1 Conclusion — nothing is adopted
+
+**The shipped configuration stands at 101/127.** Across 22 experiments in three rounds:
+
+- every *optimisation* lever is dead — budget, schedule, loss weights, horizon balance, loss
+  composition, weight averaging;
+- every *capacity* lever is dead — trunk width, trunk depth, head depth, receptive field;
+- the two *objective* alternatives are worse, and one of them (Winkler) was provably the same
+  objective;
+- the one defect that was genuinely fixed and replicated — the lead-time growth profile — is
+  one the post-hoc layer already handles, and fixing it in the model costs more than it buys;
+- the one candidate that improved the scorecard (E5, 104/128) is inside its own
+  configuration's run-to-run spread, does not reproduce Africa-wide, and fails a hard gate.
+
+### 8.2 What this phase actually established
+
+1. **The central field is at an information ceiling, not a capacity or optimisation one.**
+   Twelve configurations varied h=5 RMSE by under 2%, tripling the budget did nothing, and
+   doubling or halving the trunk did nothing. The error is 27% larger on Africa, so the
+   ceiling belongs to the inputs.
+2. **The width defect that motivated the phase is largely a southern-Africa artifact.** Both
+   configurations are about twice as well calibrated Africa-wide (`mean|ln k|` 0.39 vs 0.73).
+   The regional protocol is right for speed and wrong for target selection.
+3. **The screening protocol used in round 1 could not resolve the effects being chased.** One
+   run per configuration against a floor borrowed from a different configuration produced a
+   win that replication removed. Rounds 2 and 3 fixed this and it changed the answers.
+4. **Two objective facts about the loss**: the histogram term has never trained anything and
+   is harmful when made live; and pinball's bounded influence is what makes it right for a
+   residual with kurtosis ~10³, where Gaussian NLL inflates the widths by 7×.
+
+### 8.3 What to do next, in order
+
+1. **Rescore the E5 k=5 ensemble at M ≥ 800.** §5.3 shows E5's residual is spikier at every
+   horizon, and its two lost rows are both percentile-estimated. Cheap, and it decides
+   whether 104/128 was an understatement.
+2. **Replicate E5 at k=5** (~105 min per replicate). It is the only candidate with a positive
+   downstream reading and the only thing blocking it is that one run cannot establish it.
+3. **Stop optimising against southern-Africa width statistics.** If the width heads are
+   revisited, judge them Africa-wide, where the defect is smaller and the central error larger.
+4. **If the central field is to improve, it needs new information, not new architecture.**
+   Every internal lever is now measured and dead. That is a covariate question, which this
+   phase was scoped out of.
+
 ## 4. Results
 
 Screening: folds 1 and 2, scored on identical pixels (1,542,872 at h=5). The phase reference
