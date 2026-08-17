@@ -39,6 +39,38 @@ from src.ensemble import aggregate as agg  # noqa: E402
 from compare_marginal_renders import HM_DIR, pick_windows, read_like  # noqa: E402
 
 
+def spread_windows(d_obs, size=768, n=3, n_candidates=400, seed=0):
+    """``n`` windows spanning the observed-change spectrum, busiest first.
+
+    ``pick_windows`` returns the two extremes, which is the right choice when the question
+    is "where do the two regimes fail differently". When the question is instead "what does
+    this model look like across the domain", two extremes are misleading — they are the
+    tails. This samples candidate windows, ranks them by mean |Δ observed|, and returns
+    evenly spaced quantiles of that ranking so the set brackets *and* fills the range.
+
+    Candidates must be substantially on land: a window that is 90% ocean scores as quiet for
+    a reason that has nothing to do with the forecast.
+    """
+    H, W = d_obs.shape
+    rng = np.random.default_rng(seed)
+    cands = []
+    for _ in range(n_candidates):
+        r0 = int(rng.integers(0, max(1, H - size)))
+        c0 = int(rng.integers(0, max(1, W - size)))
+        sub = d_obs[r0:r0 + size, c0:c0 + size]
+        finite = np.isfinite(sub)
+        if finite.mean() < 0.6:
+            continue
+        cands.append((float(np.nanmean(np.abs(sub))), (r0, c0)))
+    if not cands:
+        return pick_windows(d_obs, size=size)
+    cands.sort(key=lambda t: -t[0])
+    n = min(n, len(cands))
+    idx = [int(round(i * (len(cands) - 1) / max(n - 1, 1))) for i in range(n)]
+    names = ["busiest", "mid-change", "quietest"] if n == 3 else [f"q{i + 1}" for i in range(n)]
+    return {names[i] if i < len(names) else f"w{i}": cands[j][1] for i, j in enumerate(idx)}
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -52,6 +84,11 @@ def main(argv=None):
     ap.add_argument("--seed", type=int, default=0,
                     help="Picks the random members; fixed so the figure is reproducible.")
     ap.add_argument("--out_dir", required=True)
+    ap.add_argument("--n_windows", type=int, default=0,
+                    help="Instead of the default busiest/quietest pair, take this many "
+                         "windows spanning the observed-change spectrum — busiest, then "
+                         "evenly spaced quantiles down to the quietest. Use when the point "
+                         "is to see the same model across several regimes.")
     ap.add_argument("--wandb_project", default="spatio-temporal-convlstm")
     ap.add_argument("--wandb_group", default="marginal-comparison")
     ap.add_argument("--wandb_run_name", default=None)
@@ -91,7 +128,11 @@ def main(argv=None):
         valid = np.isfinite(cen) & np.isfinite(hm0) & np.isfinite(obs)
         d_obs_full = np.where(valid, obs - hm0, np.nan)
 
-        for wname, (r0, c0) in pick_windows(d_obs_full, size=args.size).items():
+        if args.n_windows > 0:
+            wins = spread_windows(d_obs_full, size=args.size, n=args.n_windows)
+        else:
+            wins = pick_windows(d_obs_full, size=args.size)
+        for wname, (r0, c0) in wins.items():
             sl = (slice(r0, r0 + args.size), slice(c0, c0 + args.size))
             win = (r0, r0 + args.size, c0, c0 + args.size)
             h0 = hm0[sl]

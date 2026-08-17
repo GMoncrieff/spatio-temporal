@@ -33,11 +33,19 @@ MEMBERS="${2:-20}"
 PY="${PY:-/home/glenn/miniforge3/envs/spatio-temporal-dl/bin/python}"
 GPUS="${GPUS:-0,1}"
 ROOT="data/ensemble/exp/${NAME}"
-REGION_ROOT="data/ensemble/region/southern_africa"
+# The region whose fold mask, ecoregion raster and distance covariate the loop scores
+# against. Southern Africa by default (CLAUDE.md: all iteration is regional); set
+# REGION_ROOT=data/ensemble/region/africa to run the same loop on the Africa extent, whose
+# assets are cropped from the global rasters on the identical window.
+REGION_ROOT="${REGION_ROOT:-data/ensemble/region/southern_africa}"
+# Base year of the prediction window. The hindcast loop scores w2000 -> 2005..2020; a
+# forward product would set BASE_YEAR=2020 and YEARS=2025,2030,2035,2040.
+BASE_YEAR="${BASE_YEAR:-2000}"
+YEARS="${YEARS:-2005,2010,2015,2020}"
 BLOCKS="${BLOCKS:-1,10,100}"
 PAIRS="${PAIRS:-80000}"
 MAXLAG="${MAXLAG:-256}"
-DIST_RASTER="${REGION_ROOT}/covariates/w2000_dist_past_change.tif"
+DIST_RASTER="${REGION_ROOT}/covariates/w${BASE_YEAR}_dist_past_change.tif"
 SHAPE="${SHAPE:-none}"
 WIDTHS="${WIDTHS:-none}"
 SUFFIX="${SUFFIX:-}"
@@ -134,9 +142,9 @@ fi
 echo "=== ${NAME} · Phase 3: ensemble on the recalibrated marginals ==="
 $PY -u scripts/generate_ensemble.py \
     --central_dir "$RECAL_DIR" --recal_dir "$RECAL_DIR" \
-    --central_pattern 'w2000_prediction_{year}_central_recal.tif' \
-    --recal_pattern 'w2000_prediction_{year}_{q}_recal.tif' \
-    --years 2005,2010,2015,2020 --base_year 2000 --members "$MEMBERS" \
+    --central_pattern "w${BASE_YEAR}_prediction_{year}_central_recal.tif" \
+    --recal_pattern "w${BASE_YEAR}_prediction_{year}_{q}_recal.tif" \
+    --years "$YEARS" --base_year "$BASE_YEAR" --members "$MEMBERS" \
     --spectral_fits "${ROOT}/spectral_fits.json" \
     --variogram_fits "${ROOT}/diagnostics/variogram_fits.csv" \
     --rho_json "${ROOT}/residuals/horizon_autocorrelation.json" \
@@ -147,9 +155,9 @@ $PY -u scripts/generate_ensemble.py \
 echo "=== ${NAME} · Phase 3: independent-pixel null (same marginals, no spatial structure) ==="
 $PY -u scripts/generate_ensemble.py \
     --central_dir "$RECAL_DIR" --recal_dir "$RECAL_DIR" \
-    --central_pattern 'w2000_prediction_{year}_central_recal.tif' \
-    --recal_pattern 'w2000_prediction_{year}_{q}_recal.tif' \
-    --years 2005,2010,2015,2020 --base_year 2000 --members "$MEMBERS" --independent \
+    --central_pattern "w${BASE_YEAR}_prediction_{year}_central_recal.tif" \
+    --recal_pattern "w${BASE_YEAR}_prediction_{year}_{q}_recal.tif" \
+    --years "$YEARS" --base_year "$BASE_YEAR" --members "$MEMBERS" --independent \
     --spectral_fits "${ROOT}/spectral_fits.json" \
     --variogram_fits "${ROOT}/diagnostics/variogram_fits.csv" \
     --rho_json "${ROOT}/residuals/horizon_autocorrelation.json" \
