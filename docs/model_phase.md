@@ -502,6 +502,57 @@ in every window-horizon row — a number that cannot be true — rather than by 
 is now the fifth time in this project that has been the detection mechanism. Fixed, pinned by
 a test, and re-queued.
 
+## 7. Round 3 — replication, and what survives it
+
+Round 2's two apparent width-head wins were each run again at a second seed. **This is the
+step that decides everything**, given §5.5.
+
+| group (n) | mean\|ln k\| | within 20% | growth mid (10–30 px) | growth far (30–100 px) |
+|---|---|---|---|---|
+| base (3) | .681–.769 | .179–.236 | .252–.414 | .077–.354 |
+| power (2) | **.787–.810** ✗ | .179–.184 | **.899–1.230** ✓ | .337–.812 |
+| joint (2) | .653–.702 | .190–.255 | .422–.533 | .128–.148 |
+| power_plus (2) | .752–.876 | **.139–.148** ✗ | **.759–1.097** ✓ | **.521–.600** ✓ |
+
+Growth ratio is `k_up(20)/k_up(5)`; 1.0 means the interval grows with lead time exactly as the
+residual's spread does.
+
+**What replicates.** Both power modes fix the lead-time growth in the mid field, with ranges
+that do not overlap the base at all — and `power_plus` also fixes the far field without
+overlap. That is the only replicated, non-overlapping improvement in the whole phase, and it
+is on the quantity §3.1 identified as most wrong.
+
+**What does not.** `joint`'s round-2 numbers (`mean|ln k|` .653, `within 20%` .255) were a
+favourable draw: the replicate lands at .702 and .190, both inside the base range. The
+stricter bar of §6.1 had already called it null; replication confirmed the bar rather than the
+first result.
+
+**What it costs.** `power` is worse on `mean|ln k|` with no overlap; `power_plus` is worse on
+`within 20%` with no overlap. Neither restructuring is free.
+
+**And there is a reason to expect the cost to matter more than the gain.**
+`fit_width_factors.py` fits its factors per (horizon × band × Δ̂ × HM) — *per horizon* — so a
+wrong lead-time growth profile is precisely the error the post-hoc layer already corrects,
+while `within 20%` measures the correction still outstanding. On the metric that predicts
+downstream benefit, `power_plus` is worse than base. The downstream run exists to settle that
+conflict rather than to confirm a guess.
+
+### 7.1 The histogram loss should stay off, now for a measured reason
+
+Fixed and re-run, the differentiable histogram is **decisively worse**: RMSE at h=20 is
+0.02368 against a base range of 0.02178–0.02225, outside by 3.1× the spread (+6.4%), with
+h=15 worse too. Its rarity weights upweight the rare large-change bins by roughly 240× over
+the no-change bin, so a live version pushes the model to reproduce the marginal *distribution*
+of change at the expense of the conditional mean — which is what RMSE measures.
+
+So the term was inert by accident and should be off by choice. Two independent reasons now
+support the same setting.
+
+### 7.2 Round-3 nulls
+
+`joint` with 3-layer heads: `mean|ln k|` .703, `within 20%` .210, both inside the base range.
+Extra head capacity does not rescue the joint parameterisation.
+
 ## 4. Results
 
 Screening: folds 1 and 2, scored on identical pixels (1,542,872 at h=5). The phase reference
