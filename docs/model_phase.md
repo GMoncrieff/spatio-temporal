@@ -406,6 +406,102 @@ that measurement should be made before this configuration is published.
 Honest summary of the size of the win: small, region-specific, and resting on a single k=5
 run per configuration.
 
+## 6. Round 2 — substantial changes to architecture and objective
+
+Round 1 established that no *optimisation* lever moves this model. Round 2 therefore changes
+what the model can express. Base is the round-1 candidate (E5), run three times so the bar is
+that configuration's own spread.
+
+### 6.1 How round 2 is judged, and why the round-1 bar was wrong
+
+A single new draw falls outside the range of three base runs roughly half the time under the
+null, so "outside the base range" is barely a test at all. **The bar used here is that the
+margin beyond the base range must exceed the range's own width.** Applying the looser test
+first produced two false positives that the stricter one removes (`r2_wjoint`, `r8_asinh`),
+which is exactly the failure mode round 1 fell into with a floor borrowed from a different
+configuration.
+
+| run | rmse5 | rmse10 | rmse15 | rmse20 | mean\|ln k\| | within20 | growth (far) |
+|---|---|---|---|---|---|---|---|
+| base ×3 | .00930–.00938 | .01434–.01441 | .01831–.01919 | .02178–.02225 | .681–.769 | .179–.236 | .077–.354 |
+| **r1_wpower** | .00932 | **.01426** | .01829 | .02178 | .787 | .184 | **0.812** |
+| r2_wjoint | .00936 | .01432 | .01832 | .02172 | .653 | .255 | .128 |
+| r3_headdeep | .00936 | .01448 | .01872 | .02165 | .724 | .237 | .427 |
+| r6_nll | .00933 | .01436 | .01838 | .02176 | **1.008** | .126 | .392 |
+| r8_asinh | .00931 | .01433 | .01888 | .02172 | .768 | .157 | .365 |
+| r4_wide (dim 128) | .00934 | .01435 | .01844 | .02180 | .713 | .151 | .140 |
+| r5_shallow (2 layers) | .00937 | .01430 | .01866 | .02185 | .857 | .150 | .302 |
+
+Clearing the bar:
+
+| run | result |
+|---|---|
+| **r1_wpower** | growth ratio **better by 1.7×** the base spread; rmse10 better by 1.1× |
+| r6_nll | `mean\|ln k\|` **worse by 2.7×** |
+| r3_headdeep | rmse10 worse by 1.0× |
+| r5_shallow | `mean\|ln k\|` worse by 1.0× |
+| r2_wjoint, r8_asinh, r4_wide | nothing clears the bar |
+
+### 6.2 The power-law width head fixes the defect it was built for
+
+`k_up(20)/k_up(5)` is how much too fast the interval grows with lead time; 1.0 is correct.
+
+| run | 10–30 px | 30–100 px |
+|---|---|---|
+| base s42 | 0.414 | 0.354 |
+| base s43 | 0.252 | 0.105 |
+| e5_dhat | — | 0.077 |
+| **r1_wpower** | **1.230** | **0.812** |
+
+The base has the far-field width growing three to nine times too fast. Parameterising it as
+`w(h) = w0·(h/5)^γ` — two per-pixel parameters instead of four free increments — brings both
+bands to essentially correct. Its `mean|ln k|` is *not* better (0.787 against .681–.769), so
+the two parameters buy a correct growth **shape** at some cost in per-horizon level freedom.
+That trade is what `power_plus` was added to test.
+
+### 6.3 Why the log score fails, which is more useful than that it fails
+
+`r6_nll` fits (lower, central, upper) as a two-piece normal by log score. It is the worst
+result of either round on width calibration, and **in the opposite direction to the
+expectation** — the intervals got far *wider*, not narrower:
+
+| band, h=5 | base `k_up` | NLL `k_up` |
+|---|---|---|
+| 10–30 px | 0.743 | 0.157 |
+| 30–100 px | 1.517 | 0.198 |
+
+Gaussian NLL is not robust. Its quadratic term is dominated by rare extreme residuals — this
+residual has kurtosis 928–20366 — while the `log(σ_lo+σ_up)` penalty resists only
+logarithmically, so a handful of outliers inflate the fitted scale. **Pinball at 0.025/0.975
+has bounded influence per pixel and cannot be dragged that way.** This is a positive
+justification for the incumbent objective rather than merely a failed alternative.
+
+### 6.4 The trunk is not the bottleneck in any dimension
+
+| change | result |
+|---|---|
+| training budget ×3 (E1) | null |
+| receptive field, dilations 1/2/4/8 (E7) | worse |
+| width, `hidden_dim` 64 → 128 (r4) | null, at 2× the wall clock |
+| depth, `num_layers` 4 → 2 (r5) | null centrally |
+| head depth 1 → 3 (r3) | rmse10 worse |
+
+Doubling the trunk changes nothing and halving its depth costs nothing measurable centrally.
+Together with round 1 this says the trunk is **over-specified for what these inputs support**,
+and that the central field is at an information ceiling rather than a capacity or
+optimisation one. The Africa comparison (§5.4) points the same way from the other side: the
+central error is 27% larger there, so the ceiling is a property of the data available, not of
+the model.
+
+### 6.5 A bug worth recording
+
+`r7_softhist` produced rasters with **zero valid pixels** after 35 minutes. `compute_histogram`
+masks by indexing, so invalid pixels never reach the arithmetic; the soft version is dense and
+applied the mask *after* the sigmoid, and NaN × 0 is still NaN. It announced itself as `0 px`
+in every window-horizon row — a number that cannot be true — rather than by inspection, which
+is now the fifth time in this project that has been the detection mechanism. Fixed, pinned by
+a test, and re-queued.
+
 ## 4. Results
 
 Screening: folds 1 and 2, scored on identical pixels (1,542,872 at h=5). The phase reference
