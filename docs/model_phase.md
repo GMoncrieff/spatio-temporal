@@ -657,6 +657,55 @@ as §5.3 predicted.**
 What this does **not** settle is replication — both k=5 numbers remain single runs, and §5.5's
 objection stands until the seed-43 replicate lands.
 
+## 10. The k=5 replicate — E5 is not an improvement, and the downstream itself is noisy
+
+§5.5 said E5 needed k=5 replicates before it could be believed. Seed 43 was trained through
+the identical chain.
+
+| | baseline | E5 seed 42 | E5 seed 43 |
+|---|---|---|---|
+| **scorecard** | 101/127 | 104/128 | **97/128** |
+| per-member cells inside | 15/20 | 15/20 | 14/20 |
+| mean \|rank − M/2\| | 115.6 | 103.3 | 124.5 |
+| T2 / T8 | 31 / 11 | 32 / 12 | 30 / 9 |
+
+**On every downstream metric the two E5 seeds bracket the baseline.** The effect does not
+replicate. E5 is not an improvement.
+
+### 10.1 The measurement that matters more than the verdict
+
+**Two runs of one configuration differ by 7 scorecard rows out of 128 at k=5.** That is the
+project's decisive test, on all five folds and 4.36 million pixels, and its run-to-run spread
+**exceeds every effect this phase measured** (+3 rows for E5 at M=400, +6 at M=800, −4 for
+power_plus).
+
+The stratified metrics behaved better than the scorecard: the *central* improvement did
+replicate (the baseline is worse than both E5 seeds at h=5, h=10 and h=15) and `within 20%`
+did, while `mean|ln k|` and every downstream metric did not. So the cheap instruments were not
+the weak link — the scorecard is noisier than the thing it is being asked to resolve.
+
+This applies retrospectively. Every scorecard comparison in this project has been one run per
+configuration. The large historical moves — 73/137 → 91/128 for the central-field phase,
+90/126 → 101/127 for the marginal phase — are +18 and +11 rows and comfortably clear a
+7-row band. **Anything within ±7 rows is not resolvable without replicates**, which
+includes the whole of this phase.
+
+### 10.2 What the M=800 result still supports, and what it does not
+
+**Stands:** the hard gate was a finite-M artifact. It has a mechanism measured in advance
+(E5's `S'(0)` down 24–43%), a control (the baseline gains 3–8× less from the same change),
+and a replication of the phenomenon (seed 42 fails T5.1 at 2015, seed 43 at 2020 — a
+different horizon, which is what a near-gate marginal does and what a lead-time-specific
+defect does not).
+
+**Does not stand:** the "+6 rows at M=800" reading. That compared one E5 seed against one
+baseline run, and 6 is inside the 7-row spread — using the favourable seed.
+
+### 10.3 Final verdict
+
+**Nothing from the model phase is adopted. The shipped configuration stands at 101/127.**
+E5 was the last candidate and replication removed it.
+
 ## 4. Results
 
 Screening: folds 1 and 2, scored on identical pixels (1,542,872 at h=5). The phase reference
