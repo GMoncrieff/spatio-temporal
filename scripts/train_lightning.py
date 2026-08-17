@@ -361,7 +361,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--width_head_mode", type=str, default="per_horizon",
-        choices=["per_horizon", "joint", "power"],
+        choices=["per_horizon", "joint", "power", "power_plus"],
         help="How the four horizons' half-widths are produced. 'joint' emits all four from "
              "one module so the growth profile in lead time is learned coherently; 'power' "
              "parameterises it as w(h) = w0 * (h/5)**gamma, two per-pixel parameters, which "

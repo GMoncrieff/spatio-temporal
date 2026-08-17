@@ -107,7 +107,7 @@ def test_head_depth_adds_parameters_and_keeps_the_output_shape():
         assert deep(d, s, quantile_context=ctx).shape == shallow(d, s, quantile_context=ctx).shape
 
 
-@pytest.mark.parametrize("mode", ["joint", "power"])
+@pytest.mark.parametrize("mode", ["joint", "power", "power_plus"])
 def test_alternative_width_heads_stay_positive_and_monotone(mode):
     d, s, ctx = inputs()
     m = build(**BASE, width_head_mode=mode)

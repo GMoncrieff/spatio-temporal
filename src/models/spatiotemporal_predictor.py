@@ -148,7 +148,13 @@ class SpatioTemporalPredictor(nn.Module):
         #                   to be wrong: the far field's width grows 3.7-8.9x too fast with
         #                   lead time (k_up(20)/k_up(5) = 0.27 and 0.11 against 0.82-0.92
         #                   in the near field).
-        if width_head_mode not in ('per_horizon', 'joint', 'power'):
+        #   'power_plus'  — a power law plus a *monotone additive* correction per horizon,
+        #                   w(h) = w0*(h/5)**gamma + cumsum(softplus(extra))_h. The power law
+        #                   supplies the growth shape 'power' gets right and the correction
+        #                   restores the per-horizon level freedom 'joint' gets right, while
+        #                   staying non-decreasing because both terms are. Initialised with
+        #                   the correction negligible, so it starts exactly at 'power'.
+        if width_head_mode not in ('per_horizon', 'joint', 'power', 'power_plus'):
             raise ValueError(f"unknown width_head_mode {width_head_mode!r}")
         self.width_head_mode = str(width_head_mode)
         # 'asinh' gives the central head a variance-stabilised output space: the change is
@@ -190,22 +196,26 @@ class SpatioTemporalPredictor(nn.Module):
         # of the width's growth in lead time is a learned function of shared features.
         q_in = hidden_dim + self.quantile_context_channels + n_dhat
         q_mid = hidden_dim // 2
-        n_out = {'per_horizon': 1, 'joint': self.num_horizons, 'power': 2}[self.width_head_mode]
+        n_out = {'per_horizon': 1, 'joint': self.num_horizons, 'power': 2,
+                 'power_plus': 2 + self.num_horizons}[self.width_head_mode]
         n_modules = self.num_horizons if self.width_head_mode == 'per_horizon' else 1
         self.lower_heads = nn.ModuleList([_head(q_in, q_mid, n_out) for _ in range(n_modules)])
         self.upper_heads = nn.ModuleList([_head(q_in, q_mid, n_out) for _ in range(n_modules)])
         if self.monotone_quantile_width:
             heads = list(self.lower_heads) + list(self.upper_heads)
-            if self.width_head_mode == 'power':
+            if self.width_head_mode in ('power', 'power_plus'):
                 # Channel 0 is w0, channel 1 is the growth exponent. Start at w(5) = w0 and
                 # gamma = 1, i.e. width linear in lead time — exactly what four equal
                 # cumulative increments give, so 'power' starts where 'per_horizon' does.
                 b_w0 = math.log(math.expm1(max(self.initial_width_normalized, 1e-4)))
                 b_g = math.log(math.expm1(1.0))
+                b_extra = math.log(math.expm1(1e-4))   # negligible additive correction
                 for head in heads:
                     nn.init.zeros_(head[-1].weight)
                     head[-1].bias.data[0] = b_w0
                     head[-1].bias.data[1] = b_g
+                    if self.width_head_mode == 'power_plus':
+                        head[-1].bias.data[2:] = b_extra
             elif self.width_parameterisation == 'exp':
                 # step = w0 * exp(raw); zero the output conv so every head starts at exactly
                 # w0, the same place the softplus bias below starts it.
@@ -327,14 +337,22 @@ class SpatioTemporalPredictor(nn.Module):
                 cum_up = torch.cumsum(self._width_step(raw_up), dim=1)
                 w_lo = [cum_lo[:, i:i + 1] for i in range(self.num_horizons)]
                 w_up = [cum_up[:, i:i + 1] for i in range(self.num_horizons)]
-            else:  # 'power': w(h) = w0 * (h/5) ** gamma
+            else:  # 'power' / 'power_plus': w(h) = w0 * (h/5)**gamma [+ monotone correction]
                 w0_lo, g_lo = F.softplus(raw_lo[:, 0:1]), F.softplus(raw_lo[:, 1:2])
                 w0_up, g_up = F.softplus(raw_up[:, 0:1]), F.softplus(raw_up[:, 1:2])
+                add_lo = add_up = None
+                if self.width_head_mode == 'power_plus':
+                    add_lo = torch.cumsum(F.softplus(raw_lo[:, 2:]), dim=1)
+                    add_up = torch.cumsum(F.softplus(raw_up[:, 2:]), dim=1)
                 for h_idx in range(self.num_horizons):
-                    ratio = float(h_idx + 1)          # (5,10,15,20) / 5
-                    lr = math.log(ratio)
-                    w_lo.append(w0_lo * torch.exp((g_lo * lr).clamp(max=8.0)))
-                    w_up.append(w0_up * torch.exp((g_up * lr).clamp(max=8.0)))
+                    lr = math.log(float(h_idx + 1))    # (5,10,15,20) / 5
+                    wl = w0_lo * torch.exp((g_lo * lr).clamp(max=8.0))
+                    wu = w0_up * torch.exp((g_up * lr).clamp(max=8.0))
+                    if add_lo is not None:
+                        wl = wl + add_lo[:, h_idx:h_idx + 1]
+                        wu = wu + add_up[:, h_idx:h_idx + 1]
+                    w_lo.append(wl)
+                    w_up.append(wu)
 
         for h_idx in range(self.num_horizons):
             pred_central = centrals[h_idx]
