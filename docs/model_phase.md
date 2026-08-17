@@ -617,6 +617,46 @@ the instrument earning its place.
    Every internal lever is now measured and dead. That is a covariate question, which this
    phase was scoped out of.
 
+## 9. Rescored at M=800 — the finite-M penalty was real, and it was hiding a larger gap
+
+§5.3 predicted from a measured mechanism that E5's two lost rows were finite-M artifacts:
+its fitted marginal is spikier at the median at every horizon (`S'(0)` down 24–43%), which
+makes the sample median a noisier estimator in value units, and h=15 was the horizon already
+closest to the gate. Both configurations were regenerated at M=800 from their own existing
+recal rasters, spectrum, width factors and marginal shape — nothing retrained — and rescored.
+
+**The prediction holds, and the control confirms the mechanism.** T5.1, gain from M=400 to
+M=800:
+
+| horizon | baseline | E5 |
+|---|---|---|
+| 2005 | 0.9982 → 0.9985 (+0.0003) | 0.9960 → 0.9982 (+0.0022) |
+| 2010 | 0.9985 → 0.9989 (+0.0004) | 0.9991 → 0.9994 (+0.0003) |
+| **2015** | 0.9958 → 0.9984 (+0.0026) | **0.9888 → 0.9957 (+0.0069)** |
+
+The baseline, with the flatter marginal, barely moves; E5 gains two to three times as much and
+**clears the hard gate**. T2.5's rank histogram at 2015 also recovers (p 0.0075 → 0.660). E5's
+T5 goes 11/12 → 12/12.
+
+**And the matched comparison moves the other way from what M=400 suggested:**
+
+| | M=400 | M=800 |
+|---|---|---|
+| baseline | 101/127 | **99/127** |
+| E5 | 104/128 | **105/128** |
+| E5 lead | +3 rows | **+6 rows** |
+
+By family at M=800 the lead is T2 +3, T3 +1, T6 +1, T8 +1.
+
+**The baseline gets worse with more members while E5 gets better.** That is exactly the
+mechanism `docs/next_phase_marginals.md` recorded when an M=100 comparison between marginal
+families reversed at M=400: MC-scaled tolerances tighten as 1/√M, so a higher member count
+exposes error that a looser tolerance was hiding. **The M=400 comparison was understating E5,
+as §5.3 predicted.**
+
+What this does **not** settle is replication — both k=5 numbers remain single runs, and §5.5's
+objection stands until the seed-43 replicate lands.
+
 ## 4. Results
 
 Screening: folds 1 and 2, scored on identical pixels (1,542,872 at h=5). The phase reference
