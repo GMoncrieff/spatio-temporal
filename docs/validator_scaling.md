@@ -201,3 +201,53 @@ that were invisible at the smaller extent. The useful conclusion for the global 
 narrower than the headline: **the central field and the marginals travel; the correlation
 structure and the far-field change realism do not, and were being flattered by the region
 they were tuned on.**
+
+---
+
+## 8. Why the folds disagree: two runs, and the answer is "not the data"
+
+The checkerboard is fold-model disagreement on the upper bound, so the question is what
+drives that disagreement — the fact that each fold trained on a different 80% of the world,
+or the fact that training is noisy. Repeated k-fold CV would average it away at 5x the
+budget, but only the first answer would justify the spend.
+
+Fold 1 was retrained twice more with the africa_k5 configuration unchanged in every flag
+except `--seed` (7 and 1234, against the original 42). Same held-out geography, so anything
+these three disagree about is training noise. Scored on the 309,163 pixels finite in all
+five folds and all three seeds, as mean pairwise |a − b| at +20 yr:
+
+| upper half-width | mean pairwise difference | share of the 0.085 level |
+|---|---|---|
+| seed-to-seed (same fold, 3 seeds) | **0.0308** | 36% |
+| fold-to-fold (5 folds, same seed) | 0.0335 | 40% |
+
+**Only 8% of the fold-to-fold difference comes from the data.** Retrain the same model on
+the same 80% with a different seed and you get a width field that differs almost as much as
+one trained on a different fifth of the world. The central field behaves the same way but
+an order of magnitude smaller in absolute terms (0.0043 vs 0.0053, 20% data-driven).
+
+Treating the mean absolute difference as proportional to a standard deviation, the
+fold-to-fold spread decomposes into a **0.0308 training-noise** component and a **0.0132
+data-driven** one. That sets what averaging can buy:
+
+| | R=2 | R=5 | R=10 |
+|---|---|---|---|
+| repeat seeds, fold mask fixed | 1.32x | 1.76x | 2.04x |
+| repeated k-fold (folds reshuffled too) | 1.41x | 2.24x | 3.16x |
+
+Three things follow.
+
+* **Repeated k-fold at R=5 shrinks the seam ~2.2x, not to zero.** From 2.01x the within-fold
+  step to about 1.45x, and in quiet country from 47x the local background to roughly 21x.
+* **You do not need repeated *k-fold* for most of it.** Averaging R seeds at a *fixed* fold
+  mask is still strictly out of sample — every model in the average excluded that pixel —
+  and captures the 92% noise component. Reshuffling the folds as well buys the remaining
+  8%, at the same cost. Repeated k-fold is the better of the two (1.76x vs 2.24x at R=5),
+  but not by the margin its name suggests.
+* **The cheapest lever is not averaging at all.** If 92% of the disagreement is optimisation
+  noise, the training recipe is the defect. `--weight_avg_last` already exists for exactly
+  this — its own help text records the checkpoint pick landing on epoch 140/85/60 across
+  three seeds of one configuration while the best 10% of epochs sat within 3% of the
+  minimum. Switching the monitor to `val_central_loss` (the e5_africa configuration) already
+  cut the fold-to-fold upper-width spread from 0.0335 to 0.0275, an 18% reduction for free.
+  Weight averaging is the obvious next test, at 1x budget rather than 5x.
