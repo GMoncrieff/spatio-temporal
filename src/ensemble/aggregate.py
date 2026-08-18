@@ -19,12 +19,33 @@ from .validate import _stripe_rows
 # --------------------------------------------------------------------------------------
 # Store access
 # --------------------------------------------------------------------------------------
-def open_ensemble(path):
+ARRAY_NAME = "members"
+
+# Read-only sessions are pinned here for the life of the process. The zarr array holds the
+# session's store, but nothing holds the session, and letting it be collected pulls the
+# store out from under an array that is still being read.
+_OPEN_SESSIONS = []
+
+
+def open_ensemble(path, branch: str = "main"):
+    """``(array, attrs)`` for an ensemble stored as an icechunk repository.
+
+    Ensembles are icechunk rather than a bare zarr directory because the write is
+    transactional: two GPU workers write disjoint member blocks into a forked session and
+    the snapshot only exists once both have been merged and committed. The previous
+    plain-zarr store had no such boundary, so a run killed part-way — which is exactly how
+    the Africa scorecard ended — left a directory that looked like a complete ensemble and
+    read back as sentinel.
+    """
+    import icechunk
     import zarr
 
-    z = zarr.open(str(path), mode="r")
-    attrs = dict(z.attrs)
-    return z, attrs
+    repo = icechunk.Repository.open(icechunk.local_filesystem_storage(str(path)))
+    session = repo.readonly_session(branch)
+    _OPEN_SESSIONS.append(session)
+    root = zarr.open_group(session.store, mode="r")
+    arr = root[ARRAY_NAME]
+    return arr, dict(arr.attrs)
 
 
 def dequantize_block(q, attrs):
@@ -32,6 +53,33 @@ def dequantize_block(q, attrs):
     offset = float(attrs.get("offset", 0.0))
     out = q.astype(np.float32) * scale + offset
     return np.where(q == INT16_SENTINEL, np.nan, out)
+
+
+def members_at_points(store, attrs, horizon_idx, flat_idx, H, W, tile: int = 512):
+    """``(M, len(flat_idx))`` member values at scattered flat pixel indices.
+
+    The obvious spelling — ``member_slice(store, attrs, m, hi).ravel()[idx]`` per member —
+    reads the entire horizon once for every member to keep ~1500 points, which at M=400 is
+    the whole store pulled through memory for a handful of pixels, and the T3 sample is
+    drawn twice besides. The points come from a dozen 512 px patches, so reading the tiles
+    that actually contain them costs three orders of magnitude less and returns exactly the
+    same values.
+    """
+    M = store.shape[0]
+    flat_idx = np.asarray(flat_idx)
+    rr, cc = np.unravel_index(flat_idx, (H, W))
+    out = np.empty((M, flat_idx.size), dtype=np.float32)
+    key = (rr // tile).astype(np.int64) * (W // tile + 2) + (cc // tile)
+    for k in np.unique(key):
+        sel = key == k
+        r0 = int(rr[sel].min()) // tile * tile
+        c0 = int(cc[sel].min()) // tile * tile
+        rh, cwid = min(tile, H - r0), min(tile, W - c0)
+        blk = dequantize_block(
+            np.asarray(store[:, horizon_idx, r0:r0 + rh, c0:c0 + cwid]), attrs)
+        out[:, sel] = blk[:, rr[sel] - r0, cc[sel] - c0]
+        del blk
+    return out
 
 
 def member_slice(store, attrs, member, horizon_idx, window=None):
@@ -88,45 +136,81 @@ def aggregate_region_statistic(zarr_store, region_mask, horizon, statistic_fn=No
     return out
 
 
-def zonal_member_stats(zarr_store, horizon_idx, zone_raster, attrs=None, thresholds=(0.1, 0.3),
-                       block_rows: int = 1024, max_zone=None):
-    """Per-member zonal means and area-above-threshold, in one pass per member.
+def _compact_zones(zone_raster, H, W, block_rows=1024):
+    """``(remap, ids)`` mapping raw zone ids onto 0..n-1 over the ids actually present.
 
-    Returns ``{"zone_ids", "n_px", "mean": (M, n_zones), "area{t}": (M, n_zones)}``.
+    The raster is uint16, so indexing by raw id makes every per-member table 65,536 wide
+    for the ~164 ecoregions that exist. That is a 400x over-allocation at M=400 and it grows
+    with the member count, which is exactly the shape of thing this pass is not allowed to
+    do any more.
+    """
+    present = np.zeros(65536, dtype=bool)
+    with rasterio.open(zone_raster) as zsrc:
+        for r0 in range(0, H, block_rows):
+            rr = min(block_rows, H - r0)
+            zn = zsrc.read(1, window=Window(0, r0, W, rr), boundless=True, fill_value=0)
+            u = np.unique(zn)
+            present[u[u > 0]] = True
+    ids = np.nonzero(present)[0].astype(np.int64)
+    remap = np.zeros(65536, dtype=np.int64)
+    remap[ids] = np.arange(ids.size)
+    return remap, ids
+
+
+def zonal_member_stats(zarr_store, horizon_idx, zone_raster, attrs=None, thresholds=(0.1, 0.3),
+                       block_rows: int = 1024, budget_bytes=8e9, member_block: int = 10):
+    """Per-member zonal means and area-above-threshold, in one streaming pass.
+
+    Returns ``{"zone_ids", "n_px", "mean": (M, n_zones), "area{t}": (M, n_zones)}`` where
+    ``n_zones`` counts only the zones present in the raster.
+
+    Members are read a chunk-block at a time rather than one at a time: the store is chunked
+    ``(10, 1, 1024, 1024)``, so a single-member read decompresses a ten-member chunk and
+    throws nine tenths of it away.
     """
     store, at = (zarr_store, attrs) if attrs is not None else open_ensemble(zarr_store)
     M, _, H, W = store.shape
-    with rasterio.open(zone_raster) as zsrc:
-        z_t = zsrc.transform
-        max_zone = max_zone or (65535 if zsrc.dtypes[0] == "uint16" else 4096)
-    n_zones = int(max_zone) + 1
+    remap, ids = _compact_zones(zone_raster, H, W, block_rows)
+    n_zones = max(ids.size, 1)
 
     cnt = np.zeros(n_zones, dtype=np.int64)
     means = np.zeros((M, n_zones))
     areas = {t: np.zeros((M, n_zones)) for t in thresholds}
 
+    # Rows per read, and members per read, both sized so the working set follows the budget
+    # rather than the raster width or the member count.
+    rows = max(1, min(block_rows, int(budget_bytes / max(member_block * W * 8.0, 1))))
+    rows = min(rows, H)
+
     with rasterio.open(zone_raster) as zsrc:
-        for r0 in range(0, H, block_rows):
-            rr = min(block_rows, H - r0)
+        for r0 in range(0, H, rows):
+            rr = min(rows, H - r0)
             zn = zsrc.read(1, window=Window(0, r0, W, rr), boundless=True, fill_value=0)
-            if not (zn > 0).any():
+            zpos = zn > 0
+            if not zpos.any():
                 continue
-            for m in range(M):
-                v = dequantize_block(np.asarray(store[m, horizon_idx, r0:r0 + rr]), at)
-                ok = np.isfinite(v) & (zn > 0)
-                if not ok.any():
-                    continue
-                zf = zn[ok].astype(np.int64)
-                if m == 0:
-                    cnt += np.bincount(zf, minlength=n_zones)
-                means[m] += np.bincount(zf, weights=v[ok], minlength=n_zones)
-                for t in thresholds:
-                    areas[t][m] += np.bincount(zf, weights=(v[ok] > t).astype(float), minlength=n_zones)
+            zc = remap[zn]
+            for m0 in range(0, M, member_block):
+                m1 = min(m0 + member_block, M)
+                blk = dequantize_block(
+                    np.asarray(store[m0:m1, horizon_idx, r0:r0 + rr]), at)
+                for i, m in enumerate(range(m0, m1)):
+                    v = blk[i]
+                    ok = np.isfinite(v) & zpos
+                    if not ok.any():
+                        continue
+                    zf = zc[ok]
+                    if m == 0:
+                        cnt += np.bincount(zf, minlength=n_zones)
+                    means[m] += np.bincount(zf, weights=v[ok], minlength=n_zones)
+                    for t in thresholds:
+                        areas[t][m] += np.bincount(zf, weights=(v[ok] > t).astype(float),
+                                                   minlength=n_zones)
+                del blk
 
     keep = cnt > 0
-    ids = np.nonzero(keep)[0]
     with np.errstate(invalid="ignore", divide="ignore"):
-        out = {"zone_ids": ids, "n_px": cnt[keep], "mean": means[:, keep] / cnt[keep]}
+        out = {"zone_ids": ids[keep], "n_px": cnt[keep], "mean": means[:, keep] / cnt[keep]}
         for t in thresholds:
             out[f"area{t}"] = areas[t][:, keep] / cnt[keep]
     return out
@@ -172,6 +256,244 @@ def zonal_observed(observed_path, zone_raster, reference_profile, thresholds=(0.
     for t in thresholds:
         out[f"area{t}"] = s_area[t][keep] / cnt[keep]
     return out
+
+
+# --------------------------------------------------------------------------------------
+# Streaming block scores
+# --------------------------------------------------------------------------------------
+# Bytes per member-pixel held while a tile is being *read*: the int16 chunk data, the
+# float32 dequantized copy, the float64 base block sums, and the finite mask.
+READ_BYTES_PER_PX = 15.0
+# Bytes per member-block held while a batch of blocks is being *scored*: the compacted
+# means, nanpercentile's partition copy, and CRPS's sort and difference arrays.
+SCORE_BYTES_PER_BLOCK = 40.0
+
+
+def score_tile_shape(n_members, H, W, align, budget_bytes=8e9):
+    """Tile ``(rows, cols)`` whose read working set fits ``budget_bytes``.
+
+    Both dimensions come back as multiples of ``align`` (the coarsest block size), so a
+    block never straddles a tile and no cross-tile carry-over is needed. The final row band
+    and column tile are allowed to be short: at the coarse scales their blocks are
+    incomplete and get dropped, which is exactly what ``n_bi = H // B`` does today, and at
+    the base scale they are still whole blocks and are kept.
+
+    The tile is kept as square as the budget allows. Store chunks are 1024 px and block
+    sizes are powers of ten, so a tile can never line up with the chunk grid; what it can do
+    is be large enough that the partial chunks around its edge stop mattering, and for a
+    fixed area a square has the least edge.
+    """
+    budget_px = max(float(budget_bytes) / (n_members * READ_BYTES_PER_PX), float(align) ** 2)
+    side = max(align, int(budget_px ** 0.5) // align * align)
+    rows = min(H, side)
+    cols = min(W, max(align, int(budget_px // max(rows, 1)) // align * align))
+    return int(rows), int(cols)
+
+
+def score_batch_blocks(n_members, budget_bytes=8e9):
+    """How many blocks to score at once, so the tile can grow without the workspace doing so.
+
+    The read and the arithmetic want different sizes: reads want a big tile because the
+    store is chunked, while ``nanpercentile`` and CRPS allocate several copies of whatever
+    they are handed. Since every statistic here is additive over blocks, the two can be
+    decoupled — score the tile's blocks in batches and fold each into the accumulators.
+    """
+    return max(1024, int(float(budget_bytes) / (n_members * SCORE_BYTES_PER_BLOCK)))
+
+
+class _ScaleScore:
+    """Scalar accumulators for one aggregation scale.
+
+    Every T2 statistic is a count or a mean over blocks, so none of them needs the blocks
+    kept: coverage, the interval score and CRPS all reduce to a running sum plus a count.
+    That is what makes the pass independent of raster size — the per-scale state here is
+    nine numbers, whatever the grid.
+    """
+
+    __slots__ = ("B", "n", "n_covered", "n_below", "n_above", "sum_width", "sum_is",
+                 "sum_is_width", "sum_is_penalty", "n_is", "sum_crps", "n_crps")
+
+    def __init__(self, B):
+        self.B = int(B)
+        self.n = self.n_covered = self.n_below = self.n_above = 0
+        self.sum_width = 0.0
+        self.sum_is = self.sum_is_width = self.sum_is_penalty = 0.0
+        self.n_is = 0
+        self.sum_crps = 0.0
+        self.n_crps = 0
+
+    def add(self, member_means, observed, alpha=0.05, qs=(2.5, 97.5)):
+        """Fold one batch of blocks in, reproducing the whole-array functions exactly."""
+        if member_means.size == 0 or member_means.shape[1] == 0:
+            return
+        m = np.asarray(member_means, dtype=np.float64)
+        y = np.asarray(observed, dtype=np.float64)
+        # ``nanpercentile`` on a 2-D array has no C fast path: numpy falls back to
+        # ``apply_along_axis``, a Python-level loop over the columns. At 63.1M blocks and
+        # 400 members that is the difference between minutes and most of a day, and it buys
+        # nothing here — the block means are sums of finite pixels over a non-empty count,
+        # so they cannot be NaN. Asking for both quantiles in one call also partitions once
+        # instead of twice. The whole-array branch is kept for the case the invariant does
+        # not hold, so this is a speed path and not a change of definition.
+        if np.isfinite(m).all():
+            lo, hi = np.percentile(m, list(qs), axis=0)
+        else:
+            lo = np.nanpercentile(m, qs[0], axis=0)
+            hi = np.nanpercentile(m, qs[1], axis=0)
+        ok = np.isfinite(lo) & np.isfinite(hi) & np.isfinite(y)
+        if ok.any():
+            self.n += int(ok.sum())
+            self.n_covered += int(((y >= lo) & (y <= hi) & ok).sum())
+            self.n_below += int(((y < lo) & ok).sum())
+            self.n_above += int(((y > hi) & ok).sum())
+            self.sum_width += float((hi - lo)[ok].sum())
+            width = (hi - lo)[ok]
+            penalty = (2.0 / alpha) * (np.maximum(lo[ok] - y[ok], 0.0)
+                                       + np.maximum(y[ok] - hi[ok], 0.0))
+            self.sum_is += float((width + penalty).sum())
+            self.sum_is_width += float(width.sum())
+            self.sum_is_penalty += float(penalty.sum())
+            self.n_is += int(ok.sum())
+
+        # CRPS keeps its own mask: it needs every member finite, not just the two quantiles.
+        okc = np.isfinite(y) & np.isfinite(m).all(axis=0)
+        if okc.any():
+            X, yy = m[:, okc], y[okc]
+            M = X.shape[0]
+            term1 = np.mean(np.abs(X - yy[None, :]), axis=0)
+            Xs = np.sort(X, axis=0)
+            w = (2 * np.arange(1, M + 1) - M - 1).astype(np.float64)[:, None]
+            term2 = 2.0 * (w * Xs).sum(axis=0) / (2.0 * M * max(M - 1, 1))
+            self.sum_crps += float((term1 - term2).sum())
+            self.n_crps += int(okc.sum())
+
+    def result(self):
+        n = max(self.n, 1)
+        return {
+            "n": self.n, "n_covered": self.n_covered,
+            "coverage": self.n_covered / n,
+            "mean_width": (self.sum_width / self.n) if self.n else np.nan,
+            "frac_below": self.n_below / n, "frac_above": self.n_above / n,
+            "interval_score": (self.sum_is / self.n_is) if self.n_is else np.nan,
+            "width_term": (self.sum_is_width / self.n_is) if self.n_is else np.nan,
+            "penalty_term": (self.sum_is_penalty / self.n_is) if self.n_is else np.nan,
+            "crps": (self.sum_crps / self.n_crps) if self.n_crps else np.nan,
+        }
+
+
+def _block_reduce(a, nbi, nbj, B, axis0_is_member):
+    """Sum ``a`` over ``B x B`` blocks, dropping the incomplete right/bottom margin."""
+    if axis0_is_member:
+        s = a[:, : nbi * B, : nbj * B]
+        return s.reshape(s.shape[0], nbi, B, nbj, B).sum(axis=(2, 4))
+    s = a[: nbi * B, : nbj * B]
+    return s.reshape(nbi, B, nbj, B).sum(axis=(1, 3))
+
+
+def block_score_streaming(zarr_store, horizon_idx, block_sizes, observed_path,
+                          reference_profile, attrs=None, mask_path=None,
+                          min_valid_frac=0.5, budget_bytes=8e9, alpha=0.05,
+                          qs=(2.5, 97.5)):
+    """T2.1/T2.7/T2.8 statistics at several nested scales in one bounded-memory pass.
+
+    Replaces ``block_member_stats_multi`` + ``block_observed_multi`` + the three
+    ``*_from_members`` calls that followed them. Those built ``(M, n_bi, n_bj)`` float64
+    arrays: at ``--block_sizes 1,10,100`` the base scale's block grid *is* the pixel grid,
+    so on Africa at M=100 that is 50.5 GB for the sums and another 50.5 GB for the means —
+    which is what the OOM was. Nothing here is proportional to ``M x H x W``; the tile is
+    sized from ``budget_bytes`` and shrinks as the member count grows.
+
+    The block sets, the masking rule and the arithmetic are deliberately identical to the
+    functions being replaced, including the detail that the observed validity threshold is
+    ``min_valid_frac`` at the base scale and ``count > 0`` at the coarser ones.
+    """
+    store, at = (zarr_store, attrs) if attrs is not None else open_ensemble(zarr_store)
+    M, _, H, W = store.shape
+    sizes = sorted(int(b) for b in set(block_sizes))
+    base = sizes[0]
+    for b in sizes[1:]:
+        if b % base:
+            raise ValueError(f"block sizes must be multiples of the smallest ({base}): {sizes}")
+    bmax = sizes[-1]
+    acc = {B: _ScaleScore(B) for B in sizes}
+    min_px = {B: max(1, int(min_valid_frac * B * B)) for B in sizes}
+
+    p_t = reference_profile["transform"]
+    # The read arrays are still live while a batch is scored, so the two claims are
+    # concurrent and the budget is split between them rather than granted twice.
+    tile_h, tile_w = score_tile_shape(M, H, W, bmax, budget_bytes * 0.5)
+    batch = score_batch_blocks(M, budget_bytes * 0.5)
+
+    osrc = rasterio.open(observed_path)
+    msrc = rasterio.open(mask_path) if mask_path else None
+    try:
+        o_t = osrc.transform
+        o_off = (int(round((p_t.f - o_t.f) / o_t.e)), int(round((p_t.c - o_t.c) / o_t.a)))
+        for r0 in range(0, H, tile_h):
+            rr = min(tile_h, H - r0)
+            for c0 in range(0, W, tile_w):
+                cw = min(tile_w, W - c0)
+                nbi_b, nbj_b = rr // base, cw // base
+                if nbi_b == 0 or nbj_b == 0:
+                    continue
+
+                v = dequantize_block(
+                    np.asarray(store[:, horizon_idx, r0:r0 + rr, c0:c0 + cw]), at)
+                finite = np.isfinite(v)
+                np.copyto(v, np.float32(0.0), where=~finite)
+                # float32 reduce then widen, which is what block_member_stats does when it
+                # adds a float32 stripe sum into its float64 accumulator. Reducing the
+                # coarse scales from a float32 base instead costs ~1e-8 relative — enough
+                # to miss an exact-match check against the path being replaced.
+                msum = _block_reduce(v, nbi_b, nbj_b, base, True).astype(np.float64)
+                mcnt = _block_reduce(finite[0], nbi_b, nbj_b, base, False).astype(np.int64)
+                del v, finite
+
+                ob = osrc.read(1, window=Window(o_off[1] + c0, o_off[0] + r0, cw, rr),
+                               boundless=True, fill_value=np.nan).astype(np.float64)
+                ob = np.where(ob < 0, np.nan, ob)
+                ook = np.isfinite(ob)
+                if msrc is not None:
+                    mk = msrc.read(1, window=Window(c0, r0, cw, rr)).astype(np.float32)
+                    ook &= np.isfinite(mk)
+                osum = _block_reduce(np.where(ook, ob, 0.0), nbi_b, nbj_b, base, False)
+                ocnt = _block_reduce(ook, nbi_b, nbj_b, base, False).astype(np.int64)
+                del ob, ook
+
+                for B in sizes:
+                    f = B // base
+                    nbi, nbj = nbi_b // f, nbj_b // f
+                    if nbi == 0 or nbj == 0:
+                        continue
+                    if f == 1:
+                        s, c, os_, oc = msum, mcnt, osum, ocnt
+                        obs_ok = oc >= min_px[B]
+                    else:
+                        s = _block_reduce(msum, nbi, nbj, f, True)
+                        c = _block_reduce(mcnt, nbi, nbj, f, False)
+                        os_ = _block_reduce(osum, nbi, nbj, f, False)
+                        oc = _block_reduce(ocnt, nbi, nbj, f, False)
+                        # block_observed_multi aggregates the base counts and asks only for
+                        # a non-empty block at the coarse scales; keep that rule.
+                        obs_ok = oc > 0
+                    ok = (c >= min_px[B]) & obs_ok
+                    if not ok.any():
+                        continue
+                    sel = np.flatnonzero(ok.ravel())
+                    s2 = s.reshape(s.shape[0], -1)
+                    c2, os2, oc2 = c.ravel(), os_.ravel(), oc.ravel()
+                    for k0 in range(0, sel.size, batch):
+                        j = sel[k0:k0 + batch]
+                        with np.errstate(invalid="ignore", divide="ignore"):
+                            mm = s2[:, j].astype(np.float64) / np.maximum(c2[j], 1)
+                            om = os2[j] / np.maximum(oc2[j], 1)
+                        acc[B].add(mm, om, alpha=alpha, qs=qs)
+    finally:
+        osrc.close()
+        if msrc is not None:
+            msrc.close()
+
+    return {B: acc[B].result() for B in sizes}
 
 
 def block_member_stats(zarr_store, horizon_idx, block_size, attrs=None, min_valid_frac=0.5,
@@ -372,8 +694,14 @@ def change_distribution(zarr_store, horizon_idx, baseline_hm_path, reference_pro
                     if fin.any() and len(obs_sample) < 40:
                         v = d_ob[fin]
                         obs_sample.append(v[rng.integers(0, v.size, min(v.size, 200_000))])
+                # Members come back as one contiguous block: they are consecutive and share
+                # a member-chunk, so reading them one at a time decompresses that chunk once
+                # per member.
+                m_lo, m_hi = members[0], members[-1] + 1
+                blk = dequantize_block(
+                    np.asarray(store[m_lo:m_hi, horizon_idx, r0:r0 + rr]), at)
                 for m in members:
-                    v = dequantize_block(np.asarray(store[m, horizon_idx, r0:r0 + rr]), at)
+                    v = blk[m - m_lo]
                     d = v - hm0
                     fin = np.isfinite(d)
                     n_tot += int(fin.sum())
@@ -485,6 +813,54 @@ def member_diversity(member_fields):
     return {"mean_pairwise_corr": float(v.mean()), "min": float(v.min()), "max": float(v.max())}
 
 
+class PairCorrAccumulator:
+    """Mean pairwise member correlation (T7.2) from co-moments instead of a stacked field.
+
+    ``member_diversity`` needs every member's whole window resident to call ``np.corrcoef``;
+    on the "global" render window that is four full-resolution rasters, 11 GB on the global
+    grid. A correlation is a function of six sums per pair, so the same number falls out of
+    a streaming pass. Pixels are counted only where *every* member is finite, which is the
+    mask ``member_diversity`` applies.
+    """
+
+    def __init__(self, n_members):
+        n = int(n_members)
+        self.n = 0
+        self.s = np.zeros(n)
+        self.ss = np.zeros(n)
+        self.sxy = np.zeros((n, n))
+
+    def add(self, X):
+        X = np.asarray(X, dtype=np.float64).reshape(np.shape(X)[0], -1)
+        ok = np.isfinite(X).all(axis=0)
+        if not ok.any():
+            return
+        Xo = X[:, ok]
+        self.n += Xo.shape[1]
+        self.s += Xo.sum(axis=1)
+        self.ss += (Xo * Xo).sum(axis=1)
+        self.sxy += Xo @ Xo.T
+
+    def result(self):
+        n = self.n
+        k = self.s.size
+        if n < 10 or k < 2:
+            return {"mean_pairwise_corr": np.nan, "min": np.nan, "max": np.nan}
+        mean = self.s / n
+        var = self.ss / n - mean ** 2
+        cov = self.sxy / n - np.outer(mean, mean)
+        sd = np.sqrt(np.maximum(var, 0.0))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            C = cov / np.outer(sd, sd)
+        iu = np.triu_indices(k, k=1)
+        v = C[iu]
+        v = v[np.isfinite(v)]
+        if v.size == 0:
+            return {"mean_pairwise_corr": np.nan, "min": np.nan, "max": np.nan}
+        return {"mean_pairwise_corr": float(v.mean()), "min": float(v.min()),
+                "max": float(v.max())}
+
+
 def rank_histogram(member_stats, observed, n_bins=None):
     """Rank of the observation among the members (M members -> M+1 bins).
 
@@ -519,18 +895,28 @@ def rank_histogram_test(hist):
     return {"chi2": float(chi2), "p_value": float(p), "reliability_index": ri, "n": int(n)}
 
 
-def energy_score(members, observation):
-    """Energy score (multivariate CRPS generalization); lower is better."""
+def energy_score(members, observation, block: int = 32):
+    """Energy score (multivariate CRPS generalization); lower is better.
+
+    The pairwise term is accumulated a few rows at a time. Written the obvious way it
+    materialises ``(M, M, D)`` — 1.9 GB at M=400 on a 1500-point sample and 7.7 GB at
+    M=800 — which is the one allocation in the scorecard that scales with the *square* of
+    the member count and answers to no memory budget.
+    """
     X = np.asarray(members, dtype=np.float64)  # (M, D)
     y = np.asarray(observation, dtype=np.float64)
     M = X.shape[0]
     term1 = np.mean(np.linalg.norm(X - y[None, :], axis=1))
-    diff = np.linalg.norm(X[:, None, :] - X[None, :, :], axis=2)
-    term2 = diff.sum() / (2.0 * M * M)
+    total = 0.0
+    for i0 in range(0, M, max(1, block)):
+        d = np.linalg.norm(X[i0:i0 + block, None, :] - X[None, :, :], axis=2)
+        total += float(d.sum())
+    term2 = total / (2.0 * M * M)
     return float(term1 - term2)
 
 
-def variogram_score(members, observation, pairs, p: float = 0.5, weights=None):
+def variogram_score(members, observation, pairs, p: float = 0.5, weights=None,
+                    pair_block: int = 20000):
     """Variogram score of order p (Scheuerer & Hamill); lower is better.
 
     Sensitive to the *correlation* structure rather than the marginals — which is exactly
@@ -548,7 +934,13 @@ def variogram_score(members, observation, pairs, p: float = 0.5, weights=None):
     if len(i) == 0:
         return float("nan")
     obs_term = np.abs(y[i] - y[j]) ** p
-    ens_term = np.mean(np.abs(X[:, i] - X[:, j]) ** p, axis=0)
+    # ``X[:, i]`` is (M, n_pairs) and four of those are live at once inside the expression;
+    # at M=400 with 200k requested pairs that is gigabytes for a scalar. Chunked over pairs
+    # it is bounded by ``pair_block`` instead, and the per-pair values are unchanged.
+    ens_term = np.empty(len(i), dtype=np.float64)
+    for k0 in range(0, len(i), pair_block):
+        k1 = min(k0 + pair_block, len(i))
+        ens_term[k0:k1] = np.mean(np.abs(X[:, i[k0:k1]] - X[:, j[k0:k1]]) ** p, axis=0)
     sq = (obs_term - ens_term) ** 2
     if weights is None:
         return float(np.mean(sq))

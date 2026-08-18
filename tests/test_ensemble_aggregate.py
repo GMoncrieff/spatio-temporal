@@ -25,15 +25,26 @@ from src.ensemble.copula import DEFAULT_SCALE, INT16_SENTINEL, quantize  # noqa:
 M, H, W = 40, 32, 32
 
 
+_STORE_SEQ = [0]
+
+
 def _make_store(tmp_path, values):
-    """values: (M, n_h, H, W) float array -> a quantized zarr store."""
+    """values: (M, n_h, H, W) float array -> a quantized icechunk ensemble."""
+    import icechunk
     import zarr
 
-    path = tmp_path / "ens.zarr"
-    z = zarr.open(str(path), mode="w", shape=values.shape, chunks=(10, 1, 16, 16),
-                  dtype="i2", fill_value=INT16_SENTINEL)
+    from src.ensemble.aggregate import ARRAY_NAME
+
+    _STORE_SEQ[0] += 1
+    path = tmp_path / f"ens{_STORE_SEQ[0]}"
+    repo = icechunk.Repository.create(icechunk.local_filesystem_storage(str(path)))
+    session = repo.writable_session("main")
+    root = zarr.create_group(session.store)
+    z = root.create_array(ARRAY_NAME, shape=values.shape, chunks=(10, 1, 16, 16),
+                          dtype="i2", fill_value=INT16_SENTINEL)
     z[:] = quantize(values)
     z.attrs.update({"scale": DEFAULT_SCALE, "offset": 0.0, "sentinel": INT16_SENTINEL})
+    session.commit("test fixture")
     return str(path)
 
 
@@ -185,6 +196,71 @@ def test_multi_scale_block_stats_match_per_scale_computation(tmp_path):
         assert np.allclose(om[B][0], ref, atol=1e-6, equal_nan=True)
 
 
+
+
+def _write_tif(path, arr, transform):
+    import rasterio
+
+    with rasterio.open(path, "w", driver="GTiff", height=arr.shape[0], width=arr.shape[1],
+                       count=1, dtype="float32", crs="EPSG:4326", transform=transform,
+                       nodata=np.nan) as d:
+        d.write(arr.astype("float32"), 1)
+    return str(path)
+
+
+@pytest.mark.parametrize("budget", [1e9, 4e4])
+def test_streaming_block_scores_match_the_materialising_path(tmp_path, budget):
+    """The streaming T2 pass must reproduce the arrays-in-memory path exactly.
+
+    This is the gate on the OOM fix. The old path built ``(M, n_bi, n_bj)`` float64 arrays
+    — 50.5 GB on Africa at M=100 with ``--block_sizes 1,10,100``, because at B=1 the block
+    grid is the pixel grid. The replacement streams, so it must be checked against the
+    thing it replaces rather than against a hand-derived expectation. The small budget
+    forces many tiles, which is where a block-straddling bug would show.
+    """
+    from rasterio.transform import from_origin
+
+    from src.ensemble.aggregate import (
+        block_member_stats_multi, block_observed_multi, block_score_streaming,
+        coverage_from_members, crps_from_members, interval_score_from_members,
+    )
+
+    rng = np.random.default_rng(3)
+    h, w, m = 37, 41, 12          # deliberately not multiples of any block size
+    vals = rng.uniform(0.05, 0.95, (m, 1, h, w)).astype(np.float32)
+    vals[:, :, 30:, :] = np.nan   # a band of invalid pixels, shared by every member
+    path = _make_store(tmp_path, vals)
+    store, attrs = open_ensemble(path)
+
+    t = from_origin(-180, 84, 0.009, 0.009)
+    obs = rng.uniform(0, 1, (h, w)).astype("float32")
+    obs[5:8, 5:8] = -1.0          # the "< 0 means nodata" convention
+    op = _write_tif(tmp_path / "obs.tif", obs, t)
+    cen = np.where(np.isfinite(vals[0, 0]), 0.5, np.nan).astype("float32")
+    cp = _write_tif(tmp_path / "central.tif", cen, t)
+    prof = {"height": h, "width": w, "transform": t}
+    sizes = [1, 4, 8]
+
+    mem_by_b = block_member_stats_multi(store, 0, sizes, attrs=attrs)
+    obs_by_b = block_observed_multi(op, prof, sizes, mask_path=cp)
+    got = block_score_streaming(store, 0, sizes, op, prof, attrs=attrs, mask_path=cp,
+                                budget_bytes=budget)
+
+    for B in sizes:
+        mem, valid, _ = mem_by_b[B]
+        ob, obs_valid = obs_by_b[B]
+        ok = valid & obs_valid
+        ref = coverage_from_members(mem[:, ok], ob[ok])
+        ref_is = interval_score_from_members(mem[:, ok], ob[ok])
+        ref_crps = crps_from_members(mem[:, ok], ob[ok])
+        g = got[B]
+        assert g["n"] == ref["n"], B
+        assert g["n_covered"] == ref["n_covered"], B
+        for k in ("coverage", "mean_width", "frac_below", "frac_above"):
+            assert g[k] == pytest.approx(ref[k], rel=1e-12, abs=1e-12), (B, k)
+        for k in ("interval_score", "width_term", "penalty_term"):
+            assert g[k] == pytest.approx(ref_is[k], rel=1e-10, abs=1e-12), (B, k)
+        assert g["crps"] == pytest.approx(ref_crps, rel=1e-10, abs=1e-12), B
 
 
 def test_interval_score_penalises_both_width_and_miscoverage():

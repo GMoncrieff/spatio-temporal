@@ -32,9 +32,15 @@ from src.ensemble import fields as fld  # noqa: E402
 from src.ensemble import validate as val  # noqa: E402
 from src.ensemble import variogram as vgm  # noqa: E402
 from src.ensemble.copula import INT16_SENTINEL, quantization_error_bound  # noqa: E402
+from src.ensemble.memtrace import make_trace  # noqa: E402
 from src.ensemble.validate import DIST_LABELS, distance_band  # noqa: E402
 
 N_BANDS = len(DIST_LABELS)
+
+# Set in main(). A module global rather than a threaded-through argument because the
+# interesting marks are three calls deep inside stages whose signatures are already long,
+# and the null implementation makes an unset trace a no-op rather than a conditional.
+TRACE = make_trace(False)
 
 REPO = Path(__file__).parent.parent
 HM_DIR = REPO / "data" / "raw" / "hm_global"
@@ -99,7 +105,7 @@ class Scorecard:
 # --------------------------------------------------------------------------------------
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--ensemble", default="data/ensemble/hindcast_members.zarr")
+    ap.add_argument("--ensemble", default="data/ensemble/hindcast_members.icechunk")
     ap.add_argument("--null_ensemble", default=None,
                     help="Independent-pixel null (same marginals, no spatial structure)")
     ap.add_argument("--years", default="2005,2010,2015,2020")
@@ -131,6 +137,18 @@ def parse_args(argv=None):
                             "visual,clustering")
     ap.add_argument("--dist_raster", default=None,
                     help="Distance-to-past-change raster for T8 (regional working set)")
+    ap.add_argument("--mem_budget_gb", type=float, default=8.0,
+                    help="Working-set budget for the streaming stages. Tiles and member "
+                         "batches are sized from it, so peak RSS is set by this rather "
+                         "than by the raster size or the member count.")
+    ap.add_argument("--mem_trace", action="store_true",
+                    help="Sample RSS on a background thread and report a peak per stage. "
+                         "A poll from outside the process cannot catch this OOM — it went "
+                         "from steady to killed inside one 120 s interval.")
+    ap.add_argument("--mem_trace_interval", type=float, default=0.25)
+    ap.add_argument("--mem_trace_tracemalloc", action="store_true",
+                    help="Also attach tracemalloc and print the top allocation sites at "
+                         "each stage boundary, so a peak lands on a line and not a stage.")
     ap.add_argument("--disable_wandb", action="store_true")
     ap.add_argument("--wandb_group", default=None)
     return ap.parse_args(argv)
@@ -158,7 +176,9 @@ def _tile_grid(store, H, W, budget_bytes=1.2e9):
     The store is chunked (10, 1, 1024, 1024). Reading a short full-width slab decompresses
     each 1024-row chunk once per slab it touches — an ~11x read amplification measured on
     the global store. Tiling on the chunk grid instead reads every chunk exactly once, and
-    the column dimension is what gets traded for the memory budget.
+    the column dimension is what gets traded for the memory budget. When even one chunk row
+    of the full member stack does not fit, the row dimension gives way too, at the cost of
+    re-reading the chunk — better than exceeding the budget.
     """
     M = store.shape[0]
     ch = store.chunks
@@ -166,7 +186,10 @@ def _tile_grid(store, H, W, budget_bytes=1.2e9):
     cols = int(ch[3]) if len(ch) >= 4 else 1024
     rows = min(rows, H)
     per_col_chunk = M * rows * cols * 4  # float32 working copy
-    n_col_chunks = max(1, int(budget_bytes // max(per_col_chunk, 1)))
+    n_col_chunks = int(budget_bytes // max(per_col_chunk, 1))
+    if n_col_chunks < 1:
+        rows = max(1, int(budget_bytes // max(M * cols * 4, 1)))
+        n_col_chunks = 1
     tile_w = min(W, n_col_chunks * cols)
     return rows, tile_w
 
@@ -175,7 +198,10 @@ def stage_gates(args, store, attrs, years, paths, out_dir, card, block_rows=None
     """T5.1/T5.2/T5.3 in one streaming pass, which also writes the percentile rasters."""
     print("\n=== T5 · hard gates (median / tails / mask) ===")
     M, nH, H, W = store.shape
-    tile_h, tile_w = _tile_grid(store, H, W)
+    # The tile carries the member stack four times over (int16 read, float32 dequantized,
+    # the compacted valid pixels, and percentile's partition workspace), so the budget is
+    # spent at a quarter of its face value.
+    tile_h, tile_w = _tile_grid(store, H, W, budget_bytes=float(args.mem_budget_gb) * 1e9 / 4)
     tiles = [(r0, min(tile_h, H - r0), c0, min(tile_w, W - c0))
              for r0 in range(0, H, tile_h) for c0 in range(0, W, tile_w)]
     print(f"  streaming {M} members on the chunk grid: {len(tiles)} tiles of {tile_h} x {tile_w}")
@@ -212,10 +238,10 @@ def stage_gates(args, store, attrs, years, paths, out_dir, card, block_rows=None
         print(f"  T5 tolerances are shape-aware ({args.marginal_shape}"
               f"{', per distance band' if banded else ''})")
 
-    band_full = None
-    if banded:
-        with rasterio.open(args.dist_raster) as s:
-            band_full = distance_band(s.read(1).astype(np.float64))
+    # The distance raster is read per tile rather than whole: as a float64 it is 0.5 GB on
+    # Africa and 5.5 GB on the global grid, for a band index that is only ever used one
+    # tile at a time.
+    band_src = rasterio.open(args.dist_raster) if banded else None
 
     def _slopes(year):
         """(3, N_BANDS) slopes at the lower bound, the median and the upper bound."""
@@ -228,10 +254,9 @@ def stage_gates(args, store, attrs, years, paths, out_dir, card, block_rows=None
 
     def _tile_slopes(tbl, win):
         """The three slopes over a tile: rasters when per-band, scalars otherwise."""
-        if band_full is None:
+        if band_src is None:
             return tbl[0, 0], tbl[1, 0], tbl[2, 0]
-        bw = band_full[win.row_off:win.row_off + win.height,
-                       win.col_off:win.col_off + win.width]
+        bw = distance_band(band_src.read(1, window=win).astype(np.float64))
         return tbl[0][bw], tbl[1][bw], tbl[2][bw]
 
     pct_paths = {}
@@ -326,11 +351,13 @@ def stage_gates(args, store, attrs, years, paths, out_dir, card, block_rows=None
                  note=f"M={M}, mc_sigma_z={mc_sigma_z:.3f}, shape slope at the bounds "
                       + (f"{slope_tbl[0].min():.2f}-{slope_tbl[0].max():.2f} / "
                          f"{slope_tbl[2].min():.2f}-{slope_tbl[2].max():.2f} over bands"
-                         if band_full is not None else
+                         if band_src is not None else
                          f"{slope_tbl[0, 0]:.2f}/{slope_tbl[2, 0]:.2f}"), knob="T5")
         card.add("T5.3", f"valid-mask identity ({year})", n_mask_mismatch, "0 pixels",
                  n_mask_mismatch == 0, knob="T5")
 
+    if band_src is not None:
+        band_src.close()
     pd.DataFrame(summary).to_csv(out_dir / "t5_gates.csv", index=False)
     return pct_paths
 
@@ -341,6 +368,7 @@ def stage_gates(args, store, attrs, years, paths, out_dir, card, block_rows=None
 def stage_aggregate(args, store, attrs, years, paths, out_dir, card, null_store=None, null_attrs=None):
     print("\n=== T2 · aggregate-scale coverage ===")
     block_sizes = [int(b) for b in args.block_sizes.split(",")]
+    budget_bytes = float(args.mem_budget_gb) * 1e9
     rows, zonal_rows = [], []
     thresholds = (0.1, 0.3)
     zonal_members_by_year = {}
@@ -351,35 +379,37 @@ def stage_aggregate(args, store, attrs, years, paths, out_dir, card, null_store=
         # ---- T2.1 blocks --------------------------------------------------------------
         usable = [B for B in block_sizes
                   if profile["height"] // B > 0 and profile["width"] // B > 0]
-        # One pass over the members for all scales: at 50 members a global pass is ~68 GB
-        # of reads, and the nested block sums aggregate upward for free.
-        mem_by_b = agg.block_member_stats_multi(store, hi, usable, attrs=attrs)
-        # The observed aggregate must be taken over exactly the pixels the ensemble
-        # covers; T5.3 proves the ensemble mask equals the central raster's, so that is
-        # the mask to apply.
-        obs_by_b = agg.block_observed_multi(paths[year]["observed"], profile, usable,
-                                            mask_path=str(paths[year]["central"]))
+        # One streaming pass over the members for all scales. The nested block sums
+        # aggregate upward for free, and — unlike the arrays-in-memory version this
+        # replaced — nothing here is proportional to M x H x W, so the peak follows
+        # --mem_budget_gb rather than the grid.
+        with TRACE.section(f"block_score_streaming[{year}]"):
+            # The observed aggregate must be taken over exactly the pixels the ensemble
+            # covers; T5.3 proves the ensemble mask equals the central raster's, so that
+            # is the mask to apply.
+            scored = agg.block_score_streaming(
+                store, hi, usable, str(paths[year]["observed"]), profile, attrs=attrs,
+                mask_path=str(paths[year]["central"]), budget_bytes=budget_bytes)
+        # Pixelwise-independent-propagation baselines: the motivating contrast, and the
+        # reason the ensemble exists. One call for every scale — it used to be re-invoked
+        # per scale, re-reading the rasters three times per year for nothing.
+        with TRACE.section(f"compute_block_coverage[{year}]"):
+            base_all = val.compute_block_coverage(
+                paths[year]["lower"], paths[year]["upper"], paths[year]["observed"],
+                block_sizes=usable, pred_central_path=paths[year]["central"])
         for B in usable:
-            mem, valid, _ = mem_by_b[B]
-            obs, obs_valid = obs_by_b[B]
-            ok = valid & obs_valid
-            if not ok.any():
+            res = dict(scored[B])
+            if res["n"] == 0:
                 continue
-            res = agg.coverage_from_members(mem[:, ok], obs[ok])
+            isc = {k: res.pop(k) for k in ("interval_score", "width_term", "penalty_term")}
+            crps = res.pop("crps")
             lo, hi_w = val.wilson_interval(res["n_covered"], res["n"])
-            # Coverage and width scored together: an interval cannot win by being huge.
-            isc = agg.interval_score_from_members(mem[:, ok], obs[ok])
-            crps = agg.crps_from_members(mem[:, ok], obs[ok])
             rows.append({"year": year, "scale_km": B, "kind": "ensemble", **res,
                          "wilson_lo": float(lo), "wilson_hi": float(hi_w),
                          "interval_score": isc["interval_score"],
                          "is_width_term": isc["width_term"], "is_penalty_term": isc["penalty_term"],
                          "crps": crps})
-            # Pixelwise-independent-propagation baseline at the same scale: the motivating
-            # contrast, and the reason the ensemble exists.
-            base = val.compute_block_coverage(paths[year]["lower"], paths[year]["upper"],
-                                              paths[year]["observed"], block_sizes=[B],
-                                              pred_central_path=paths[year]["central"])
+            base = base_all[base_all["scale_px"] == B] if "scale_px" in base_all else base_all
             for _, b in base.iterrows():
                 rows.append({"year": year, "scale_km": B, "kind": b.get("kind", "pixelwise"),
                              "n": int(b["n_blocks"]), "n_covered": int(b["n_covered"]),
@@ -393,8 +423,9 @@ def stage_aggregate(args, store, attrs, years, paths, out_dir, card, null_store=
 
         # ---- T2.2 / T2.3 ecoregion ------------------------------------------------------
         if Path(args.ecoregion_raster).exists():
-            zm = agg.zonal_member_stats(store, hi, args.ecoregion_raster, attrs=attrs,
-                                        thresholds=thresholds)
+            with TRACE.section(f"zonal_member_stats[{year}]"):
+                zm = agg.zonal_member_stats(store, hi, args.ecoregion_raster, attrs=attrs,
+                                            thresholds=thresholds)
             zo = agg.zonal_observed(paths[year]["observed"], args.ecoregion_raster, profile,
                                     thresholds=thresholds,
                                     mask_path=str(paths[year]["central"]))
@@ -528,13 +559,35 @@ def _plot_rank_hist(rows, path):
 # --------------------------------------------------------------------------------------
 # T3 spatial realism, T4 temporal coherence
 # --------------------------------------------------------------------------------------
+def _read_sampled(path, rows, cols, band_rows=1024):
+    """``a[np.ix_(rows, cols)]`` without ever holding the whole raster.
+
+    The sample is scattered, so every row band contains some of it; what this avoids is the
+    full-resolution intermediate, which is 2.7 GB per raster on the global grid and is read
+    three times per year.
+    """
+    with rasterio.open(path) as s:
+        H, W = s.height, s.width
+        out = np.empty((len(rows), len(cols)), dtype=np.float32)
+        rows = np.asarray(rows)
+        for r0 in range(0, H, band_rows):
+            rr = min(band_rows, H - r0)
+            sel = np.flatnonzero((rows >= r0) & (rows < r0 + rr))
+            if sel.size == 0:
+                continue
+            a = s.read(1, window=Window(0, r0, W, rr)).astype(np.float32)
+            out[sel] = a[rows[sel] - r0][:, cols]
+    return out
+
+
 def _marginal_arrays(paths, year, rows=None, cols=None):
     from src.ensemble.copula import Z975
 
     def _read(p):
+        if rows is not None:
+            return _read_sampled(p, rows, cols)
         with rasterio.open(p) as s:
-            a = s.read(1).astype(np.float32)
-        return a if rows is None else a[np.ix_(rows, cols)]
+            return s.read(1).astype(np.float32)
 
     cen, low, upp = _read(paths[year]["central"]), _read(paths[year]["lower"]), _read(paths[year]["upper"])
     sl = np.maximum((cen - low) / Z975, 1e-6)
@@ -599,19 +652,97 @@ def recover_z(member, cen, sl, sr, eps=1e-4, quant=1.0 / 32767.0, min_sigma_step
     return np.where(np.isfinite(z) & ~unusable, z, np.nan)
 
 
+def _points_from_raster(path, flat_idx, H, W, tile: int = 512):
+    """Raster values at scattered flat indices, without reading the whole raster."""
+    rr, cc = np.unravel_index(np.asarray(flat_idx), (H, W))
+    out = np.empty(len(rr), dtype=np.float32)
+    key = (rr // tile).astype(np.int64) * (W // tile + 2) + (cc // tile)
+    with rasterio.open(path) as s:
+        for k in np.unique(key):
+            sel = key == k
+            r0 = int(rr[sel].min()) // tile * tile
+            c0 = int(cc[sel].min()) // tile * tile
+            a = s.read(1, window=Window(c0, r0, min(tile, W - c0), min(tile, H - r0))
+                       ).astype(np.float32)
+            out[sel] = a[rr[sel] - r0, cc[sel] - c0]
+    return out
+
+
+def _build_z_field(args, store, attrs, hi, year, paths, scratch, budget_bytes):
+    """Member 0's normal-score field, on disk, plus the two scalars T3 reads off it.
+
+    The field is needed *whole* — the variogram draws 400k random pairs from it and the
+    spectrum crops a corner — but it never needs to be resident: 5.5 GB of float64 on the
+    global grid, next to the four full-resolution marginal rasters it is built from. A
+    memmap keeps the random access while leaving the pages evictable, and the two scalars
+    (usable fraction, variance) accumulate as it is written.
+
+    Returns ``(z, spread, valid, frac_usable, var_z)`` where ``z`` and ``spread`` are
+    memmaps and ``valid`` is the finite-central mask.
+    """
+    M, nH, H, W = store.shape
+    shape, band_full = _shape_context(args, year)
+    if shape is not None:
+        print("  normal scores recovered through the empirical shape"
+              + (", per distance band" if band_full is not None else ""))
+    z = np.memmap(scratch / "z.f8", dtype=np.float64, mode="w+", shape=(H, W))
+    spread = np.memmap(scratch / "spread.f4", dtype=np.float32, mode="w+", shape=(H, W))
+    valid = np.zeros((H, W), dtype=bool)
+
+    # ~40 bytes per pixel across the member slice, the three marginals, z and spread.
+    rows = max(1, min(H, int(budget_bytes / max(W * 40.0, 1))))
+    n_z = n_cen = 0
+    wn = 0
+    wmean = wm2 = 0.0
+    srcs = {k: rasterio.open(paths[year][k]) for k in ("central", "lower", "upper")}
+    try:
+        for r0 in range(0, H, rows):
+            rr = min(rows, H - r0)
+            win = Window(0, r0, W, rr)
+            cen = srcs["central"].read(1, window=win).astype(np.float32)
+            low = srcs["lower"].read(1, window=win).astype(np.float32)
+            upp = srcs["upper"].read(1, window=win).astype(np.float32)
+            sl = np.maximum((cen - low) / cop.Z975, 1e-6)
+            sr = np.maximum((upp - cen) / cop.Z975, 1e-6)
+            mem = agg.member_slice(store, attrs, 0, hi, window=(r0, r0 + rr, 0, W))
+            b = band_full[r0:r0 + rr] if band_full is not None else None
+            zt = recover_z(mem, cen, sl, sr, shape=shape, band=b)
+            z[r0:r0 + rr] = zt
+            spread[r0:r0 + rr] = np.where(np.isfinite(sl) & np.isfinite(sr),
+                                          (sl + sr) * 0.5, np.nan)
+            cok = np.isfinite(cen)
+            valid[r0:r0 + rr] = cok
+            n_cen += int(cok.sum())
+            f = np.isfinite(zt)
+            n_z += int(f.sum())
+            # Welford on the finite scores, so the variance never needs the field resident.
+            v = zt[f]
+            if v.size:
+                wn += v.size
+                d = v - wmean
+                wmean += float(d.sum() / wn)
+                wm2 += float((d * (v - wmean)).sum())
+    finally:
+        for s in srcs.values():
+            s.close()
+    z.flush()
+    spread.flush()
+    frac_usable = n_z / max(n_cen, 1)
+    var_z = (wm2 / wn) if wn else np.nan
+    return z, spread, valid, frac_usable, var_z
+
+
 def stage_spatial(args, store, attrs, years, paths, out_dir, card, null_store=None, null_attrs=None):
     print("\n=== T3 · spatial realism ===")
     M, nH, H, W = store.shape
     hi = nH - 1
     year = years[hi]
-    cen, sl, sr = _marginal_arrays(paths, year)
-    mem = agg.member_slice(store, attrs, 0, hi)
-    spatial_shape, spatial_band = _shape_context(args, year)
-    if spatial_shape is not None:
-        print("  normal scores recovered through the empirical shape"
-              + (", per distance band" if spatial_band is not None else ""))
-    z = recover_z(mem, cen, sl, sr, shape=spatial_shape, band=spatial_band)
-    frac_usable = float(np.isfinite(z).sum() / max(np.isfinite(cen).sum(), 1))
+    budget_bytes = float(args.mem_budget_gb) * 1e9
+    scratch = Path(out_dir) / "_scratch"
+    scratch.mkdir(parents=True, exist_ok=True)
+    with TRACE.section("build_z_field"):
+        z, spread, valid_cen, frac_usable, var_z = _build_z_field(
+            args, store, attrs, hi, year, paths, scratch, budget_bytes)
     print(f"  recovered normal scores at {100*frac_usable:.1f}% of valid pixels "
           f"(rest clipped at the [0,1] bounds)")
 
@@ -635,7 +766,7 @@ def stage_spatial(args, store, attrs, years, paths, out_dir, card, null_store=No
     # carries its own variance, so only *scale-free* quantities are comparable between the
     # two: the nugget fraction and the practical range. The sill is checked against the
     # generator's own contract (unit variance) instead.
-    var_z = float(np.nanvar(z))
+    var_z = float(var_z)
     card.add("T3.1", "member normal-score variance", var_z, "1.0 +/- 0.15",
              abs(var_z - 1.0) <= 0.15, knob="T3")
     if fit_target:
@@ -650,22 +781,45 @@ def stage_spatial(args, store, attrs, years, paths, out_dir, card, null_store=No
     # ---- T3.2 / T3.3 against the independent-pixel null ----------------------------------
     if null_store is not None:
         rng = np.random.default_rng(0)
+        with rasterio.open(paths[year]["central"]) as c:
+            p_t = c.transform
         with rasterio.open(paths[year]["observed"]) as o:
             o_t = o.transform
-            p_t = rasterio.open(paths[year]["central"]).transform
             r_off = int(round((p_t.f - o_t.f) / o_t.e))
             c_off = int(round((p_t.c - o_t.c) / o_t.a))
-            obs = o.read(1, window=Window(c_off, r_off, W, H), boundless=True,
-                         fill_value=np.nan).astype(np.float32)
-        ok = np.isfinite(obs) & np.isfinite(cen)
+            # Only the mask is kept whole (one byte a pixel); the observed values
+            # themselves are read back at the sampled points, which is all they are used
+            # for. The float32 raster is 2.7 GB on the global grid.
+            ok = np.zeros((H, W), dtype=bool)
+            rows_b = max(1, min(H, int(budget_bytes / max(W * 8.0, 1))))
+            for r0 in range(0, H, rows_b):
+                rr = min(rows_b, H - r0)
+                ob = o.read(1, window=Window(c_off, r_off + r0, W, rr), boundless=True,
+                            fill_value=np.nan).astype(np.float32)
+                ok[r0:r0 + rr] = np.isfinite(ob) & valid_cen[r0:r0 + rr]
+                del ob
+
+        def _obs_at(idx):
+            """Observed values at flat indices, read block by block."""
+            rr_, cc_ = np.unravel_index(idx, (H, W))
+            out = np.empty(idx.size, dtype=np.float32)
+            with rasterio.open(paths[year]["observed"]) as o:
+                for key in np.unique((rr_ // 512) * 10 ** 6 + (cc_ // 512)):
+                    br, bc = int(key // 10 ** 6) * 512, int(key % 10 ** 6) * 512
+                    sel = (rr_ >= br) & (rr_ < br + 512) & (cc_ >= bc) & (cc_ < bc + 512)
+                    a = o.read(1, window=Window(c_off + bc, r_off + br,
+                                                min(512, W - bc), min(512, H - br)),
+                               boundless=True, fill_value=np.nan).astype(np.float32)
+                    out[sel] = a[rr_[sel] - br, cc_[sel] - bc]
+            return out
         # Points must be *clustered*, not scattered across the globe: these scores test
         # spatial structure, so the sample has to contain pairs at the separations where
         # the correlation lives. Sampling 1500 points uniformly over a 17111 x 40000 grid
         # leaves ~26 of 20000 requested pairs within 500 px — the correlated ensemble and
         # the independent null are then indistinguishable for want of nearby pairs.
-        # Marginal spread, shared identically by the ensemble and its independent-pixel
-        # null. This is the sampling weight for T3.2 — see _clustered_sample.
-        spread = np.where(np.isfinite(sl) & np.isfinite(sr), (sl + sr) * 0.5, np.nan)
+        # The marginal spread — shared identically by the ensemble and its
+        # independent-pixel null — is the sampling weight for T3.2; see _clustered_sample.
+        # It was built alongside z and lives on disk.
         null_hi = min(hi, null_store.shape[1] - 1)
 
         # Pairs must sit *inside* the correlation range or the comparison is scored where
@@ -683,14 +837,12 @@ def stage_spatial(args, store, attrs, years, paths, out_dir, card, null_store=No
         def _score(idx, tag):
             rr, cc = np.unravel_index(idx, (H, W))
             coords = np.stack([rr, cc], axis=1).astype(float)
-            y = obs.ravel()[idx]
-            X = np.stack([agg.member_slice(store, attrs, m, hi).ravel()[idx]
-                          for m in range(M)])
+            y = _obs_at(idx)
+            X = agg.members_at_points(store, attrs, hi, idx, H, W)
             # The null only has to cover the horizon being scored; it is white noise and so
             # compresses far worse than the correlated ensemble, and storing all four
             # horizons of it buys nothing.
-            Xn = np.stack([agg.member_slice(null_store, null_attrs, m, null_hi).ravel()[idx]
-                           for m in range(null_store.shape[0])])
+            Xn = agg.members_at_points(null_store, null_attrs, null_hi, idx, H, W)
             pairs = agg.sample_pairs(idx.size, 200000, rng=rng, coords=coords,
                                      max_dist=max_dist)
             vs = agg.variogram_score(X, y, pairs)
@@ -704,9 +856,10 @@ def stage_spatial(args, store, attrs, years, paths, out_dir, card, null_store=No
 
         # Uniform sampling is retained and reported so the effect of the weighting is
         # visible rather than a silent replacement of a previously published number.
-        uni = _score(_clustered_sample(ok, args.score_points, rng, patch=512), "uniform")
-        wtd = _score(_clustered_sample(ok, args.score_points, rng, patch=512, spread=spread),
-                     "spread-weighted")
+        uni = _score(_clustered_sample(ok, args.score_points, rng, patch=512,
+                                       budget_bytes=budget_bytes), "uniform")
+        wtd = _score(_clustered_sample(ok, args.score_points, rng, patch=512, spread=spread,
+                                       budget_bytes=budget_bytes), "spread-weighted")
 
         card.add("T3.2", "variogram score vs independent-pixel null (spread-weighted)",
                  wtd["improve"], ">= 0.30 lower", wtd["improve"] >= 0.30, knob="T3",
@@ -723,8 +876,8 @@ def stage_spatial(args, store, attrs, years, paths, out_dir, card, null_store=No
         # same footing as before.
         es = agg.energy_score(uni["X"], uni["y"])
         es_null = agg.energy_score(uni["Xn"], uni["y"])
-        es_degen = agg.energy_score(
-            np.repeat(cen.ravel()[uni["idx"]][None, :], 2, axis=0), uni["y"])
+        cen_pts = _points_from_raster(paths[year]["central"], uni["idx"], H, W)
+        es_degen = agg.energy_score(np.repeat(cen_pts[None, :], 2, axis=0), uni["y"])
         print(f"  energy score {es:.4g} vs null {es_null:.4g}, degenerate {es_degen:.4g}")
         card.add("T3.3", "energy score beats null and degenerate", es,
                  f"< min(null {es_null:.4g}, degenerate {es_degen:.4g})",
@@ -829,32 +982,49 @@ def stage_visual(args, store, attrs, years, paths, out_dir, card, run=None, n_me
     horizons = list(range(len(years)))
     figs = []
     diversity_rows = []
+    n_mem = min(n_members, store.shape[0])
+    p_t = profile["transform"]
+    budget_bytes = float(args.mem_budget_gb) * 1e9
     for name, (r0, c0, hgt, wid) in windows.items():
-        with rasterio.open(base_hm) as b:
-            b_t = b.transform
-            p_t = profile["transform"]
-            off = (int(round((p_t.f - b_t.f) / b_t.e)), int(round((p_t.c - b_t.c) / b_t.a)))
-            hm0 = b.read(1, window=Window(off[1] + c0, off[0] + r0, wid, hgt)).astype(np.float32)
-        hm0 = np.where(hm0 < 0, np.nan, hm0)
+        # The panels are drawn at ~1200 px, so the render only ever needs a decimated copy;
+        # the "global" window at full resolution is four member rasters plus three
+        # covariate rasters, 19 GB on the global grid for a figure. T7.2 is scored on the
+        # full-resolution data all the same, accumulated band by band.
+        step = max(1, max(hgt, wid) // 1200)
+        rows_b = max(1, min(hgt, int(budget_bytes / max(wid * (n_mem + 4) * 8.0, 1))))
+        rows_b = max(rows_b // step * step, step)
         for h_idx in horizons:
             y_h = years[h_idx]
-            with rasterio.open(paths[y_h]["observed"]) as o:
-                o_t = o.transform
+            acc = agg.PairCorrAccumulator(n_mem)
+            dec = {"obs": [], "cen": [], "mem": []}
+            with rasterio.open(base_hm) as b, rasterio.open(paths[y_h]["observed"]) as o, \
+                 rasterio.open(paths[y_h]["central"]) as c:
+                b_t, o_t = b.transform, o.transform
+                off = (int(round((p_t.f - b_t.f) / b_t.e)), int(round((p_t.c - b_t.c) / b_t.a)))
                 ooff = (int(round((p_t.f - o_t.f) / o_t.e)), int(round((p_t.c - o_t.c) / o_t.a)))
-                obs = o.read(1, window=Window(ooff[1] + c0, ooff[0] + r0, wid, hgt)).astype(np.float32)
-            obs = np.where(obs < 0, np.nan, obs)
-            d_obs = obs - hm0
-            with rasterio.open(paths[y_h]["central"]) as c:
-                cen = c.read(1, window=Window(c0, r0, wid, hgt)).astype(np.float32)
-            d_cen = np.where(np.isfinite(cen), cen - hm0, np.nan)
-            mem = np.stack([
-                agg.member_slice(store, attrs, m, h_idx, window=(r0, r0 + hgt, c0, c0 + wid)) - hm0
-                for m in range(min(n_members, store.shape[0]))
-            ])
-            div = agg.member_diversity(mem)
+                for rr0 in range(0, hgt, rows_b):
+                    rh = min(rows_b, hgt - rr0)
+                    hm0 = b.read(1, window=Window(off[1] + c0, off[0] + r0 + rr0, wid, rh)
+                                 ).astype(np.float32)
+                    hm0 = np.where(hm0 < 0, np.nan, hm0)
+                    obs = o.read(1, window=Window(ooff[1] + c0, ooff[0] + r0 + rr0, wid, rh)
+                                 ).astype(np.float32)
+                    obs = np.where(obs < 0, np.nan, obs)
+                    cen = c.read(1, window=Window(c0, r0 + rr0, wid, rh)).astype(np.float32)
+                    mem = agg.dequantize_block(
+                        np.asarray(store[0:n_mem, h_idx, r0 + rr0:r0 + rr0 + rh,
+                                         c0:c0 + wid]), attrs) - hm0
+                    acc.add(mem)
+                    dec["obs"].append((obs - hm0)[::step, ::step])
+                    dec["cen"].append(np.where(np.isfinite(cen), cen - hm0, np.nan)[::step, ::step])
+                    dec["mem"].append(mem[:, ::step, ::step])
+                    del hm0, obs, cen, mem
+            div = acc.result()
             diversity_rows.append({"window": name, "target_year": y_h, **div})
             figs.append(_plot_members_vs_observed(
-                mem, d_obs, out_dir / f"members_{name}_{y_h}.png", name, y_h, d_central=d_cen))
+                np.concatenate(dec["mem"], axis=1), np.concatenate(dec["obs"]),
+                out_dir / f"members_{name}_{y_h}.png", name, y_h,
+                d_central=np.concatenate(dec["cen"]), step=1))
             print(f"  {name} {y_h}: mean pairwise member correlation "
                   f"{div['mean_pairwise_corr']:.3f}")
 
@@ -884,8 +1054,63 @@ def stage_visual(args, store, attrs, years, paths, out_dir, card, run=None, n_me
              note="see W&B images and data/ensemble/validation/members_*.png")
 
 
+def _patch_weight_sums(spread, valid, rs, cs, patch, spread_power, budget_bytes):
+    """Total spread inside each candidate patch, ``(len(rs), len(cs))``.
+
+    Two ways to the same number. The summed-area table is exact and fast but needs three
+    full-raster arrays — 8 GB on the global grid, and a float32 cumulative sum over 684M
+    elements loses precision besides. The streaming form walks row bands and sums the
+    ``step``-sized cells a patch is made of, which costs nothing but visits the raster once
+    per band. The table is kept for the sizes where it fits, so the regional numbers this
+    project has already published do not move.
+    """
+    H, W = valid.shape
+    step = max(patch // 2, 1)
+    r1 = np.minimum(rs + patch, H)
+    c1 = np.minimum(cs + patch, W)
+    if float(H) * W * 24.0 <= budget_bytes:
+        w_full = np.where(np.isfinite(spread) & valid, np.maximum(spread, 0.0), 0.0)
+        if spread_power != 1.0:
+            w_full = w_full ** spread_power
+        # The accumulation is float64 even though the spread is float32. A summed-area
+        # table over 63.1M float32 values loses enough precision that the four-corner
+        # difference comes out *negative* for a low-weight patch, and rng.choice rejects
+        # the weights with "Probabilities are not non-negative". Southern Africa's 1.86M
+        # pixels never accumulated far enough to show it.
+        cum = w_full.astype(np.float64).cumsum(axis=0).cumsum(axis=1)
+        cum = np.pad(cum, ((1, 0), (1, 0)))
+        block = (cum[np.ix_(r1, c1)] - cum[np.ix_(rs, c1)]
+                 - cum[np.ix_(r1, cs)] + cum[np.ix_(rs, cs)])
+        return np.maximum(block, 0.0)
+
+    # Cell sums on the same grid the patch origins sit on, so a patch is a whole number of
+    # cells and its total is a slice sum rather than a difference of large numbers.
+    cell_r = np.arange(0, H, step)
+    cell_c = np.arange(0, W, step)
+    cells = np.zeros((cell_r.size, cell_c.size))
+    rows = max(step, min(H, int(budget_bytes / max(W * 16.0, 1)) // step * step))
+    for r0 in range(0, H, rows):
+        rr = min(rows, H - r0)
+        w = np.where(np.isfinite(spread[r0:r0 + rr]) & valid[r0:r0 + rr],
+                     np.maximum(spread[r0:r0 + rr], 0.0), 0.0).astype(np.float64)
+        if spread_power != 1.0:
+            w = w ** spread_power
+        nr = int(np.ceil(rr / step))
+        nc = cell_c.size
+        pad = np.zeros((nr * step, nc * step))
+        pad[:rr, :W] = w
+        cells[r0 // step: r0 // step + nr] += pad.reshape(nr, step, nc, step).sum(axis=(1, 3))
+        del w, pad
+    ccum = np.pad(cells.cumsum(axis=0).cumsum(axis=1), ((1, 0), (1, 0)))
+    ri0, ci0 = rs // step, cs // step
+    ri1 = np.minimum(np.ceil(r1 / step).astype(int), cells.shape[0])
+    ci1 = np.minimum(np.ceil(c1 / step).astype(int), cells.shape[1])
+    return np.maximum(ccum[np.ix_(ri1, ci1)] - ccum[np.ix_(ri0, ci1)]
+                      - ccum[np.ix_(ri1, ci0)] + ccum[np.ix_(ri0, ci0)], 0.0)
+
+
 def _clustered_sample(valid, n_points, rng, patch=512, n_patches=12, spread=None,
-                      spread_power=1.0):
+                      spread_power=1.0, budget_bytes=8e9):
     """Flat indices of valid pixels drawn from a handful of local patches.
 
     Structure-sensitive scores (variogram, energy) need pairs separated by less than the
@@ -906,28 +1131,25 @@ def _clustered_sample(valid, n_points, rng, patch=512, n_patches=12, spread=None
     H, W = valid.shape
     per_patch = max(10, n_points // n_patches)
 
-    w_full = None
-    if spread is not None:
-        w_full = np.where(np.isfinite(spread) & valid, np.maximum(spread, 0.0), 0.0)
-        if w_full.sum() <= 0:
-            w_full = None
-        elif spread_power != 1.0:
-            w_full = w_full ** spread_power
+    use_spread = spread is not None
+
+    def _w_patch(r0, c0):
+        """Patch weights, computed where they are needed instead of raster-wide."""
+        s = np.asarray(spread[r0:r0 + patch, c0:c0 + patch])
+        v = valid[r0:r0 + patch, c0:c0 + patch]
+        w = np.where(np.isfinite(s) & v, np.maximum(s, 0.0), 0.0)
+        return w ** spread_power if spread_power != 1.0 else w
 
     # Patch origins proportional to the spread they contain, on a coarse grid so the draw
     # is cheap. Falls back to uniform when no spread raster is supplied or it is degenerate.
     origins = None
-    if w_full is not None:
+    if use_spread:
         step = max(patch // 2, 1)
         rs = np.arange(0, max(1, H - patch) + 1, step)
         cs = np.arange(0, max(1, W - patch) + 1, step)
         if rs.size and cs.size:
-            cum = w_full.cumsum(axis=0).cumsum(axis=1)
-            cum = np.pad(cum, ((1, 0), (1, 0)))
-            r1 = np.minimum(rs + patch, H)
-            c1 = np.minimum(cs + patch, W)
-            block = (cum[np.ix_(r1, c1)] - cum[np.ix_(rs, c1)]
-                     - cum[np.ix_(r1, cs)] + cum[np.ix_(rs, cs)])
+            block = _patch_weight_sums(spread, valid, rs, cs, patch, spread_power,
+                                       budget_bytes)
             flat = block.ravel()
             if flat.sum() > 0:
                 pick = rng.choice(flat.size, size=n_patches * 4, replace=True,
@@ -947,8 +1169,8 @@ def _clustered_sample(valid, n_points, rng, patch=512, n_patches=12, spread=None
         sub = valid[r0:r0 + patch, c0:c0 + patch]
         loc = np.flatnonzero(sub.ravel())
         p = None
-        if w_full is not None:
-            sw = w_full[r0:r0 + patch, c0:c0 + patch].ravel()[loc]
+        if use_spread:
+            sw = _w_patch(r0, c0).ravel()[loc]
             if sw.sum() > 0:
                 # Drop the near-zero-weight pixels *before* drawing. `replace=False` has to
                 # return `per_patch` distinct indices, so a patch that only clips the live
@@ -1000,7 +1222,7 @@ def _pick_windows(observed_path, base_hm_path, profile, H, W, size=768):
     return out
 
 
-def _plot_members_vs_observed(members, d_obs, path, name, year, d_central=None):
+def _plot_members_vs_observed(members, d_obs, path, name, year, d_central=None, step=None):
     """Members beside the observation, the central forecast, and their Δ distributions.
 
     The central panel is what makes this diagnostic rather than decorative: members are
@@ -1015,7 +1237,10 @@ def _plot_members_vs_observed(members, d_obs, path, name, year, d_central=None):
     import matplotlib.pyplot as plt
 
     n = members.shape[0]
-    step = max(1, max(d_obs.shape) // 1200)
+    # The caller may already have decimated on read, in which case it passes step=1 so the
+    # arrays are not thinned twice.
+    if step is None:
+        step = max(1, max(d_obs.shape) // 1200)
     vmax = float(np.nanpercentile(np.abs(d_obs[::step, ::step]), 99.5)) or 0.05
     vmax = max(vmax, 0.02)
 
@@ -1083,47 +1308,78 @@ def stage_clustering(args, store, attrs, years, paths, out_dir, card, n_members:
     print("\n=== T8 · change clustering near past change ===")
     from src.ensemble.validate import DIST_LABELS, distance_band
 
-    with rasterio.open(args.dist_raster) as s:
-        dist = s.read(1).astype(np.float32)
-    band = distance_band(dist)
     base_hm = HM_DIR / f"HM_{args.base_year}_AA_1000.tiff"
     hi = len(years) - 1
     year = years[hi]
+    n_mem = min(n_members, store.shape[0])
+    n_band = len(DIST_LABELS)
     with rasterio.open(paths[year]["central"]) as c:
         profile = c.profile.copy()
         H, W = c.height, c.width
     p_t = profile["transform"]
-    with rasterio.open(base_hm) as b:
-        b_t = b.transform
+
+    # Counters, not rasters. The old shape of this stage held six full-resolution arrays
+    # and then re-read every member once per distance band — 48 whole-raster reads for six
+    # bands and eight members. Everything it computes is a fraction over a band, so one
+    # streaming pass with a (band x member) counter table gives the same numbers.
+    n_sel = np.zeros(n_band, dtype=np.int64)
+    obs_pos_n = np.zeros(n_band, dtype=np.int64)
+    obs_neg_n = np.zeros(n_band, dtype=np.int64)
+    mem_ok = np.zeros((n_band, n_mem), dtype=np.int64)
+    mem_pos_n = np.zeros((n_band, n_mem), dtype=np.int64)
+    mem_neg_n = np.zeros((n_band, n_mem), dtype=np.int64)
+
+    rows_b = max(1, min(H, int(float(args.mem_budget_gb) * 1e9 / max(W * n_mem * 12.0, 1))))
+    with rasterio.open(args.dist_raster) as dsrc, rasterio.open(base_hm) as b, \
+         rasterio.open(paths[year]["observed"]) as o:
+        b_t, o_t = b.transform, o.transform
         off = (int(round((p_t.f - b_t.f) / b_t.e)), int(round((p_t.c - b_t.c) / b_t.a)))
-        hm0 = b.read(1, window=Window(off[1], off[0], W, H)).astype(np.float32)
-    with rasterio.open(paths[year]["observed"]) as o:
-        o_t = o.transform
         ooff = (int(round((p_t.f - o_t.f) / o_t.e)), int(round((p_t.c - o_t.c) / o_t.a)))
-        obs = o.read(1, window=Window(ooff[1], ooff[0], W, H)).astype(np.float32)
-    hm0 = np.where(hm0 < 0, np.nan, hm0)
-    obs = np.where(obs < 0, np.nan, obs)
-    d_obs = obs - hm0
+        for r0 in range(0, H, rows_b):
+            rr = min(rows_b, H - r0)
+            band = distance_band(dsrc.read(1, window=Window(0, r0, W, rr)).astype(np.float32))
+            hm0 = b.read(1, window=Window(off[1], off[0] + r0, W, rr)).astype(np.float32)
+            obs = o.read(1, window=Window(ooff[1], ooff[0] + r0, W, rr)).astype(np.float32)
+            hm0 = np.where(hm0 < 0, np.nan, hm0)
+            obs = np.where(obs < 0, np.nan, obs)
+            d_obs = obs - hm0
+            base_ok = np.isfinite(d_obs) & np.isfinite(hm0)
+            if not base_ok.any():
+                continue
+            blk = agg.dequantize_block(np.asarray(store[0:n_mem, hi, r0:r0 + rr]), attrs)
+            for bi in range(n_band):
+                sel = (band == bi) & base_ok
+                k = int(sel.sum())
+                if k == 0:
+                    continue
+                n_sel[bi] += k
+                obs_pos_n[bi] += int((d_obs[sel] > 0.05).sum())
+                obs_neg_n[bi] += int((d_obs[sel] < -0.05).sum())
+                for m in range(n_mem):
+                    v = blk[m] - hm0
+                    ok = sel & np.isfinite(v)
+                    if not ok.any():
+                        continue
+                    mem_ok[bi, m] += int(ok.sum())
+                    mem_pos_n[bi, m] += int((v[ok] > 0.05).sum())
+                    mem_neg_n[bi, m] += int((v[ok] < -0.05).sum())
+            del blk
 
     rows = []
     for bi, label in enumerate(DIST_LABELS):
-        sel = (band == bi) & np.isfinite(d_obs) & np.isfinite(hm0)
-        if sel.sum() < 100:
+        if n_sel[bi] < 100:
             continue
-        obs_pos = float((d_obs[sel] > 0.05).mean())
-        obs_neg = float((d_obs[sel] < -0.05).mean())
-        mem_pos, mem_neg = [], []
-        for m in range(min(n_members, store.shape[0])):
-            v = agg.member_slice(store, attrs, m, hi) - hm0
-            ok = sel & np.isfinite(v)
-            if ok.sum():
-                mem_pos.append(float((v[ok] > 0.05).mean()))
-                mem_neg.append(float((v[ok] < -0.05).mean()))
-        mp, mn = float(np.mean(mem_pos)), float(np.mean(mem_neg))
-        rows.append({"band": label, "n_px": int(sel.sum()), "observed_pos": obs_pos,
+        obs_pos = float(obs_pos_n[bi] / n_sel[bi])
+        obs_neg = float(obs_neg_n[bi] / n_sel[bi])
+        live = mem_ok[bi] > 0
+        if not live.any():
+            continue
+        mp = float(np.mean(mem_pos_n[bi][live] / mem_ok[bi][live]))
+        mn = float(np.mean(mem_neg_n[bi][live] / mem_ok[bi][live]))
+        rows.append({"band": label, "n_px": int(n_sel[bi]), "observed_pos": obs_pos,
                      "member_pos": mp, "observed_neg": obs_neg, "member_neg": mn})
         print(f"  {label:>7}: P(Δ>0.05) member {mp:.5f} vs observed {obs_pos:.5f} | "
-              f"P(Δ<-0.05) {mn:.5f} vs {obs_neg:.5f}  (n={sel.sum():,})")
+              f"P(Δ<-0.05) {mn:.5f} vs {obs_neg:.5f}  (n={n_sel[bi]:,})")
         if obs_pos > 0:
             r = mp / obs_pos
             card.add("T8.1", f"P(Δ>0.05) band {label}", r, "ratio in [0.5, 2.0]",
@@ -1150,16 +1406,47 @@ def stage_clustering(args, store, attrs, years, paths, out_dir, card, n_members:
                  bool(ratio >= 20), note=f"observed ratio {obs_ratio}", knob="T8")
 
 
-def stage_temporal(args, store, attrs, years, paths, out_dir, card):
+def _sampled_member_block(store, attrs, m0, m1, hi, rows, cols, band_rows=1024):
+    """``(m1-m0, len(rows), len(cols))`` member values, read a chunk-block at a time.
+
+    Reading one member at a time decompresses the ten-member chunk it lives in and throws
+    nine tenths away; the store is chunked ``(10, 1, 1024, 1024)``, so asking for a member
+    block instead reads each chunk once.
+    """
+    rows = np.asarray(rows)
+    out = np.empty((m1 - m0, len(rows), len(cols)), dtype=np.float32)
+    H = store.shape[2]
+    for r0 in range(0, H, band_rows):
+        rr = min(band_rows, H - r0)
+        sel = np.flatnonzero((rows >= r0) & (rows < r0 + rr))
+        if sel.size == 0:
+            continue
+        blk = agg.dequantize_block(
+            np.asarray(store[m0:m1, hi, r0:r0 + rr]), attrs)
+        out[:, sel] = blk[:, rows[sel] - r0][:, :, cols]
+        del blk
+    return out
+
+
+def stage_temporal(args, store, attrs, years, paths, out_dir, card, member_block: int = 10):
+    """T4.1 between-horizon coupling and T4.2 spread monotonicity, streamed over members.
+
+    This used to hold ``zs``: every horizon's normal scores for every member on a
+    2000 x 2000 sample, four arrays of ``(M, 2000, 2000)`` float64 — 51 GB at M=400, which
+    would have OOM'd the moment T2 stopped failing first. Both statistics are moments, so
+    neither needs the members kept: the correlation comes from pooled cross-products and
+    the spread from a per-pixel Welford pass.
+    """
     print("\n=== T4 · temporal coherence ===")
     M, nH, H, W = store.shape
     rng = np.random.default_rng(1)
     rows = np.sort(rng.choice(H, size=min(H, 2000), replace=False))
     cols = np.sort(rng.choice(W, size=min(W, 2000), replace=False))
+    nr, nc = len(rows), len(cols)
 
-    zs = {}
+    marg, shapes = {}, {}
     for hi, year in enumerate(years):
-        cen, sl, sr = _marginal_arrays(paths, year, rows, cols)
+        marg[hi] = _marginal_arrays(paths, year, rows, cols)
         # T4 measures the AR(1) coupling of the *normal scores*, so it has to undo the
         # shape for the same reason T3 does. This call omitted it, which meant the
         # between-horizon correlation was being read off a nonlinearly distorted field
@@ -1167,20 +1454,61 @@ def stage_temporal(args, store, attrs, years, paths, out_dir, card):
         shape, band = _shape_context(args, year)
         if band is not None:
             band = band[np.ix_(rows, cols)]
-        stack = []
-        for m in range(M):
-            v = agg.member_slice(store, attrs, m, hi)[np.ix_(rows, cols)]
-            stack.append(recover_z(v, cen, sl, sr, shape=shape, band=band))
-        zs[hi] = np.stack(stack)
+        shapes[hi] = (shape, band)
+
+    # T4.1: pooled cross-products per adjacent horizon pair, on the finite-in-both mask.
+    pair = {a: np.zeros(6) for a in range(nH - 1)}     # n, sx, sy, sxy, sxx, syy
+    # T4.2: per-pixel Welford over members, per horizon.
+    w_n = np.zeros((nH, nr, nc), dtype=np.int64)
+    w_mean = np.zeros((nH, nr, nc))
+    w_m2 = np.zeros((nH, nr, nc))
+
+    # The block holds nH horizons of float64 normal scores at once; size it from the budget
+    # so the peak follows the knob rather than the member count.
+    member_block = max(1, min(member_block,
+                              int(float(args.mem_budget_gb) * 1e9 / (nH * nr * nc * 16.0))))
+    for m0 in range(0, M, member_block):
+        m1 = min(m0 + member_block, M)
+        z_blk = {}
+        for hi in range(nH):
+            v = _sampled_member_block(store, attrs, m0, m1, hi, rows, cols)
+            cen, sl, sr = marg[hi]
+            shape, band = shapes[hi]
+            # recover_z's per-band branch indexes with a 2-D mask, so it is applied one
+            # member at a time rather than across the block.
+            z_blk[hi] = np.stack([recover_z(v[i], cen, sl, sr, shape=shape, band=band)
+                                  for i in range(v.shape[0])])
+            fin = np.isfinite(v)
+            for i in range(v.shape[0]):
+                f = fin[i]
+                w_n[hi] += f
+                d = np.where(f, v[i] - w_mean[hi], 0.0)
+                w_mean[hi] += np.where(f, d / np.maximum(w_n[hi], 1), 0.0)
+                w_m2[hi] += np.where(f, d * (v[i] - w_mean[hi]), 0.0)
+            del fin, v
+        for a in range(nH - 1):
+            x, y = z_blk[a].ravel(), z_blk[a + 1].ravel()
+            ok = np.isfinite(x) & np.isfinite(y)
+            if not ok.any():
+                continue
+            xs, ys = x[ok], y[ok]
+            pair[a] += np.array([ok.sum(), xs.sum(), ys.sum(),
+                                 (xs * ys).sum(), (xs * xs).sum(), (ys * ys).sum()])
+        del z_blk
 
     rho_target = {}
     if Path(args.rho_json).exists():
         rho_target = {int(k): float(v) for k, v in json.load(open(args.rho_json)).items()}
 
     for a, b in zip(range(nH - 1), range(1, nH)):
-        x, y = zs[a].ravel(), zs[b].ravel()
-        ok = np.isfinite(x) & np.isfinite(y)
-        corr = float(np.corrcoef(x[ok], y[ok])[0, 1]) if ok.sum() > 10 else np.nan
+        n, sx, sy, sxy, sxx, syy = pair[a]
+        if n > 10:
+            cov = sxy / n - (sx / n) * (sy / n)
+            vx = max(sxx / n - (sx / n) ** 2, 0.0)
+            vy = max(syy / n - (sy / n) ** 2, 0.0)
+            corr = float(cov / np.sqrt(vx * vy)) if vx > 0 and vy > 0 else np.nan
+        else:
+            corr = np.nan
         h = years[b] - args.base_year
         tgt = rho_target.get(h, np.nan)
         ok_flag = bool(np.isfinite(corr) and np.isfinite(tgt) and abs(corr - tgt) <= 0.10)
@@ -1188,13 +1516,8 @@ def stage_temporal(args, store, attrs, years, paths, out_dir, card):
         card.add("T4.1", f"between-horizon corr {years[a]}->{years[b]}", corr,
                  f"within +/-0.10 of {tgt:.3f}", ok_flag if np.isfinite(tgt) else None, knob="T4.1")
 
-    spreads = []
-    for hi in range(nH):
-        vals = []
-        for m in range(M):
-            vals.append(agg.member_slice(store, attrs, m, hi)[np.ix_(rows, cols)])
-        spreads.append(np.nanstd(np.stack(vals), axis=0))
-    spreads = np.stack(spreads)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        spreads = np.where(w_n > 0, np.sqrt(w_m2 / np.maximum(w_n, 1)), np.nan)
     ok = np.isfinite(spreads).all(axis=0)
     mono = np.all(np.diff(spreads, axis=0) >= -1e-6, axis=0)
     frac = float(mono[ok].mean()) if ok.any() else np.nan
@@ -1267,12 +1590,17 @@ def stage_percentiles(args, pct_paths, years, paths, out_dir, card):
 
 
 def main(argv=None):
+    global TRACE
     args = parse_args(argv)
     years = [int(y) for y in args.years.split(",")]
     paths = raster_paths(args, years)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     stages = [s.strip() for s in args.stages.split(",")]
+
+    TRACE = make_trace(args.mem_trace, out_dir / "mem_trace.csv",
+                       interval=args.mem_trace_interval,
+                       tracemalloc=args.mem_trace_tracemalloc)
 
     store, attrs = agg.open_ensemble(args.ensemble)
     null_store = null_attrs = None
@@ -1319,7 +1647,10 @@ def main(argv=None):
         if name not in stages:
             return None
         try:
-            return fn(*a, **kw)
+            with TRACE.section(name):
+                out = fn(*a, **kw)
+            TRACE.snapshot(name)
+            return out
         except Exception as e:
             import traceback
             print(f"\n✗ stage '{name}' failed: {e}")
@@ -1343,6 +1674,12 @@ def main(argv=None):
     _run_stage("change", stage_change, args, store, attrs, years, paths, out_dir, card)
     _run_stage("visual", stage_visual, args, store, attrs, years, paths, out_dir, card, run=run)
     _run_stage("clustering", stage_clustering, args, store, attrs, years, paths, out_dir, card)
+
+    TRACE.stop()
+    if args.mem_trace:
+        print("\n" + "=" * 78)
+        print("MEMORY")
+        print(TRACE.report())
 
     df = card.df()
     df.to_csv(out_dir / "scorecard.csv", index=False)

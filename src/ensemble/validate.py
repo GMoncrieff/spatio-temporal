@@ -168,12 +168,11 @@ def compute_block_coverage(
         n_bi, n_bj = H // B, W // B
         if n_bi == 0 or n_bj == 0:
             continue
-        sum_lo = np.zeros((n_bi, n_bj), dtype=np.float64)
-        sum_hi = np.zeros((n_bi, n_bj), dtype=np.float64)
-        sum_ob = np.zeros((n_bi, n_bj), dtype=np.float64)
-        sum_cen = np.zeros((n_bi, n_bj), dtype=np.float64)
-        sum_hw2 = np.zeros((n_bi, n_bj), dtype=np.float64)
-        cnt = np.zeros((n_bi, n_bj), dtype=np.int64)
+        # Accumulate scalars per block row and drop the blocks, rather than holding six
+        # (n_bi, n_bj) float64 grids: at B=1 those are the pixel grid, 3 GB on Africa and
+        # ~33 GB on the global raster, for a result that is nine counts and sums.
+        acc = {kind: {"n": 0, "k": 0, "w": 0.0, "below": 0, "above": 0}
+               for kind in ("mean-of-bounds", "independent")}
 
         stripe = _stripe_rows(B, n_bj, stripe_blocks)
         srcs = {
@@ -208,52 +207,59 @@ def compute_block_coverage(
                     a = np.where(valid, a, 0.0)
                     return a.reshape(rr // B, B, n_bj, B).sum(axis=(1, 3))
 
-                b0 = r0 // B
-                sum_lo[b0:b0 + rr // B] += blocksum(lo)
-                sum_hi[b0:b0 + rr // B] += blocksum(hi)
-                sum_ob[b0:b0 + rr // B] += blocksum(ob)
+                # A stripe is a whole number of block rows (_stripe_rows guarantees it), so
+                # every block started here also finishes here and nothing carries over.
+                s_lo = blocksum(lo)
+                s_hi = blocksum(hi)
+                s_ob = blocksum(ob)
                 cen = 0.5 * (lo + hi) if cen_src is None else cen_src.read(1, window=win).astype(np.float64)
-                sum_cen[b0:b0 + rr // B] += blocksum(cen)
-                sum_hw2[b0:b0 + rr // B] += blocksum((0.5 * (hi - lo)) ** 2)
-                cnt[b0:b0 + rr // B] += valid.reshape(rr // B, B, n_bj, B).sum(axis=(1, 3))
+                s_cen = blocksum(cen)
+                s_hw2 = blocksum((0.5 * (hi - lo)) ** 2)
+                s_cnt = valid.reshape(rr // B, B, n_bj, B).sum(axis=(1, 3))
+
+                ok = s_cnt >= max(1, int(min_valid_frac * B * B))
+                if not ok.any():
+                    continue
+                c = s_cnt[ok]
+                with np.errstate(invalid="ignore"):
+                    m_lo, m_hi = s_lo[ok] / c, s_hi[ok] / c
+                    m_ob, m_cen = s_ob[ok] / c, s_cen[ok] / c
+                    # Independent propagation: sd of the block mean of n independent errors.
+                    hw_ind = np.sqrt(s_hw2[ok]) / c
+                for kind, lo_b, hi_b in (
+                    ("mean-of-bounds", m_lo, m_hi),
+                    ("independent", m_cen - hw_ind, m_cen + hw_ind),
+                ):
+                    a = acc[kind]
+                    a["n"] += int(ok.sum())
+                    a["k"] += int(((m_ob >= lo_b) & (m_ob <= hi_b)).sum())
+                    a["w"] += float((hi_b - lo_b).sum())
+                    a["below"] += int((m_ob < lo_b).sum())
+                    a["above"] += int((m_ob > hi_b).sum())
         finally:
             for s in srcs.values():
                 s.close()
             if cen_src is not None:
                 cen_src.close()
 
-        ok = cnt >= max(1, int(min_valid_frac * B * B))
-        n = int(ok.sum())
+        n = acc["mean-of-bounds"]["n"]
         if n == 0:
             rows.append({"scale_px": B, "n_blocks": 0, "coverage": np.nan})
             continue
-        with np.errstate(invalid="ignore"):
-            m_lo = sum_lo[ok] / cnt[ok]
-            m_hi = sum_hi[ok] / cnt[ok]
-            m_ob = sum_ob[ok] / cnt[ok]
-            m_cen = sum_cen[ok] / cnt[ok]
-            # Independent propagation: sd of the block mean of n independent errors.
-            hw_ind = np.sqrt(sum_hw2[ok]) / cnt[ok]
-
-        for kind, lo_b, hi_b in (
-            ("mean-of-bounds", m_lo, m_hi),
-            ("independent", m_cen - hw_ind, m_cen + hw_ind),
-        ):
-            covered = (m_ob >= lo_b) & (m_ob <= hi_b)
-            k = int(covered.sum())
-            wlo, whi = wilson_interval(k, n)
+        for kind, a in acc.items():
+            wlo, whi = wilson_interval(a["k"], a["n"])
             rows.append({
                 "scale_px": B,
                 "scale_km": B,
                 "kind": kind,
-                "n_blocks": n,
-                "n_covered": k,
-                "coverage": k / n,
+                "n_blocks": a["n"],
+                "n_covered": a["k"],
+                "coverage": a["k"] / a["n"],
                 "wilson_lo": float(wlo),
                 "wilson_hi": float(whi),
-                "mean_width": float(np.mean(hi_b - lo_b)),
-                "frac_below_lower": float(np.mean(m_ob < lo_b)),
-                "frac_above_upper": float(np.mean(m_ob > hi_b)),
+                "mean_width": a["w"] / a["n"],
+                "frac_below_lower": a["below"] / a["n"],
+                "frac_above_upper": a["above"] / a["n"],
             })
     return pd.DataFrame(rows)
 
