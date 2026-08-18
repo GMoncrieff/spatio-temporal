@@ -6,21 +6,62 @@ and 2.5/97.5 quantile intervals at +5/+10/+15/+20 yr, plus a post-hoc ensemble l
 marginals.
 
 Active branch: **`ensemble`**. Read `docs/current_progress.md` for status,
-`docs/next_phase_model.md` for the current phase, and `docs/central_field_baseline.md` plus
-`docs/next_phase_marginals.md` §5-6 for the measurement record — including the negative
-results, which are load-bearing.
+`docs/ensemble_model_outline.md` (and its illustrated HTML edition) for the end-to-end
+method and the current scorecard, `docs/validator_scaling.md` for the evaluation harness,
+and `docs/central_field_baseline.md` plus `docs/next_phase_marginals.md` §5-6 and
+`docs/model_phase.md` for the measurement record — including the negative results, which are
+load-bearing and are most of the record.
 
-**The post-hoc marginal phase is closed** (scorecard 90/126 → 101/127, per-member 7/20 →
-15/20, model untouched). The lever is exhausted structurally: T5.2 pins the marginal to the
-published bounds, so any shape re-injects their width error. The current phase improves the
-ConvLSTM itself.
+## Where the project is
+
+Two phases are **closed with nothing further to take from them**:
+
+- **Post-hoc marginals** — scorecard 90/126 → 101/127, per-member 7/20 → 15/20, model
+  untouched. Exhausted structurally: T5.2 pins the marginal to the published bounds, so any
+  shape re-injects their width error.
+- **The ConvLSTM model phase** — **22 experiments, nothing adopted.** Training budget, trunk
+  capacity in both directions, receptive field, loss composition, horizon weights, LR
+  schedule, gradient clipping, weight averaging, deeper heads, the asinh transform, the
+  differentiable histogram loss, `width_head_mode power/power_plus` and
+  `quantile_dhat_context` are all measured dead or worse. See [[model-phase-results]] and
+  `docs/model_phase.md` before proposing any of them again.
+
+**Evaluation is now continental and the harness scales.** Africa k=5 M=400 scores
+**111/133** (`data/ensemble/exp/africa_k5/validation_m400/`), against southern Africa's
+101/127. The validator's peak memory follows `--mem_budget_gb`; ensembles are icechunk.
+
+**There is still no production model.** Every checkpoint carrying the current configuration
+was trained with a fold held out.
+
+## The remaining plan
+
+1. **Hyperparameter sweep at global extent** (W&B sweeps), screening cheaply, then
+2. **promote the best configuration** to the full scorecard, then
+3. **global hindcast** — published scorecard and global hindcast maps — and finally the
+   **production 2025-2040 forecast**.
+
+The binding constraint on step 1 is the noise floor, not compute: **two runs of one
+configuration differ by 7 scorecard rows out of 128 at k=5**, which exceeds every effect the
+model phase measured. A sweep cannot be ranked on the scorecard. Screen on
+`scripts/score_model_experiment.py` (~40 s, stratified central *and* width, primary quantile
+metric `mean|ln k|`), and treat any difference smaller than the base band as noise until it
+replicates across seeds.
 
 ## Environment and scale
 
 - Conda env **`spatio-temporal-dl`**, not base:
   `/home/glenn/miniforge3/envs/spatio-temporal-dl/bin/python`.
-- **All iteration is on the southern-Africa subregion.** Global runs only on explicit
-  instruction; the global k=5 hindcast already exists on disk.
+- **Screening stays regional; the phase is global.** Southern Africa (1.86 Mpx) is still the
+  right extent for a fast A/B, Africa (63.1 Mpx) for a verdict, and the globe
+  (17111 x 40000 = 684 Mpx grid, 184.6M valid px) for the published product. Do not screen
+  globally — it buys nothing a regional read does not already say, and costs 300x.
+- **Global cost, projected from the Africa run** (which is the only continental measurement
+  in hand, so treat these as estimates to be checked, not facts):
+  prediction ~121 min per fold, ~10 h for k=5; ensemble generation ~1 h per ensemble at
+  M=400; **~450 GB per ensemble on disk**, so members + null is ~0.9 TB; and the T1-T8
+  scorecard is **the better part of a day** (Africa took 190 min at 18.4 GB peak, and the
+  globe is 5.2x its valid pixels and 10.8x its grid). Budget one global scorecard run, not
+  an iteration loop.
 - Two GPUs (RTX A5000, 24 GB each). Track experiments on **W&B**.
 - Large global artifacts live on the HDD (`/mnt/hdd1/spatio-temporal/data`) behind symlinks
   in `data/ensemble/`. Root has ~90 GB free; southern-Africa ensembles at M=400 are ~3 GB
@@ -47,6 +88,9 @@ ConvLSTM itself.
 | **score a marginal without generating anything** | `scripts/predict_change_rates.py --manifest … [--sweep_u_bound …]` | ~30 s |
 | per-member realism (the honest marginal test) | `scripts/member_distance_relationship.py --ensembles label=path … --members 400` | ~10 min |
 | convert an old plain-zarr store | `scripts/migrate_zarr_to_icechunk.py --src … --dst … --verify` | ~1 min/GB |
+| **screen one configuration** (train 2 folds, predict, stitch, stratified read) | `./scripts/run_model_slate.sh <slate> 1,2` | ~35 min each |
+| **score a screened configuration**, central *and* width, no ensemble | `scripts/score_model_experiment.py` | ~40 s |
+| **promote a winner**: k=5, whole downstream chain, scorecard, per-member | `./scripts/promote_model_experiment.sh <name> "<flags>"` | ~2 h |
 
 `run_region_loop.sh` re-derives the recalibration, spectrum and AR(1) coupling from *that
 model's own* residuals. Never carry them over between configurations. `SHAPE=<u_bound>`
@@ -59,6 +103,40 @@ mean — so `predict_change_rates.py` answers in 30 s what a generate-and-valida
 answers in 35 min. It agreed with three M=400 ensembles to 1–11%. Its second job is being a
 second implementation: it shares no code with the GPU sampler, so agreement is evidence and
 disagreement localises the bug to the generation path.
+
+## Sweeping the model (the current phase)
+
+The machinery already exists and should be driven, not rebuilt: `run_model_slate.sh` queues
+screening runs on folds 1-2 with a fixed reference; `score_model_experiment.py` reads each
+one in ~40 s; `promote_model_experiment.sh` takes a winner through k=5 and the whole
+downstream chain. A W&B sweep should drive `train_lightning.py` with the same fixed folds and
+log the `score_model_experiment.py` metrics as the sweep objective.
+
+**The reference for any new run** is the shipped configuration plus the two corrections the
+model phase established: `--histogram_weight 0` (the term carries no gradient, and made
+differentiable it is decisively worse, but at weight 1.0 it swings ~60x between epochs and
+makes checkpoint selection a lottery) and `--checkpoint_monitor val_central_loss` (so a
+quantile-only change must leave the central field bit-identical — a free correctness check
+rather than a confound).
+
+**Objective.** Not the scorecard: it carries +/-7 rows of run-to-run noise at k=5. Screen on
+`mean|ln k|` over classes (the multiplier that would make the published interval the
+residual's own 95% interval — a model whose width heads are right needs k = 1 everywhere),
+with within-20% and central skill-vs-persistence alongside. Central skill is much the least
+noisy of the three.
+
+**Do not sweep what is already measured dead** (see "Where the project is"). Twenty-two
+hand-run experiments covered most of the obvious axes and adopted none of them, so a sweep
+over the same space will confirm the incumbent at best. Axes that were *not* covered and are
+worth the budget: the learning rate value itself (only the *schedule* was tried), batch size,
+`--quantile_class_weighting`, `--width_parameterisation exp` vs softplus,
+`--initial_width_normalized`, chip sampling density, and `--weight_avg_last` — which the seam
+work independently motivated, since 44-85% of the between-fold width disagreement is
+optimisation noise.
+
+**Expect the sweep to find nothing, and design for that being an acceptable answer.** The
+value of running it is a defensible statement that the configuration is at a local optimum
+before a global production run, not a promise of improvement.
 
 ## Rules learned the hard way
 
