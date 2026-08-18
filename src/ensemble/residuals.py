@@ -222,18 +222,41 @@ def stitch_fold_predictions(
     out_path: str,
     block_rows: int = 1024,
     nodata=np.nan,
+    mode: str = "holdout",
 ):
-    """Combine per-fold rasters into one out-of-sample raster.
+    """Combine per-fold rasters into one raster, either out-of-sample or seamless.
 
     Each fold's raster covers the same extent (fold membership controlled *training* data,
-    not prediction extent). At each pixel we keep the prediction from the fold whose
-    training excluded that pixel, i.e. fold ``f`` values where ``fold_mask == f``.
+    not prediction extent).
+
+    ``mode="holdout"`` (default) keeps, at each pixel, the prediction from the fold whose
+    training excluded it — ``fold f`` values where ``fold_mask == f``. This is what makes
+    the hindcast honest and it is the only mode anything scored should use.
+
+    It is also, unavoidably, a hard mosaic. The k=5 mask is a **128 px checkerboard**, so
+    adjacent tiles come from different models, and wherever those models disagree the join
+    is visible. Measured on Africa at +20 yr, the step across a fold boundary against the
+    step inside a fold is 1.08x for the central field and for the lower bound — nothing —
+    and **2.01x for the upper bound**, because the upper is the one head the five folds do
+    not agree on (mean pairwise |fold_i - fold_j| of 0.0383 against 0.0053 central and
+    0.0040 lower). A single fold's own blended raster is seamless at every period from 64
+    to 1024 px, so neither the model nor the overlap blending is involved.
+
+    ``mode="mean"`` averages every fold at every pixel instead. There is no mosaic and no
+    seam, and no pixel is out of sample any more — which is exactly right for a *forward*
+    product, where no geography was held out to begin with, and exactly wrong for scoring.
+    Note the averaged interval is narrower than any single fold's would be, because it
+    discards the between-fold spread rather than adding it.
 
     Parameters
     ----------
     fold_paths
         ``{fold_id: path}`` for a single (window, horizon, quantile) combination.
+    mode
+        ``"holdout"`` for evaluation, ``"mean"`` for a seamless product raster.
     """
+    if mode not in ("holdout", "mean"):
+        raise ValueError(f"unknown stitch mode {mode!r} (expected 'holdout' or 'mean')")
     fold_ids = sorted(fold_paths)
     srcs = {f: rasterio.open(fold_paths[f]) for f in fold_ids}
     ref = srcs[fold_ids[0]]
@@ -254,17 +277,28 @@ def stitch_fold_predictions(
                 fmask = mask_src.read(
                     1, window=Window(col_off, row_off + r0, ref.width, rows), boundless=True, fill_value=0
                 )
-                for f in fold_ids:
-                    sel = fmask == f
-                    if not sel.any():
-                        continue
-                    vals = srcs[f].read(1, window=Window(0, r0, ref.width, rows))
-                    out[sel] = vals[sel]
+                if mode == "mean":
+                    acc = np.zeros((rows, ref.width), dtype=np.float64)
+                    cnt = np.zeros((rows, ref.width), dtype=np.int32)
+                    for f in fold_ids:
+                        vals = srcs[f].read(1, window=Window(0, r0, ref.width, rows))
+                        ok = np.isfinite(vals)
+                        acc[ok] += vals[ok]
+                        cnt[ok] += 1
+                    got = cnt > 0
+                    out[got] = (acc[got] / cnt[got]).astype(np.float32)
+                else:
+                    for f in fold_ids:
+                        sel = fmask == f
+                        if not sel.any():
+                            continue
+                        vals = srcs[f].read(1, window=Window(0, r0, ref.width, rows))
+                        out[sel] = vals[sel]
                 n_written += int(np.isfinite(out).sum())
                 dst.write(out, 1, window=Window(0, r0, ref.width, rows))
     for s in srcs.values():
         s.close()
-    return {"path": str(out_path), "n_valid_px": n_written}
+    return {"path": str(out_path), "n_valid_px": n_written, "mode": mode}
 
 
 # --------------------------------------------------------------------------------------

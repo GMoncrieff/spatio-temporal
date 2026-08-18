@@ -74,6 +74,13 @@ PRODUCTION_HPARAMS = dict(
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--stage", default="all", choices=["all", "train", "stitch", "residuals"])
+    p.add_argument("--stitch_mode", default="holdout", choices=["holdout", "mean"],
+                   help="holdout keeps each pixel's held-out fold — honest, and a hard "
+                        "mosaic on the 128 px fold checkerboard, which shows as a visible "
+                        "join wherever the folds disagree (the upper bound, 2.0x the "
+                        "within-fold step). mean averages the folds everywhere: seamless, "
+                        "and correct for a forward product where nothing was held out. "
+                        "Writes to stitched_mean/ so the two never overwrite each other.")
     p.add_argument("--folds", default="1,2,3,4,5", help="Comma-separated fold ids to run")
     p.add_argument("--n_folds", type=int, default=5)
     p.add_argument("--fold_mask", default=str(FOLD_MASK))
@@ -230,7 +237,8 @@ def stitch_all(args, folds, windows):
     from src.ensemble.residuals import stitch_fold_predictions
 
     pred_dir = Path(args.output_root) / "preds"
-    out_dir = Path(args.output_root) / "stitched"
+    suffix = "" if args.stitch_mode == "holdout" else f"_{args.stitch_mode}"
+    out_dir = Path(args.output_root) / f"stitched{suffix}"
     out_dir.mkdir(parents=True, exist_ok=True)
     written = []
     for window in windows:
@@ -249,7 +257,8 @@ def stitch_all(args, folds, windows):
                     print(f"  ⚠ no fold rasters for w{base} {target_year} {q}; skipping")
                     continue
                 out_path = out_dir / f"w{base}_prediction_{target_year}_{q}.tif"
-                info = stitch_fold_predictions(fold_paths, args.fold_mask, str(out_path))
+                info = stitch_fold_predictions(fold_paths, args.fold_mask, str(out_path),
+                                               mode=args.stitch_mode)
                 print(f"  ✓ w{base} {target_year} {q}: {info['n_valid_px']:,} px -> {out_path}")
                 written.append(info)
     if not args.keep_fold_rasters:
