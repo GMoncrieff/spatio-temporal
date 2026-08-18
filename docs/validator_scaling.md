@@ -204,50 +204,56 @@ they were tuned on.**
 
 ---
 
-## 8. Why the folds disagree: two runs, and the answer is "not the data"
+## 8. Why the folds disagree: two runs, and what they actually say
 
 The checkerboard is fold-model disagreement on the upper bound, so the question is what
-drives that disagreement — the fact that each fold trained on a different 80% of the world,
-or the fact that training is noisy. Repeated k-fold CV would average it away at 5x the
-budget, but only the first answer would justify the spend.
+drives it — the folds seeing different data, or training being noisy. Repeated k-fold CV
+would average it away at 5x the budget, but only the first answer would justify the spend.
 
-Fold 1 was retrained twice more with the africa_k5 configuration unchanged in every flag
-except `--seed` (7 and 1234, against the original 42). Same held-out geography, so anything
-these three disagree about is training noise. Scored on the 309,163 pixels finite in all
-five folds and all three seeds, as mean pairwise |a − b| at +20 yr:
+Fold 1 was retrained twice with the africa_k5 configuration unchanged in every flag except
+`--seed` (7 and 1234, against the original 42). Same held-out geography, so anything these
+three disagree about is training noise. Scored on the 309,163 pixels finite in all five
+folds and all three seeds, as mean pairwise |a - b| on the upper half-width:
 
-| upper half-width | mean pairwise difference | share of the 0.085 level |
-|---|---|---|
-| seed-to-seed (same fold, 3 seeds) | **0.0308** | 36% |
-| fold-to-fold (5 folds, same seed) | 0.0335 | 40% |
-
-**Only 8% of the fold-to-fold difference comes from the data.** Retrain the same model on
-the same 80% with a different seed and you get a width field that differs almost as much as
-one trained on a different fifth of the world. The central field behaves the same way but
-an order of magnitude smaller in absolute terms (0.0043 vs 0.0053, 20% data-driven).
-
-Treating the mean absolute difference as proportional to a standard deviation, the
-fold-to-fold spread decomposes into a **0.0308 training-noise** component and a **0.0132
-data-driven** one. That sets what averaging can buy:
-
-| | R=2 | R=5 | R=10 |
+| horizon | seed-to-seed | fold-to-fold | noise share of variance |
 |---|---|---|---|
-| repeat seeds, fold mask fixed | 1.32x | 1.76x | 2.04x |
-| repeated k-fold (folds reshuffled too) | 1.41x | 2.24x | 3.16x |
+| h=5 | 0.0050 | 0.0066 | 57% |
+| h=10 | 0.0099 | 0.0150 | 44% |
+| h=15 | 0.0186 | 0.0234 | 63% |
+| h=20 | 0.0308 | 0.0335 | **85%** |
 
-Three things follow.
+**Read this in variance, not in the ratio of the two columns.** At h=20 the seed-to-seed
+figure is only 8% below the fold-to-fold one, which looks like "the data contributes
+nothing" — but the two components combine in quadrature, so the data-driven standard
+deviation is sqrt(0.0335^2 - 0.0308^2) = 0.0132, a full 39% of the fold-to-fold spread. An
+earlier version of this section reported the 8% as the data share. It is not; it is the
+difference of two quantities that do not subtract linearly.
 
-* **Repeated k-fold at R=5 shrinks the seam ~2.2x, not to zero.** From 2.01x the within-fold
-  step to about 1.45x, and in quiet country from 47x the local background to roughly 21x.
-* **You do not need repeated *k-fold* for most of it.** Averaging R seeds at a *fixed* fold
-  mask is still strictly out of sample — every model in the average excluded that pixel —
-  and captures the 92% noise component. Reshuffling the folds as well buys the remaining
-  8%, at the same cost. Repeated k-fold is the better of the two (1.76x vs 2.24x at R=5),
-  but not by the margin its name suggests.
-* **The cheapest lever is not averaging at all.** If 92% of the disagreement is optimisation
-  noise, the training recipe is the defect. `--weight_avg_last` already exists for exactly
-  this — its own help text records the checkpoint pick landing on epoch 140/85/60 across
-  three seeds of one configuration while the best 10% of epochs sat within 3% of the
-  minimum. Switching the monitor to `val_central_loss` (the e5_africa configuration) already
-  cut the fold-to-fold upper-width spread from 0.0335 to 0.0275, an 18% reduction for free.
-  Weight averaging is the obvious next test, at 1x budget rather than 5x.
+So: training noise is the larger single component at three horizons of four, and clearly
+dominant at +20 yr where the checkerboard is most visible — but it is not the whole story
+anywhere, and at h=10 the data component is actually the larger one.
+
+That distinction decides between the two averaging schemes, because only one of them
+averages the data component:
+
+| seam reduction at R=5 | h=5 | h=10 | h=15 | h=20 |
+|---|---|---|---|---|
+| repeat seeds, fold mask fixed | 1.36x | 1.24x | 1.42x | 1.76x |
+| repeated k-fold (folds reshuffled too) | 2.24x | 2.24x | 2.24x | 2.24x |
+
+Three conclusions.
+
+* **Repeated k-fold really is the better of the two.** It gives a uniform 2.24x at R=5
+  because it averages both components; averaging seeds at a fixed fold mask leaves the data
+  component untouched and delivers 1.24-1.76x. Seed-repeats are still strictly out of
+  sample and still cheaper to reason about, but they are not a substitute.
+* **Neither removes the seam.** At R=5 the upper bound goes from 2.01x the within-fold step
+  to about 1.45x, and in quiet country from 47x the local background to roughly 21x.
+* **The training recipe is still worth attacking first, and separately.** It addresses only
+  the noise component, but that component is 44-85% of the variance and it is free.
+  `--weight_avg_last` exists for exactly this — its help text records the checkpoint pick
+  landing on epoch 140/85/60 across three seeds of one configuration while the best 10% of
+  epochs sat within 3% of the minimum. And the comparison is already on disk: the
+  `e5_africa` batch differs from `africa_k5` mainly in `--checkpoint_monitor
+  val_central_loss`, and its fold-to-fold upper-width spread is 0.0275 against 0.0335 — an
+  18% reduction at no extra cost.
