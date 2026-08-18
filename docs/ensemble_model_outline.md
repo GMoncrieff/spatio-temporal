@@ -136,7 +136,7 @@ Positive means it beats that; negative means it would be better to predict no ch
 was 2.2× worse than doing nothing. It now wins at every horizon, and by more at longer lead,
 which is the sensible ordering.
 
-Scorecard: **73/137 → 101/127**.
+Scorecard on southern Africa: **73/137 → 101/127**; the same chain scores **111/133** on Africa (§3).
 
 ### 1.4 Things found in the model that should be addressed
 
@@ -486,52 +486,87 @@ second, competing product. Whatever the ensemble says, the headline numbers are 
 
 `scripts/validate_ensemble.py` scores the generated ensemble against eight families of
 targets and writes a pass/fail row per (target × horizon × scale), with a diagnosis attached
-to each failure saying which knob would move it. Current state on southern Africa, k=5,
-M=400, the shipped configuration: **101 of 127 scoreable rows pass.**
+to each failure saying which knob would move it.
 
-A note on reading it: five targets are **reported, not scored** (T2.6, T3.2b, T3.4, T4.1,
-T7.1) — they produce numbers or figures for inspection but have no pass gate.
+**Current state: Africa, k=5, M=400 — 111 of 133 scoreable rows pass.** The southern-Africa
+run of the same chain, also at M=400, reads 101/127 and is kept below as the regional
+comparison. Fourteen rows are **reported, not scored** (T2.6, T3.2b, T3.4, T4.1, T7.1) —
+they produce numbers or figures for inspection but have no pass gate.
 
-### T1 — Is each pixel's uncertainty right? (29/31)
+The two regions are not interchangeable, and the differences are informative in both
+directions. Africa has **158 ecoregions against southern Africa's 18**, which turns several
+aggregate targets from undecidable into real tests; it also has enough remote country to
+populate the far distance bands, which exposes a failure the smaller extent could not show.
+Read the families, not the totals.
+
+| family | Africa | s. Africa | what moved |
+|---|---|---|---|
+| T1 pixel-scale coverage | 29/33 | 29/31 | pooled coverage flips from over- to under-covering |
+| T2 aggregate coverage | **37/41** | 31/41 | ecoregion rows become decidable at n=158 |
+| T3 spatial realism | 3/6 | 3/6 | unchanged — the correlation structure is regionally invariant |
+| T4 temporal coherence | 0/1 | 0/1 | monotone spread worse on Africa (0.712 vs 0.937) |
+| T5 hard gates | 11/12 | 12/12 | h=20 median gate misses by 0.0015 |
+| T6 change realism | **19/24** | 14/22 | change quantiles 7/8 against 3/8 |
+| T7 diversity / spread-skill | 1/2 | 1/2 | unchanged |
+| T8 change placement | 11/14 | 11/12 | two new far-band failures Africa can see and s. Africa cannot |
+
+### T1 — Is each pixel's uncertainty right? (29/33)
 
 | row | plain meaning | result |
 |---|---|---|
-| **T1.1** pooled coverage | Of all pixels, does the truth fall inside the 95% interval 95% of the time? | 3/4 — h=20 at 0.963, slightly wide |
-| **T1.2** class-conditional coverage | Same question but *within* each class of pixel (by distance to past change, by predicted change, by HM level). Catches the case where being right on average hides being wrong everywhere in compensating directions. | 14/15 |
-| **T1.3** high-change tail | Coverage specifically on the rare pixels where a lot of change is predicted — the ones the project exists to get right. | **2/2** |
-| **T1.5** sharpness | Are the intervals no wider than they need to be? An interval can always be made to cover by being useless. | **10/10** — mean width halved vs the original heads |
+| **T1.1** pooled coverage | Of all pixels, does the truth fall inside the 95% interval 95% of the time? | 2/4 — 0.944 / 0.938 / 0.942 / 0.939, mildly **under** at every horizon |
+| **T1.2** class-conditional coverage | Same question but *within* each class of pixel (by distance to past change, by predicted change, by HM level). Catches the case where being right on average hides being wrong everywhere in compensating directions. | 14/16 — worst cell deviation 0.033 against a 0.05 allowance |
+| **T1.3** high-change tail | Coverage specifically on the rare pixels where a lot of change is predicted — the ones the project exists to get right. | **3/3** (0.966 / 0.965 / 0.950) |
+| **T1.5** sharpness | Are the intervals no wider than they need to be? An interval can always be made to cover by being useless. | **10/10** — width ratios 0.81–1.09 against the original heads |
+
+**The direction reversed between regions.** On southern Africa T1.1 was mildly *over*-covering
+(0.963 at h=20); on Africa it is mildly *under* at all four horizons. The width machinery was
+fitted on southern Africa, and about half of it turns out to be compensating for that
+region's own error structure rather than the model's.
 
 **Why T1.2 matters more than T1.1.** Pooled coverage of 0.966 once coexisted with 0.335 in the
 high-change class. Averages hide exactly the failures you care about.
 
-### T2 — Is uncertainty right at *larger* scales? (31/41)
+### T2 — Is uncertainty right at *larger* scales? (37/41)
 
-This is the motivating problem of the whole project.
+This is the motivating problem of the whole project, and Africa is where it can finally be
+measured properly.
 
 | row | plain meaning | result |
 |---|---|---|
-| **T2.1** block coverage | Aggregate HM over 1 km, 10 km and 100 km blocks. Does the truth fall inside the ensemble's range 95% of the time at *every* scale? | **12/12** |
+| **T2.1** block coverage | Aggregate HM over 1 km, 10 km and 100 km blocks. Does the truth fall inside the ensemble's range 95% of the time at *every* scale? | **12/12** (0.924–0.978) |
 | **T2.8** aggregate width | Is the aggregate interval narrower than naively averaging the per-pixel bounds — i.e. is the correlation actually buying anything? | **12/12** |
-| **T2.5** rank histogram | Where does the truth rank among the members? If the ensemble is calibrated the truth is equally likely to be 1st, 50th or 100th — a flat histogram. A U-shape means too narrow; a hump means too wide. | **4/4** |
-| **T2.2 / T2.3 / T2.4** ecoregion coverage | Same test over real ecological regions rather than square blocks. | **0/4, 3/8, 0/1** |
+| **T2.5** rank histogram | Where does the truth rank among the members? A flat histogram means calibrated; a U-shape means too narrow, a hump too wide. | 3/4 — 2005 fails at p = 1.2e-6 |
+| **T2.2 / T2.3 / T2.4** ecoregion coverage | Same test over real ecological regions rather than square blocks. | 2/4, **7/8**, **1/1** |
 
-**T2.1 at 12/12 is the headline result of the project.** Aggregate coverage is correct at
-every block scale, which is precisely what per-pixel intervals could not deliver.
+**T2.1 at 12/12 is the headline result of the project**, and it now holds on a continent as
+well as a region. Aggregate coverage is correct at every block scale, which is precisely what
+per-pixel intervals could not deliver.
 
-**The ecoregion failures are over-coverage, and largely a power problem.** Every failing row
-sits at exactly 1.000 — the truth is *always* inside. With ~18 ecoregions in the region, the
-plan's own power analysis says a ±0.05 target is undecidable at that sample size (Wilson
-half-width ±0.114). These rows need more aggregation units, not a different field; sweeping
-the field knob over a 4.7× range never moved them.
+**The ecoregion rows were a resolution problem, and Africa proves it.** With 18 units the
+coverage can only take values k/18, so 18/18 = 1.000 fails a ±0.05 target while 17/18 = 0.944
+passes — the metric was quantised too coarsely to land inside its own tolerance, and every
+southern-Africa failure sat at exactly 1.000. Africa's 158 units give values of 0.981–0.994
+and the family goes 3/8 → 7/8, with T2.4 (ecoregion mean *change* between horizons, the
+hardest case) passing for the first time. The remaining T2.2 failures are still over-coverage.
+
+**T2.5 is the mirror image: a test that gained power and started failing.** Southern Africa
+returned p = 0.72 three times of four at n=18 — no power. At n=158 the 2005 rank histogram
+fails decisively. That is a stronger test failing, not a worse model.
 
 ### T3 — Do the members look like real maps? (3/6)
 
 | row | plain meaning | result |
 |---|---|---|
-| **T3.1** member variogram | Does a member's spatial structure match the structure fitted to the real residuals? | 1/3 — practical range off by 0.35, nugget by 0.12 |
-| **T3.2** vs an independent null | Compare against an ensemble with identical marginals but *no* spatial structure. The correlated one should be markedly better. | **fails** (0.021 against a ≥0.30 target) |
+| **T3.1** member variogram | Does a member's spatial structure match the structure fitted to the real residuals? | 1/3 — normal-score variance 1.151 (target 1.0 ± 0.15), practical range off by 0.148 (**passes**), nugget by 0.103 against a 0.10 allowance |
+| **T3.2** vs an independent null | Compare against an ensemble with identical marginals but *no* spatial structure. The correlated one should be markedly better. | **fails** (0.031 against a ≥0.30 target) |
 | **T3.3** energy score | A proper multivariate score against the same null. | **passes** |
-| **T3.5** seam continuity | No visible discontinuity at the longitude wrap. | **passes** |
+| **T3.5** seam continuity | No visible discontinuity at the longitude wrap. | **passes** (regional grid) |
+
+**T3 is the one family that does not move between regions** — 3/6 on both, and T3.2 reads
+0.031 on Africa against 0.021 on southern Africa. The correlation structure is the live
+defect and it is regionally invariant, which makes it the one thing southern-Africa iteration
+was *not* flattering.
 
 **T3.2's target is the problem, not the field, and this is measured.** An ensemble calibrated
 to the residual can only differ from an independent one in the variance still *correlated* at
@@ -546,20 +581,21 @@ threshold should be re-scoped rather than tuned toward.
 
 | row | plain meaning | result |
 |---|---|---|
-| **T4.1** between-horizon correlation | Members should carry their story forward in time. | reported: 0.724/0.939/0.916 vs observed 0.737/0.943/0.922 — very close |
-| **T4.2** monotone spread | Uncertainty should not *shrink* as you forecast further ahead. | 0.937 against a ≥0.99 gate |
+| **T4.1** between-horizon correlation | Members should carry their story forward in time. | reported: 0.900 / 0.901 / 0.900 — the AR(1) target file does not exist for this configuration, so ρ fell back to 0.9 and the row is not gated |
+| **T4.2** monotone spread | Uncertainty should not *shrink* as you forecast further ahead. | 0.712 against a ≥0.99 gate (southern Africa: 0.937) |
 
 T4.2 is the one real cost of raising the marginal's tail bound: extending the upper tail adds
-spread at every horizon, and at h=5 that buys nothing while perturbing the ordering. A bound
-that varies by horizon as well as by band is the obvious next move.
+spread at every horizon, and at h=5 that buys nothing while perturbing the ordering. It is
+markedly worse on Africa. A bound that varies by horizon as well as by band is the obvious
+next move.
 
-### T5 — Hard gates: is the ensemble faithful to the published product? (12/12)
+### T5 — Hard gates: is the ensemble faithful to the published product? (11/12)
 
 | row | plain meaning | result |
 |---|---|---|
-| **T5.1** | ensemble median == published central forecast | **4/4** |
-| **T5.2** | ensemble 2.5/97.5 percentiles == published bounds | **4/4** |
-| **T5.3** | ensemble validity mask == model validity mask | **4/4** |
+| **T5.1** | ensemble median == published central forecast | 3/4 — 0.9956 / 0.9989 / 0.9975 / **0.9935** against a ≥0.995 gate |
+| **T5.2** | ensemble 2.5/97.5 percentiles == published bounds | **4/4** (0.986–0.992) |
+| **T5.3** | ensemble validity mask == model validity mask | **4/4**, zero mismatched pixels |
 
 These are non-negotiable. If they fail, the ensemble is telling a different story from the
 published maps. Their tolerances are Monte-Carlo scaled (they tighten as 1/√M) and
@@ -567,48 +603,62 @@ published maps. Their tolerances are Monte-Carlo scaled (they tighten as 1/√M)
 quantile, which for a reshaped marginal is not the same as for a normal. Ignoring that made
 the tolerance 1.3–2.2× too tight at the bounds and up to 3.7× too loose at the median.
 
-### T6 — Is the *amount* and *sign* of change realistic? (14/22)
+**The member count is visible in this family.** At M=100 the same Africa ensemble scored T5.1
+at 0.9923 / 0.9976 / 0.9968 / 0.9921 — 2/4. At M=400 it is 3/4, with h=20 missing by 0.0015.
+Nothing changed but the number of draws.
+
+### T6 — Is the *amount* and *sign* of change realistic? (19/24)
 
 | row | plain meaning | result |
 |---|---|---|
-| **T6.1** | Does a member show decreases of >0.01 as often as reality? | 1/4 — over-predicted 2.1–3.5× |
+| **T6.1** | Does a member show decreases of >0.01 as often as reality? | 0/4 — over-predicted 2.5–4.5× |
 | **T6.2 / T6.3** | Same for larger decreases (>0.05, >0.15). | **4/4, 4/4** |
-| **T6.4** | Is the asymmetry between increases and decreases right? | **2/2** |
-| **T6.5** | Do member change quantiles match observed ones? | 3/8 |
+| **T6.4** | Is the asymmetry between increases and decreases right? | **4/4** |
+| **T6.5** | Do member change quantiles match observed ones? | **7/8** — ratios 1.01–1.86, only h=20 q05 misses at 4.25 |
 
-HM decreases are real but rare, and the ensemble manufactures too many small ones. Most of
-this is not fixable by any per-pixel marginal: the ideal calculation — using each band's own
-empirical distribution — still over-predicts by 3.05×, so it reflects a dependence between
-the standardised residual and the pixel's own threshold, which a marginal by definition
-cannot encode.
+**T6.5 is the clearest place Africa is genuinely better**, 7/8 against southern Africa's 3/8,
+with ratios of 1.01–1.86 against 1.11–5.41. On a fairer HM distribution the members' change
+distribution matches observation well.
+
+T6.1 is the counterweight and it is worse on Africa. HM decreases are real but rare, and the
+ensemble manufactures too many small ones. Most of this is not fixable by any per-pixel
+marginal: the ideal calculation — using each band's own empirical distribution — still
+over-predicts by 3.05×, so it reflects a dependence between the standardised residual and the
+pixel's own threshold, which a marginal by definition cannot encode.
 
 ### T7 — Are the members diverse but not absurd? (1/2 scored)
 
 | row | plain meaning | result |
 |---|---|---|
-| **T7.2** member diversity | Members must not be near-copies of each other. | **passes** (0.26–0.46 mean pairwise correlation) |
-| **T7.3** spread-skill ratio | Where the ensemble is uncertain, the model should actually be more wrong. A ratio of 1 means spread predicts error correctly. | 1.58 against 1.0 ± 0.25 |
+| **T7.2** member diversity | Members must not be near-copies of each other. | **passes** (0.256 mean pairwise correlation) |
+| **T7.3** spread-skill ratio | Where the ensemble is uncertain, the model should actually be more wrong. A ratio of 1 means spread predicts error correctly. | 1.891 against 1.0 ± 0.25 (southern Africa: 1.583) |
 
-T7.3 above 1 means the ensemble is somewhat over-spread relative to the error it needs to
-explain — consistent with T1.1's mild over-coverage. Lowering `long_weight` fixes it but pulls
-near-nominal T2.3 rows below target, so it is recorded as a known near-miss with an
-undesirable remedy.
+T7.3 above 1 means the ensemble is over-spread relative to the error it needs to explain, and
+it is worse on Africa. Lowering `long_weight` fixes it but pulls near-nominal T2.3 rows below
+target, so it is recorded as a known near-miss with an undesirable remedy.
 
-### T8 — Is change put in the *right places*? (11/12)
+### T8 — Is change put in the *right places*? (11/14)
 
-This family is the geographic sanity check, and it is where the project's largest failure
-originally lived.
+This family is the geographic sanity check, it is where the project's largest failure
+originally lived, and it is where Africa's extra area buys the most information.
 
 | row | plain meaning | result |
 |---|---|---|
-| **T8.1** | Probability of >0.05 increase, per distance-to-past-change band, against observed. | 4/5 — the 10–30 px band 3.0× hot |
-| **T8.2** | Change invented in the remote band, where observed change is exactly zero over 493,240 pixels. | **exactly 0.00000** |
-| **T8.3** | Ratio of near-field to remote-field change. | **∞** (remote is exactly zero) |
-| **T8.4** | Same for decreases. | **5/5** |
+| **T8.1** | Probability of >0.05 increase, per distance-to-past-change band, against observed. | 5/6 — bands 1–5 at 1.06–1.36, the **>100 px band at 0.107**, i.e. ten times too *little* |
+| **T8.2** | Change invented in the remote band. | **passes** — 1.4e-06 against a ≤0.002 allowance |
+| **T8.3** | Ratio of near-field to remote-field change. | **passes** — 2.3e+05 against ≥20 |
+| **T8.4** | Same for decreases. | 4/6 — the 30–100 px band **7.8×** and the >100 px band **123×** the observed rate |
 
-**T8.2 and T8.3 are the clearest single improvement in the project.** The original heads
-assigned a 3% chance of substantial change to country where change has never been observed.
-That is now identically zero: remote stable land receives no invented change at all.
+**T8.2 and T8.3 remain the clearest single improvement in the project.** The original heads
+assigned a 3% chance of substantial change to country where change has never been observed;
+the remote band now receives essentially none.
+
+**But Africa exposes the opposite error on the same axis.** Southern Africa passes T8.4 5/5
+because it has too little remote country to populate the far bands — its remote observed
+change is exactly zero, so the rows are trivial. Africa has real far-field observations, and
+there the ensemble produces far too many *decreases* (7.8× and 123×) while producing too few
+*increases* (0.107×). Both are invisible at the smaller extent. This is the strongest single
+argument for evaluating on the continent rather than the region.
 
 ### How to read the scorecard honestly
 
@@ -616,7 +666,12 @@ That is now identically zero: remote stable land receives no invented change at 
   near-nominal rows below target.
 - **Member count is part of the measurement.** Tolerances tighten as 1/√M, so comparisons
   must be at matched M. An M=100 comparison between two marginal families once *reversed* at
-  M=400; a 101/127 at M=400 became 99/127 at M=800.
+  M=400; a 101/127 at M=400 became 99/127 at M=800. On Africa, going M=100 → M=400 with
+  nothing else changed moved T5.1 from 2/4 to 3/4 and T1.1 from 0/4 to 2/4.
+- **Region is part of the measurement too, and not only through difficulty.** Several
+  aggregate targets are limited by the *number of aggregation units*, not by the field: with
+  18 ecoregions a ±0.05 coverage target is undecidable, and rows can fail on quantisation
+  alone. Compare regions per family, never on the total.
 - **A single scorecard has ±7 rows of run-to-run noise** (§1.5a). Differences smaller than
   that are not interpretable without replicate training runs.
 
@@ -637,6 +692,64 @@ five predictions are stitched into one raster.
 **The result is a complete map that is out-of-sample at every pixel** — 184.6M pixels
 globally, 4.36M for southern Africa, 142.6M for Africa. This is what makes the residuals
 honest, and every downstream statistic depends on it.
+
+#### The seam this creates, and the recipe for it
+
+Holding geography out has a visible consequence. The fold mask is a **128 px checkerboard** —
+`create_kfold_splits` assigns each chip independently — so adjacent tiles of the stitched map
+come from *different models*, joined with no blending. Wherever those models disagree, the
+join shows.
+
+They disagree on one head only. Measured on Africa at +20 yr, mean pairwise
+|fold_i − fold_j| is 0.0053 for the central field and 0.0040 for the lower bound, against
+**0.0383 for the upper bound**. The step across a fold boundary is 1.08× the step inside a
+fold for central and lower, and **2.01× for the upper** — 47× the local background in quiet
+country, where nothing else is happening. A single fold model's own large-area prediction is
+seamless at every period from 64 to 1024 px, so neither the ConvLSTM nor the overlap blending
+is involved: it is purely the mosaic.
+
+**The recipe, deliberately split in two:**
+
+- **Products and display rasters are stitched as the fold mean** (`--stitch_mode mean`):
+  every fold averaged at every pixel. There is no mosaic and no seam — the upper bound's
+  fold-boundary ratio goes 31.9× → 1.9× after recalibration, and an ensemble member 2.5× →
+  1.1×. This mixes in-sample and out-of-sample predictions by construction.
+- **Everything scored stays on the holdout mosaic** (`--stitch_mode holdout`, the default).
+  A fold-mean raster is in-sample at every pixel and would score flatteringly.
+
+The forward 2025–2040 forecast has no seam at all: nothing is held out, so no mosaic is built.
+
+#### What was considered and not adopted
+
+Two ways of removing the seam *within* the scored product were investigated and rejected on
+measurement, not on cost alone:
+
+- **Repeated k-fold CV** (each chip predicted out-of-fold R times from models trained on
+  different subsets, then averaged). It reduces the seam by √R — at R=5 the upper bound goes
+  from 2.01× to about 1.45×, and quiet country from 47× to ~21×. It does not remove it, and
+  it costs 5× the training budget. It also changes what is being scored: an average of R
+  out-of-fold predictions has lower error than any single model, so unless the average is
+  also what ships, the hindcast becomes optimistic in a way that does not transfer.
+- **Repeated seeds at a fixed fold mask.** Cheaper to reason about and still strictly out of
+  sample, but it only averages the training-noise component and delivers 1.24–1.76× at R=5.
+
+To decide between them, fold 1 was retrained twice with only `--seed` changed. On the upper
+half-width the seed-to-seed spread is 0.0308 against a fold-to-fold 0.0335 at h=20; in
+variance terms training noise is 85% of the disagreement at h=20 and 44–63% at shorter
+horizons. So both schemes are largely averaging away *optimisation noise* rather than genuine
+model diversity — which points at the training recipe as the cheaper lever. Switching the
+checkpoint monitor to `val_central_loss` alone already cuts the fold-to-fold upper-width
+spread from 0.0335 to 0.0275, an 18% reduction at no extra cost, and `--weight_avg_last`
+exists and is untested for this purpose. Full detail in `docs/validator_scaling.md` §8.
+
+A third option — **coarser fold blocks** (`--fold_block_chips 10`, giving contiguous 1280 px
+fold territories instead of a 128 px checkerboard) — is implemented but not trained. It cuts
+seam *density* about 12×, so a typical viewing window sits inside one fold, though the step at
+the seams that remain is unchanged. Its real argument is not cosmetic: the residual field's
+fitted practical range is 99–166 px, typically ~130, against a 128 px fold tile, so the
+current split holds geography out at **one correlation length** and the held-out skill is
+therefore optimistic. Adopting it means retraining all five folds and makes every existing
+scorecard non-comparable.
 
 Each model predicts four input windows (ending 2000, 2005, 2010, 2015) at four horizons,
 giving ten (window × horizon) pairs within the observed record.

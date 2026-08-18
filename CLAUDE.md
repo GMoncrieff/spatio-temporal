@@ -118,6 +118,29 @@ disagreement localises the bug to the generation path.
     every version until garbage collection. The first M=400 null came to 16.7 GB against
     2.9 GB for the identical array, and took 4x as long. Chunks are `(1, 1, 1024, 1024)` now
     — one member per chunk, which also means two workers can never share one.
+18. **The stitched hindcast is a quilt of five models, and the seam is real.** The k=5 fold
+    mask is a 128 px checkerboard, so adjacent tiles come from different fold models and
+    `stitch_fold_predictions` joins them with no blending. They agree on the central field
+    and the lower bound (mean pairwise |fold_i - fold_j| 0.0053 and 0.0040) and not on the
+    upper (0.0383), so the join shows in the upper bound only — 2.01x the within-fold step,
+    47x the local background in quiet country. A single fold's own prediction is seamless at
+    every period from 64 to 1024 px; neither the model nor the overlap blending is involved.
+    **The settled recipe: products and display rasters use `--stitch_mode mean` (every fold
+    averaged, seamless, in-sample); anything scored stays on `holdout` (the default).** Never
+    score a mean-stitched raster. The forward 2025-2040 product has no mosaic and no seam.
+19. **The fold tile is one correlation length, so held-out skill is optimistic.** The residual
+    field's fitted practical range on Africa is 99-166 px, typically ~130, against a 128 px
+    fold tile — every held-out tile is ringed by trained-on tiles well inside the range the
+    residual is still correlated over. `create_validity_mask.py --fold_block_chips 10` builds
+    contiguous 1280 px fold territories instead; implemented, **not trained**, because
+    adopting it retrains all five folds and makes every existing scorecard non-comparable.
+20. **Most of the fold disagreement is optimisation noise, not data.** Retraining one fold
+    with only the seed changed gives a seed-to-seed spread of 0.0308 on the upper half-width
+    against a fold-to-fold 0.0335 at h=20 — 85% of the variance at h=20, 44-63% at shorter
+    horizons. Repeated k-fold CV or repeated seeds would average this away at 5x the budget
+    and still only shrink the seam ~2.2x; **both were rejected**. The cheap lever is the
+    training recipe: `--checkpoint_monitor val_central_loss` alone cuts the spread 0.0335 ->
+    0.0275 for free, and `--weight_avg_last` exists and is untested for it.
 
 11. **A width factor must not be centred on the residual median.** `fit_residual_shape`
     centres because T5.1 pins the shape's median to zero; a *width* is centred on the
