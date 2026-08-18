@@ -35,17 +35,29 @@ was trained with a fold held out.
 
 ## The remaining plan
 
-1. **Hyperparameter sweep at global extent** (W&B sweeps), screening cheaply, then
-2. **promote the best configuration** to the full scorecard, then
-3. **global hindcast** — published scorecard and global hindcast maps — and finally the
-   **production 2025-2040 forecast**.
+1. **Global hindcast** with the configuration Africa already validated — five-fold
+   prediction at 17111 x 40000, stitched twice (holdout for scoring, fold mean for maps).
+2. **The published global scorecard**, Phase 0-4 re-derived from that model's own residuals,
+   M >= 400.
+3. **The production 2025-2040 forecast.**
 
-The binding constraint on step 1 is the noise floor, not compute: **two runs of one
-configuration differ by 7 scorecard rows out of 128 at k=5**, which exceeds every effect the
-model phase measured. A sweep cannot be ranked on the scorecard. Screen on
-`scripts/score_model_experiment.py` (~40 s, stratified central *and* width, primary quantile
-metric `mean|ln k|`), and treat any difference smaller than the base band as noise until it
-replicates across seeds.
+**A hyperparameter sweep was planned and dropped on evidence.** The model phase ran 22
+experiments and adopted none, and two runs of one configuration differ by 7 scorecard rows
+out of 128 at k=5 — a noise floor that exceeds every effect that phase measured. Do not
+re-propose a sweep without a specific untried lever. What ships is the `africa_k5`
+configuration exactly; `--histogram_weight 0` and `--checkpoint_monitor val_central_loss` are
+better motivated but were not what Africa scored, and only move checkpoint selection.
+
+**No retraining is needed for the hindcast.** All five Africa fold checkpoints survive under
+`spatio-temporal-convlstm/*/checkpoints/`, and `train_lightning.py --max_epochs 0
+--checkpoint <path>` is the predict-only path. **The global rasters already in
+`data/ensemble/hindcast/stitched/` are the wrong model** — they predate `--central_residual`
+and must not be reused, nor may the icechunk ensembles built from them.
+
+**There is still no production model**, so what predicts 2040 is an open decision: a sixth
+model trained on all chips (most consistent with a scorecard that measures a single model),
+or the fold mean (no extra training, matches how the published maps are made, but its
+intervals would be somewhat too wide). See [[final-phase-plan]].
 
 ## Environment and scale
 
@@ -103,40 +115,6 @@ mean — so `predict_change_rates.py` answers in 30 s what a generate-and-valida
 answers in 35 min. It agreed with three M=400 ensembles to 1–11%. Its second job is being a
 second implementation: it shares no code with the GPU sampler, so agreement is evidence and
 disagreement localises the bug to the generation path.
-
-## Sweeping the model (the current phase)
-
-The machinery already exists and should be driven, not rebuilt: `run_model_slate.sh` queues
-screening runs on folds 1-2 with a fixed reference; `score_model_experiment.py` reads each
-one in ~40 s; `promote_model_experiment.sh` takes a winner through k=5 and the whole
-downstream chain. A W&B sweep should drive `train_lightning.py` with the same fixed folds and
-log the `score_model_experiment.py` metrics as the sweep objective.
-
-**The reference for any new run** is the shipped configuration plus the two corrections the
-model phase established: `--histogram_weight 0` (the term carries no gradient, and made
-differentiable it is decisively worse, but at weight 1.0 it swings ~60x between epochs and
-makes checkpoint selection a lottery) and `--checkpoint_monitor val_central_loss` (so a
-quantile-only change must leave the central field bit-identical — a free correctness check
-rather than a confound).
-
-**Objective.** Not the scorecard: it carries +/-7 rows of run-to-run noise at k=5. Screen on
-`mean|ln k|` over classes (the multiplier that would make the published interval the
-residual's own 95% interval — a model whose width heads are right needs k = 1 everywhere),
-with within-20% and central skill-vs-persistence alongside. Central skill is much the least
-noisy of the three.
-
-**Do not sweep what is already measured dead** (see "Where the project is"). Twenty-two
-hand-run experiments covered most of the obvious axes and adopted none of them, so a sweep
-over the same space will confirm the incumbent at best. Axes that were *not* covered and are
-worth the budget: the learning rate value itself (only the *schedule* was tried), batch size,
-`--quantile_class_weighting`, `--width_parameterisation exp` vs softplus,
-`--initial_width_normalized`, chip sampling density, and `--weight_avg_last` — which the seam
-work independently motivated, since 44-85% of the between-fold width disagreement is
-optimisation noise.
-
-**Expect the sweep to find nothing, and design for that being an acceptable answer.** The
-value of running it is a defensible statement that the configuration is at a local optimum
-before a global production run, not a promise of improvement.
 
 ## Rules learned the hard way
 
