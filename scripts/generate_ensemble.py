@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Phase 3 — generate the correlated ensemble and write it to zarr.
+"""Phase 3 — generate the correlated ensemble and write it to an icechunk repository.
 
 Marginals come from the **recalibrated** production rasters (Phase 1.5) plus the unmodified
 central forecast; correlation structure comes from the Phase 1c variogram fit and the
 hindcast horizon autocorrelation. Members are AR(1)-coupled across horizons so that
 *change* statistics between two horizons inherit the right correlation.
 
-Members are split across GPUs in blocks aligned to the zarr member-chunk, so two workers
-never write the same chunk.
+Members are split across GPUs in blocks aligned to the member-chunk, so two workers never
+write the same chunk. Each worker writes through a forked icechunk session and hands its
+change record back; the parent merges them and commits once, so the snapshot either exists
+complete or not at all.
 
-Storage: ``(M, n_horizons, H, W)`` int16, chunks ``(10, 1, 1024, 1024)``, scale 1/32767
+Storage: an icechunk repository holding one array, ``members``, of shape
+``(M, n_horizons, H, W)`` int16, chunks ``(1, 1, 1024, 1024)``, scale 1/32767
 (HM is bounded on [0,1] and the observed maximum reaches 1.0), sentinel -32768 for invalid
 pixels. ``manifest.json`` records each member's seed and AR(1) chain, so a single member can
 be regenerated deterministically and the ensemble can be extended from 50 to 200 members
@@ -34,10 +37,19 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.ensemble.copula import (  # noqa: E402
     DEFAULT_SCALE, INT16_SENTINEL, Z975, read_shape_artifact, shape_bounds, stack_shapes,
 )
+from src.ensemble.aggregate import ARRAY_NAME  # noqa: E402
 from src.ensemble.validate import DIST_LABELS, distance_band  # noqa: E402
 
 REPO = Path(__file__).parent.parent
-MEMBER_CHUNK = 10
+# One member per chunk. A member is generated and written whole, so a ten-member chunk means
+# ten read-modify-write cycles over the same 20 MB object — invisible in plain zarr, where the
+# last write wins and overwrites the file, but icechunk keeps every version until it is
+# garbage-collected: the first M=400 null written that way came to 16.7 GB against 2.9 GB for
+# the identical array copied in chunk-aligned blocks. One member per chunk also means no two
+# workers can ever touch the same chunk, and reading a single member (T3 does) stops
+# decompressing nine others.
+MEMBER_CHUNK = 1
+CHUNK_SHAPE = (MEMBER_CHUNK, 1, 1024, 1024)
 N_BANDS = len(DIST_LABELS)
 
 
@@ -51,7 +63,7 @@ def parse_args(argv=None):
     ap.add_argument("--years", default="2025,2030,2035,2040")
     ap.add_argument("--base_year", type=int, default=2020)
     ap.add_argument("--members", type=int, default=50)
-    ap.add_argument("--out", default="data/ensemble/members.zarr")
+    ap.add_argument("--out", default="data/ensemble/members.icechunk")
     ap.add_argument("--variogram_fits", default="data/ensemble/diagnostics/variogram_fits.csv")
     ap.add_argument("--rho_json", default="data/ensemble/residuals/horizon_autocorrelation.json")
     ap.add_argument("--ranges_px", default=None, help="Override, e.g. '8,240'")
@@ -242,13 +254,19 @@ def assign_members(n_members, n_workers, block=MEMBER_CHUNK):
 
 
 # --------------------------------------------------------------------------------------
-def worker(worker_id, gpu, member_ids, cfg):
+def worker(worker_id, gpu, member_ids, cfg, session=None):
+    """Generate this worker's members. Returns the forked icechunk session to be merged.
+
+    Members are partitioned on the chunk boundary (``assign_members``), so two workers never
+    touch the same chunk and their change sets merge without conflict. Only the parent
+    commits — local-filesystem icechunk warns that concurrent *commits* are unsafe, and this
+    shape has exactly one.
+    """
     import torch
+    import zarr
 
     from src.ensemble.copula import marginal_from_z_torch
     from src.ensemble.fields import generate_correlated_field
-
-    import zarr
 
     years = cfg["years"]
     horizons = cfg["horizons"]
@@ -257,7 +275,7 @@ def worker(worker_id, gpu, member_ids, cfg):
 
     compact = cfg["compact"]
     idx_np = np.load(cfg["idx"], mmap_mode="r")
-    z_store = zarr.open(cfg["out"], mode="r+")
+    z_store = zarr.open_group(session.store, mode="r+")[ARRAY_NAME]
 
     idx_arr = np.asarray(idx_np)
     idx_t = torch.as_tensor(idx_arr.copy(), device=device)
@@ -322,6 +340,7 @@ def worker(worker_id, gpu, member_ids, cfg):
             scatter[idx_arr] = q
             z_store[m, hi] = scatter.reshape(H, W)
         print(f"[worker {worker_id} gpu {gpu}] member {m} done in {time.time() - t0:.1f}s", flush=True)
+    return session
 
 
 def main(argv=None):
@@ -352,16 +371,24 @@ def main(argv=None):
         print(f"  h={h}: kernel={fps[h].get('kernel','gaussian')} nugget={fps[h]['nugget']:.3f} "
               f"top structures=" + " ".join(f"{r:g}px:{w:.3f}" for r, w in top if w > 0.004))
 
+    import icechunk
     import zarr
 
     out_path = Path(args.out)
     est_gb = args.members * len(years) * H * W * 2 / 1e9
     print(f"  writing {out_path} — {est_gb:.1f} GB uncompressed "
           f"({100 * idx.size / valid.size:.0f}% populated, expect far less on disk)")
-    store = zarr.open(
-        str(out_path), mode="w",
+    # Recreating an icechunk repository in place is not a thing, and clearing the old one is
+    # the caller's decision, not a silent side effect of pointing --out at it.
+    if out_path.exists() and any(out_path.iterdir()):
+        raise SystemExit(f"{out_path} already exists and is not empty — remove it first")
+    repo = icechunk.Repository.create(icechunk.local_filesystem_storage(str(out_path)))
+    session = repo.writable_session("main")
+    root = zarr.create_group(session.store)
+    store = root.create_array(
+        ARRAY_NAME,
         shape=(args.members, len(years), H, W),
-        chunks=(MEMBER_CHUNK, 1, 1024, 1024),
+        chunks=CHUNK_SHAPE,
         dtype="i2", fill_value=INT16_SENTINEL,
     )
     store.attrs.update({
@@ -422,18 +449,24 @@ def main(argv=None):
     assignment = assign_members(args.members, len(gpus))
     t0 = time.time()
     if len(gpus) == 1:
-        worker(0, gpus[0], assignment[0], cfg)
+        session = worker(0, gpus[0], assignment[0], cfg, session=session)
     else:
+        # Each worker gets a fork of the session, writes its own member blocks, and hands
+        # the change record back; the parent merges them and commits once. A ProcessPool
+        # rather than bare Processes because the forked sessions have to come *back*.
+        from concurrent.futures import ProcessPoolExecutor
+
         ctx = mp.get_context("spawn")
-        procs = []
-        for wid, (gpu, members) in enumerate(zip(gpus, assignment)):
-            p = ctx.Process(target=worker, args=(wid, gpu, members, cfg))
-            p.start()
-            procs.append(p)
-        for p in procs:
-            p.join()
-            if p.exitcode != 0:
-                raise RuntimeError(f"Ensemble worker failed with exit code {p.exitcode}")
+        fork = session.fork()
+        with ProcessPoolExecutor(max_workers=len(gpus), mp_context=ctx) as ex:
+            futures = [ex.submit(worker, wid, gpu, members, cfg, fork)
+                       for wid, (gpu, members) in enumerate(zip(gpus, assignment))]
+            done = [f.result() for f in futures]
+        session.merge(*done)
+    snapshot = session.commit(
+        f"{args.members} members x {len(years)} horizons"
+        + (" (independent-pixel null)" if args.independent else ""))
+    print(f"  committed snapshot {snapshot}")
     elapsed = time.time() - t0
 
     manifest = {

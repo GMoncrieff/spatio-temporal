@@ -50,7 +50,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ensembles", nargs="+", required=True,
-                    help="label=path pairs, e.g. 'two-piece=...zarr' 'shaped=...zarr'")
+                    help="label=path pairs, e.g. 'two-piece=...icechunk' 'shaped=...icechunk'")
     ap.add_argument("--recal_dir", required=True)
     ap.add_argument("--dist_raster", required=True)
     ap.add_argument("--dist_band", type=int, default=1)

@@ -40,7 +40,7 @@ $PY -u scripts/generate_ensemble.py \
     --central_pattern 'w2000_prediction_{year}_central_recal.tif' \
     --recal_pattern 'w2000_prediction_{year}_{q}_recal.tif' \
     --years 2005,2010,2015,2020 --base_year 2000 --members "$MEMBERS" \
-    --out data/ensemble/hindcast_members.zarr --gpus "$GPUS" \
+    --out data/ensemble/hindcast_members.icechunk --gpus "$GPUS" \
     --wandb_group "ensemble-${SCALE}"
 
 echo "=== Phase 3: independent-pixel null (same marginals, no spatial structure) ==="
@@ -49,19 +49,19 @@ $PY -u scripts/generate_ensemble.py \
     --central_pattern 'w2000_prediction_{year}_central_recal.tif' \
     --recal_pattern 'w2000_prediction_{year}_{q}_recal.tif' \
     --years 2005,2010,2015,2020 --base_year 2000 --members "$MEMBERS" --independent \
-    --out data/ensemble/hindcast_members_null.zarr --gpus "$GPUS" --disable_wandb
+    --out data/ensemble/hindcast_members_null.icechunk --gpus "$GPUS" --disable_wandb
 
 echo "=== Phase 4: scorecard ==="
 $PY -u scripts/validate_ensemble.py \
-    --ensemble data/ensemble/hindcast_members.zarr \
-    --null_ensemble data/ensemble/hindcast_members_null.zarr \
+    --ensemble data/ensemble/hindcast_members.icechunk \
+    --null_ensemble data/ensemble/hindcast_members_null.icechunk \
     --block_sizes "$BLOCKS" --wandb_group "ensemble-${SCALE}"
 
 if [ "$SCALE" = "global" ]; then
   echo "=== Phase 3: production 2025-2040 ensemble (recalibrated marginals) ==="
   $PY -u scripts/generate_ensemble.py --members "$MEMBERS" --gpus "$GPUS" \
       --years 2025,2030,2035,2040 --base_year 2020 \
-      --out data/ensemble/members.zarr --wandb_group "ensemble-${SCALE}"
+      --out data/ensemble/members.icechunk --wandb_group "ensemble-${SCALE}"
 fi
 
 echo

@@ -49,8 +49,11 @@ DIST_RASTER="${REGION_ROOT}/covariates/w${BASE_YEAR}_dist_past_change.tif"
 SHAPE="${SHAPE:-none}"
 WIDTHS="${WIDTHS:-none}"
 SUFFIX="${SUFFIX:-}"
-MEMBERS_ZARR="${ROOT}/members${SUFFIX}.zarr"
-NULL_ZARR="${ROOT}/null${SUFFIX}.zarr"
+# Ensembles are icechunk repositories (see generate_ensemble.py): the write is one
+# transaction, so a run killed part-way leaves no store rather than a plausible-looking
+# directory of sentinel.
+MEMBERS_ZARR="${ROOT}/members${SUFFIX}.icechunk"
+NULL_ZARR="${ROOT}/null${SUFFIX}.icechunk"
 VALIDATION_DIR="${ROOT}/validation${SUFFIX}"
 SHAPE_JSON="${ROOT}/marginal_shape${SUFFIX}.json"
 WIDTH_JSON="${ROOT}/width_factors${SUFFIX}.json"
