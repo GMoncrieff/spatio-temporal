@@ -23,8 +23,18 @@ ConvLSTM itself.
   instruction; the global k=5 hindcast already exists on disk.
 - Two GPUs (RTX A5000, 24 GB each). Track experiments on **W&B**.
 - Large global artifacts live on the HDD (`/mnt/hdd1/spatio-temporal/data`) behind symlinks
-  in `data/ensemble/`. Root has ~230 GB free; ensembles at M=400 are ~3 GB each, so delete
-  superseded ones (they regenerate from recorded seeds in ~3 min).
+  in `data/ensemble/`. Root has ~90 GB free; southern-Africa ensembles at M=400 are ~3 GB
+  each, so delete superseded ones (they regenerate from recorded seeds in ~3 min). Africa at
+  M=400 is ~85 GB per ensemble and belongs on the HDD — pass the HDD path directly as
+  `--out`, never a symlink, since the store's directory gets cleared with `shutil.rmtree`
+  and that refuses on a symbolic link.
+- **Ensembles are icechunk repositories, not plain zarr** (`*.icechunk`, one array named
+  `members`). `src.ensemble.aggregate.open_ensemble` opens them; everything downstream is
+  unchanged because it still returns `(array, attrs)`. The write is one transaction: each
+  GPU worker writes through a forked session and the parent merges and commits once, so a
+  killed run leaves no store instead of a directory that reads back as sentinel.
+  `scripts/migrate_zarr_to_icechunk.py --verify` converts an old store and proves the copy
+  byte-identical.
 
 ## The loops
 
@@ -36,6 +46,7 @@ ConvLSTM itself.
 | compare configurations | `scripts/compare_central_runs.py label=dir …` | seconds |
 | **score a marginal without generating anything** | `scripts/predict_change_rates.py --manifest … [--sweep_u_bound …]` | ~30 s |
 | per-member realism (the honest marginal test) | `scripts/member_distance_relationship.py --ensembles label=path … --members 400` | ~10 min |
+| convert an old plain-zarr store | `scripts/migrate_zarr_to_icechunk.py --src … --dst … --verify` | ~1 min/GB |
 
 `run_region_loop.sh` re-derives the recalibration, spectrum and AR(1) coupling from *that
 model's own* residuals. Never carry them over between configurations. `SHAPE=<u_bound>`
@@ -92,6 +103,21 @@ disagreement localises the bug to the generation path.
     stratum is 6% of the region against 40% of Africa. Regional iteration is right for speed,
     but a stratified finding measured only there is provisional. Only w2000 reaches +20 yr
     whatever the geography, so every h=20 number is in-sample in time.
+15. **A regional working set can hide a quadratic.** `validate_ensemble.py` allocated
+    `(M, H, W)` float64 for the block-mean pass, which at `--block_sizes 1,10,100` is the
+    pixel grid: 6 GB on southern Africa's 1.86 Mpx at M=400 and unremarkable, 50 GB on
+    Africa's 63.1 Mpx at M=100, dead. Every scored statistic there was a count or a mean
+    over blocks, so none of it ever needed to be resident. Peak memory is now set by
+    `--mem_budget_gb` and the stages are checked against it with `--mem_trace`.
+16. **Sample memory faster than the thing you are watching for.** The OOM went from steady
+    to killed in under 60 s; a 120 s poll saw nothing. `src/ensemble/memtrace.py` samples
+    `/proc/self/statm` at 0.25 s and attributes each sample to the innermost labelled
+    section, which is what turned "T2 died" into "`block_member_stats` at B=1".
+17. **In icechunk, a partial-chunk write keeps both versions.** Writing one member into a
+    ten-member chunk is a read-modify-write; plain zarr overwrote the file, icechunk retains
+    every version until garbage collection. The first M=400 null came to 16.7 GB against
+    2.9 GB for the identical array, and took 4x as long. Chunks are `(1, 1, 1024, 1024)` now
+    — one member per chunk, which also means two workers can never share one.
 
 11. **A width factor must not be centred on the residual median.** `fit_residual_shape`
     centres because T5.1 pins the shape's median to zero; a *width* is centred on the
