@@ -112,11 +112,43 @@ def parse_args(argv=None):
     p.add_argument("--extra_train_args", default="",
                    help="Extra flags appended verbatim to every train_lightning.py call, "
                         "e.g. '--central_residual True'. Appended last, so they win.")
+    p.add_argument("--fold_checkpoints", default="",
+                   help="Per-fold checkpoints as 'fold=path' pairs, e.g. "
+                        "'1=runs/a/epoch=1.ckpt,2=runs/b/epoch=2.ckpt'. Each fold's own path "
+                        "becomes its --checkpoint, which train_lightning.py prefers over "
+                        "anything training produced. With --max_epochs 0 this is the "
+                        "predict-only path: re-predict surviving fold models on a new extent "
+                        "without retraining. --extra_train_args cannot express this because it "
+                        "is one string shared by every fold. Paths may contain '=' (they "
+                        "usually do); only the first '=' separates the fold id.")
     p.add_argument("--tag", default="",
                    help="Suffix for per-fold log filenames so concurrent variants do not "
                         "overwrite each other's logs")
     p.add_argument("--dry_run", action="store_true", help="Print the fold commands and exit")
     return p.parse_args(argv)
+
+
+def parse_fold_checkpoints(spec):
+    """'1=a.ckpt,2=b.ckpt' -> {1: 'a.ckpt', 2: 'b.ckpt'}, validating that each file exists.
+
+    Lightning checkpoint names embed '=' ("epoch=106-step=1391.ckpt"), so split on the first
+    one only.
+    """
+    if not spec:
+        return {}
+    out = {}
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(f"--fold_checkpoints entry {item!r} is not 'fold=path'")
+        fold_s, path = item.split("=", 1)
+        fold = int(fold_s)
+        if not Path(path).exists():
+            raise FileNotFoundError(f"fold {fold} checkpoint does not exist: {path}")
+        out[fold] = path
+    return out
 
 
 def selected_windows(spec):
@@ -154,6 +186,9 @@ def build_fold_command(args, fold, windows):
         "--predict_restrict_mask", args.fold_mask,
         "--predict_restrict_values", str(fold),
     ]
+    ckpt = getattr(args, "_fold_checkpoints", {}).get(fold)
+    if ckpt:
+        cmd += ["--checkpoint", ckpt]
     if len(windows) == len(ALL_WINDOWS):
         # train_lightning loops the windows itself and appends "w{base}_" to the prefix,
         # so one checkpoint load covers all four.
@@ -354,6 +389,13 @@ def main(argv=None):
     args = parse_args(argv)
     folds = [int(f) for f in args.folds.split(",")]
     windows = selected_windows(args.windows)
+    args._fold_checkpoints = parse_fold_checkpoints(args.fold_checkpoints)
+    missing = [f for f in folds if args._fold_checkpoints and f not in args._fold_checkpoints]
+    if missing:
+        raise SystemExit(
+            f"--fold_checkpoints given but folds {missing} have no entry; a fold silently "
+            f"falling back to a freshly trained model is the failure this flag exists to stop"
+        )
     if args.wandb_group is None:
         args.wandb_group = f"hindcast-{time.strftime('%Y%m%d-%H%M%S')}"
 
@@ -366,6 +408,10 @@ def main(argv=None):
     print(f"GPUs:         {args.gpus}")
     print(f"Stage:        {args.stage}")
     print(f"W&B group:    {args.wandb_group}")
+    if args._fold_checkpoints:
+        print(f"Checkpoints:  predict-only, max_epochs={args.max_epochs}")
+        for f in folds:
+            print(f"  fold {f} -> {args._fold_checkpoints[f]}")
     print("=" * 78)
 
     if args.dry_run:

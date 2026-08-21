@@ -35,13 +35,37 @@ ROOT="data/ensemble/exp/${NAME}"
 # sample of HM level: the [0,0.01) stratum is 6% of it and 40% of Africa, and that stratum
 # carries the defect the class fits are chasing.
 REGION="${REGION:-config/region_to_predict_small.geojson}"
+# The k-fold mask the run trains, restricts prediction and stitches against. Defaults to the
+# production 128 px checkerboard every existing checkpoint was trained on. Stage C of
+# docs/improvement_plan.md points this at fold_mask_b4_1000.tif (512 px blocks), which puts
+# 31.9% of held-out pixels beyond one residual correlation length instead of 0.0% — and
+# which makes every earlier checkpoint and scorecard non-comparable, so it is set explicitly
+# and never by default.
+FOLD_MASK="${FOLD_MASK:-data/raw/hm_global/fold_mask_1000.tif}"
 
 mkdir -p "$ROOT"
-echo "=== ${NAME} | GPU ${GPU} | folds ${FOLDS} | ${EXTRA:-<production architecture>} ==="
+# "no extra flags" is NOT the production architecture — it is argparse defaults, and those
+# have --central_residual False, under which the central head predicts absolute HM and must
+# reconstruct the baseline through the trunk. That costs sd ~0.0075 HM of spurious change on
+# pixels that did not move, which is larger than the signal. A k=5 run launched this way
+# scored h=5 skill -0.50 against africa_k5's +0.13 and looked exactly like a fold-mask
+# finding. Pass the reference set through BASE_ARGS; run_model_slate.sh and
+# promote_model_experiment.sh hold it as PHASE_REF.
+if [ -z "${BASE_ARGS}${EXTRA}" ]; then
+  echo "WARNING: no BASE_ARGS and no extra flags — training with argparse DEFAULTS," >&2
+  echo "         which is NOT the shipped configuration (--central_residual defaults False)." >&2
+  echo "         The shipped set is:" >&2
+  echo "           --central_residual True --central_context True \\" >&2
+  echo "           --monotone_quantile_width True --quantile_context True" >&2
+  echo "         Set BASE_ARGS to it, or export ALLOW_DEFAULT_ARCH=1 to proceed anyway." >&2
+  [ -n "${ALLOW_DEFAULT_ARCH:-}" ] || exit 3
+fi
+echo "=== ${NAME} | GPU ${GPU} | folds ${FOLDS} | fold_mask $(basename "$FOLD_MASK") ==="
+echo "    args: ${BASE_ARGS} ${EXTRA}"
 
 $PY -u scripts/run_hindcast_folds.py \
     --stage train --folds "$FOLDS" --gpus "$GPU" \
-    --region "$REGION" --windows all \
+    --region "$REGION" --windows all --fold_mask "$FOLD_MASK" \
     --output_root "$ROOT" \
     --log_dir data/ensemble/logs \
     --tag "_${NAME}" \
@@ -52,7 +76,7 @@ $PY -u scripts/run_hindcast_folds.py \
 
 $PY -u scripts/run_hindcast_folds.py \
     --stage stitch --folds "$FOLDS" \
-    --region "$REGION" --windows all \
+    --region "$REGION" --windows all --fold_mask "$FOLD_MASK" \
     --output_root "$ROOT" --keep_fold_rasters
 
 echo "=== ${NAME} stitched -> ${ROOT}/stitched ==="

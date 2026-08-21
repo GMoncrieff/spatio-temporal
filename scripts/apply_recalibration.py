@@ -227,6 +227,65 @@ def recalibrate_one(
     }
 
 
+def enforce_horizon_monotonicity(out_dir, suffix="_recal"):
+    """Make each pixel's half-widths non-decreasing across horizons, in place.
+
+    **Why this cannot live in the fit.** Constraining the factor table stops any *class*
+    claiming more certainty at longer lead time, but a pixel is not in one class: predicted
+    change grows with horizon, so 2.6% of pixels move between predicted-change bins along the
+    sequence and pick up a different factor at each. Only a per-pixel pass closes that.
+
+    **Why a cumulative maximum and not a smoothing.** The gate (T4.2) asks that spread never
+    *decrease*. A cummax is the smallest change that guarantees it: it only ever widens, only
+    at the horizons that dipped, and it leaves h=5 untouched. Measured cost on Africa:
+    +1.2% / +1.5% / +2.5% of mean width at h=10/15/20.
+
+    Applied to the half-widths about the central forecast, separately per side, so the
+    central raster is untouched and T5.1's median identity is unaffected.
+    """
+    out_dir = Path(out_dir)
+    groups = {}
+    for cen in sorted(out_dir.glob(f"*_prediction_*_central{suffix}.tif")):
+        stem = cen.name.replace(f"_central{suffix}.tif", "")
+        base = int(stem.split("_")[0][1:])
+        year = int(stem.split("_")[-1])
+        groups.setdefault(base, []).append((year - base, stem))
+    total_lifted = n_px = 0
+    for base, items in sorted(groups.items()):
+        items.sort()
+        if len(items) < 2:
+            continue
+        cen, lo, up, prof = [], [], [], None
+        for _, stem in items:
+            with rasterio.open(out_dir / f"{stem}_central{suffix}.tif") as sc:
+                cen.append(sc.read(1).astype(np.float64)); prof = sc.profile.copy()
+            with rasterio.open(out_dir / f"{stem}_lower{suffix}.tif") as sl:
+                lo.append(sl.read(1).astype(np.float64))
+            with rasterio.open(out_dir / f"{stem}_upper{suffix}.tif") as su:
+                up.append(su.read(1).astype(np.float64))
+        C, L, U = np.stack(cen), np.stack(lo), np.stack(up)
+        valid = np.isfinite(C).all(0) & np.isfinite(L).all(0) & np.isfinite(U).all(0) & (C >= 0).all(0)
+        hu = np.maximum(U - C, 0.0)
+        hl = np.maximum(C - L, 0.0)
+        hu2 = np.maximum.accumulate(hu, axis=0)
+        hl2 = np.maximum.accumulate(hl, axis=0)
+        lifted = ((hu2 > hu + 1e-12) | (hl2 > hl + 1e-12))
+        total_lifted += int(lifted[:, valid].any(axis=0).sum())
+        n_px += int(valid.sum())
+        for i, (_, stem) in enumerate(items):
+            new_up = np.where(valid, np.clip(C[i] + hu2[i], 0.0, 1.0), U[i])
+            new_lo = np.where(valid, np.clip(C[i] - hl2[i], 0.0, 1.0), L[i])
+            for arr, name in ((new_lo, "lower"), (new_up, "upper")):
+                with rasterio.open(out_dir / f"{stem}_{name}{suffix}.tif", "w", **prof) as dst:
+                    dst.write(arr.astype(prof["dtype"]), 1)
+        print(f"  w{base}: {len(items)} horizons, "
+              f"{100 * lifted[:, valid].any(axis=0).mean():.1f}% of pixels widened somewhere")
+    if n_px:
+        print(f"  horizon monotonicity enforced on {total_lifted:,} of {n_px:,} pixels "
+              f"({100 * total_lifted / n_px:.1f}%)")
+    return total_lifted
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--factors", default="data/ensemble/calibration/scale_factors.csv")
@@ -248,6 +307,12 @@ def main(argv=None):
                          "instead of copying it, which the rest of the pipeline assumes it "
                          "never does — pass it only deliberately. The whole interval is "
                          "shifted, so a width factor still acts on width alone.")
+    ap.add_argument("--monotone_horizons", type=lambda x: (str(x).lower() == "true"),
+                    nargs="?", const=True, default=False,
+                    help="After all factors are applied, force each pixel's half-widths to be "
+                         "non-decreasing across horizons (cumulative max). This is what makes "
+                         "T4.2 structural rather than hoped-for; see "
+                         "enforce_horizon_monotonicity for why it cannot live in the fit.")
     ap.add_argument("--width_factors", default=None,
                     help="JSON of per-(horizon x distance band) half-width multipliers "
                          "(scripts/predict_change_rates.py --out_width_json), applied on "
@@ -259,7 +324,20 @@ def main(argv=None):
                          "the factors were fit against distance rather than biome")
     args = ap.parse_args(argv)
 
-    table = ScaleFactorTable.from_csv(args.factors)
+    if str(args.factors).lower() in ("none", ""):
+        # Unified mode: the width-factor table is the sole source of the rescaling, so the
+        # conformal table is the identity. The two used to be fitted separately on different
+        # class axes and multiplied here, which meant no single fit ever saw the product it
+        # was contributing to — and the isotonic horizon constraint on one half was defeated
+        # by the other. One layer, one class definition, one constraint.
+        table = ScaleFactorTable(pd.DataFrame([
+            {"horizon": h, "dhat_bin_idx": d, "hm_bin_idx": j, "biome": b,
+             "s_up": 1.0, "s_lo": 1.0, "n_eff": 1}
+            for h in (5, 10, 15, 20) for d in range(8) for j in range(8) for b in range(64)
+        ]))
+        print("  conformal table: IDENTITY (unified mode — width factors carry everything)")
+    else:
+        table = ScaleFactorTable.from_csv(args.factors)
     central_bias = None
     if args.central_bias:
         central_bias = json.load(open(args.central_bias)).get("by_horizon", {})
@@ -268,10 +346,25 @@ def main(argv=None):
               f"the central raster is REGENERATED, not copied")
     width_factors = None
     if args.width_factors:
-        if not args.dist_raster:
-            raise SystemExit("--width_factors needs --dist_raster: the distance band is the "
-                             "class axis the factors are keyed on")
-        width_factors = json.load(open(args.width_factors)).get("by_horizon", {})
+        _wf = json.load(open(args.width_factors))
+        width_factors = _wf.get("by_horizon", {})
+        axis = _wf.get("class_axis", "band")
+        # The third class axis is keyed off whichever raster is supplied — dist wins over
+        # ecoregion inside recalibrate_one — so a mismatch here looks up the wrong classes
+        # and silently applies the wrong factors. Checked rather than trusted.
+        if axis in ("band", "both") and not args.dist_raster:
+            raise SystemExit(f"width factors were fitted on the '{axis}' axis, which needs "
+                             f"--dist_raster")
+        if axis == "biome":
+            if args.dist_raster:
+                raise SystemExit("width factors were fitted on the 'biome' axis but "
+                                 "--dist_raster is set; the distance raster takes priority "
+                                 "when both are given, so this would key the lookup off the "
+                                 "wrong axis. Drop --dist_raster.")
+            if args.no_biome or not args.ecoregion_raster:
+                raise SystemExit("width factors were fitted on the 'biome' axis and need "
+                                 "--ecoregion_raster")
+        print(f"  width factors keyed on '{axis}'")
         n = sum(len(v) if isinstance(v, dict) else 1
                 for d in width_factors.values() for v in d.values())
         print(f"  width factors from {args.width_factors}: "
@@ -318,6 +411,13 @@ def main(argv=None):
                 lookup_csv=lut, dist_raster=args.dist_raster, width_factors=width_factors,
                 central_bias=central_bias,
             ))
+
+    if args.monotone_horizons:
+        print("\nEnforcing non-decreasing half-widths across horizons ...")
+        if args.targets in ("hindcast", "both"):
+            enforce_horizon_monotonicity(args.hindcast_out, "_recal")
+        if args.targets in ("production", "both"):
+            enforce_horizon_monotonicity(args.production_out, "_recal")
 
     out_manifest = Path(args.production_out if args.targets != "hindcast" else args.hindcast_out)
     out_manifest.mkdir(parents=True, exist_ok=True)

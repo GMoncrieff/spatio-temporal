@@ -425,39 +425,114 @@ def read_manifest(manifest_path):
     return pd.read_csv(manifest_path)
 
 
-def horizon_autocorrelation(manifest, n_sample_px: int = 2_000_000, random_seed: int = 42):
+def _stripe_pairs(path_a, path_b, stripe_h: int, stride: int, offset: int):
+    """Every valid (z_{h-5}, z_h) pair inside evenly spaced full-width row stripes."""
+    with rasterio.open(path_a) as sa, rasterio.open(path_b) as sb:
+        H, W = sa.height, sa.width
+        out_a, out_b = [], []
+        for r0 in range(offset % stride, H, stride):
+            rr = min(stripe_h, H - r0)
+            if rr <= 0:
+                continue
+            win = Window(0, r0, W, rr)
+            za = sa.read(1, window=win).ravel()
+            zb = sb.read(1, window=win).ravel()
+            ok = np.isfinite(za) & np.isfinite(zb)
+            if ok.any():
+                out_a.append(za[ok])
+                out_b.append(zb[ok])
+    if not out_a:
+        return None
+    return np.concatenate(out_a), np.concatenate(out_b)
+
+
+def horizon_autocorrelation(manifest, n_sample_px: int = 2_000_000, random_seed: int = 42,
+                            block: int = 512, max_attempts_per_block: int = 400,
+                            report: bool = False, method: str = "stripes",
+                            stripe_h: int = 64, stride: int = 512, offset: int = 0):
     """corr(z_h, z_{h-5}) of the residual field, pooled over windows.
 
     Feeds the AR(1) coupling in Phase 2 (``rho_by_horizon``).
+
+    ``n_sample_px`` is a target number of **valid pixel pairs**, and blocks are drawn until it
+    is met. The previous version converted it to a block count instead --
+    ``n_sample_px // block**2``, which is *seven* 512 px blocks at the default -- and drew them
+    uniformly over the whole grid. On southern Africa's 1.86 Mpx those seven blocks covered
+    most of the region and the estimate looked stable. On the global grid, which is 73%
+    invalid, they land mostly in ocean and the few that hit land are one correlation length
+    across, so the estimate was noise: measured over three seeds at two sample sizes, rho(h=15)
+    ranged 0.319 to 0.827 and did not converge when the sample was doubled. An empty or
+    nearly-empty block now costs an attempt rather than a share of the sample.
+
+    Targeting valid pairs was necessary but not sufficient: at 20M pairs the estimate still
+    moved 0.11-0.16 between seeds, because ~130 blocks of 512 px is an effective sample of
+    *blocks*, and the residual field is correlated well inside one. ``method="stripes"``
+    (the default) instead reads evenly spaced full-width row stripes, so the sample spans every
+    longitude and both hemispheres and is **deterministic** -- no seed, nothing to converge.
+    ``method="blocks"`` keeps the random path for callers that want it.
     """
     import pandas as pd
 
     df = manifest if isinstance(manifest, pd.DataFrame) else read_manifest(manifest)
     rng = np.random.default_rng(random_seed)
-    out = {}
+    out, diag = {}, {}
     for h in (10, 15, 20):
-        pairs = []
+        windows = []
+        _ = rng  # random path is only used when method="blocks"
         for window, grp in df.groupby("window"):
             a = grp[grp["horizon"] == h - 5]
             b = grp[grp["horizon"] == h]
-            if a.empty or b.empty:
-                continue
-            with rasterio.open(a.iloc[0]["path_res_z"]) as sa, rasterio.open(b.iloc[0]["path_res_z"]) as sb:
+            if not a.empty and not b.empty:
+                windows.append((a.iloc[0]["path_res_z"], b.iloc[0]["path_res_z"]))
+        if not windows:
+            out[h] = float("nan")
+            continue
+
+        if method == "stripes":
+            pa_all, pb_all, n_pairs = [], [], 0
+            for pa, pb in windows:
+                got = _stripe_pairs(pa, pb, stripe_h, stride, offset)
+                if got is not None:
+                    pa_all.append(got[0]); pb_all.append(got[1]); n_pairs += got[0].size
+            if pa_all:
+                a = np.concatenate(pa_all); b = np.concatenate(pb_all)
+                out[h] = float(np.corrcoef(a, b)[0, 1])
+            else:
+                out[h] = float("nan")
+            diag[h] = {"pairs": n_pairs, "windows": len(windows),
+                       "stripe_h": stripe_h, "stride": stride, "offset": offset}
+            continue
+
+        target = max(1, n_sample_px // len(windows))
+        pairs, n_pairs, n_blocks, n_empty = [], 0, 0, 0
+        for pa, pb in windows:
+            got = 0
+            with rasterio.open(pa) as sa, rasterio.open(pb) as sb:
                 H, W = sa.height, sa.width
-                block = 512
-                n_blocks = max(1, n_sample_px // (block * block))
-                for _ in range(n_blocks):
+                attempts = 0
+                cap = max_attempts_per_block * max(1, target // (block * block) + 1)
+                while got < target and attempts < cap:
+                    attempts += 1
                     i = int(rng.integers(0, max(1, H - block)))
                     j = int(rng.integers(0, max(1, W - block)))
                     win = Window(j, i, min(block, W - j), min(block, H - i))
                     za = sa.read(1, window=win).ravel()
                     zb = sb.read(1, window=win).ravel()
                     ok = np.isfinite(za) & np.isfinite(zb)
-                    if ok.sum() > 10:
-                        pairs.append(np.stack([za[ok], zb[ok]], axis=0))
+                    n_ok = int(ok.sum())
+                    if n_ok <= 10:
+                        n_empty += 1
+                        continue
+                    pairs.append(np.stack([za[ok], zb[ok]], axis=0))
+                    got += n_ok
+                    n_blocks += 1
+            n_pairs += got
+
         if pairs:
             allp = np.concatenate(pairs, axis=1)
             out[h] = float(np.corrcoef(allp[0], allp[1])[0, 1])
         else:
             out[h] = float("nan")
-    return out
+        diag[h] = {"pairs": n_pairs, "blocks": n_blocks, "empty_draws": n_empty,
+                   "windows": len(windows)}
+    return (out, diag) if report else out

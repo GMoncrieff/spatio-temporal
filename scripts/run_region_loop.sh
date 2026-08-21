@@ -49,11 +49,25 @@ DIST_RASTER="${REGION_ROOT}/covariates/w${BASE_YEAR}_dist_past_change.tif"
 SHAPE="${SHAPE:-none}"
 WIDTHS="${WIDTHS:-none}"
 SUFFIX="${SUFFIX:-}"
+# Longitude wrap. generate_ensemble.py auto-detects it from the grid (W >= 39000 and the
+# transform starting at -180), which is exactly the global raster; every regional extent is a
+# crop and does not wrap. False stays the default so regional runs are unchanged, but a global
+# run must set WRAP=True or the field is generated with a discontinuity at the antimeridian and
+# T3.5's seam gate scores a seam the sampler was told not to close.
+WRAP="${WRAP:-False}"
+# Peak validator memory follows this knob (validate_ensemble.py sizes every streaming stage
+# from it; T5 spends it at a quarter of face value by design). The script's own default is
+# 8 GB, which is right for southern Africa and leaves a 125 GB box idle on the global grid.
+MEM_BUDGET_GB="${MEM_BUDGET_GB:-}"
+# The icechunk stores are the largest artifacts in the project (~450 GB each at M=400 on the
+# global grid), so they need to be addressable independently of ROOT, which lives on /.
+MEMBERS_OUT="${MEMBERS_OUT:-}"
+NULL_OUT="${NULL_OUT:-}"
 # Ensembles are icechunk repositories (see generate_ensemble.py): the write is one
 # transaction, so a run killed part-way leaves no store rather than a plausible-looking
 # directory of sentinel.
-MEMBERS_ZARR="${ROOT}/members${SUFFIX}.icechunk"
-NULL_ZARR="${ROOT}/null${SUFFIX}.icechunk"
+MEMBERS_ZARR="${MEMBERS_OUT:-${ROOT}/members${SUFFIX}.icechunk}"
+NULL_ZARR="${NULL_OUT:-${ROOT}/null${SUFFIX}.icechunk}"
 VALIDATION_DIR="${ROOT}/validation${SUFFIX}"
 SHAPE_JSON="${ROOT}/marginal_shape${SUFFIX}.json"
 WIDTH_JSON="${ROOT}/width_factors${SUFFIX}.json"
@@ -81,6 +95,21 @@ $PY -u scripts/build_region_residuals.py \
     --pred_dir "${ROOT}/stitched" --pred_suffix "" --keep_splits all \
     --out_dir "${ROOT}/residuals" \
     --covariate_dir "${REGION_ROOT}/covariates"
+
+# The AR(1) coupling between horizons, measured on this model's own standardized residuals.
+# build_region_residuals.py does not write it -- only run_hindcast_folds.py --stage residuals
+# did, which the regional loop never calls. Every regional run so far therefore fell back to
+# rho = 0.9 inside generate_ensemble.py and left T4.1 reported-only rather than scored,
+# including the Africa 111/133 card. Deriving it here makes the loop self-contained; the
+# consequence is that T4.1 becomes a scored row, so the pass denominator moves.
+$PY -u -c "
+import json, sys
+sys.path.insert(0, '.')
+from src.ensemble.residuals import horizon_autocorrelation
+rho = horizon_autocorrelation('${ROOT}/residuals/manifest.csv')
+json.dump({str(k): v for k, v in rho.items()}, open('${ROOT}/residuals/horizon_autocorrelation.json', 'w'), indent=2)
+print('  horizon autocorrelation rho =', rho)
+"
 
 echo "=== ${NAME} · Phase 1 + 1.5: coverage, variograms, class audit, recal decision ==="
 $PY -u scripts/run_diagnostics.py \
@@ -151,7 +180,7 @@ $PY -u scripts/generate_ensemble.py \
     --spectral_fits "${ROOT}/spectral_fits.json" \
     --variogram_fits "${ROOT}/diagnostics/variogram_fits.csv" \
     --rho_json "${ROOT}/residuals/horizon_autocorrelation.json" \
-    --wrap_lon False "${SHAPE_ARGS[@]+"${SHAPE_ARGS[@]}"}" \
+    --wrap_lon "$WRAP" "${SHAPE_ARGS[@]+"${SHAPE_ARGS[@]}"}" \
     --out "$MEMBERS_ZARR" --gpus "$GPUS" \
     --wandb_group "central-${NAME}"
 
@@ -164,7 +193,7 @@ $PY -u scripts/generate_ensemble.py \
     --spectral_fits "${ROOT}/spectral_fits.json" \
     --variogram_fits "${ROOT}/diagnostics/variogram_fits.csv" \
     --rho_json "${ROOT}/residuals/horizon_autocorrelation.json" \
-    --wrap_lon False "${SHAPE_ARGS[@]+"${SHAPE_ARGS[@]}"}" \
+    --wrap_lon "$WRAP" "${SHAPE_ARGS[@]+"${SHAPE_ARGS[@]}"}" \
     --out "$NULL_ZARR" --gpus "$GPUS" --disable_wandb
 
 echo "=== ${NAME} · Phase 4: T1-T8 scorecard ==="
@@ -177,6 +206,7 @@ $PY -u scripts/validate_ensemble.py \
     --recal_manifest "${RECAL_DIR}/recal_manifest.json" \
     --dist_raster "$DIST_RASTER" "${VAL_SHAPE_ARGS[@]+"${VAL_SHAPE_ARGS[@]}"}" \
     --block_sizes "$BLOCKS" --out_dir "$VALIDATION_DIR" \
+    ${MEM_BUDGET_GB:+--mem_budget_gb "$MEM_BUDGET_GB" --mem_trace} \
     --wandb_group "central-${NAME}"
 
 echo

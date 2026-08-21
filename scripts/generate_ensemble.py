@@ -24,9 +24,17 @@ from __future__ import annotations
 import argparse
 import json
 import multiprocessing as mp
+import os
 import sys
 import time
 from pathlib import Path
+
+# Set before torch is imported anywhere (the workers are spawned, so they inherit it).
+# At the global grid the circulant-embedding field is 26136 x 40000 after padding and its
+# working set peaks at 22.5 GB on a 24 GB card. The default caching allocator reserved
+# 24.62 GB to serve that -- 2.1 GB of it fragmentation -- and OOM'd; expandable segments
+# reserve 22.53 GB for the identical allocation. Measured, not guessed.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import numpy as np
 import pandas as pd
@@ -278,7 +286,10 @@ def worker(worker_id, gpu, member_ids, cfg, session=None):
     z_store = zarr.open_group(session.store, mode="r+")[ARRAY_NAME]
 
     idx_arr = np.asarray(idx_np)
-    idx_t = torch.as_tensor(idx_arr.copy(), device=device)
+    # int32 on the device, int64 on the host. These two live for the whole worker and would
+    # otherwise sit inside the field's peak: at 184.6M valid px int64 costs 1.48 GB and the
+    # index fits in int32 (H*W = 684M < 2^31). Torch indexes fine with int32.
+    idx_t = torch.as_tensor(idx_arr.astype(np.int32), device=device)
     # Marginals stay pinned on the host and only the horizon in flight is moved to the
     # GPU: all four years at once is ~9 GB, which does not coexist with the FFT working
     # set on a 24 GB card.
@@ -293,7 +304,9 @@ def worker(worker_id, gpu, member_ids, cfg, session=None):
     # no-op because device and dtype already match.
     band_t = None
     if cfg.get("band"):
-        band_t = torch.as_tensor(np.load(cfg["band"]).astype(np.int64), device=device)
+        # int8 holds a distance-band index (0-5) in 0.18 GB instead of 1.48 GB;
+        # apply_shape_torch casts it to long itself, and only after the field is freed.
+        band_t = torch.as_tensor(np.load(cfg["band"]).astype(np.int8), device=device)
     shapes_dev = {}
     for h, sh in (cfg.get("shapes") or {}).items():
         shapes_dev[h] = {k: (torch.as_tensor(np.asarray(v), device=device,

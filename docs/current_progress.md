@@ -1,5 +1,12 @@
 # Current Progress — Spatiotemporal HM Uncertainty
 
+> **SUPERSEDED for status as of 2026-08-20 — read `docs/global_scorecard.md` first.**
+> The global hindcast and the published scorecard (112/146 at M=400) are done. The live target is
+> the model's interval width in the far field, which collapses 51.8x from near to far and which
+> **no post-hoc fix can reach**. Crucially, the 22 model experiments summarised below and in
+> `docs/model_phase.md` were all screened on southern Africa, whose observed far-field change rate
+> is 0.0000 — so none of them could have detected it. This document remains accurate as history.
+
 Status as of 2026-08-14, branch `ensemble`. Companion to
 `docs/ensemble_uncertainty_plan.md`, which holds the design and the full target definitions.
 This document records what exists, what was learned, how we score against each target, and

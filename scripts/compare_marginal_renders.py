@@ -42,16 +42,30 @@ def read_like(path, ref, band=1):
     return np.where(a < -1e6, np.nan, a)
 
 
-def pick_windows(d_obs, size=768, n=2):
-    """The busiest window and a quiet one — the two regimes that fail differently."""
+def pick_windows(d_obs, size=768, n=2, min_land=0.6, n_candidates=400):
+    """The busiest window and a quiet one — the two regimes that fail differently.
+
+    **Candidates must be substantially on land.** Requiring merely one finite pixel lets an
+    almost-entirely-ocean window win the "quiet" slot on a nanmean taken over a handful of
+    coastal pixels — which renders as a blank map with a few coloured pixels in one corner,
+    and says nothing about the forecast. Measured on Africa: the unguarded pick returned a
+    window whose maps were empty while its member histograms were fully populated, which is
+    the tell that the crop, not the field, was degenerate. ``spread_windows`` in
+    ``plot_forecast_panel.py`` already guarded this at 0.6; the guard belongs here, where
+    both scripts read it from.
+
+    The candidate count is raised with it: at 60 draws a 60%-land requirement can leave the
+    quiet slot filled by whatever survived rather than by the quietest land window.
+    """
     H, W = d_obs.shape
     rng = np.random.default_rng(0)
     best, quiet = None, None
-    for _ in range(60):
+    for _ in range(n_candidates):
         r0 = int(rng.integers(0, max(1, H - size)))
         c0 = int(rng.integers(0, max(1, W - size)))
         sub = d_obs[r0:r0 + size, c0:c0 + size]
-        if not np.isfinite(sub).any():
+        finite = np.isfinite(sub)
+        if finite.mean() < min_land:
             continue
         score = float(np.nanmean(np.abs(sub)))
         if best is None or score > best[0]:

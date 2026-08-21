@@ -1,5 +1,15 @@
 # The Model Phase — Improving the ConvLSTM Itself
 
+> **Correction, 2026-08-20 — read before citing anything below as a dead lever.**
+> Every experiment in this document was screened on **southern Africa, whose observed far-field
+> change rate is 0.0000**. An experiment aimed at the model's behaviour beyond ~100 px from past
+> change reads "no effect" there whatever it actually did. These are results about the **near
+> field only**. The global scorecard (`docs/global_scorecard.md`) shows the far-field interval
+> width collapsing 51.8x and the ensemble emitting 2.3% of the observed increase rate out there —
+> a defect this screening could not see. `width_head_mode power/power_plus` in particular speaks
+> directly to far-field width and its verdict inherits the blind spot.
+
+
 Branch `ensemble`, southern Africa, started 2026-08-16. Companion to
 `docs/next_phase_model.md` (the plan), `docs/next_phase_marginals.md` §5-6 (the closed
 post-hoc phase) and `docs/central_field_baseline.md` (the last time the model was changed).

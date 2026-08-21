@@ -79,11 +79,95 @@ def unstretch(e, min_count):
     return k_up, k_lo, int(e.size)
 
 
+_BIOME_CACHE = {}
+
+
+def _third_axis(args, dist_band, row):
+    """The class index for whichever third axis was chosen.
+
+    Distance band and biome are alternatives, not partners, in the sense that the two
+    calibration layers this script replaces used one each: the conformal layer keyed on
+    biome, the width layer on distance band, and their factors were multiplied. Which of
+    them actually carries signal is settled here by fitting each and scoring on held-out
+    folds, which is the measurement that was owed and never taken.
+    """
+    if args.class_axis == "band":
+        return dist_band.astype(np.int64)
+    if "biome" not in _BIOME_CACHE:
+        from src.ensemble.validate import biome_lut
+        biome_map, _, _ = biome_lut(args.lookup_csv)
+        with rasterio.open(args.ecoregion_raster) as s:
+            eco = s.read(1)
+        _BIOME_CACHE["biome"] = biome_map[np.clip(eco, 0, len(biome_map) - 1)].astype(np.int64)
+    bio = _BIOME_CACHE["biome"]
+    if bio.shape != dist_band.shape:
+        raise SystemExit(f"biome raster {bio.shape} does not match residual grid "
+                         f"{dist_band.shape}; crop it to the region first")
+    if args.class_axis == "biome":
+        return bio
+    # both: cross the two, distance band varying fastest so band-only artifacts stay readable
+    return bio * len(DIST_LABELS) + dist_band.astype(np.int64)
+
+
+def _apply_horizon_monotonicity(out):
+    """Make every class's factors non-decreasing in horizon, in place.
+
+    The conformal layer smoothed isotonically across horizons for exactly this reason; the
+    width layer never did. Enforced on the *factor*, this is a cumulative maximum over the
+    sorted horizons within each (axis, dhat, HM) cell. It cannot fix a pixel that changes
+    class between horizons — that is what apply_recalibration's final pass handles — but it
+    removes the part of the defect that lives in the table.
+    """
+    by_h = out["by_horizon"]
+    horizons = sorted(by_h, key=lambda x: int(x))
+    keys = set()
+    for h in horizons:
+        for b, dd in by_h[h].items():
+            for d, hm in dd.items():
+                for j in hm:
+                    keys.add((b, d, j))
+    n_lifted = 0
+    for key in keys:
+        b, d, j = key
+        run_up = run_lo = 0.0
+        for h in horizons:
+            cell = by_h[h].get(b, {}).get(d, {}).get(j)
+            if cell is None:
+                continue
+            ku, kl = float(cell[0]), float(cell[1])
+            new_up, new_lo = max(ku, run_up), max(kl, run_lo)
+            if new_up > ku + 1e-12 or new_lo > kl + 1e-12:
+                n_lifted += 1
+            cell[0], cell[1] = new_up, new_lo
+            run_up, run_lo = new_up, new_lo
+    return n_lifted
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--class_axis", default="band", choices=["band", "biome", "both"],
+                    help="The third class axis, beside predicted change and HM level. "
+                         "'band' is distance-to-past-change, which is where the *change* "
+                         "failures organise; 'biome' is what the conformal layer used, which "
+                         "is where the *coverage* failures organise; 'both' crosses them. "
+                         "This is the choice that decides whether one unified layer can "
+                         "replace the two that used to be multiplied together — and it is a "
+                         "held-out measurement, not a preference.")
+    ap.add_argument("--ecoregion_raster",
+                    default="data/raw/hm_global/ecoregion_id_1000.tif")
+    ap.add_argument("--lookup_csv", default="data/raw/hm_global/ecoregion_lookup.csv")
+    ap.add_argument("--monotone_horizons", type=lambda x: (str(x).lower() == "true"),
+                    nargs="?", const=True, default=True,
+                    help="Make each class's factors non-decreasing across horizons, so the "
+                         "calibration cannot claim more certainty at longer lead time. The "
+                         "conformal layer smoothed isotonically for this reason and the width "
+                         "layer never did; between them they took the heads' monotonicity "
+                         "from 0.980 to 0.813 (T4.2). Note this fixes the *factors* only — a "
+                         "pixel that changes class between horizons can still inverit, which "
+                         "is what apply_recalibration's final pass is for.")
     ap.add_argument("--bands", default="0,1,2",
                     help="Distance bands to narrow. Default 0,1,2 (out to 10 px); beyond "
                          "that narrowing measurably hurts — see the module docstring.")
@@ -95,6 +179,15 @@ def main(argv=None):
                          "factor is *biased* for the high-change class (0.77 against its "
                          "own 0.95), not merely noisier, so shrinking hard toward it "
                          "reintroduces the error this axis exists to remove.")
+    ap.add_argument("--fold_mask", default=None,
+                    help="Fold mask raster. With --fit_folds, only those folds' pixels are "
+                         "used to fit, so the rest are genuinely held out for scoring. "
+                         "Needed because a class-conditional correction fitted to the metric "
+                         "it is scored on will look good and not generalise (CLAUDE.md 13).")
+    ap.add_argument("--fit_folds", default=None,
+                    help="Comma-separated fold ids to fit on, e.g. '1,2,3'. Requires "
+                         "--fold_mask. Omitted, every pixel is used, which is the "
+                         "production setting.")
     ap.add_argument("--clip", type=float, default=8.0)
     ap.add_argument("--floor", type=float, default=0.25,
                     help="Never narrow below this. A factor near zero would be fitted on a "
@@ -103,6 +196,17 @@ def main(argv=None):
 
     bands = {int(x) for x in args.bands.split(",") if x.strip() != ""}
     man = pd.read_csv(args.manifest)
+
+    fit_mask = None
+    if args.fit_folds:
+        if not args.fold_mask:
+            raise SystemExit("--fit_folds requires --fold_mask")
+        keep = {int(x) for x in args.fit_folds.split(",") if x.strip() != ""}
+        with rasterio.open(args.fold_mask) as s:
+            fold_ids = s.read(1)
+        fit_mask = np.isin(fold_ids, list(keep))
+        print(f"  fitting on folds {sorted(keep)}: {int(fit_mask.sum()):,} px "
+              f"({100 * fit_mask.mean():.1f}% of the grid)")
 
     # Three nested class levels, each shrunk toward its parent: the band is the root, the
     # predicted-change bin sits under it, and the HM level under that. Measured at h=20,
@@ -122,16 +226,20 @@ def main(argv=None):
         with rasterio.open(row["path_dhat"]) as s:
             dhat = s.read(1).astype(np.float64)
         with rasterio.open(row["path_dist_past_change"]) as s:
-            band = distance_band(s.read(1).astype(np.float64))
+            dist_band = distance_band(s.read(1).astype(np.float64))
+        band = _third_axis(args, dist_band, row)
 
         ok = (np.isfinite(res) & np.isfinite(wu) & np.isfinite(wl) & np.isfinite(dhat)
               & (wu > 0) & (wl > 0))
+        if fit_mask is not None:
+            ok &= fit_mask
         with np.errstate(invalid="ignore", divide="ignore"):
             e = np.clip(res / (np.where(res >= 0, wu, wl) / Z975), -args.clip, args.clip)
         d_idx = np.digitize(dhat, DHAT_BINS[1:-1])
         with rasterio.open(row["path_hm_t0"]) as s:
             hm_idx = np.digitize(s.read(1).astype(np.float64), HM_BINS[1:-1])
-        for b in sorted(bands):
+        axis_vals = sorted(bands) if args.class_axis == "band" else sorted(np.unique(band[ok]))
+        for b in axis_vals:
             mb = ok & (band == b)
             if mb.any():
                 per_band.setdefault((h, b), []).append(e[mb])
@@ -183,15 +291,23 @@ def main(argv=None):
                 n_leaf += 1
                 n_fitted += fitted
                 if fitted:
-                    print(f"{h:>3} {DIST_LABELS[b]:>9} {DHAT_LABELS[d]:>15} "
+                    lbl = DIST_LABELS[b] if args.class_axis == "band" else str(b)
+                    print(f"{h:>3} {lbl:>9} {DHAT_LABELS[d]:>15} "
                           f"{HM_LABELS[j]:>12} {n:>9,} {k_up:>6.3f} {k_lo:>6.3f}")
+
+    n_lifted = _apply_horizon_monotonicity(out) if args.monotone_horizons else 0
+    out["class_axis"] = args.class_axis
+    out["monotone_horizons"] = bool(args.monotone_horizons)
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     with open(args.out, "w") as fh:
         json.dump(out, fh, indent=1)
-    print(f"\n✓ {args.out} — {n_leaf} (band x predicted-change x HM) classes, of which "
-          f"{n_fitted} fitted on their own pixels and {n_leaf - n_fitted} inherited from a "
-          f"parent; bands {sorted(bands)} narrowed, the rest keep their published width")
+    print(f"\n✓ {args.out} — {n_leaf} ({args.class_axis} x predicted-change x HM) classes, "
+          f"of which {n_fitted} fitted on their own pixels and {n_leaf - n_fitted} inherited "
+          f"from a parent")
+    if args.monotone_horizons:
+        print(f"  horizon monotonicity: {n_lifted} cells lifted so no class claims more "
+              f"certainty at a longer lead time")
     return 0
 
 

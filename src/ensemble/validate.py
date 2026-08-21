@@ -61,6 +61,52 @@ def distance_band(dist):
     return np.digitize(np.asarray(dist), DIST_BINS[1:-1], right=True).astype(np.int8)
 
 
+def remote_band_error(member_pos, observed_pos, member_neg, observed_neg, ceiling=0.002):
+    """Two-sided remote-band error: mean ``|log10(member / observed)|`` over both tails.
+
+    T8.2 was written as a one-sided ceiling on invented change, which was the right
+    instrument when the heads put 0.0297 of change beyond 100 px against an observed
+    0.0000. The failure has since inverted — the global ensemble emits 2.3% of the observed
+    increase rate and 28x the decrease rate out there — and a ceiling reads its best at
+    exactly the moment the far field goes silent.
+
+    An observed rate of exactly zero admits no ratio, so that direction alone falls back to
+    the original ceiling, expressed on the same log scale so the two halves can be
+    averaged. Southern Africa is the extent where that branch is taken.
+
+    Returns ``(error, notes)``; a value of 0.301 is a factor of two either way.
+    """
+    errs, notes = [], []
+    for label, m, o in (("P(Δ>0.05)", member_pos, observed_pos),
+                        ("P(Δ<-0.05)", member_neg, observed_neg)):
+        m = float(m)
+        o = float(o)
+        if o > 0:
+            errs.append(abs(np.log10(max(m, 1e-12) / o)))
+            notes.append(f"{label} {m:.3g} vs {o:.3g} (x{m / o:.3g})")
+        else:
+            errs.append(0.0 if m <= ceiling else float(np.log10(max(m, 1e-12) / ceiling)))
+            notes.append(f"{label} {m:.3g} vs observed 0 — ceiling {ceiling:g} applied")
+    return float(np.mean(errs)), notes
+
+
+def near_far_contrast(member_near, member_far, observed_near, observed_far):
+    """``(near/far)_member / (near/far)_observed``, with both contrasts.
+
+    The old T8.3 asked only that the member contrast exceed 20x, which an ensemble with no
+    remote change at all satisfies by construction — the global card read 90,596 against an
+    observed 1,527 and passed. Returns ``(member_contrast, observed_contrast, ratio)``,
+    with ``ratio`` NaN when the observed remote rate is zero and no contrast exists to
+    compare against.
+    """
+    member_contrast = (float(member_near) / float(member_far)
+                       if float(member_far) > 0 else np.inf)
+    if float(observed_far) <= 0 or not np.isfinite(member_contrast):
+        return member_contrast, np.inf, np.nan
+    observed_contrast = float(observed_near) / float(observed_far)
+    return member_contrast, observed_contrast, member_contrast / observed_contrast
+
+
 N_MARGINAL_CLASS = len(HM_LABELS) * len(DIST_LABELS)
 
 

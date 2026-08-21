@@ -14,6 +14,7 @@ that a given failure has one correct response.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 import time
@@ -122,6 +123,15 @@ def parse_args(argv=None):
     ap.add_argument("--recal_manifest", default="data/ensemble/hindcast/recal/recal_manifest.json",
                     help="Used for the T1.5 sharpness guard (width vs the original heads)")
     ap.add_argument("--block_sizes", default="10,100,1000")
+    ap.add_argument("--aggregate_parts", default="block,zonal",
+                    help="Which halves of the T2 stage to run. 'block' is T2.1/T2.7/T2.8 "
+                         "and dominates the run; 'zonal' is T2.2-T2.4 and is the only "
+                         "input T2.5 needs.")
+    ap.add_argument("--rank_min_expected", type=float, default=16.0,
+                    help="Minimum expected count per pooled rank bin for T2.5. The "
+                         "aggregation units are ecoregions (158 on Africa, 804 global) "
+                         "against M+1 raw bins, which is valid but nearly powerless "
+                         "against a smooth dome; pooling recovers the power.")
     ap.add_argument("--score_points", type=int, default=1500)
     ap.add_argument("--marginal_shape", default=None,
                     help="Empirical marginal shape the ensemble was generated with. The T5 "
@@ -365,6 +375,41 @@ def stage_gates(args, store, attrs, years, paths, out_dir, card, block_rows=None
 # --------------------------------------------------------------------------------------
 # T2 aggregate coverage
 # --------------------------------------------------------------------------------------
+@contextlib.contextmanager
+def _nullsection():
+    """A no-op stand-in for ``TRACE.section`` when the work inside is being skipped."""
+    yield
+
+
+def _save_zonal_cache(out_dir, zonal_members_by_year):
+    """Persist the zonal member/observed means T2.5 scores.
+
+    ``stage_rank`` took its input from ``stage_aggregate``'s return value, so asking for
+    ``--stages rank`` alone scored an empty dict and silently emitted no T2.5 rows at all.
+    Caching makes the rank stage re-runnable on its own, which is the difference between a
+    36-minute re-score and a 111-minute one.
+    """
+    if not zonal_members_by_year:
+        return
+    flat = {}
+    for year, d in zonal_members_by_year.items():
+        for k, v in d.items():
+            flat[f"{year}|{k}"] = np.asarray(v)
+    np.savez_compressed(Path(out_dir) / "t2_zonal_members.npz", **flat)
+
+
+def _load_zonal_cache(out_dir):
+    path = Path(out_dir) / "t2_zonal_members.npz"
+    if not path.exists():
+        return {}
+    z = np.load(path, allow_pickle=False)
+    out = {}
+    for key in z.files:
+        year, k = key.split("|", 1)
+        out.setdefault(int(year), {})[k] = z[key]
+    return out
+
+
 def stage_aggregate(args, store, attrs, years, paths, out_dir, card, null_store=None, null_attrs=None):
     print("\n=== T2 · aggregate-scale coverage ===")
     block_sizes = [int(b) for b in args.block_sizes.split(",")]
@@ -372,6 +417,11 @@ def stage_aggregate(args, store, attrs, years, paths, out_dir, card, null_store=
     rows, zonal_rows = [], []
     thresholds = (0.1, 0.3)
     zonal_members_by_year = {}
+    # The two halves of T2 cost very differently — on Africa at M=400, block streaming is
+    # 78 min and the zonal pass 31 min — and T2.5 depends only on the zonal half. Splitting
+    # them makes a rank-only re-score affordable instead of an incidental 111 min.
+    parts = [p.strip() for p in args.aggregate_parts.split(",") if p.strip()]
+    do_block, do_zonal = "block" in parts, "zonal" in parts
 
     for hi, year in enumerate(years):
         with rasterio.open(paths[year]["central"]) as c:
@@ -383,20 +433,24 @@ def stage_aggregate(args, store, attrs, years, paths, out_dir, card, null_store=
         # aggregate upward for free, and — unlike the arrays-in-memory version this
         # replaced — nothing here is proportional to M x H x W, so the peak follows
         # --mem_budget_gb rather than the grid.
-        with TRACE.section(f"block_score_streaming[{year}]"):
+        if not do_block:
+            usable = []
+        with TRACE.section(f"block_score_streaming[{year}]") if usable else _nullsection():
             # The observed aggregate must be taken over exactly the pixels the ensemble
             # covers; T5.3 proves the ensemble mask equals the central raster's, so that
             # is the mask to apply.
-            scored = agg.block_score_streaming(
+            scored = (agg.block_score_streaming(
                 store, hi, usable, str(paths[year]["observed"]), profile, attrs=attrs,
                 mask_path=str(paths[year]["central"]), budget_bytes=budget_bytes)
+                if usable else {})
         # Pixelwise-independent-propagation baselines: the motivating contrast, and the
         # reason the ensemble exists. One call for every scale — it used to be re-invoked
         # per scale, re-reading the rasters three times per year for nothing.
-        with TRACE.section(f"compute_block_coverage[{year}]"):
-            base_all = val.compute_block_coverage(
+        with TRACE.section(f"compute_block_coverage[{year}]") if usable else _nullsection():
+            base_all = (val.compute_block_coverage(
                 paths[year]["lower"], paths[year]["upper"], paths[year]["observed"],
                 block_sizes=usable, pred_central_path=paths[year]["central"])
+                if usable else pd.DataFrame())
         for B in usable:
             res = dict(scored[B])
             if res["n"] == 0:
@@ -422,7 +476,7 @@ def stage_aggregate(args, store, attrs, years, paths, out_dir, card, null_store=
                   f"vs pixelwise {float(base.iloc[0]['coverage']) if not base.empty else np.nan:.3f}")
 
         # ---- T2.2 / T2.3 ecoregion ------------------------------------------------------
-        if Path(args.ecoregion_raster).exists():
+        if do_zonal and Path(args.ecoregion_raster).exists():
             with TRACE.section(f"zonal_member_stats[{year}]"):
                 zm = agg.zonal_member_stats(store, hi, args.ecoregion_raster, attrs=attrs,
                                             thresholds=thresholds)
@@ -467,10 +521,14 @@ def stage_aggregate(args, store, attrs, years, paths, out_dir, card, null_store=
 
     block_df = pd.DataFrame(rows)
     zonal_df = pd.DataFrame(zonal_rows)
-    block_df.to_csv(out_dir / "t2_block_coverage.csv", index=False)
-    zonal_df.to_csv(out_dir / "t2_zonal_coverage.csv", index=False)
+    if do_block:
+        block_df.to_csv(out_dir / "t2_block_coverage.csv", index=False)
+    if do_zonal:
+        zonal_df.to_csv(out_dir / "t2_zonal_coverage.csv", index=False)
+        _save_zonal_cache(out_dir, zonal_members_by_year)
 
-    for _, r in block_df[block_df["kind"] == "ensemble"].iterrows():
+    for _, r in (block_df[block_df["kind"] == "ensemble"].iterrows() if len(block_df)
+                 else iter(())):
         ok = abs(r["coverage"] - 0.95) <= 0.05
         card.add("T2.1", f"block coverage {int(r['scale_km'])}km ({r['year']})", r["coverage"],
                  "0.95 +/- 0.05", ok, knob="T2_under" if r["coverage"] < 0.95 else "T2_over",
@@ -502,7 +560,7 @@ def stage_aggregate(args, store, attrs, years, paths, out_dir, card, null_store=
                  knob="T2_under" if r["coverage"] < 0.95 else "T2_over")
 
     # ---- T2.4 change between horizons ----------------------------------------------------
-    if len(years) >= 2 and Path(args.ecoregion_raster).exists():
+    if do_zonal and len(years) >= 2 and Path(args.ecoregion_raster).exists():
         y0, y1 = years[0], years[-1]
         a, b = zonal_members_by_year.get(y0), zonal_members_by_year.get(y1)
         if a and b:
@@ -519,38 +577,54 @@ def stage_aggregate(args, store, attrs, years, paths, out_dir, card, null_store=
 
 
 def stage_rank(args, zonal_members_by_year, out_dir, card):
-    """T2.5 — rank histogram at aggregate (ecoregion) scale."""
+    """T2.5 — rank histogram at aggregate (ecoregion) scale.
+
+    The aggregation units are ecoregions — 158 on Africa, 804 globally — against M+1 raw
+    rank bins. The chi-square is valid at that sparsity (checked, not assumed) but has
+    little power against the broad, smooth miscalibration these histograms carry, so the
+    ranks are pooled to an expected occupancy of at least ``--rank_min_expected`` first;
+    see ``src.ensemble.aggregate.pool_rank_bins``.
+    """
     print("\n=== T2.5 · rank histograms ===")
     rows = []
     for year, d in zonal_members_by_year.items():
         hist = agg.rank_histogram(d["mean_members"], d["mean_obs"])
-        test = agg.rank_histogram_test(hist)
+        test = agg.rank_histogram_test(hist, min_expected=args.rank_min_expected)
         rows.append({"year": year, **test, "hist": json.dumps(hist.tolist())})
         computable = test["p_value"] is not None and np.isfinite(test["p_value"])
         card.add("T2.5", f"rank histogram flatness ({year})", test["p_value"], "chi2 p > 0.01",
                  (test["p_value"] > 0.01) if computable else None,
-                 note=(f"reliability index {test['reliability_index']:.4f}" if computable
+                 note=(f"reliability index {test['reliability_index']:.4f} on "
+                       f"{test['n_bins']} pooled bins, n={test['n']} units, "
+                       f"min expected {test['min_expected']:.1f}" if computable
                        else f"not scorable: only {test['n']} aggregation units"),
                  knob="T2_under")
-        print(f"  {year}: chi2 p={test['p_value']:.4g}, reliability index "
-              f"{test['reliability_index']:.4f}")
+        print(f"  {year}: chi2 p={test['p_value']:.4g} over {test['n_bins']} pooled bins "
+              f"(n={test['n']}, min expected {test['min_expected']:.1f}), "
+              f"reliability index {test['reliability_index']:.4f}")
     if rows:
         pd.DataFrame(rows).to_csv(out_dir / "t2_rank_histograms.csv", index=False)
-        _plot_rank_hist(rows, out_dir / "rank_histograms.png")
+        _plot_rank_hist(rows, out_dir / "rank_histograms.png",
+                        min_expected=args.rank_min_expected)
 
 
-def _plot_rank_hist(rows, path):
+def _plot_rank_hist(rows, path, min_expected=16.0):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     fig, axes = plt.subplots(1, len(rows), figsize=(4 * len(rows), 3), squeeze=False)
     for ax, r in zip(axes[0], rows):
-        h = np.array(json.loads(r["hist"]))
-        ax.bar(np.arange(h.size), h / max(h.sum(), 1), width=1.0)
-        ax.axhline(1 / h.size, ls="--", c="k", lw=1)
-        ax.set_title(f"{r['year']} (p={r['p_value']:.3g})", fontsize=9)
-        ax.set_xlabel("rank")
+        # Plot the pooled bins the test actually scores. The raw M+1 bins hold well under
+        # one count each at these unit counts, so their picture is sampling noise and
+        # invites the opposite reading to the statistic printed beside it.
+        h, expected = agg.pool_rank_bins(np.array(json.loads(r["hist"])),
+                                         min_expected=min_expected)
+        n = max(h.sum(), 1)
+        ax.bar(np.arange(h.size), h / n, width=1.0)
+        ax.plot(np.arange(h.size), expected / n, ls="--", c="k", lw=1)
+        ax.set_title(f"{r['year']} (p={r['p_value']:.3g}, {h.size} pooled bins)", fontsize=9)
+        ax.set_xlabel("pooled rank bin")
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -732,6 +806,35 @@ def _build_z_field(args, store, attrs, hi, year, paths, scratch, budget_bytes):
     return z, spread, valid, frac_usable, var_z
 
 
+def _structure_budget(fit_row, d_px):
+    """``1 - gamma(d)/sill`` of the fitted residual variogram: what T3.2 can reward.
+
+    An ensemble calibrated to the residual reproduces the residual's correlation
+    structure, so it can beat an independent-pixel ensemble with identical marginals only
+    on the share of variance still correlated at the separation being scored. Everything
+    beyond that is decorrelated in the data itself, where a faithful ensemble and an
+    unfaithful one are indistinguishable by construction.
+
+    ``scripts/t32_structure_budget.py`` measures the same quantity from the empirical
+    variogram of the standardized residual field. This reads it from the fitted model
+    instead, which costs nothing at scoring time and lets the budget be reported next to
+    the score it bounds.
+    """
+    if not fit_row:
+        return np.nan
+    try:
+        sill = float(fit_row["sill"])
+        if not np.isfinite(sill) or sill <= 0 or not np.isfinite(d_px):
+            return np.nan
+        gamma = vgm.nugget_two_range_model(
+            float(d_px), float(fit_row["nugget"]), float(fit_row["var_short"]),
+            float(fit_row["range_short_px"]), float(fit_row["var_long"]),
+            float(fit_row["range_long_px"]))
+        return float(np.clip(1.0 - gamma / sill, 0.0, 1.0))
+    except (KeyError, TypeError, ValueError):
+        return np.nan
+
+
 def stage_spatial(args, store, attrs, years, paths, out_dir, card, null_store=None, null_attrs=None):
     print("\n=== T3 · spatial realism ===")
     M, nH, H, W = store.shape
@@ -834,7 +937,7 @@ def stage_spatial(args, store, attrs, years, paths, out_dir, card, null_store=No
         print(f"  pair separation capped at {max_dist:.0f} px "
               f"(member practical range {member_fit['practical_range_px']:.1f} px)")
 
-        def _score(idx, tag):
+        def _score(idx, tag, cap=None):
             rr, cc = np.unravel_index(idx, (H, W))
             coords = np.stack([rr, cc], axis=1).astype(float)
             y = _obs_at(idx)
@@ -844,14 +947,21 @@ def stage_spatial(args, store, attrs, years, paths, out_dir, card, null_store=No
             # horizons of it buys nothing.
             Xn = agg.members_at_points(null_store, null_attrs, null_hi, idx, H, W)
             pairs = agg.sample_pairs(idx.size, 200000, rng=rng, coords=coords,
-                                     max_dist=max_dist)
+                                     max_dist=cap if cap is not None else max_dist)
             vs = agg.variogram_score(X, y, pairs)
             vs_null = agg.variogram_score(Xn, y, pairs)
             live = agg.informative_pair_fraction(spread.ravel()[idx], pairs)
             improve = 1.0 - vs / max(vs_null, 1e-12)
+            # The separation the score was actually taken at. The cap is an upper bound,
+            # not the scored lag, and the structure budget below is a steep function of
+            # lag — reading the budget at the cap would overstate the difficulty by
+            # roughly a factor of two on Africa.
+            d_bar = (float(np.mean(np.linalg.norm(coords[pairs[0]] - coords[pairs[1]], axis=1)))
+                     if len(pairs[0]) else np.nan)
             print(f"  [{tag}] variogram score {vs:.4g} vs null {vs_null:.4g} "
-                  f"({100*improve:.1f}% lower); {100*live:.1f}% of pairs carry spread")
-            return dict(vs=vs, vs_null=vs_null, improve=improve, live=live,
+                  f"({100*improve:.1f}% lower); {100*live:.1f}% of pairs carry spread; "
+                  f"mean separation {d_bar:.1f} px")
+            return dict(vs=vs, vs_null=vs_null, improve=improve, live=live, d_bar=d_bar,
                         X=X, Xn=Xn, y=y, idx=idx)
 
         # Uniform sampling is retained and reported so the effect of the weighting is
@@ -861,14 +971,46 @@ def stage_spatial(args, store, attrs, years, paths, out_dir, card, null_store=No
         wtd = _score(_clustered_sample(ok, args.score_points, rng, patch=512, spread=spread,
                                        budget_bytes=budget_bytes), "spread-weighted")
 
-        card.add("T3.2", "variogram score vs independent-pixel null (spread-weighted)",
-                 wtd["improve"], ">= 0.30 lower", wtd["improve"] >= 0.30, knob="T3",
-                 note=f"{100*wtd['live']:.1f}% of pairs carry spread; "
-                      f"uniform sampling gives {100*uni['improve']:.1f}% "
-                      f"at {100*uni['live']:.1f}% live pairs")
+        # T3.2's 0.30 threshold was set a priori and is scored against a quantity that is
+        # bounded by the data, not by the generator: an ensemble calibrated to the
+        # residual can differ from an independent-pixel ensemble only in the variance
+        # still *correlated* at the separation being scored. That budget is read off the
+        # residual's own fitted variogram as 1 - gamma(d)/sill. It is not a regional
+        # constant — southern Africa's fit gives 14% at 25 px, Africa's gives 57% at the
+        # same lag and 27% at 78 px — so a fixed threshold is scoring different extents
+        # against different implicit difficulties. The gate is now the *share of the
+        # available budget* the ensemble captures, and the raw improvement stays on the
+        # card so the published series remains readable.
+        budget = _structure_budget(fit_target, wtd["d_bar"])
+        frac = wtd["improve"] / budget if (budget and np.isfinite(budget) and budget > 0) \
+            else np.nan
+        card.add("T3.2", "variogram-score improvement as a share of the structure budget",
+                 frac, ">= 0.50 of budget",
+                 bool(np.isfinite(frac) and frac >= 0.50), knob="T3",
+                 note=f"improvement {wtd['improve']:.4f} against budget {budget:.4f} at "
+                      f"mean separation {wtd['d_bar']:.1f} px; "
+                      f"{100*wtd['live']:.1f}% of pairs carry spread")
+        card.add("T3.2r", "variogram score vs independent-pixel null (spread-weighted)",
+                 wtd["improve"], "reported, not gated", None,
+                 note="the raw improvement the >= 0.30 gate used to score, kept "
+                      "comparable to the published cards")
         card.add("T3.2b", "variogram score vs null (uniform sampling, reference)",
                  uni["improve"], "reported, not gated", None,
                  note="retained so the weighting's effect is auditable")
+
+        # Reported, not gated: the same comparison at a short lag, where the residual has
+        # most of its structure left. Whether T3.2 should move there is item 9's open
+        # question, and it should be decided on measurements rather than on the argument
+        # that the long-lag reading is hard.
+        short_cap = max(4.0, min(8.0, 0.25 * float(member_fit["practical_range_px"])))
+        if short_cap < max_dist:
+            sht = _score(wtd["idx"], f"short-lag <= {short_cap:.0f}px", cap=short_cap)
+            b_s = _structure_budget(fit_target, sht["d_bar"])
+            f_s = sht["improve"] / b_s if (b_s and np.isfinite(b_s) and b_s > 0) else np.nan
+            card.add("T3.2s", "variogram score vs null at short lag", sht["improve"],
+                     "reported, not gated", None,
+                     note=f"pairs capped at {short_cap:.0f} px, mean separation "
+                          f"{sht['d_bar']:.1f} px; budget {b_s:.4f}, share {f_s:.3f}")
 
         # The energy score is a whole-vector quantity, so it is scored on the uniform
         # sample: reweighting the points would change what distribution it is an
@@ -897,10 +1039,23 @@ def stage_spatial(args, store, attrs, years, paths, out_dir, card, null_store=No
         left = agg.member_slice(store, attrs, 0, hi, window=(0, H, 0, 8))
         right = agg.member_slice(store, attrs, 0, hi, window=(0, H, W - 8, W))
         interior = agg.member_slice(store, attrs, 0, hi, window=(0, H, W // 2 - 8, W // 2 + 8))
-        seam_diff = np.nanmean(np.abs(right[:, -1] - left[:, 0]))
+        n_seam = int((np.isfinite(right[:, -1]) & np.isfinite(left[:, 0])).sum())
+        seam_diff = np.nanmean(np.abs(right[:, -1] - left[:, 0])) if n_seam else np.nan
         int_diff = np.nanmean(np.abs(np.diff(interior, axis=1)))
-        seam_ok = bool(np.isfinite(seam_diff) and np.isfinite(int_diff) and seam_diff <= 3 * int_diff)
-        seam_note = f"mean |Δ| across seam {seam_diff:.5f} vs interior {int_diff:.5f}"
+        if not n_seam:
+            # The antimeridian is open ocean for its whole length on this grid: columns 0 and
+            # W-1 carry no valid pixels at all (measured: 0 of 17111 rows finite on either
+            # side). A gate with nothing to compare has not been failed, it has not been
+            # evaluated -- scoring the NaN as a failed hard gate says the field is
+            # discontinuous when the field was never sampled there.
+            seam_ok = None
+            seam_note = (f"not evaluable: 0 valid px on either side of the seam "
+                         f"(interior |Δ| {int_diff:.5f})")
+        else:
+            seam_ok = bool(np.isfinite(seam_diff) and np.isfinite(int_diff)
+                           and seam_diff <= 3 * int_diff)
+            seam_note = (f"mean |Δ| across seam {seam_diff:.5f} vs interior {int_diff:.5f} "
+                         f"over {n_seam:,} rows")
     card.add("T3.5", "lon seam continuity", seam_note, "no discontinuity (hard gate)",
              seam_ok, knob="T3")
     _plot_member_render(z, out_dir / "member_field_render.png")
@@ -955,9 +1110,15 @@ def stage_change(args, store, attrs, years, paths, out_dir, card, n_members: int
         if obs.get(-0.15, 0) > 0 and mem.get(-0.15, 0) > 0:
             asym_obs = obs.get(0.15, 0) / obs[-0.15]
             asym_mem = mem.get(0.15, 0) / mem[-0.15]
-            card.add("T6.4", f"tail asymmetry vs observed ({year})", asym_mem,
-                     f">= {0.5 * asym_obs:.1f} (observed {asym_obs:.1f})",
-                     asym_mem >= 0.5 * asym_obs, knob="T6")
+            # Two-sided, for the same reason as T8.2/T8.3: a one-sided floor is satisfied
+            # by an ensemble whose upper tail is arbitrarily too heavy relative to its
+            # lower one. The global card passed this row at 1343.9 against an observed
+            # 5.3 — 254x the quantity being checked — which is not evidence of health.
+            rr = asym_mem / asym_obs if asym_obs > 0 else np.nan
+            card.add("T6.4", f"tail asymmetry vs observed ({year})", rr,
+                     "ratio in [0.5, 2.0]",
+                     bool(np.isfinite(rr) and 0.5 <= rr <= 2.0),
+                     note=f"member {asym_mem:.4g} vs observed {asym_obs:.4g}", knob="T6")
         for q in ("q01", "q05"):
             m, o = d.get(f"member_{q}"), d.get(f"observed_{q}")
             if m is not None and o is not None and o != 0:
@@ -1392,18 +1553,40 @@ def stage_clustering(args, store, attrs, years, paths, out_dir, card, n_members:
     df = pd.DataFrame(rows)
     df.to_csv(out_dir / "t8_change_clustering.csv", index=False)
     if not df.empty:
+        # T8.2 and T8.3 were written when remote-band *invention* was the failure mode —
+        # the original heads put 0.0297 of change beyond 100 px against an observed
+        # 0.0000, and a one-sided ceiling was the right instrument for that. Globally the
+        # sign has flipped: the ensemble emits 2.3% of the observed increase rate out
+        # there, so both gates now read their best at the moment the far field goes
+        # silent, which is the defect. Scored as a ratio to observed they discriminate in
+        # both directions, like T8.1 always did. The one-sided forms are kept only for the
+        # case they were written for — an observed rate of exactly zero, where no ratio
+        # exists — and that fallback is recorded in the note rather than left implicit.
         remote = df[df["band"] == DIST_LABELS[-1]]
         if len(remote):
-            v = float(remote["member_pos"].iloc[0])
-            card.add("T8.2", "P(Δ>0.05) in the remote band", v, "<= 0.002", v <= 0.002,
-                     note=f"observed {float(remote['observed_pos'].iloc[0]):.6f}", knob="T8")
-        near = float(df["member_pos"].iloc[0])
-        far = float(df["member_pos"].iloc[-1])
-        ratio = near / far if far > 0 else np.inf
-        obs_ratio = (float(df["observed_pos"].iloc[0]) / float(df["observed_pos"].iloc[-1])
-                     if float(df["observed_pos"].iloc[-1]) > 0 else np.inf)
-        card.add("T8.3", "near/remote change ratio", ratio, ">= 20x",
-                 bool(ratio >= 20), note=f"observed ratio {obs_ratio}", knob="T8")
+            err, notes = val.remote_band_error(
+                float(remote["member_pos"].iloc[0]), float(remote["observed_pos"].iloc[0]),
+                float(remote["member_neg"].iloc[0]), float(remote["observed_neg"].iloc[0]))
+            card.add("T8.2", "remote-band change realism (both directions)", err,
+                     "mean |log10 ratio| <= 0.301 (within 2x)", err <= 0.301,
+                     note="; ".join(notes), knob="T8")
+        ratio, obs_ratio, rr = val.near_far_contrast(
+            float(df["member_pos"].iloc[0]), float(df["member_pos"].iloc[-1]),
+            float(df["observed_pos"].iloc[0]), float(df["observed_pos"].iloc[-1]))
+        if np.isfinite(rr):
+            card.add("T8.3", "near/remote contrast vs observed", rr, "ratio in [0.5, 2.0]",
+                     bool(0.5 <= rr <= 2.0),
+                     note=f"member {ratio:.4g} vs observed {obs_ratio:.4g}", knob="T8")
+        else:
+            # Observed contrast is undefined (no remote change at all in this extent), so
+            # the only thing left to ask is the original one: that the members do not
+            # invent any either. Scored on the remote rate rather than on the contrast,
+            # which is infinite here and would put a non-finite value on a scored row.
+            # Southern Africa is the extent where this branch is taken.
+            far = float(df["member_pos"].iloc[-1])
+            card.add("T8.3", "remote-band change where none is observed", far, "<= 0.002",
+                     bool(far <= 0.002),
+                     note=f"observed remote rate 0; member contrast {ratio:.4g}", knob="T8")
 
 
 def _sampled_member_block(store, attrs, m0, m1, hi, rows, cols, band_rows=1024):
@@ -1516,13 +1699,82 @@ def stage_temporal(args, store, attrs, years, paths, out_dir, card, member_block
         card.add("T4.1", f"between-horizon corr {years[a]}->{years[b]}", corr,
                  f"within +/-0.10 of {tgt:.3f}", ok_flag if np.isfinite(tgt) else None, knob="T4.1")
 
+    # T4.2 asks whether the ensemble gets *more certain* further out, which is a property of
+    # the marginals the members are drawn from — not of any finite sample of them. Scored on
+    # the sample spread over M members it measured three things at once and gated on a target
+    # none of them could reach: under z_h = rho z_{h-1} + sqrt(1-rho^2) eps every z_h is
+    # marginally N(0,1), so rho cannot move the population spread at any horizon, yet the
+    # statistic moved 0.62 -> 0.45 when rho was measured rather than left at 0.9, and 0.71 ->
+    # 0.62 when M fell from 400 to 50. Meanwhile the published widths themselves are
+    # non-decreasing across all three steps at only 78.94% of Africa's pixels, so the >= 0.99
+    # target was unreachable by ~0.2 for a reason that has nothing to do with the copula.
+    #
+    # The population spread is available without any members: integrate the marginal against
+    # the standard normal. Gauss-Hermite is exact for the two-piece normal and converges fast
+    # through the shape, and it sees the [0,1] clip the sampler applies, so it is the same
+    # quantity the members estimate — without their noise.
+    pop = np.stack([population_spread(*marg[hi], *shapes[hi]) for hi in range(nH)])
+
+    ok_pop = np.isfinite(pop).all(axis=0)
+    mono_pop = np.all(np.diff(pop, axis=0) >= -1e-9, axis=0)
+    frac_pop = float(mono_pop[ok_pop].mean()) if ok_pop.any() else np.nan
+
     with np.errstate(invalid="ignore", divide="ignore"):
         spreads = np.where(w_n > 0, np.sqrt(w_m2 / np.maximum(w_n, 1)), np.nan)
     ok = np.isfinite(spreads).all(axis=0)
     mono = np.all(np.diff(spreads, axis=0) >= -1e-6, axis=0)
     frac = float(mono[ok].mean()) if ok.any() else np.nan
-    print(f"  spread non-decreasing with horizon at {100*frac:.2f}% of sampled pixels")
-    card.add("T4.2", "spread non-decreasing in horizon", frac, ">= 0.99", frac >= 0.99, knob="T4.2")
+    print(f"  population spread non-decreasing at {100*frac_pop:.2f}% of sampled pixels; "
+          f"the {M}-member sample reproduces {100*frac:.2f}%")
+    card.add("T4.2", "population spread non-decreasing in horizon", frac_pop, ">= 0.99",
+             bool(np.isfinite(frac_pop) and frac_pop >= 0.99),
+             note=f"marginals integrated against N(0,1); the {M}-member sample "
+                  f"estimate is {frac:.4f}", knob="T4.2")
+    # Reported, not gated: the sample statistic the old gate used. Its shortfall against the
+    # population value is Monte-Carlo noise modulated by M and rho, so there is no
+    # M-independent threshold to put on it.
+    card.add("T4.2s", "sample spread non-decreasing in horizon", frac,
+             "reported, not gated", None,
+             note=f"M={M}; population value {frac_pop:.4f}, ratio "
+                  f"{frac / frac_pop:.3f}" if np.isfinite(frac_pop) and frac_pop > 0 else "")
+
+
+def population_spread(cen, sl, sr, shape=None, band=None, n_nodes: int = 65):
+    """Standard deviation of the member marginal at each pixel, with no members involved.
+
+    ``x = clip(cen + scale(S(z)) * S(z), 0, 1)`` with ``z ~ N(0,1)``, integrated by
+    Gauss-Hermite. Exact for the two-piece normal, fast-converging through an empirical
+    shape, and it sees the [0,1] clip the sampler applies — so it is the same quantity a
+    finite ensemble estimates, without the finite ensemble's noise.
+
+    This exists because T4.2 used to be scored on the sample spread over M members, which
+    made a statement about the ensemble's *law* depend on M and on the AR(1) coupling. Both
+    dependencies are spurious: under ``z_h = rho z_{h-1} + sqrt(1-rho^2) eps`` every ``z_h``
+    is marginally N(0,1), so rho cannot move this quantity at all. Measured, it does not:
+    two ensembles differing only in rho (0.9 against the measured
+    {10: 0.374, 15: 0.347, 20: 0.769}) return 0.7304648026222341 from this function to every
+    digit, while their sample statistics read 0.6194 and 0.4540.
+    """
+    nodes, wq = np.polynomial.hermite_e.hermegauss(n_nodes)
+    wq = wq / wq.sum()
+    m1 = np.zeros_like(np.asarray(cen, dtype=np.float64))
+    m2 = np.zeros_like(m1)
+    for zn, w in zip(nodes, wq):
+        zz = np.full(m1.shape, float(zn))
+        if shape is not None:
+            if band is None:
+                zz = cop.apply_shape(zz, shape)
+            else:
+                out = np.array(zz)
+                for b, sh in shape.items():
+                    mb = band == b
+                    if mb.any():
+                        out[mb] = cop.apply_shape(zz[mb], sh)
+                zz = out
+        x = np.clip(cen + np.where(zz < 0, sl, sr) * zz, 0.0, 1.0)
+        m1 += w * x
+        m2 += w * x * x
+    return np.sqrt(np.maximum(m2 - m1 * m1, 0.0))
 
 
 def _plot_member_render(z, path):
@@ -1666,8 +1918,17 @@ def main(argv=None):
     _run_stage("percentiles", stage_percentiles, args, pct_paths, years, paths, out_dir, card)
     zonal = _run_stage("aggregate", stage_aggregate, args, store, attrs, years, paths,
                        out_dir, card, null_store, null_attrs) or {}
+    if not zonal and "rank" in stages:
+        # Fall back to the cache a previous aggregate run left, so `--stages rank` is a
+        # real request rather than a silent no-op.
+        zonal = _load_zonal_cache(out_dir)
+        if zonal:
+            print(f"  T2.5 reading cached zonal members from {out_dir}/t2_zonal_members.npz")
     if zonal:
         _run_stage("rank", stage_rank, args, zonal, out_dir, card)
+    elif "rank" in stages:
+        card.add("T2.5", "rank histogram flatness", "no zonal stats", "requires the "
+                 "aggregate stage or a cached t2_zonal_members.npz", False)
     _run_stage("spatial", stage_spatial, args, store, attrs, years, paths, out_dir, card,
                null_store, null_attrs)
     _run_stage("temporal", stage_temporal, args, store, attrs, years, paths, out_dir, card)
