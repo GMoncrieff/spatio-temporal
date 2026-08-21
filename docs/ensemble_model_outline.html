@@ -142,7 +142,7 @@
   <span class="lab">Contents</span>
   <a class="top" href="#orient">Orientation</a>
   <a class="top" href="#s1">1 · Central &amp; quantile models</a>
-  <a class="sub" href="#s1-changes">What changed from main</a>
+  <a class="sub" href="#s1-changes">How the model is built</a>
   <a class="sub" href="#s1-latent">Latent defects</a>
   <a class="sub" href="#s1-validity">Issues bearing on validity</a>
   <a class="top" href="#s2">2 · Ensembles</a>
@@ -164,9 +164,9 @@
   kilometre to a continent.</p>
   <dl>
     <dt>Predicts</dt><dd>Human Modification, 0–1, on a 1 km grid at +5 / +10 / +15 / +20 years</dd>
-    <dt>Baseline</dt><dd>the model on <code>main</code></dd>
-    <dt>Scored</dt><dd>Africa, k=5, M=400 — <strong>111 of 133</strong> scorecard rows pass (southern Africa 101/127)</dd>
-    <dt>Written</dt><dd>2026-08-17</dd>
+    <dt>Calibration</dt><dd>one layer: distance band × predicted change × HM level, monotone in horizon</dd>
+    <dt>Scored</dt><dd>Africa, k=5, M=400 — <strong>107 of 136</strong> scorecard rows pass, 14 reported-only</dd>
+    <dt>Written</dt><dd>2026-08-17, revised 2026-08-21</dd>
   </dl>
 </header>
 
@@ -175,7 +175,7 @@
 
 <p>For every pixel and horizon the model publishes three numbers: a <strong>central
 forecast</strong>, and a <strong>lower</strong> and <strong>upper</strong> bound forming a 95%
-interval. The model on <code>main</code> produces exactly this and stops there.</p>
+interval. That triple is the published product.</p>
 
 <p>Per-pixel intervals answer <em>“how uncertain is this one pixel?”</em>. They cannot answer
 <em>“how uncertain is this district, this ecoregion, this country?”</em> — because to add
@@ -263,12 +263,12 @@ one must be re-derived per model configuration rather than carried over.</figcap
 <p>The trunk is a 4-layer ConvLSTM over three input timesteps (t−10, t−5, t), hidden dimension
 64, 3×3 kernels, feeding twelve independent heads — four horizons × {lower, central, upper}.
 Inputs are HM and its component layers, seven static rasters, and eight learned
-location-encoder channels. That much is shared with <code>main</code>.</p>
+location-encoder channels.</p>
 
 <h3 id="s1-changes">What changed</h3>
 
 <h4>The central head predicts <em>change</em>, not level</h4>
-<p>On <code>main</code> the head predicts absolute HM, so it must first reproduce HM at t₀
+<p>Predicting absolute HM means the head must first reproduce HM at t₀
 through the trunk before adding anything. That reproduction is not free. On the 53–70% of
 pixels whose true change is under 0.001 — where the right answer is “emit t₀ unchanged” — the
 model still emitted change with sd ≈ 0.0075 HM, <strong>larger than the entire signal being
@@ -290,7 +290,7 @@ change anywhere in this chip” — measured at 0.752 mean occupancy for a singl
 That is an artifact of framing, not geography.</p></div>
 
 <h4>The interval is built around the central forecast</h4>
-<p>On <code>main</code> the three heads predict independently, so nothing stops the +10 yr
+<p>With the three heads predicting independently, nothing stops the +10 yr
 interval being <em>narrower</em> than the +5 yr one. It was: the h=10 half-width was smaller
 than h=5’s while the error it had to cover was 1.5× larger, and coverage there fell to 0.892.
 Now each quantile head emits a non-negative half-width <em>increment</em> that accumulates
@@ -302,22 +302,31 @@ and <code>lower ≤ central ≤ upper</code> is structural rather than clipped a
 computed over the whole globe instead of held-out geography. <strong>Any <code>val_coverage_*</code>
 number from before that fix is not comparable to one after it.</strong></p>
 
-<h3>What it bought</h3>
+<h3>Where the central field stands</h3>
+
+<p>The right yardstick for a forecast is <strong>skill against persistence</strong> — against
+simply predicting that nothing will change. That bar is higher than it sounds: the median
+20-year HM change is 0.0001, so pooled RMSE can look unremarkable while the model loses badly
+to doing nothing.</p>
+
 <div class="tw">
 <table>
-<thead><tr><th>Horizon</th><th class="n">RMSE <code>main</code></th><th class="n">RMSE now</th><th class="n">MAE <code>main</code></th><th class="n">MAE now</th><th class="n">Skill vs persistence</th></tr></thead>
+<thead><tr><th>Horizon</th><th class="n">Skill vs persistence</th></tr></thead>
 <tbody>
-<tr><td>+5 yr</td><td class="n">0.01478</td><td class="n">0.00947 <span class="pass">−36%</span></td><td class="n">0.00759</td><td class="n">0.00288 <span class="pass">−62%</span></td><td class="n"><span class="fail">−1.227</span> → <span class="pass">+0.085</span></td></tr>
-<tr><td>+10 yr</td><td class="n">0.01746</td><td class="n">0.01444 <span class="pass">−17%</span></td><td class="n">0.00859</td><td class="n">0.00505 <span class="pass">−41%</span></td><td class="n"><span class="fail">−0.244</span> → <span class="pass">+0.148</span></td></tr>
-<tr><td>+15 yr</td><td class="n">0.02047</td><td class="n">0.01855 <span class="pass">−9%</span></td><td class="n">0.00988</td><td class="n">0.00728 <span class="pass">−26%</span></td><td class="n">+0.006 → <span class="pass">+0.184</span></td></tr>
-<tr><td>+20 yr</td><td class="n">0.02416</td><td class="n">0.02222 <span class="pass">−8%</span></td><td class="n">0.01255</td><td class="n">0.00939 <span class="pass">−25%</span></td><td class="n">+0.045 → <span class="pass">+0.191</span></td></tr>
+<tr><td>+5 yr</td><td class="n"><span class="pass">+0.130</span></td></tr>
+<tr><td>+10 yr</td><td class="n"><span class="pass">+0.196</span></td></tr>
+<tr><td>+15 yr</td><td class="n"><span class="pass">+0.228</span></td></tr>
+<tr><td>+20 yr</td><td class="n"><span class="pass">+0.222</span></td></tr>
 </tbody></table>
 </div>
-<p><em>Skill vs persistence</em> compares the model against the forecast “nothing will change”.
-Negative means you would do better predicting no change at all. <strong>On <code>main</code> the
-model lost to persistence at +5 and +10 years</strong> — its squared error at +5 yr was 2.2×
-worse than doing nothing. It now wins at every horizon, and by more at longer lead, which is the
-sensible ordering. Scorecard on southern Africa: 73/137 → <strong>101/127</strong>; the same chain scores <strong>111/133</strong> on Africa.</p>
+<p>Positive at every horizon and rising with lead time, which is the sensible ordering — the
+further out you go, the more there is for a model to beat “nothing happens” at.</p>
+
+<p><strong>These are honest held-out numbers, and that phrase is doing work.</strong> The fold
+mask holds out contiguous 512 px territories, so 31.9% of held-out pixels sit beyond one
+residual correlation length of any pixel their fold trained on. Under a finer checkerboard that
+figure is 0.0%, and skill measured there is optimistic — measurably so: within the current mask,
++20 yr skill falls from +0.239 within 32 px of trained-on data to +0.188 beyond 192 px.</p>
 
 <h3 id="s1-latent">Latent defects found while auditing</h3>
 <p>None of these degrade the model. They are wasted work, or hazards for whoever reads the
@@ -371,7 +380,7 @@ large</em> on southern Africa as on Africa.</li>
 
 <section id="s2">
 <h2><span class="num">Section 2</span>Ensembles</h2>
-<p>Everything in this section is new on this branch. <code>main</code> has none of it.</p>
+<p>Everything in this section is the ensemble machinery proper.</p>
 
 <h3 id="s2-idea">Two requirements, two separable steps</h3>
 <p>We want <em>M</em> maps, each satisfying two things at once:</p>
@@ -581,25 +590,26 @@ minutes.</p>
 <section id="s3">
 <h2><span class="num">Section 3</span>The scorecard</h2>
 <p>Eight families of targets, scored per (target × horizon × scale), each failure carrying a
-diagnosis of which knob would move it. Africa, k=5, M=400, the shipped configuration:
-<strong>111 of 133 scoreable rows pass</strong>. The same chain on southern Africa reads
-101/127. Fourteen targets are reported but not gated.</p>
+diagnosis of which knob would move it. Africa, k=5, M=400:
+<strong>107 of 136 scoreable rows pass</strong>, with fourteen reported but not gated.</p>
 
-<p>The two regions are not interchangeable, and the differences run both ways. Africa has
-<strong>158 ecoregions against southern Africa&rsquo;s 18</strong>, which turns several
-aggregate targets from statistically undecidable into real tests; it also has enough remote
-country to populate the far distance bands, exposing a failure the smaller extent cannot
-see. Compare families, never totals.</p>
+<p>Targets come from four different places, and knowing which tells you how seriously to take
+a near-miss. Some are <strong>definitional</strong> — a 95% interval must cover 95%. Some are
+<strong>derived from the data</strong> — the observation is counted and the ensemble must
+match it. Some are <strong>Monte-Carlo scaled</strong> — what a finite sample of M members can
+achieve even when perfect. And some were <strong>set a priori</strong>, before the measurement
+existed. The last kind is the one to distrust: two such thresholds have already been
+re-derived from data after turning out to ask for something the data cannot supply.</p>
 
 <div class="fam">
-<div class="row ok"><span class="id">T1</span><span class="what"><b>Is each pixel&rsquo;s uncertainty right?</b> Does the truth fall inside the 95% interval 95% of the time — overall, and <em>within each class</em> of pixel? Pooled coverage is 0.938–0.944, mildly <em>under</em> at every horizon, where southern Africa was mildly <em>over</em>: about half the width machinery was compensating for that region&rsquo;s own error structure. The class version is the one that matters — pooled coverage of 0.966 once coexisted with 0.335 in the high-change class.</span><span class="score">29 / 33</span></div>
-<div class="row ok"><span class="id">T2</span><span class="what"><b>Is uncertainty right at larger scales?</b> Aggregate over 1 km, 10 km and 100 km blocks and over real ecoregions. <b>Block coverage is 12/12</b> — the motivating problem of the project, solved, and now on a continent. The ecoregion family goes 3/8 → 7/8 because it was a <em>resolution</em> problem: with 18 units coverage can only take values k/18, so 18/18 = 1.000 fails a ±0.05 target while 17/18 = 0.944 passes. At 158 units the values are 0.981–0.994 and T2.4 passes for the first time. T2.5 is the mirror image — a rank test that gained power and now fails 2005 at p = 1.2e-6.</span><span class="score">37 / 41</span></div>
-<div class="row no"><span class="id">T3</span><span class="what"><b>Do members look like real maps?</b> The one family that does not move between regions — 3/6 on both, T3.2 at 0.031 against 0.021. The correlation structure is the live defect and it is regionally invariant, which makes it the one thing southern-Africa iteration was <em>not</em> flattering. T3.2&rsquo;s 30% target conflicts with T3.4: 86% of the residual&rsquo;s variance is already decorrelated at the distance T3.2 scores, so passing it would mean generating a field smoother than reality.</span><span class="score">3 / 6</span></div>
-<div class="row no"><span class="id">T4</span><span class="what"><b>Are the horizons coherent?</b> Spread non-decreasing in lead time sits at 0.712 against a ≥0.99 gate, markedly worse than southern Africa&rsquo;s 0.937 — the one real cost of raising the marginal&rsquo;s tail bound. Between-horizon correlation is reported only: no AR(1) target file exists for this configuration, so ρ fell back to 0.9.</span><span class="score">0 / 1</span></div>
-<div class="row ok"><span class="id">T5</span><span class="what"><b>Hard gates — is the ensemble faithful to the published product?</b> Median = central, percentiles = bounds, mask = mask. Non-negotiable. The member count is visible here: at M=100 the same ensemble scored T5.1 2/4, at M=400 it is 3/4 with h=20 missing by 0.0015. Nothing changed but the number of draws.</span><span class="score">11 / 12</span></div>
-<div class="row ok"><span class="id">T6</span><span class="what"><b>Is the amount and sign of change realistic?</b> Change quantiles are <b>7/8</b> against southern Africa&rsquo;s 3/8, with ratios of 1.01–1.86 against 1.11–5.41 — the clearest place Africa is genuinely better. Large decreases and tail asymmetry are right. Small decreases are still over-produced 2.5–4.5×, and mostly not fixable by any per-pixel marginal: the ideal calculation still over-predicts 3.05×.</span><span class="score">19 / 24</span></div>
-<div class="row ok"><span class="id">T7</span><span class="what"><b>Are members diverse but not absurd?</b> Diversity passes at 0.256 mean pairwise correlation. Spread-skill sits at 1.891 against 1.0 ± 0.25 — over-spread, and worse than southern Africa&rsquo;s 1.583. The remedy is known and undesirable, so it is recorded as a near-miss.</span><span class="score">1 / 2</span></div>
-<div class="row ok"><span class="id">T8</span><span class="what"><b>Is change put in the right places?</b> The remote band still receives essentially no invented change (1.4e-06 against a ≤0.002 allowance) — the clearest single improvement in the project, against 3% under the original heads. But Africa exposes the opposite error on the same axis: with real far-field observations to compare against, the ensemble produces far too many <em>decreases</em> out there (7.8× and 123×) and too few <em>increases</em> (0.107×). Southern Africa passes these rows only because its remote observed change is exactly zero.</span><span class="score">11 / 14</span></div>
+<div class="row ok"><span class="id">T1</span><span class="what"><b>Is each pixel&rsquo;s uncertainty right?</b> Does the truth fall inside the 95% interval 95% of the time — pooled, and within every class of pixel? Class-conditional coverage is <b>16/16</b> and the high-change tail <b>3/3</b>, which matter more than the pooled row: a pooled 0.966 once coexisted with 0.335 in the high-change class. Pooled coverage is 2/4, failing in <em>opposite</em> directions — 0.936 at +5 yr, 0.965 at +20 yr — because the horizon monotonicity pass only ever widens, and widens later horizons hardest.</span><span class="score">31/33</span></div>
+<div class="row ok"><span class="id">T2</span><span class="what"><b>Is uncertainty right at larger scales?</b> Aggregate over 1 km, 10 km and 100 km blocks and over real ecoregions. <b>Block coverage is 12/12</b> — the motivating problem of the project, correct at every scale at once, where assuming perfect correlation gives 0.97–1.00 and assuming independence collapses to 0.09 at 100 km. Aggregate width is 12/12 too, so the correlation is buying something rather than just covering. The failures are ecoregion rows saturating at exactly 1.000 — over-coverage.</span><span class="score">34/41</span></div>
+<div class="row no"><span class="id">T3</span><span class="what"><b>Do members look like real maps?</b> Variogram, spectrum, and a comparison against an ensemble with identical marginals but no spatial structure. The member&rsquo;s own structure matches the fitted residual on all three checks (<b>3/3</b>). The null comparison fails at 0.104 of the available structure budget — a target now <em>derived</em> from how much of the residual is still correlated at the scored separation, rather than set a priori. At short lag the same comparison reads 0.269, so the shortfall is specifically at long range.</span><span class="score">5/6</span></div>
+<div class="row ok"><span class="id">T4</span><span class="what"><b>Are the horizons coherent?</b> A member is one story about the future, so its four horizons must hang together. Between-horizon correlation reproduces the measured AR(1) coupling to within 0.011 at every step. Spread non-decreasing in lead time reads <b>0.995</b> against a ≥0.99 gate — passing, and only because a per-pixel cumulative maximum is applied to the half-widths after calibration. Without it the same chain reads 0.802.</span><span class="score">4/4</span></div>
+<div class="row ok"><span class="id">T5</span><span class="what"><b>Hard gates — is the ensemble faithful to the published product?</b> Median = central, percentiles = bounds, mask = mask. Non-negotiable: if these fail the ensemble tells a different story from the maps beside it. Bounds and mask pass everywhere. The median row fails at +5 and +10 yr — but the distributional median is exact <em>by construction</em> and only the sample median of 400 draws is not, so this scores a population property through a finite sample. Flagged as an open instrument question rather than a defect.</span><span class="score">10/12</span></div>
+<div class="row no"><span class="id">T6</span><span class="what"><b>Is the amount and sign of change realistic?</b> Read as a map of change, does a member resemble a real one? Large decreases and the asymmetry gates behave; small decreases do not — the marginal&rsquo;s lower tail is two to five times too heavy for a quantity that is real but rare. The excess is entirely in <em>small</em> decreases, not extreme ones, which is diagnostic: it points at a dependence between the standardised residual and the pixel&rsquo;s own threshold that no per-pixel marginal can encode.</span><span class="score">12/24</span></div>
+<div class="row ok"><span class="id">T7</span><span class="what"><b>Are members diverse but not absurd?</b> Diversity passes comfortably at 0.191 mean pairwise correlation. Spread-skill — where the ensemble says it is uncertain, is the model actually more wrong? — reads 1.768 against 1.0 ± 0.25. Above 1 means over-spread at aggregate scale, the same defect the rank histograms and the saturated ecoregion rows report from other directions. Three independent instruments agreeing.</span><span class="score">1/2</span></div>
+<div class="row ok"><span class="id">T8</span><span class="what"><b>Is change put in the right places?</b> Scored per distance-to-past-change band, because development happens near development. The far field beyond 100 px now emits <b>1.36×</b> the observed rate of new development — an earlier arrangement of this chain managed 0.107×, an ensemble that could not imagine change appearing anywhere new. Near/remote contrast lands at 1.138. The cost is the 10–30 px band overshooting at 2.28.</span><span class="score">10/14</span></div>
 </div>
 
 <div class="note warn"><span class="tag">How to read it honestly</span>
@@ -607,11 +617,16 @@ see. Compare families, never totals.</p>
 quietly pushed near-nominal rows below target.</p>
 <p><strong>Member count is part of the measurement.</strong> Tolerances tighten as 1/√M, so
 comparisons must be at matched M. An M=100 comparison between two marginal families once
-<em>reversed</em> at M=400; the same 101/127 reads 99/127 at M=800.</p>
+<em>reversed</em> at M=400.</p>
 <p><strong>Region is part of the measurement too, and not only through difficulty.</strong>
 Several aggregate targets are limited by the <em>number of aggregation units</em> rather than
-by the field. At 18 ecoregions a ±0.05 coverage target is undecidable and rows can fail on
-quantisation alone.</p>
+by the field. With too few ecoregions a ±0.05 coverage target is undecidable and rows can fail
+on quantisation alone. Africa&rsquo;s 158 make those rows real tests.</p>
+<p><strong>A pooled average cannot see a defect that lives in a thousandth of the pixels.</strong>
+Keying the calibration on ecosystem rather than distance once won the held-out interval score
+by 0.8% while removing the far field&rsquo;s entire change signal — the average remote pixel got
+<em>wider</em> the whole time. That failure is invisible to every scalar on this page except the
+T8 rows.</p>
 <p><strong>A single scorecard carries ±7 rows of run-to-run noise.</strong> Differences smaller
 than that are not interpretable without replicate training runs.</p></div>
 </section>
@@ -773,24 +788,20 @@ targets 2025 / 2030 / 2035 / 2040, which is the identical +5/+10/+15/+20 structu
 residual statistics transfer directly; apply those statistics to the forward bounds; generate
 the forward ensemble with the same spectrum, shape and coupling.</p>
 
-<h3>Summary of differences to <code>main</code></h3>
+<h3>The chain, end to end</h3>
 <div class="tw">
 <table>
-<thead><tr><th></th><th><code>main</code></th><th>this branch</th></tr></thead>
+<thead><tr><th>stage</th><th>what it does</th></tr></thead>
 <tbody>
-<tr><td>central head</td><td>predicts absolute HM</td><td>predicts <strong>change</strong> on top of HM at t₀</td></tr>
-<tr><td>long-range covariate</td><td>none</td><td>precomputed distance-to-past-change, 8 channels, to <strong>both</strong> head families</td></tr>
-<tr><td>interval construction</td><td>three independent predictions</td><td>half-widths accumulating around the central forecast; monotone in lead time by construction</td></tr>
-<tr><td>validation geography</td><td>grid mode ignored the split mask</td><td>fixed; fold-aware</td></tr>
-<tr><td>out-of-sample maps</td><td>not possible</td><td>k=5 fold rotation</td></tr>
-<tr><td>uncertainty product</td><td>per-pixel intervals only</td><td>+ M-member ensemble with fitted spatial structure</td></tr>
-<tr><td>recalibration</td><td>none</td><td>conformal, decided on held-out interval score (currently identity)</td></tr>
-<tr><td>per-class width correction</td><td>none</td><td>three-axis factors, shrunk hierarchically</td></tr>
-<tr><td>marginal</td><td>—</td><td>two-piece normal reshaped by the residual’s own quantile function</td></tr>
-<tr><td>spatial structure</td><td>—</td><td>Matérn (ν=0.5) spectral mixture by circulant embedding + calibrated long-range term</td></tr>
-<tr><td>horizon coupling</td><td>—</td><td>AR(1) on the normal-score fields</td></tr>
-<tr><td>validation</td><td>loss curves</td><td>T1–T8 scorecard, per-member rank diagnostics, closed-form cross-check</td></tr>
-<tr><td>skill vs persistence</td><td><span class="fail">negative at +5 and +10 yr</span></td><td><span class="pass">positive at all four horizons</span></td></tr>
+<tr><td>central head</td><td>predicts <strong>change</strong> on top of HM at t₀, starting from exact persistence</td></tr>
+<tr><td>long-range covariate</td><td>precomputed distance-to-past-change, 8 channels, to <strong>both</strong> head families</td></tr>
+<tr><td>interval construction</td><td>half-widths accumulating around the central forecast; monotone in lead time by construction</td></tr>
+<tr><td>out-of-sample maps</td><td>k=5 fold rotation on 512 px territories</td></tr>
+<tr><td>calibration</td><td><strong>one layer</strong>: distance band × predicted change × HM level, shrunk hierarchically, monotone in horizon, plus a per-pixel cumulative maximum</td></tr>
+<tr><td>marginal</td><td>two-piece normal reshaped by the residual’s own quantile function, anchored so the published triple stays exact</td></tr>
+<tr><td>spatial structure</td><td>Matérn (ν=0.5) spectral mixture by circulant embedding + calibrated long-range term</td></tr>
+<tr><td>horizon coupling</td><td>AR(1) on the normal-score fields, at a <strong>measured</strong> ρ</td></tr>
+<tr><td>validation</td><td>T1–T8 scorecard, per-member rank diagnostics, closed-form cross-check, M=4 smoke gate before any long run</td></tr>
 </tbody></table>
 </div>
 </section>

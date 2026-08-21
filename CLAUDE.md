@@ -5,156 +5,67 @@ and 2.5/97.5 quantile intervals at +5/+10/+15/+20 yr, plus a post-hoc ensemble l
 (`src/ensemble/`) that adds spatial and temporal coherence on top of the per-pixel
 marginals.
 
-Active branch: **`ensemble`**. Read **`docs/global_scorecard.md` first** — it is the current
-state of the product and names the live defect. Then `docs/current_progress.md` for history,
-`docs/ensemble_model_outline.md` (and its illustrated HTML edition) for the end-to-end
-method and the current scorecard, `docs/validator_scaling.md` for the evaluation harness,
-and `docs/central_field_baseline.md` plus `docs/next_phase_marginals.md` §5-6 and
-`docs/model_phase.md` for the measurement record — including the negative results, which are
-load-bearing and are most of the record.
+Active branch: **`ensemble`**. **The model is frozen; the remaining work is the global
+product.** Read **`docs/global_final_phase.md` first** — it is the plan, and it says what may
+and may not be changed. Then `docs/ensemble_model_outline.md` (and its illustrated HTML
+edition) for the whole method and a row-by-row explanation of the scorecard.
+
+For the measurement record — including the negative results, which are load-bearing and are
+most of it — see `docs/improvement_plan.md` (this round, stage by stage),
+`docs/stage_a_instruments.md` (the scoring instruments and why five were rewritten),
+`docs/model_phase.md` (22 ConvLSTM experiments, all dead), `docs/validator_scaling.md`
+(the evaluation harness), and `docs/central_field_baseline.md`.
+
+Superseded and kept only for history: `docs/global_scorecard.md` (112/146, the old lineage),
+`docs/reference_card.md` (103/136, two calibration layers), `docs/current_progress.md`.
 
 ## Where the project is
 
-**The global product is measured.** The five Africa fold checkpoints were re-predicted over the
-full 17111 x 40000 extent (no retraining), stitched holdout *and* fold-mean, and pushed through
-the whole chain re-derived from their own residuals. **The published global scorecard is
-112/146 at M=400** — `docs/global_scorecard.md` is the full reading and is the document to start
-from. Africa's 111/133 and southern Africa's 101/127 are superseded as references and are not
-directly comparable to it (different denominators; see that doc §7).
+**The model is accepted and frozen. The remaining work is the global product.**
+`docs/global_final_phase.md` is the plan and the document to start from.
 
-**The live target is the width heads in the far field**, and Stage B (2026-08-20) narrowed it
-to one side. Beyond ~100 px the ensemble emits **2.3% of the observed rate of increase**; that
-is 83,797 observed global events and ~346 on Africa, so it is measurable and screenable.
-The mirror figure — 28x the observed rate of decrease — is **88 events on 0.14% of the band**
-and should not be fitted against (rule 13); Africa carries exactly one, so it cannot screen it
-at all.
+The accepted configuration is **`c1_foldb4`** — five folds on the 512 px fold mask, one
+unified calibration layer, marginal at `u_bound 0.999`. Its card is **107/136 on Africa**,
+the best in the project's history and the first with a single calibration layer.
+`docs/ensemble_model_outline.md` describes the whole chain and explains every scorecard row.
 
-**Post-hoc is exhausted, measured not assumed.** Sweeping the remote tail bound on Africa,
-0.999 and 1.0 give *identical* far-field rates — the lever saturates — and even unbounded the
-far field reaches only 1.7-26% of the observed increase rate. Raising the bound is still worth
-taking for the **mid** field (30-100 px: 0.109 -> 0.449 at h=5; pooled mean |log10 ratio|
-0.587 -> 0.297).
+**The five fold checkpoints are already trained on GLOBAL chips.** Only the *prediction
+extent* was Africa. Exact paths in `data/ensemble/exp/c1_foldb4/FOLD_CHECKPOINTS.json`.
+**Global hindcasts therefore need no retraining** — `run_hindcast_folds.py --fold_checkpoints
+… --max_epochs 0` is the predict-only path, ~5 h for k=5 against ~10 h if retrained by reflex.
 
-**Do not fix the far field by widening it.** `score_model_experiment.py` on the Africa stitch
-puts `k_up` at **0.24-0.75** beyond 100 px with coverage **0.997** against a 0.95 target: the
-far-field intervals are already 2-4x too wide in the bulk while being too short-tailed in the
-extreme. The lever is tail *shape* at fixed or reduced bulk width.
+### What the last round established
 
-**The physical floor is already implemented.** `marginal_from_z_torch` clamps members to
-HM in [0, 1], so Δ >= −HM_t0 holds by construction and every one of the 88 observed far-band
-decreases lies above it. `docs/global_scorecard.md` §3.2's "missing floor" mechanism is
-corrected in place and the plan item is dropped.
+- **The fold mask is honest now and it was nearly free.** 512 px blocks put **31.9%** of
+  held-out pixels beyond one residual correlation length, against **0.0%** under the old 128 px
+  checkerboard, and cost at most 0.9 skill points (h=5 unchanged). The leak it removes is real
+  but modest: within the new mask, h=20 skill falls **+0.239 → +0.188** with distance from
+  trained-on data. Rule 19 is now a number, not a worry.
+- **The far field is fixed on the increase side.** `P(Δ>0.05)` beyond 100 px went **0.107 →
+  1.36** of observed across the round; near/remote contrast is 1.138. Two levers did it: the
+  marginal's `u_bound` raised to 0.999 on every band, and the calibration separating remote
+  land that can develop from remote land that cannot.
+- **One calibration layer, not two.** Distance band × predicted change × HM level, monotone in
+  horizon, with a per-pixel cumulative max after apply. Adopted for **simplicity** — held out,
+  every axis choice sits within 0.9% of doing nothing.
+- **T4.2 is structural now** (0.802 → 0.995) and was never a model defect: the raw heads are
+  0.980 monotone and the *calibration* was breaking it.
 
-**Do not treat the model phase as closed on this.** Its 22 experiments were all screened on
-southern Africa, **where the observed far-field change rate genuinely is 0.0000** — so none of
-them could have detected this defect, and none of them is evidence against fixing it. See
-[[model-phase-results]] for what *is* dead and `docs/global_scorecard.md` §3 for what the
-screening was blind to. **Screen far-field work on Africa or global, never southern Africa.**
+### What is still wrong, and why it is not being chased
 
-Still closed with nothing further to take from them: post-hoc marginal *shape* (T5.2 pins it to
-the published bounds), the southern-Africa-screened model levers, and the Africa dress rehearsal.
-
-**There is still no production model.** Every checkpoint carrying the current configuration was
-trained with a fold held out. The 2025-2040 forecast has not been run; when it is, the decision
-already taken is a sixth model trained on all chips, with the fold mean reserved for display.
-
-## The plan for this round
-
-**The round is complete. `docs/reference_card.md` is the current state of the product.**
-`exp/c1_foldb4/validation_m400/` — **103/136 at M=400 on Africa**, the first card of the
-honest-fold-mask lineage. `africa_k5`'s 111/133 and the Stage A re-score's 102/133 are
-superseded and **not comparable** to it: the mask, five gates, the calibration and the
-marginal all changed.
-
-**The far field is fixed on the increase side, which was the round's target.** Remote-band
-`P(Δ>0.05)` goes **0.107 → 0.845** of observed (T8.1 passes there for the first time) and the
-near/remote contrast lands at 1.63 against [0.5, 2.0]. The lever was `--u_bound 0.999` on
-every band including the remote one. Two caveats: the 30-100 px band tips to 2.03, just past
-its bound, so a band-varying bound is the cheap follow-up; and the *decrease* side is still
-18.9x, which 4-diag showed rests on 88 global events and cannot be fitted against.
-
-**What is left is mostly model work, and it is named:** ecoregion-scale over-dispersion
-(T2.5 0/4, corroborated by T7.3 = 1.64) and long-range structure at an eighth of the
-residual's own budget (T3.2 = 0.125). **T4.2 = 0.802 is NOT model work** — decomposed, the raw
-heads are 0.980 monotone and the *calibration* takes it to 0.813 (the conformal layer smooths
-isotonically across horizons, the width layer does not, and 2.6% of pixels change class
-between horizons). Fix is a cumulative max on the half-widths after both layers: 1.000 by
-construction for +1.2-2.5% width, and it should help T1.1's under-coverage. **Item 1 (unify
-the two calibration layers) was never done** — Stage D measured the axes and stopped; the
-biome axis it turns on is still untested. Plus one open instrument question — **T5.1 fails at h=5/h=10 and it is not
-settled whether that is generation or the gate's own tolerance**, which tightens mechanically
-when `u_bound` rises. See the reference card §4.
-
-**Stage C is done: the 4x4 fold mask is adopted and it is nearly free.** `exp/c1_foldb4/`
-(mask `fold_mask_b4_1000.tif`, `VAL_STRIDE=1024`, shipped flags) scores **0.1301 / 0.1960 /
-0.2277 / 0.2221** against `africa_k5`'s 0.1298 / 0.2006 / 0.2340 / 0.2313 — **at most 0.9
-skill points, none at h=5**. Every card from here uses it; `africa_k5` and the 102/133 card
-are the last of the 1x1 lineage.
-
-**The leak is now measurable and modest.** Within the new mask, h=20 skill falls **+0.239
-(1-32 px) → +0.188 (>192 px)** with distance from the fold's own trained-on data, a 21%
-relative decline. The 1x1 mask stops at 128 px and cannot see it. Rule 19 is confirmed and
-quantified rather than feared.
-
-**Stages A and B are done.** `docs/stage_a_instruments.md` records the instruments;
-`docs/improvement_plan.md` Stage B records the four diagnostics and what they changed:
-item 4 **dropped** (the floor already exists), item 7 **moved to Stage D** (h=5's width error
-is class-concentrated, so it is calibration not the head), item 5 **demoted to a mid-field
-fix**, and Stage C **confirmed to need a far-field width-head change**.
-
-**T4.2 is fixed too** (a fifth instrument, found in Stage B). It scored the *sample* spread
-over M members, so it moved 0.62 -> 0.45 under rho and 0.71 -> 0.62 under M — neither of which
-can change the quantity it claims to measure. It now scores the **population** spread,
-integrated against N(0,1) by Gauss-Hermite (`validate_ensemble.population_spread`,
-shape- and clip-aware); the sample statistic survives as reported-only **T4.2s**. Two
-ensembles differing only in rho return **0.7304648026222341 to every digit**. The gate still
-fails, correctly: **the width heads shrink with horizon at 27% of the map**, which is a model
-defect for the far-field width work and cannot be reached post-hoc.
-
-**Africa's measured rho is `{10: 0.374, 15: 0.347, 20: 0.769}`**, now on disk at
-`exp/africa_k5/residuals/horizon_autocorrelation.json`. With it T4.1 becomes scorable and
-passes all three rows to <= 0.025; every regional card to date, including 111/133, ran at the
-0.9 fallback against a NaN target.
-
-**Stage A is done** — `docs/stage_a_instruments.md` is the record. The scoring instruments
-are fixed and the Africa baseline is re-scored: **111/133 → 102/133 on the same ensemble**
-(`data/ensemble/exp/africa_k5/validation_m400_stageA/scorecard_spliced.csv`). All nine lost
-rows are instruments — T8.2, T8.3 and T6.4×4 were passing *because* the far field is too
-quiet, and T2.5×3 were non-rejections at n=158 rather than flatness. **111/133 is superseded;
-compare everything from here against 102/133.**
-
-Two premises in the plan did not survive measurement, and both corrections are load-bearing:
-
-- **T2.5 is not a pixel test and its χ² was never invalid.** Its units are ecoregions (158 on
-  Africa, 804 global) against 401 rank bins, and at that sparsity the equiprobable-cell χ²
-  holds its size (0.0105 measured at nominal 0.01). The defect is *power* — 0.59 against a
-  smooth dome, 0.90 pooled — so the ranks are pooled to ≥16 expected per bin. Ecoregion-scale
-  over-dispersion is real on Africa too, not just globally.
-- **T3.2's "unreachable target" argument is southern-Africa-only.** The structure budget is
-  0.14 at 25 px there and **0.497** at Africa's scored separation, so the old 0.30 threshold
-  sat *below* the budget and the target was always reachable here. T3.2 now gates on
-  `improve / budget ≥ 0.50`; Africa reads 0.063 at 40 px and 0.357 at 6 px. Treat it as a
-  genuine long-range structure shortfall, not a threshold to waive.
-
-**Run `./scripts/run_smoke_tier.sh <exp>` before any long validation run** — every stage at
-M=4, all four block scales, ~33 min on Africa, and `scripts/check_smoke.py` gates on stage
-completeness and non-finite values rather than on pass counts.
-
-**`docs/improvement_plan.md` is the sequence.** Ten changes in six stages, all evaluated on
-Africa. The ordering is fixed by three constraints: fix the scoring gates before judging anything
-(T8.2/T8.3/T6.4 currently pass *because* the far field is too quiet), change the fold mask only
-once (it invalidates every checkpoint and every residual-fitted calibration), and run the cheap
-diagnostics first because five of the ten items have an experiment that decides their own scope.
-
-Two findings already settled inside that plan:
-
-- **Fold blocks: 2x2 does not work, use 4x4.** The residual's practical range is 135 px and a
-  pixel in a 128·B block is at most 64·B px from trained-on data, so at 2x2 (256 px) **0%** of
-  held-out pixels are beyond one correlation length; at 4x4 (512 px) 22.3% are, with ~48 blocks
-  per fold still left on Africa. 10x10 was sized for the global grid and leaves ~7 per fold here.
-- **The two recalibration layers are keyed on different axes**, not simply redundant: conformal
-  is `horizon × dhat × HM × biome`, width factors are `horizon × band × dhat × HM` out to 10 px.
-  Unifying them means *measuring* which axis earns its place, on held-out data.
+- **Over-dispersion at aggregate scale** — T2.5 rejected 4/4, T7.3 at 1.77, T2.2/T2.4
+  saturated at 1.000. Three instruments agreeing. This is the clearest remaining model defect
+  and it is **out of scope for this phase**.
+- **T3.2 at 0.104** of the structure budget; the short-lag reading is 0.269, so the shortfall
+  is specifically long-range.
+- **T8.1 at 10-30 px overshoots at 2.28** — correcting every band was slightly too aggressive
+  there. Excluding band 3 is untested and is the one calibration question worth re-taking
+  globally.
+- **T5.1 fails at h=5/h=10 and it is not settled whether generation or the gate is at fault.**
+  Its tolerance scales with the marginal shape's slope at the median, which tightens when
+  `u_bound` rises. **Do not tune the field to pass it.**
+- **T8.4 in the far band** rests on **88 observed events globally and one on Africa**. Not
+  fittable; do not chase.
 
 ## Environment and scale
 
@@ -204,10 +115,11 @@ Two findings already settled inside that plan:
 | **score a marginal without generating anything** | `scripts/predict_change_rates.py --manifest … [--sweep_u_bound …]` | ~30 s |
 | per-member realism (the honest marginal test) | `scripts/member_distance_relationship.py --ensembles label=path … --members 400` | ~10 min |
 | convert an old plain-zarr store | `scripts/migrate_zarr_to_icechunk.py --src … --dst … --verify` | ~1 min/GB |
-| **prove the chain before a long run** (every stage at M=4, all four block scales) | `./scripts/run_smoke_tier.sh <name>` | ~33 min on Africa |
-| **screen one configuration** (train 2 folds, predict, stitch, stratified read) | `./scripts/run_model_slate.sh <slate> 1,2` | ~35 min each |
-| **score a screened configuration**, central *and* width, no ensemble | `scripts/score_model_experiment.py` | ~40 s |
-| **promote a winner**: k=5, whole downstream chain, scorecard, per-member | `./scripts/promote_model_experiment.sh <name> "<flags>"` | ~2 h |
+| **prove the chain before a long run** (every stage at M=4, all four block scales) | `./scripts/run_smoke_tier.sh <name>` | ~33 min on Africa, longer globally |
+| **predict-only from frozen checkpoints** (no retraining) | `run_hindcast_folds.py --fold_checkpoints … --max_epochs 0` | ~121 min/fold globally |
+| **score calibration variants on held-out folds** | `scripts/score_width_variants.py --score_folds 4,5 --variants …` | ~15 min |
+| **check a calibration keeps the far-field tail** | `scripts/band_tail_audit.py --variants …` | seconds |
+| **score a screened configuration**, central *and* width, no ensemble | `scripts/score_model_experiment.py` | ~40 s (5 min on Africa) |
 
 `run_region_loop.sh` re-derives the recalibration, spectrum and AR(1) coupling from *that
 model's own* residuals. Never carry them over between configurations. `SHAPE=<u_bound>`
@@ -354,6 +266,28 @@ disagreement localises the bug to the generation path.
     `--central_residual` the startup diagnostic prints `ConvLSTM grad norm: 0.000000` (the
     trunk gets no gradient from the central loss); on defaults it prints ~0.04 and the
     initial central loss is 20x higher. Dead run: `exp/c1_foldb4_noflags/`.
+
+26. **A pooled average cannot see a defect that lives in a thousandth of the pixels.**
+    Keying the calibration on *biome* rather than distance band won the held-out interval
+    score by 0.8% and destroyed the far field: `P(Δ>0.05)` beyond 100 px went 0.845 → **0.042**
+    of observed, because biome classes average across distance and regressed the far band's
+    p99.9 half-width to **0.435×** — while the *median* far-field pixel got 1.65× **wider** the
+    whole time. Those pixels are ~0.1% of the band. **Judge a calibration on the interval score
+    AND a tail check** (`scripts/band_tail_audit.py`); the far-band p99.9 half-width is the
+    quantity that carries T8. The two axes were never redundant: distance separates remote land
+    that can develop from remote land that cannot, and any axis that blurs that scores well on
+    average and removes the product feature.
+27. **A restriction inherited from an older model can invert.** The width layer corrected only
+    bands 0-2 because far-band narrowing once made +0.05 unreachable. On this model's residuals
+    the far-band fit *widens* (p99.9 at 3.9× the raw heads), so the restriction was still being
+    applied for a reason that had stopped being true — the southern-Africa blind spot one layer
+    down. Re-measure the reason, not just the setting.
+28. **Never edit a shell script while it is running.** Bash reads a script incrementally by
+    byte offset, so inserting lines mid-run makes it resume at a stale offset and execute a
+    fragment. It cost a stitch stage this round (`odel_experiment.sh: command not found`), and
+    the same edit made twenty minutes earlier would have destroyed the run. Copy to a new name
+    and launch that. Likewise `pkill -f <pattern>` matches the shell running it — use
+    `ps -eo pid,cmd | grep "patt[e]rn"` and kill by pid.
 
 11. **A width factor must not be centred on the residual median.** `fit_residual_shape`
     centres because T5.1 pins the shape's median to zero; a *width* is centred on the
