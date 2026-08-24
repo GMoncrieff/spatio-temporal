@@ -44,15 +44,32 @@ nothing changes. That bar is higher than it sounds, because the median 20-year H
 0.0001, so pooled RMSE can look unremarkable while the model loses to doing nothing. Measured
 globally on held-out geography:
 
-| horizon | skill vs persistence |
-|---|---|
-| +5 yr | **+0.110** |
-| +10 yr | **+0.183** |
-| +15 yr | **+0.226** |
-| +20 yr | **+0.222** |
+| horizon | skill vs persistence | measured on this branch |
+|---|---|---|
+| +5 yr | **+0.110** | +0.107 |
+| +10 yr | **+0.183** | +0.181 |
+| +15 yr | **+0.226** | +0.226 |
+| +20 yr | **+0.222** | +0.222 |
 
 Positive at every horizon and rising with lead time, which is the sensible ordering: the
 further out you forecast, the more there is to beat "nothing happens" at.
+
+The right-hand column is `scripts/diagnose_central_field.py` re-run on this branch, averaged
+over windows the same way — it reproduces the published figures to within 0.003, which is
+rounding. Those are averages across input windows; the products themselves come from the
+w2000 window alone, whose own numbers over all 184,573,321 out-of-sample pixels are:
+
+| horizon | target | skill vs persistence | RMSE | persistence RMSE | pooled coverage |
+|---|---|---|---|---|---|
+| +5 yr | 2005 | +0.0433 | 0.01330 | 0.01360 | 94.85% |
+| +10 yr | 2010 | +0.1743 | 0.02049 | 0.02255 | 95.61% |
+| +15 yr | 2015 | +0.2121 | 0.02673 | 0.03012 | 94.95% |
+| +20 yr | 2020 | +0.2219 | 0.03157 | 0.03579 | 94.85% |
+
+Coverage is the fraction of observations falling inside the 2.5/97.5 interval, against a 95%
+nominal target — near-nominal straight out of the heads, with no calibration layer. Read that
+narrowly: it is a *pooled per-pixel* figure. It says nothing about coverage at aggregate scales
+or in the far field, which is where the known defect lives (§10).
 
 ## 3. The long-range context covariate
 
