@@ -26,15 +26,21 @@ class PinballLoss(nn.Module):
         self.quantile = quantile
         self.reduction = reduction
     
-    def forward(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor = None,
+                weights: torch.Tensor = None) -> torch.Tensor:
         """
         Compute pinball loss.
-        
+
         Args:
             pred: Predicted values [B, 1, H, W] or [B, H, W]
             target: Target values [B, 1, H, W] or [B, H, W]
             mask: Valid pixel mask [B, 1, H, W] or [B, H, W] (True = valid)
-        
+            weights: Optional per-pixel weights, same shape as pred. Used to balance the
+                classes the pooled loss otherwise ignores: the far field is the great
+                majority of pixels, so an unweighted loss is minimised by a globally
+                reasonable interval width and the head never learns that change is
+                impossible far from past change.
+
         Returns:
             Scalar loss (if reduction='mean' or 'sum') or tensor (if reduction='none')
         """
@@ -43,16 +49,18 @@ class PinballLoss(nn.Module):
             # Only compute loss on valid pixels
             pred_valid = pred[mask]
             target_valid = target[mask]
-            
+            w_valid = weights[mask] if weights is not None else None
+
             if pred_valid.numel() == 0:
                 return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
         else:
             pred_valid = pred
             target_valid = target
-        
+            w_valid = weights
+
         # Compute error on valid pixels only
         error = target_valid - pred_valid
-        
+
         # Pinball loss: q * max(error, 0) + (1-q) * max(-error, 0)
         # Equivalent to: q * error if error > 0, else (q-1) * error
         loss = torch.where(
@@ -60,9 +68,15 @@ class PinballLoss(nn.Module):
             self.quantile * error,
             (self.quantile - 1) * error
         )
-        
+        if w_valid is not None:
+            loss = loss * w_valid
+
         # Apply reduction
         if self.reduction == 'mean':
+            if w_valid is not None:
+                # Weighted mean, so the loss scale (and the tuned learning rate) is
+                # unchanged when weighting is switched on.
+                return loss.sum() / w_valid.sum().clamp(min=1e-8)
             return loss.mean()
         elif self.reduction == 'sum':
             return loss.sum()

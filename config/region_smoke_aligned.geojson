@@ -1,0 +1,38 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "note": "Tile-phase-aligned smoke window. Origin and size are multiples of predict_stride=64 relative to the global bbox origin (0,0), so interior pixels are blended from tiles at the same absolute offsets as a global run and must agree with it exactly."
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              31.96799099999999,
+              -36.38699099999999
+            ],
+            [
+              31.96799099999999,
+              -27.170999999999992
+            ],
+            [
+              13.535999999999973,
+              -27.170999999999992
+            ],
+            [
+              13.535999999999973,
+              -36.38699099999999
+            ],
+            [
+              31.96799099999999,
+              -36.38699099999999
+            ]
+          ]
+        ]
+      }
+    }
+  ]
+}

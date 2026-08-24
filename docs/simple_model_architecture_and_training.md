@@ -1,5 +1,10 @@
 # Model Architecture and Training Pipeline
 
+> **Superseded.** This describes the pre-k-fold model: a single 70/10/10/10 random-chip split,
+> an absolute-HM central head, and no change-context input. The shipped configuration is in
+> `docs/model_architecture.md`, and the runbook is `docs/fitting_running_model.md`. Kept for the
+> history of why choices were made, not as a description of what runs.
+
 **Document Version:** 1.0  
 **Last Updated:** 2025-10-27  
 **Model:** SpatioTemporalPredictor with ConvLSTM

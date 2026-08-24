@@ -10,15 +10,54 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def soft_histogram(changes, bin_edges, mask=None, tau=None):
+    """Differentiable histogram: membership is a difference of sigmoids, not a comparison.
+
+    ``compute_histogram`` below bins with boolean comparisons summed into a plain zeros
+    buffer, so it returns a constant with respect to ``changes`` — which is why the
+    histogram term has never trained anything (see
+    ``tests/test_model_phase_flags.py::test_histogram_loss_carries_no_gradient``). This is
+    the version that carries a gradient.
+
+    ``tau`` is the softness in the units of ``changes``; it defaults to a fifth of the
+    narrowest interior bin, which keeps the soft counts close to the hard ones while
+    leaving a usable slope at every edge.
+    """
+    B, H, W = changes.shape
+    edges = bin_edges.to(changes.device, changes.dtype)
+    if tau is None:
+        interior = (edges[2:-1] - edges[1:-2]).abs()
+        tau = float(interior.min()) / 5.0 if interior.numel() else 0.002
+    tau = max(float(tau), 1e-6)
+
+    # The hard version masks by *indexing*, so invalid pixels never reach the arithmetic.
+    # This one is dense, and NaN * 0 is still NaN — so the invalid values have to be
+    # neutralised before the sigmoid, not after it. Getting this wrong makes every
+    # prediction NaN, which is how it was found.
+    x = torch.nan_to_num(changes, nan=0.0, posinf=0.0, neginf=0.0).reshape(B, -1, 1)
+    lo = torch.sigmoid((x - edges[:-1]) / tau)           # [B, N, num_bins]
+    hi = torch.sigmoid((x - edges[1:]) / tau)
+    memb = lo - hi
+    if mask is not None:
+        memb = memb * mask.reshape(B, -1, 1).to(memb.dtype)
+    counts = memb.sum(dim=1)                             # [B, num_bins]
+    proportions = counts / counts.sum(dim=1, keepdim=True).clamp(min=1.0)
+    return counts, proportions
+
+
 def compute_histogram(changes, bin_edges, mask=None):
     """
     Compute histogram from continuous pixel changes.
-    
+
+    **This is not differentiable** — membership is a boolean comparison summed into a
+    ``torch.zeros`` buffer, so the result carries no gradient with respect to ``changes``.
+    Use :func:`soft_histogram` when the histogram term is meant to train something.
+
     Args:
         changes: [B, H, W] - continuous change values (target - last_input)
         bin_edges: [num_bins + 1] - histogram bin edges
         mask: [B, H, W] - optional boolean mask for valid pixels
-        
+
     Returns:
         counts: [B, num_bins] - histogram counts per sample
         proportions: [B, num_bins] - normalized proportions (sum to 1 per sample)
@@ -26,10 +65,10 @@ def compute_histogram(changes, bin_edges, mask=None):
     B, H, W = changes.shape
     num_bins = len(bin_edges) - 1
     device = changes.device
-    
+
     # Initialize histogram
     counts = torch.zeros(B, num_bins, device=device, dtype=torch.float32)
-    
+
     for b in range(B):
         change_tile = changes[b]  # [H, W]
         
@@ -141,7 +180,7 @@ class HistogramLoss(nn.Module):
         
         return w2_weighted
     
-    def forward(self, changes_obs, changes_pred, mask=None, horizon_idx=0):
+    def forward(self, changes_obs, changes_pred, mask=None, horizon_idx=0, soft=False):
         """
         Compute rarity-weighted W2 histogram loss.
         
@@ -156,9 +195,13 @@ class HistogramLoss(nn.Module):
             p_obs: Observed histogram proportions (for logging)
             p_pred: Predicted histogram proportions (for logging)
         """
-        # Compute histograms
+        # Compute histograms. The observation's side never needs a gradient; the
+        # prediction's side does, and only gets one under `soft`.
         counts_obs, p_obs = compute_histogram(changes_obs, self.bin_edges, mask=mask)
-        counts_pred, p_pred = compute_histogram(changes_pred, self.bin_edges, mask=mask)
+        if soft:
+            counts_pred, p_pred = soft_histogram(changes_pred, self.bin_edges, mask=mask)
+        else:
+            counts_pred, p_pred = compute_histogram(changes_pred, self.bin_edges, mask=mask)
         
         # Rarity-weighted Wasserstein-2 loss using horizon-specific weights
         w2_loss = self.wasserstein2_loss_weighted(p_obs, p_pred, horizon_idx=horizon_idx)

@@ -1,5 +1,12 @@
 # Pinball Loss Gradient Isolation
 
+> **Superseded for the shipped configuration.** Under `--monotone_quantile_width` (which the
+> production models use) the quantile heads emit cumulative softplus half-widths around a
+> *detached* central prediction, so the isolation described below is structural: there is no
+> gradient path from the pinball loss into the trunk or the central heads to cut. The manual
+> save-and-restore scheme documented here still runs, and is still what isolates the two
+> objectives, whenever `--monotone_quantile_width` is off. See `docs/model_architecture.md` §4.
+
 ## Overview
 Modified the training process to ensure pinball loss gradients **only affect quantile head parameters**, not the shared ConvLSTM backbone or central prediction heads.
 

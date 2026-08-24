@@ -120,19 +120,16 @@ dmypy.json
 *.xlsx
 *.xls
 
-python scripts/train_lightning.py \
-  --checkpoint "model-khrpthgy:v0" \
-  --max_epochs 0 \
-  --predict_after_training true \
-  --predict_region "config/region_to_predict.geojson" \
-  --predict_stride 64 \
-  --predict_batch_size 16
-
 # Large datasets
 data/raw/
 data/processed/
 data/external/
 data/predictions/
+data/ensemble/
+data/global
+data/hindcast
+data/logs/
+data/conv_update/
 data/prompts/
 scripts/notebooks/
 plots/

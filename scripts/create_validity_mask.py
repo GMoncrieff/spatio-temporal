@@ -9,6 +9,7 @@ Outputs:
 """
 
 import os
+from pathlib import Path
 import numpy as np
 import rasterio
 from rasterio.enums import Resampling
@@ -22,6 +23,8 @@ HM_DIR = "data/raw/hm_global"
 TARGET_FILE = os.path.join(HM_DIR, "HM_2020_AA_1000.tiff")
 VALIDITY_MASK_FILE = os.path.join(HM_DIR, "validity_mask_1000.tif")
 SPLIT_MASK_FILE = os.path.join(HM_DIR, "split_mask_1000.tif")
+FOLD_MASK_FILE = os.path.join(HM_DIR, "fold_mask_1000.tif")
+FOLD_MANIFEST_FILE = os.path.join(HM_DIR, "fold_manifest.csv")
 VISUALIZATION_FILE = "outputs/split_visualization.pdf"
 
 # Split ratios
@@ -86,33 +89,44 @@ def create_validity_mask():
         
         return valid_mask, profile, src.transform, src.crs
 
+def enumerate_valid_chips(valid_mask, chip_size=CHIP_SIZE, min_valid_ratio=MIN_VALID_RATIO):
+    """Enumerate (i, j) origins of non-overlapping chips with enough valid pixels.
+
+    Shared by create_spatial_splits (70/10/10/10) and create_kfold_splits (k rotating
+    folds) so both partitions are built from exactly the same chip population.
+    """
+    H, W = valid_mask.shape
+    chip_positions = []
+    for i in range(0, H - chip_size + 1, chip_size):
+        for j in range(0, W - chip_size + 1, chip_size):
+            chip = valid_mask[i:i+chip_size, j:j+chip_size]
+            valid_ratio = chip.sum() / (chip_size ** 2)
+
+            if valid_ratio >= min_valid_ratio:
+                chip_positions.append((i, j))
+    return chip_positions
+
+
 def create_spatial_splits(valid_mask, profile, transform, crs):
     """Create train/val/test/calibration splits using spatial blocking."""
     print("\n" + "=" * 80)
     print("Creating Spatial Splits")
     print("=" * 80)
-    
+
     H, W = valid_mask.shape
     print(f"Raster dimensions: {H} x {W}")
     print(f"Chip size: {CHIP_SIZE}")
     print(f"Minimum valid ratio per chip: {MIN_VALID_RATIO} ({MIN_VALID_RATIO*100:.0f}%)")
-    
+
     # Create grid of chip positions
-    chip_positions = []
-    for i in range(0, H - CHIP_SIZE + 1, CHIP_SIZE):
-        for j in range(0, W - CHIP_SIZE + 1, CHIP_SIZE):
-            chip = valid_mask[i:i+CHIP_SIZE, j:j+CHIP_SIZE]
-            valid_ratio = chip.sum() / (CHIP_SIZE ** 2)
-            
-            if valid_ratio >= MIN_VALID_RATIO:
-                chip_positions.append((i, j))
-    
+    chip_positions = enumerate_valid_chips(valid_mask)
+
     print(f"\nFound {len(chip_positions)} valid chips (>={MIN_VALID_RATIO*100:.0f}% valid pixels)")
-    
+
     # Shuffle and split
     rng = np.random.default_rng(RANDOM_SEED)
     rng.shuffle(chip_positions)
-    
+
     n_chips = len(chip_positions)
     n_train = int(n_chips * TRAIN_RATIO)
     n_val = int(n_chips * VAL_RATIO)
@@ -171,6 +185,107 @@ def create_spatial_splits(valid_mask, profile, transform, crs):
     print("✓ Split mask created successfully")
     
     return split_mask
+
+def create_kfold_splits(valid_mask, profile, transform, crs, k=5, block_chips=1,
+                        out_path=None, manifest_path=None):
+    """Create k rotating spatial folds for the out-of-sample hindcast harness.
+
+    Same chip enumeration and same fixed RANDOM_SEED shuffle as create_spatial_splits,
+    but sliced into k equal groups instead of ratio cuts. Leaves split_mask_1000.tif
+    untouched — that artifact belongs to the already-trained production checkpoint.
+
+    ``block_chips`` sets the granularity of the split. At 1 (the default, and what every
+    measurement to date was made on) each 128 px chip is assigned independently, which
+    makes the fold mask a 128 px checkerboard. That has two consequences, both measured on
+    Africa:
+
+    * **It is why the stitched hindcast has a visible checkerboard.** Adjacent tiles come
+      from different fold models, and where those models disagree the join shows — 2.01x
+      the within-fold step on the upper bound, 47x the local background in quiet country.
+      Only the upper bound: the five folds agree on the central field and the lower bound
+      (mean pairwise |fold_i - fold_j| of 0.0053 and 0.0040) and not on the upper (0.0383).
+    * **It makes the held-out evaluation optimistic.** The residual field's fitted practical
+      range is 99-166 px, typically ~130 — so a 128 px tile holds geography out at *one
+      correlation length*, with every held-out tile ringed by trained-on tiles well inside
+      the range over which the residual is still correlated.
+
+    ``block_chips=10`` groups chips into 1280 px super-blocks before the shuffle, so folds
+    are contiguous territories about ten correlation lengths across. Seam *length* drops by
+    the same factor — a 768 px view then almost always sits inside one fold — though the
+    step at the seams that remain is unchanged, since that is set by how much the fold
+    models disagree. Expect the scorecard to get worse and to deserve more trust.
+
+    Nothing already trained reads a mask built this way: pass ``out_path`` to write it
+    somewhere other than the production ``fold_mask_1000.tif``.
+
+    Writes (by default):
+      data/raw/hm_global/fold_mask_1000.tif  uint8, 0=invalid, 1..k=fold id
+      data/raw/hm_global/fold_manifest.csv   fold_id, n_chips, n_pixels
+    """
+    out_file = str(out_path or FOLD_MASK_FILE)
+    manifest_file = str(manifest_path or FOLD_MANIFEST_FILE)
+    block_chips = max(int(block_chips), 1)
+    print("\n" + "=" * 80)
+    print(f"Creating {k}-Fold Spatial Splits")
+    print("=" * 80)
+
+    H, W = valid_mask.shape
+    chip_positions = enumerate_valid_chips(valid_mask)
+    print(f"Found {len(chip_positions)} valid chips (>={MIN_VALID_RATIO*100:.0f}% valid pixels)")
+
+    rng = np.random.default_rng(RANDOM_SEED)
+    if block_chips == 1:
+        rng.shuffle(chip_positions)
+        groups = np.array_split(np.arange(len(chip_positions)), k)
+    else:
+        # Shuffle super-blocks, not chips, so a fold is contiguous territory. Blocks are
+        # kept whole, and they are shuffled by a sorted key so the assignment is
+        # reproducible from RANDOM_SEED alone.
+        span = CHIP_SIZE * block_chips
+        by_block = {}
+        for idx, (i, j) in enumerate(chip_positions):
+            by_block.setdefault((i // span, j // span), []).append(idx)
+        block_keys = sorted(by_block)
+        order = rng.permutation(len(block_keys))
+        # Greedy fill: blocks vary in how many valid chips they hold, so round-robin on
+        # block count alone would leave the folds unequal in pixels.
+        sizes = [len(by_block[block_keys[b]]) for b in order]
+        buckets = [[] for _ in range(k)]
+        totals = [0] * k
+        for b, n in zip(order, sizes):
+            f = int(np.argmin(totals))
+            buckets[f].extend(by_block[block_keys[b]])
+            totals[f] += n
+        groups = [np.array(sorted(b), dtype=int) for b in buckets]
+        print(f"  grouped {len(block_keys):,} super-blocks of {span} px "
+              f"({block_chips}x{block_chips} chips) into {k} folds")
+
+    fold_mask = np.zeros((H, W), dtype=np.uint8)
+    rows = []
+    for fold_idx, group in enumerate(groups, start=1):
+        for idx in group:
+            i, j = chip_positions[idx]
+            fold_mask[i:i+CHIP_SIZE, j:j+CHIP_SIZE] = fold_idx
+        n_pixels = int((fold_mask == fold_idx).sum())
+        rows.append({"fold_id": fold_idx, "n_chips": len(group), "n_pixels": n_pixels})
+        print(f"  Fold {fold_idx}: {len(group):,} chips, {n_pixels:,} pixels")
+
+    profile_fold = profile.copy()
+    profile_fold.update(dtype=rasterio.uint8, count=1, nodata=None)
+    print(f"\nWriting fold mask: {out_file}")
+    with rasterio.open(out_file, 'w', **profile_fold) as dst:
+        dst.write(fold_mask, 1)
+        dst.set_band_description(1, f"Fold: 0=invalid, 1..{k}=fold id")
+
+    import csv
+    with open(manifest_file, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=["fold_id", "n_chips", "n_pixels"])
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"✓ Fold manifest written: {manifest_file}")
+
+    return fold_mask
+
 
 def visualize_splits(split_mask, transform, crs):
     """Create PDF visualization of splits."""
@@ -310,8 +425,51 @@ Configuration:
     
     print(f"✓ Visualization saved: {VISUALIZATION_FILE}")
 
-def main():
+def main(argv=None):
     """Main execution."""
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--folds_only",
+        action="store_true",
+        help="Only build the k-fold mask (reuses the existing validity mask; leaves "
+             "split_mask_1000.tif untouched)",
+    )
+    parser.add_argument(
+        "--make_folds",
+        action="store_true",
+        help="Also build the k-fold mask after the regular splits",
+    )
+    parser.add_argument("--k", type=int, default=5, help="Number of spatial folds (default: 5)")
+    parser.add_argument("--fold_block_chips", type=int, default=1,
+                        help="Chips per side of a fold super-block. 1 (default) assigns "
+                             "each 128 px chip independently, which is what every existing "
+                             "measurement was made on and which makes the mask a 128 px "
+                             "checkerboard. 10 gives contiguous 1280 px fold territories: "
+                             "far fewer seams in the stitched hindcast, and a split at ten "
+                             "residual correlation lengths instead of one.")
+    parser.add_argument("--fold_mask_out", default=None,
+                        help="Where to write the fold mask. Defaults to the production "
+                             "fold_mask_1000.tif; point it elsewhere to build an "
+                             "alternative mask without disturbing trained folds.")
+    args = parser.parse_args(argv)
+
+    if args.folds_only:
+        if not os.path.exists(VALIDITY_MASK_FILE):
+            print(f"✗ Validity mask not found: {VALIDITY_MASK_FILE}. Run without --folds_only first.")
+            return 1
+        with rasterio.open(VALIDITY_MASK_FILE) as src:
+            valid_mask = src.read(1)
+            profile = src.profile.copy()
+            transform, crs = src.transform, src.crs
+        create_kfold_splits(valid_mask, profile, transform, crs, k=args.k,
+                            block_chips=args.fold_block_chips,
+                            out_path=args.fold_mask_out,
+                            manifest_path=(str(Path(args.fold_mask_out).with_suffix("")) + "_manifest.csv"
+                                           if args.fold_mask_out else None))
+        print("\n✓ Fold mask complete")
+        return 0
+
     print("\n" + "=" * 80)
     print("VALIDITY MASK AND SPLIT GENERATION")
     print("=" * 80)
@@ -332,7 +490,15 @@ def main():
     
     # Step 2: Create spatial splits
     split_mask = create_spatial_splits(valid_mask, profile, transform, crs)
-    
+
+    # Step 2b: Optional k-fold mask for the hindcast harness
+    if args.make_folds:
+        create_kfold_splits(valid_mask, profile, transform, crs, k=args.k,
+                            block_chips=args.fold_block_chips,
+                            out_path=args.fold_mask_out,
+                            manifest_path=(str(Path(args.fold_mask_out).with_suffix("")) + "_manifest.csv"
+                                           if args.fold_mask_out else None))
+
     # Step 3: Visualize
     visualize_splits(split_mask, transform, crs)
     

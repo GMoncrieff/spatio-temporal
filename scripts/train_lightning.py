@@ -13,6 +13,52 @@ from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import WandbLogger
 from torch.utils.data import DataLoader
 from src.models.lightning_module import SpatioTemporalLightningModule
+from src.models.change_weights import N_CONTEXT_CHANNELS
+
+
+def _wants_context(args):
+    """True when any head is configured to read the past-change context rasters.
+
+    The quantile heads were the first consumer, but the central heads can take the same
+    tensor, so the dataset must load it whenever either asks for it.
+    """
+    return bool(getattr(args, "quantile_context", False) or getattr(args, "central_context", False))
+
+
+def _csv_floats(spec):
+    """'1,1.333,2,4' -> [1.0, 1.333, 2.0, 4.0]; None/'' -> None (today's behaviour)."""
+    if spec is None or str(spec).strip() == "":
+        return None
+    return [float(x) for x in str(spec).split(",")]
+
+
+def _csv_ints(spec):
+    if spec is None or str(spec).strip() == "":
+        return None
+    return [int(x) for x in str(spec).split(",")]
+
+
+def _experiment_kwargs(args):
+    """Model-phase flags, as constructor kwargs. Every default is today's behaviour."""
+    return dict(
+        quantile_dhat_context=args.quantile_dhat_context,
+        width_parameterisation=args.width_parameterisation,
+        convlstm_dilations=_csv_ints(args.convlstm_dilations),
+        horizon_loss_weights=_csv_floats(args.horizon_loss_weights),
+        loss_on_change=args.loss_on_change,
+        pinball_scale_norm=args.pinball_scale_norm,
+        lr_schedule=args.lr_schedule,
+        lr_warmup_frac=args.lr_warmup_frac,
+        lr_min_frac=args.lr_min_frac,
+        weight_decay=args.weight_decay,
+        grad_clip=args.grad_clip,
+        weight_avg_last=args.weight_avg_last,
+        head_hidden_layers=args.head_hidden_layers,
+        width_head_mode=args.width_head_mode,
+        central_target_transform=args.central_target_transform,
+        quantile_loss=args.quantile_loss,
+        histogram_soft=args.histogram_soft,
+    )
 from torchgeo_dataloader import get_dataloader, hm_files, component_files, static_files, years
 
 # Geospatial imports for inference
@@ -37,6 +83,14 @@ if __name__ == "__main__":
     parser.add_argument("--train_mode", type=str, default="random", choices=["random", "grid"], help="Sampling mode for training")
     parser.add_argument("--val_mode", type=str, default="grid", choices=["random", "grid"], help="Sampling mode for validation")
     parser.add_argument("--stride", type=int, default=128, help="Stride for grid sampling (pixels)")
+    parser.add_argument(
+        "--val_stride",
+        type=int,
+        default=None,
+        help="Stride for grid-mode val/test sampling (default: --stride). A larger value "
+             "subsamples the held-out geography, which keeps per-epoch validation cheap on "
+             "long runs without changing what is being validated.",
+    )
     parser.add_argument(
         "--include_components",
         type=lambda x: (str(x).lower() == 'true'),
@@ -105,6 +159,272 @@ if __name__ == "__main__":
         choices=[2020, 2040],
         help="Final prediction year for large-area GeoTIFF output: 2040 (inputs 2010/2015/2020) or 2020 (inputs 1990/1995/2000)",
     )
+    # --- Hindcast / ensemble extensions (all additive; defaults reproduce today's behavior) ---
+    parser.add_argument(
+        "--predict_input_years",
+        type=str,
+        default=None,
+        help="Comma-separated 3 input years (e.g. '1995,2000,2005'). Overrides the legacy "
+             "--predict_final_year branch. Targets are base+5/10/15/20.",
+    )
+    parser.add_argument(
+        "--predict_all_windows",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?',
+        const=True,
+        default=False,
+        help="Loop prediction over all 4 hindcast input windows in one process/checkpoint load",
+    )
+    parser.add_argument(
+        "--predict_output_prefix",
+        type=str,
+        default=None,
+        help="Prefix prepended to output GeoTIFF filenames (default None = today's exact names)",
+    )
+    parser.add_argument(
+        "--predict_output_dir",
+        type=str,
+        default=None,
+        help="Directory for prediction GeoTIFFs (default: data/predictions)",
+    )
+    parser.add_argument(
+        "--predict_max_target_year",
+        type=int,
+        default=None,
+        help="Skip writing horizons whose target year exceeds this (e.g. 2020 for hindcasts)",
+    )
+    parser.add_argument(
+        "--predict_restrict_mask",
+        type=str,
+        default=None,
+        help="Raster mask; tiles not overlapping --predict_restrict_values are skipped. "
+             "Used to predict only a fold's held-out pixels (exact for those pixels, ~5x cheaper).",
+    )
+    parser.add_argument(
+        "--predict_restrict_values",
+        type=str,
+        default=None,
+        help="Comma-separated values of --predict_restrict_mask to keep",
+    )
+    parser.add_argument(
+        "--fold_mask",
+        type=str,
+        default=None,
+        help="Path to fold_mask_1000.tif; when set with --exclude_fold, replaces split_mask_1000.tif "
+             "for train/val chip selection",
+    )
+    parser.add_argument(
+        "--train_all_splits",
+        type=lambda x: (str(x).lower() == 'true'), nargs='?', const=True, default=False,
+        help="Train on EVERY valid chip in the split mask, ignoring the 70/10/10/10 "
+             "train/val/test/calib partition. This is the production setting: the forward "
+             "model has no held-out geography to protect, so restricting it to split 1 "
+             "throws away 30%% of the world for nothing. Validation still runs on split 2, "
+             "which is now in-sample -- that is unavoidable for a production model and is "
+             "why the configuration is validated by k-fold instead. Ignored in fold-CV mode "
+             "(--exclude_fold), where holding geography out is the whole point.",
+    )
+    parser.add_argument(
+        "--exclude_fold",
+        type=int,
+        default=None,
+        help="Fold id held out from training (its pixels never enter train or val)",
+    )
+    parser.add_argument(
+        "--val_fold",
+        type=int,
+        default=None,
+        help="Fold id used for validation during fold-CV training (default: (exclude_fold %% k) + 1)",
+    )
+    parser.add_argument(
+        "--n_folds",
+        type=int,
+        default=5,
+        help="Number of folds in --fold_mask (default: 5)",
+    )
+    parser.add_argument(
+        "--norm_stats_json",
+        type=str,
+        default=None,
+        help="JSON sidecar of normalization stats. Loaded if it exists, otherwise written "
+             "after the first dataset build (they are not persisted in the .ckpt).",
+    )
+    parser.add_argument("--wandb_project", type=str, default="spatio-temporal-convlstm")
+    parser.add_argument("--wandb_run_name", type=str, default=None)
+    parser.add_argument("--wandb_group", type=str, default=None)
+    parser.add_argument("--wandb_tags", type=str, default=None, help="Comma-separated W&B tags")
+    parser.add_argument(
+        "--devices",
+        type=str,
+        default="auto",
+        help="Lightning devices spec: 'auto', an int count, or a comma-separated device list",
+    )
+    # --- Quantile-head retraining (the T8/T6 root-cause fix) ---
+    parser.add_argument(
+        "--split_mask", type=str, default=None,
+        help="Override the split mask (e.g. a region-restricted one for development)",
+    )
+    parser.add_argument(
+        "--quantile_context",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=False,
+        help="Feed multi-scale past-change occupancy to the quantile heads. The trunk's "
+             "receptive field is ~10px and cannot see whether change occurred 30-100px "
+             "away, which is what decides whether change is possible at all.",
+    )
+    parser.add_argument(
+        "--context_pattern", type=str,
+        default="data/raw/hm_global/change_context_w{year}_1000.tif",
+        help="Full-raster past-change context rasters (band 1 past change, band 2 distance)",
+    )
+    parser.add_argument(
+        "--quantile_class_weighting", type=str, default="none",
+        choices=["none", "distance"],
+        help="Balance the distance-to-past-change bands in the pinball loss (default: none)",
+    )
+    parser.add_argument(
+        "--central_context",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=False,
+        help="Feed the same past-change context to the central heads. Beyond 100px from "
+             "past change, no measured pixel moved by >0.01 in 20 years, and the trunk "
+             "cannot see that far.",
+    )
+    parser.add_argument(
+        "--central_residual",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=False,
+        help="Central heads predict change on top of HM_t0 rather than the absolute level, "
+             "starting from exact persistence. Measured: with the absolute parameterisation "
+             "the model emits change of sd ~0.0075 HM on pixels that did not change.",
+    )
+    parser.add_argument(
+        "--monotone_quantile_width",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=False,
+        help="Quantile heads emit half-widths around the (detached) central forecast that "
+             "accumulate across horizons, making spread non-decreasing in lead time and "
+             "lower<=central<=upper structural.",
+    )
+    parser.add_argument(
+        "--freeze_trunk",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=False,
+        help="Train the quantile heads only; the trunk and central heads keep the frozen "
+             "checkpoint's weights exactly, so the central forecast cannot change.",
+    )
+    # --- Model-phase experiment flags. All additive; defaults reproduce today's model. ---
+    parser.add_argument(
+        "--checkpoint_monitor", type=str, default="val_total_loss",
+        choices=["val_total_loss", "val_central_loss", "val_loss"],
+        help="Metric ModelCheckpoint selects on. val_total_loss (the default) includes "
+             "pinball and the histogram term, so a quantile-only change still selects a "
+             "different epoch and therefore a different central field; central-only A/Bs "
+             "need val_central_loss.",
+    )
+    parser.add_argument(
+        "--horizon_loss_weights", type=str, default=None,
+        help="Four comma-separated weights for h=5,10,15,20, renormalised to mean 1. "
+             "Training exposure is 4:3:2:1 across horizons (end_year is sampled from "
+             "2000/2005/2010/2015 and targets past 2020 are NaN), so h=20 gets a quarter "
+             "of h=5's gradient. '1,1.333,2,4' compensates exactly.",
+    )
+    parser.add_argument(
+        "--loss_on_change",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=False,
+        help="Compute SSIM and the Laplacian pyramid on the change field rather than on "
+             "absolute HM. Under --central_residual the absolute prediction is HM_t0 plus "
+             "a small change, so both terms mostly score the copy.",
+    )
+    parser.add_argument(
+        "--pinball_scale_norm",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=False,
+        help="Divide each pixel's pinball loss by its own detached half-width, making the "
+             "quantile objective relative rather than absolute. Not class weighting.",
+    )
+    parser.add_argument(
+        "--quantile_dhat_context",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=False,
+        help="Feed the detached predicted change (and its magnitude) to the quantile "
+             "heads. The needed width varies with predicted change and the heads have no "
+             "channel carrying it.",
+    )
+    parser.add_argument(
+        "--width_parameterisation", type=str, default="softplus",
+        choices=["softplus", "exp"],
+        help="How a raw quantile-head output becomes a positive half-width increment. "
+             "'exp' makes d(width)/d(raw) proportional to the width itself.",
+    )
+    parser.add_argument(
+        "--convlstm_dilations", type=str, default=None,
+        help="Comma-separated per-layer dilation for the ConvLSTM cells, e.g. '1,2,4,8'. "
+             "Widens the trunk's ~10 px receptive radius at zero parameter cost. Default "
+             "(None) is dilation 1 everywhere, i.e. today's trunk.",
+    )
+    # --- Round-2 flags: substantial architecture and objective changes ---
+    parser.add_argument(
+        "--head_hidden_layers", type=int, default=1,
+        help="Depth of every prediction head. 1 (default) is Conv3x3 -> ReLU -> Conv1x1; "
+             "each extra stage adds a 3x3+ReLU and widens the head's own radius by 1 px.",
+    )
+    parser.add_argument(
+        "--width_head_mode", type=str, default="per_horizon",
+        choices=["per_horizon", "joint", "power", "power_plus"],
+        help="How the four horizons' half-widths are produced. 'joint' emits all four from "
+             "one module so the growth profile in lead time is learned coherently; 'power' "
+             "parameterises it as w(h) = w0 * (h/5)**gamma, two per-pixel parameters, which "
+             "is exactly the quantity measured to be wrong (the far field's width grows "
+             "3.7-8.9x too fast with lead time).",
+    )
+    parser.add_argument(
+        "--central_target_transform", type=str, default="none", choices=["none", "asinh"],
+        help="'asinh' gives the central head a variance-stabilised output space: the change "
+             "is scale*sinh(raw), linear near zero and reaching large values without large "
+             "weights. Zero-init still starts at exact persistence.",
+    )
+    parser.add_argument(
+        "--quantile_loss", type=str, default="pinball", choices=["pinball", "nll"],
+        help="'nll' fits (lower, central, upper) as a two-piece normal by log score instead "
+             "of fitting two independent percentiles — a different estimand on the same "
+             "parameterisation. The Winkler interval score is deliberately not offered: it "
+             "is exactly 2/alpha times the pinball sum, so it cannot move the optimum.",
+    )
+    parser.add_argument(
+        "--histogram_soft",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=False,
+        help="Use the differentiable soft-binned histogram. The default hard binning "
+             "carries no gradient at all, so the histogram term has never trained anything.",
+    )
+    parser.add_argument("--lr", type=float, default=1e-3, help="Adam learning rate")
+    parser.add_argument(
+        "--lr_schedule", type=str, default="none", choices=["none", "cosine"],
+        help="Learning-rate schedule. 'cosine' warms up linearly then anneals; stepped by "
+             "hand because manual optimization does not drive a Lightning scheduler.",
+    )
+    parser.add_argument("--lr_warmup_frac", type=float, default=0.05)
+    parser.add_argument("--lr_min_frac", type=float, default=0.01)
+    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument(
+        "--weight_avg_last", type=int, default=0,
+        help="Average the weights of the last N epochs instead of selecting one. On fold 1 "
+             "the epoch ModelCheckpoint picked was 140/85/60 across three seeds of the same "
+             "configuration while the best 10%% of epochs sat within 3%% of the minimum, so "
+             "the argmin is close to arbitrary among the candidates. Implies "
+             "--checkpoint_select final. 0 disables it.",
+    )
+    parser.add_argument(
+        "--checkpoint_select", type=str, default="best", choices=["best", "final"],
+        help="Which checkpoint prediction uses: the monitored best (default) or the state "
+             "at the end of training. 'final' is the coherent choice with an annealed "
+             "learning rate or with weight averaging.",
+    )
+    parser.add_argument("--grad_clip", type=float, default=0.0,
+                        help="Global grad-norm clip applied after the two backward passes, "
+                             "0 disables it (today's behaviour)")
     parser.add_argument(
         "--use_location_encoder",
         type=lambda x: (str(x).lower() == 'true'),
@@ -253,12 +573,50 @@ if __name__ == "__main__":
     pl.seed_everything(args.seed, workers=True)
     
     # Split mask file
-    split_mask_file = "data/raw/hm_global/split_mask_1000.tif"
+    split_mask_file = args.split_mask or "data/raw/hm_global/split_mask_1000.tif"
     if not os.path.exists(split_mask_file):
         print(f"WARNING: Split mask not found: {split_mask_file}")
         print("Training without train/val/test separation. Run scripts/create_validity_mask.py to create splits.")
         split_mask_file = None
-    
+
+    # Fold-CV mode: the fold mask replaces the 70/10/10/10 split mask. Fold `exclude_fold`
+    # is held out entirely (never seen in train or val) so its predictions are genuinely
+    # out-of-sample; one other fold serves as the validation set for checkpoint selection.
+    train_split_value, train_exclude = 1, None
+    val_split_value, test_split_value = 2, 3
+    if args.train_all_splits and args.exclude_fold is None:
+        # None/None is the dataset's "all data" case (torchgeo_dataloader: "None=all data").
+        train_split_value, train_exclude = None, None
+        print("=" * 70)
+        print("PRODUCTION MODE: training on EVERY chip in the split mask")
+        print("  no geography held out; validation on split 2 is in-sample by construction")
+        print("=" * 70)
+    if args.fold_mask is not None and args.exclude_fold is not None:
+        if not os.path.exists(args.fold_mask):
+            raise FileNotFoundError(f"--fold_mask not found: {args.fold_mask}")
+        split_mask_file = args.fold_mask
+        held_out = int(args.exclude_fold)
+        val_fold = int(args.val_fold) if args.val_fold is not None else (held_out % args.n_folds) + 1
+        if val_fold == held_out:
+            raise ValueError("--val_fold must differ from --exclude_fold")
+        train_split_value = None
+        train_exclude = [held_out, val_fold]
+        val_split_value = val_fold
+        test_split_value = val_fold
+        print("=" * 70)
+        print(f"FOLD-CV MODE: holding out fold {held_out} (out-of-sample), "
+              f"validating on fold {val_fold}")
+        print(f"  Training pool: all folds except {train_exclude}")
+        print(f"  Fold mask: {split_mask_file}")
+        print("=" * 70)
+
+    # Normalization-stat sidecar (they are plain attributes, absent from the .ckpt)
+    cached_norm_stats = None
+    if args.norm_stats_json and os.path.exists(args.norm_stats_json):
+        with open(args.norm_stats_json, 'r') as f:
+            cached_norm_stats = json.load(f)
+        print(f"Loaded normalization stats from {args.norm_stats_json}")
+
     # Data
     train_loader = get_dataloader(
         batch_size=args.batch_size,
@@ -275,8 +633,19 @@ if __name__ == "__main__":
         pin_memory=True if args.num_workers > 0 else False,
         persistent_workers=True if args.num_workers > 0 else False,
         split_mask_file=split_mask_file,
-        split_value=1,  # Train split
+        context_pattern=(args.context_pattern if _wants_context(args) else None),
+        split_value=train_split_value,  # Train split (None in fold-CV mode)
+        exclude_split_values=train_exclude,
+        norm_stats=cached_norm_stats,
     )
+    # Persist the sidecar once so later inference entrypoints skip the raster-sampling cost
+    if args.norm_stats_json and cached_norm_stats is None:
+        cached_norm_stats = train_loader.dataset.norm_stats_dict()
+        Path(args.norm_stats_json).parent.mkdir(parents=True, exist_ok=True)
+        with open(args.norm_stats_json, 'w') as f:
+            json.dump(cached_norm_stats, f, indent=2)
+        print(f"✓ Wrote normalization stats sidecar: {args.norm_stats_json}")
+    val_stride = args.val_stride if args.val_stride is not None else args.stride
     # Validation uses fixed years (1990, 1995, 2000 -> 2005-2020) for consistent metrics
     val_loader = get_dataloader(
         batch_size=args.batch_size,
@@ -284,7 +653,7 @@ if __name__ == "__main__":
         timesteps=3,
         chips_per_epoch=args.val_chips,
         mode=args.val_mode,
-        stride=args.stride,
+        stride=val_stride,
         include_components=args.include_components,
         static_channels=args.static_channels,
         use_temporal_sampling=False,  # Fixed years for validation (Option A)
@@ -292,7 +661,9 @@ if __name__ == "__main__":
         pin_memory=True if args.num_workers > 0 else False,
         persistent_workers=True if args.num_workers > 0 else False,
         split_mask_file=split_mask_file,
-        split_value=2,  # Validation split
+        context_pattern=(args.context_pattern if _wants_context(args) else None),
+        split_value=val_split_value,  # Validation split
+        norm_stats=cached_norm_stats,
     )
     # Test uses fixed years (1990, 1995, 2000 -> 2005-2020) for final evaluation
     test_loader = get_dataloader(
@@ -301,7 +672,7 @@ if __name__ == "__main__":
         timesteps=3,
         chips_per_epoch=args.val_chips,
         mode=args.val_mode,
-        stride=args.stride,
+        stride=val_stride,
         include_components=args.include_components,
         static_channels=args.static_channels,
         use_temporal_sampling=False,
@@ -309,7 +680,9 @@ if __name__ == "__main__":
         pin_memory=True if args.num_workers > 0 else False,
         persistent_workers=True if args.num_workers > 0 else False,
         split_mask_file=split_mask_file,
-        split_value=3,  # Test split
+        context_pattern=(args.context_pattern if _wants_context(args) else None),
+        split_value=test_split_value,  # Test split
+        norm_stats=cached_norm_stats,
     )
 
     # Model
@@ -322,8 +695,43 @@ if __name__ == "__main__":
         print("\n" + "="*70)
         print(f"Loading model from checkpoint: {checkpoint_path}")
         print("="*70)
-        model = SpatioTemporalLightningModule.load_from_checkpoint(checkpoint_path)
-        print(f"✓ Checkpoint loaded successfully!")
+        overrides = dict(
+            quantile_context_channels=(N_CONTEXT_CHANNELS if args.quantile_context else 0),
+            quantile_class_weighting=args.quantile_class_weighting,
+            freeze_trunk=args.freeze_trunk,
+            central_context_channels=(N_CONTEXT_CHANNELS if args.central_context else 0),
+            central_residual=args.central_residual,
+            monotone_quantile_width=args.monotone_quantile_width,
+            **_experiment_kwargs(args),
+        )
+        if args.quantile_context or args.central_context:
+            # The quantile heads gain input channels, so their first conv no longer matches
+            # the checkpoint. Warm-start it: the trained weights are copied into the
+            # original channels and the new context channels start at zero, so the model
+            # initially reproduces the checkpoint exactly and then learns what the context
+            # adds. Random re-initialisation would throw away a trained head for nothing.
+            ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+            hp = dict(ckpt.get('hyper_parameters', {}))
+            hp.update(overrides)
+            model = SpatioTemporalLightningModule(**hp)
+            sd = dict(ckpt['state_dict'])
+            msd = model.state_dict()
+            grown = []
+            for k, v in list(sd.items()):
+                if k in msd and msd[k].shape != v.shape and v.dim() == 4:
+                    new_w = torch.zeros_like(msd[k])
+                    new_w[:, :v.shape[1]] = v
+                    sd[k] = new_w
+                    grown.append(k)
+            missing, unexpected = model.load_state_dict(sd, strict=False)
+            print(f"✓ Checkpoint loaded with {len(grown)} warm-started quantile-head convs")
+            if missing:
+                print(f"  (randomly initialised: {len(missing)} tensors)")
+            print("  Trunk and central heads keep the checkpoint's weights exactly.")
+        else:
+            model = SpatioTemporalLightningModule.load_from_checkpoint(
+                checkpoint_path, strict=not args.freeze_trunk, **overrides)
+            print(f"✓ Checkpoint loaded successfully!")
         print(f"\nModel configuration from checkpoint:")
         for key in ['hidden_dim', 'num_layers', 'kernel_size', 'num_static_channels', 
                     'num_dynamic_channels', 'use_location_encoder', 'locenc_out_channels']:
@@ -333,7 +741,7 @@ if __name__ == "__main__":
     else:
         model = SpatioTemporalLightningModule(
             hidden_dim=args.hidden_dim,
-            lr=1e-3,
+            lr=args.lr,
             num_static_channels=num_static_channels,
             num_dynamic_channels=num_dynamic_channels,
             num_layers=args.num_layers,
@@ -346,8 +754,15 @@ if __name__ == "__main__":
             histogram_weight=args.histogram_weight,
             histogram_lambda_w2=args.histogram_lambda_w2,
             histogram_warmup_epochs=args.histogram_warmup_epochs,
+            quantile_context_channels=(N_CONTEXT_CHANNELS if args.quantile_context else 0),
+            quantile_class_weighting=args.quantile_class_weighting,
+            freeze_trunk=args.freeze_trunk,
+            central_context_channels=(N_CONTEXT_CHANNELS if args.central_context else 0),
+            central_residual=args.central_residual,
+            monotone_quantile_width=args.monotone_quantile_width,
+            **_experiment_kwargs(args),
         )
-    
+
     # Compute histogram bin weights from training data (per horizon)
     if args.histogram_weight > 0 and hasattr(model, 'histogram_loss_fn'):
         print("\nComputing histogram bin weights for each horizon from 10 training batches...")
@@ -440,18 +855,50 @@ if __name__ == "__main__":
             model.hm_std = ds.hm_std
 
     # Callbacks
-    checkpoint_cb = ModelCheckpoint(monitor='val_total_loss', save_top_k=1, mode='min')
+    checkpoint_cb = ModelCheckpoint(monitor=args.checkpoint_monitor, save_top_k=1, mode='min')
+    print(f"Checkpoint selection monitors: {args.checkpoint_monitor}")
     # No early stopping
 
     # Wandb logger (optional)
     use_wandb = not args.disable_wandb
-    wandb_logger = False if not use_wandb else WandbLogger(project='spatio-temporal-convlstm', log_model=True)
+    wandb_tags = [t.strip() for t in args.wandb_tags.split(',')] if args.wandb_tags else None
+    wandb_logger = False if not use_wandb else WandbLogger(
+        project=args.wandb_project,
+        name=args.wandb_run_name,
+        group=args.wandb_group,
+        tags=wandb_tags,
+        log_model=True,
+    )
+    if use_wandb:
+        # Record the fold-CV context so hindcast runs are identifiable in the W&B UI
+        try:
+            wandb_logger.experiment.config.update(
+                {
+                    "cli_args": vars(args),
+                    "exclude_fold": args.exclude_fold,
+                    "val_fold": val_split_value if args.exclude_fold is not None else None,
+                    "fold_mask": args.fold_mask,
+                },
+                allow_val_change=True,
+            )
+        except Exception as e:
+            print(f"⚠ Could not log config to W&B: {e}")
+
+    # Devices: 'auto' keeps today's behavior; an explicit spec lets the fold orchestrator
+    # pin one process per GPU.
+    def _parse_devices(spec):
+        if spec is None or spec == "auto":
+            return "auto"
+        if ',' in spec:
+            return [int(x) for x in spec.split(',')]
+        return int(spec)
 
     # Trainer
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
         callbacks=[checkpoint_cb],
         accelerator='auto',
+        devices=_parse_devices(args.devices),
         default_root_dir=os.path.join(os.getcwd(), 'models', 'checkpoints'),
         logger=wandb_logger,
         log_every_n_steps=10,
@@ -461,6 +908,16 @@ if __name__ == "__main__":
 
     # Train
     trainer.fit(model, train_loader, val_loader)
+
+    # Weight averaging rewrites the in-memory weights in on_train_end, so the epoch-best
+    # checkpoint on disk is not the model we mean to publish. Save the end state and point
+    # every downstream consumer at it.
+    if args.checkpoint_select == 'final' or args.weight_avg_last > 0:
+        _final = os.path.join(os.getcwd(), 'models', 'checkpoints',
+                              f'final_fold{args.exclude_fold}_{os.getpid()}.ckpt')
+        trainer.save_checkpoint(_final)
+        checkpoint_cb.best_model_path = _final
+        print(f"Prediction will use the end-of-training checkpoint: {_final}")
 
     # --- Log validation predictions/metrics from checkpoint to wandb (rank 0 only) ---
     import torch
@@ -1226,10 +1683,44 @@ if __name__ == "__main__":
             pass
 
     # -------------------- Large-area prediction to GeoTIFF --------------------
-    def _predict_region_and_write(best_ckpt_path: str):
+    # Snapshot everything prediction needs from the training dataset, so the loaders (and
+    # their persistent worker processes) can be released first. At the global extent the
+    # blending accumulators need tens of GB, and two folds run concurrently.
+    _ds_train = train_loader.dataset
+    PREDICT_STATS = {
+        'hm_mean': _ds_train.hm_mean,
+        'hm_std': _ds_train.hm_std,
+        'elev_mean': _ds_train.elev_mean,
+        'elev_std': _ds_train.elev_std,
+        'include_components': bool(getattr(_ds_train, 'include_components', True)),
+        'comp_means': dict(_ds_train.comp_means),
+        'comp_stds': dict(_ds_train.comp_stds),
+        'static_means': list(_ds_train.static_means),
+        'static_stds': list(_ds_train.static_stds),
+    }
+
+    def _release_dataloaders():
+        import gc
+        for name in ('train_loader', 'val_loader', 'test_loader'):
+            obj = globals().pop(name, None)
+            if obj is not None and hasattr(obj, '_iterator'):
+                obj._iterator = None
+            del obj
+        gc.collect()
+
+    # Hindcast input windows: every 3-year window whose +5yr target is still observed.
+    HINDCAST_WINDOWS = [
+        (1990, 1995, 2000),
+        (1995, 2000, 2005),
+        (2000, 2005, 2010),
+        (2005, 2010, 2015),
+    ]
+
+    def _predict_region_and_write(best_ckpt_path: str, input_years_override=None,
+                                  output_prefix=None, infer_model=None):
         import time
         start_time = time.time()
-        
+
         print("\n" + "="*70)
         print("LARGE-AREA PREDICTION")
         print("="*70)
@@ -1264,8 +1755,18 @@ if __name__ == "__main__":
         if not geoms:
             print("Empty geometry in region GeoJSON; skipping.")
             return
-        # Configure prediction years from CLI
-        if args.predict_final_year == 2040:
+        # Configure prediction years: explicit window (new) > --predict_input_years > legacy branch
+        window = input_years_override
+        if window is None and args.predict_input_years:
+            window = [int(y.strip()) for y in args.predict_input_years.split(',')]
+        if window is not None:
+            input_years = list(window)
+            if len(input_years) != 3:
+                raise ValueError(f"Prediction window needs exactly 3 input years, got {input_years}")
+            base_year = input_years[-1]
+            target_years = tuple(base_year + h for h in (5, 10, 15, 20))
+            print(f"Input window: {input_years} -> targets {list(target_years)}")
+        elif args.predict_final_year == 2040:
             # Use 2020 as base, predict 2025, 2030, 2035, 2040
             input_years = [2010, 2015, 2020]
             target_years = (2025, 2030, 2035, 2040)
@@ -1316,29 +1817,40 @@ if __name__ == "__main__":
             horizon_years = list(target_years)
             quantile_names = ['lower', 'central', 'upper']  # Updated to match independent heads terminology
             
-            # Create accumulators for each horizon-quantile combination
+            # Create accumulators for each horizon-quantile combination.
+            # float32 (not float64) and only for horizons that will actually be written:
+            # at the global extent each accumulator is 2.7 GB, and a hindcast window whose
+            # later horizons fall past the last observed year needs none of them.
+            active_horizons = [
+                h for h, y in zip(horizon_names, horizon_years)
+                if args.predict_max_target_year is None or y <= args.predict_max_target_year
+            ]
+            if not active_horizons:
+                print("⚠ No horizons within --predict_max_target_year; skipping this window.")
+                return infer_model
             accum_horizons = {}
-            for h in horizon_names:
+            for h in active_horizons:
                 for q in quantile_names:
                     key = f"{h}_{q}"
-                    accum_horizons[key] = np.zeros((Hwin, Wwin), dtype=np.float64)
-            
-            wsum = np.zeros((Hwin, Wwin), dtype=np.float64)
+                    accum_horizons[key] = np.zeros((Hwin, Wwin), dtype=np.float32)
+
+            wsum = np.zeros((Hwin, Wwin), dtype=np.float32)
             nodata_mask_total = np.zeros((Hwin, Wwin), dtype=bool)
 
-            # Stats and config from training dataset
-            ds_train = train_loader.dataset
-            hm_mean, hm_std = ds_train.hm_mean, ds_train.hm_std
-            elev_mean, elev_std = ds_train.elev_mean, ds_train.elev_std
-            include_components = bool(getattr(ds_train, 'include_components', True))
+            # Stats and config captured from the training dataset before it is released
+            # (see PREDICT_STATS below) — prediction must not keep the dataloaders and
+            # their worker processes alive, since the global accumulators need the RAM.
+            hm_mean, hm_std = PREDICT_STATS['hm_mean'], PREDICT_STATS['hm_std']
+            elev_mean, elev_std = PREDICT_STATS['elev_mean'], PREDICT_STATS['elev_std']
+            include_components = bool(PREDICT_STATS['include_components'])
             static_list_paths = list(static_files if args.static_channels is None else static_files[:int(args.static_channels)])
             t_idxs = [year_to_idx[y] for y in input_years]
-            
-            # CRITICAL: Get per-variable normalization stats (NOT pooled hm_mean/hm_std)
-            comp_means = ds_train.comp_means  # Dict: {var_name: mean}
-            comp_stds = ds_train.comp_stds    # Dict: {var_name: std}
-            static_means = ds_train.static_means  # List: [mean_0, mean_1, ...]
-            static_stds = ds_train.static_stds    # List: [std_0, std_1, ...]
+
+            # CRITICAL: per-variable normalization stats (NOT pooled hm_mean/hm_std)
+            comp_means = PREDICT_STATS['comp_means']  # Dict: {var_name: mean}
+            comp_stds = PREDICT_STATS['comp_stds']    # Dict: {var_name: std}
+            static_means = PREDICT_STATS['static_means']  # List: [mean_0, mean_1, ...]
+            static_stds = PREDICT_STATS['static_stds']    # List: [std_0, std_1, ...]
             # HM_VARS from module (not instance attribute)
             HM_VARS = ["AG", "BU", "EX", "FR", "HI", "NS", "PO", "TI", "gdp", "population"]
 
@@ -1346,6 +1858,14 @@ if __name__ == "__main__":
             hm_srcs = [rasterio.open(p) for p in hm_files]
             comp_srcs = {y: [rasterio.open(p) for p in component_files[y]] for y in years} if include_components else {y: [] for y in years}
             stat_srcs = [rasterio.open(p) for p in static_list_paths]
+            ctx_src = None
+            if _wants_context(args) and args.context_pattern:
+                ctx_path = args.context_pattern.format(year=base_year)
+                if os.path.exists(ctx_path):
+                    ctx_src = rasterio.open(ctx_path)
+                    print(f"Quantile-head context: {ctx_path}")
+                else:
+                    print(f"⚠ context raster missing ({ctx_path}); heads will see zeros")
 
             tile = 128
             stride = int(args.predict_stride)
@@ -1354,12 +1874,40 @@ if __name__ == "__main__":
             bbox_transform = ref_transform * Affine.translation(c0, r0)
             bbox_mask = rio_features.geometry_mask([mapping(region_geom)], out_shape=(Hwin, Wwin), transform=bbox_transform, invert=True)
 
-            # Load model for inference
-            print(f"\nLoading model from checkpoint: {best_ckpt_path}")
+            # Load model for inference (reused across windows when caller supplies it)
             device = next(model.parameters()).device
-            infer_model = SpatioTemporalLightningModule.load_from_checkpoint(best_ckpt_path, map_location=device)
-            infer_model.eval()
-            print(f"✓ Model loaded on device: {device}")
+            if device.type == 'cpu' and torch.cuda.is_available():
+                # Lightning may have returned the module to CPU after fit; prediction over a
+                # large region on CPU is orders of magnitude slower.
+                device = torch.device('cuda')
+            if infer_model is None:
+                print(f"\nLoading model from checkpoint: {best_ckpt_path}")
+                infer_model = SpatioTemporalLightningModule.load_from_checkpoint(best_ckpt_path, map_location=device)
+                # The quantile-head context is derived from the normalized HM channel and
+                # rescaled by hm_std; these are plain attributes absent from the .ckpt, so
+                # without setting them here inference would build the context at a
+                # different scale than training did.
+                infer_model.hm_mean = PREDICT_STATS['hm_mean']
+                infer_model.hm_std = PREDICT_STATS['hm_std']
+                infer_model.eval()
+                print(f"✓ Model loaded on device: {device}")
+            infer_model = infer_model.to(device)
+
+            # Optional restriction mask: skip tiles that do not overlap the requested values.
+            # Used for fold hindcasts, where only the held-out fold's pixels are consumed.
+            # Every tile overlapping a kept pixel is still processed, so kept pixels get
+            # exactly the same blended value as an unrestricted run.
+            restrict_win = None
+            restrict_values = None
+            if args.predict_restrict_mask:
+                if not args.predict_restrict_values:
+                    raise ValueError("--predict_restrict_mask requires --predict_restrict_values")
+                restrict_values = [int(v) for v in str(args.predict_restrict_values).split(',')]
+                with rasterio.open(args.predict_restrict_mask) as rsrc:
+                    restrict_win = rsrc.read(1, window=Window(c0, r0, Wwin, Hwin))
+                restrict_win = np.isin(restrict_win, restrict_values)
+                print(f"Restriction mask: {args.predict_restrict_mask} values={restrict_values} "
+                      f"({restrict_win.sum():,} of {restrict_win.size:,} px kept)")
             
             def lonlat_grid_for_window(i0: int, j0: int, hi: int, wj: int):
                 rows = np.arange(i0, i0 + hi)
@@ -1407,9 +1955,7 @@ if __name__ == "__main__":
             tiles_with_valid = 0
             last_percent = -1
             tile_start_time = time.time()
-            
-            import torch
-            
+
             # Process tiles in batches
             for batch_start in range(0, len(tile_coords), batch_size):
                 batch_end = min(batch_start + batch_size, len(tile_coords))
@@ -1417,6 +1963,7 @@ if __name__ == "__main__":
                 
                 # Prepare batch data
                 batch_inputs_dyn = []
+                batch_contexts = []
                 batch_inputs_stat = []
                 batch_lonlats = []
                 batch_metadata = []  # Store (i, j, hi, wj, li0, lj0, li1, lj1, valid_mask, input_invalid_mask)
@@ -1431,6 +1978,11 @@ if __name__ == "__main__":
                     li1, lj1 = li0 + hi, lj0 + wj
                     submask = bbox_mask[li0:li1, lj0:lj1]
                     if not np.any(submask):
+                        tiles_processed += 1
+                        tiles_skipped += 1
+                        continue
+                    # Cheap pre-read rejection (before any raster IO) for restricted runs
+                    if restrict_win is not None and not restrict_win[li0:li1, lj0:lj1].any():
                         tiles_processed += 1
                         tiles_skipped += 1
                         continue
@@ -1509,6 +2061,17 @@ if __name__ == "__main__":
                         lonlat_padded[:hi, :wj, :] = lonlat_hw2
                         lonlat_hw2 = lonlat_padded
                     
+                    if ctx_src is not None:
+                        cx = np.stack([
+                            np.nan_to_num(ctx_src.read(1, window=win, masked=True).filled(np.nan), nan=0.0),
+                            np.nan_to_num(ctx_src.read(2, window=win, masked=True).filled(np.nan), nan=1e4),
+                        ], axis=0).astype(np.float32)
+                        if hi < tile or wj < tile:
+                            padded = np.zeros((2, tile, tile), dtype=np.float32)
+                            padded[1] = 1e4
+                            padded[:, :hi, :wj] = cx
+                            cx = padded
+                        batch_contexts.append(cx)
                     batch_inputs_dyn.append(in_dyn)
                     batch_inputs_stat.append(in_stat)
                     batch_lonlats.append(lonlat_hw2)
@@ -1521,8 +2084,14 @@ if __name__ == "__main__":
                     batch_stat_tensor = torch.from_numpy(np.stack(batch_inputs_stat, axis=0)).to(device)  # [B, C, H, W]
                     batch_lonlat_tensor = torch.from_numpy(np.stack(batch_lonlats, axis=0)).to(device)  # [B, H, W, 2]
                     
+                    batch_ctx_tensor = (
+                        torch.from_numpy(np.stack(batch_contexts, axis=0)).to(device)
+                        if batch_contexts else None
+                    )
                     with torch.no_grad():
-                        batch_preds = infer_model(batch_dyn_tensor, batch_stat_tensor, lonlat=batch_lonlat_tensor)  # [B, 12, H, W]
+                        batch_preds = infer_model(batch_dyn_tensor, batch_stat_tensor,
+                                                  lonlat=batch_lonlat_tensor,
+                                                  change_context=batch_ctx_tensor)  # [B, 12, H, W]
                     
                     # Process each tile in the batch
                     for tile_idx, (i, j, hi, wj, li0, lj0, li1, lj1, valid_mask, input_invalid_mask) in enumerate(batch_metadata):
@@ -1531,6 +2100,8 @@ if __name__ == "__main__":
                         # Channel ordering: [lower_5yr, central_5yr, upper_5yr, lower_10yr, ...]
                         preds_horizons = {}
                         for h_idx, h_name in enumerate(horizon_names):
+                            if h_name not in active_horizons:
+                                continue
                             # Extract 3 quantiles for this horizon
                             pred_lower = batch_preds[tile_idx, 3*h_idx, :hi, :wj].detach().cpu().numpy()
                             pred_central = batch_preds[tile_idx, 3*h_idx+1, :hi, :wj].detach().cpu().numpy()
@@ -1581,7 +2152,7 @@ if __name__ == "__main__":
             print("Blending overlapping tiles for all horizons and quantiles...")
             m = wsum > 0
             out_horizons = {}
-            for h_name in horizon_names:
+            for h_name in active_horizons:
                 for q_name in quantile_names:
                     key = f"{h_name}_{q_name}"
                     out_h = np.full((Hwin, Wwin), np.nan, dtype=np.float32)
@@ -1608,16 +2179,27 @@ if __name__ == "__main__":
                 'transform': ref_transform * Affine.translation(c0, r0),
                 'count': 1,
                 'dtype': 'float32',
+                # Invalid pixels are written as NaN below, so nodata must say NaN. Inheriting
+                # the source raster's 3.4e38 leaves the header disagreeing with the data, and
+                # a consumer honouring the header renders every ocean pixel as valid.
+                'nodata': np.nan,
                 'compress': 'deflate'
             })
-            out_dir = Path(os.getcwd()) / 'data' / 'predictions'
+            out_dir = Path(args.predict_output_dir) if args.predict_output_dir else (
+                Path(os.getcwd()) / 'data' / 'predictions'
+            )
             out_dir.mkdir(parents=True, exist_ok=True)
-            
+            prefix = output_prefix if output_prefix is not None else (args.predict_output_prefix or "")
+            max_year = args.predict_max_target_year
+
             out_paths = {}
             for h_name, h_year in zip(horizon_names, horizon_years):
+                if h_name not in active_horizons:
+                    print(f"  · {h_year}: skipped (> --predict_max_target_year {max_year})")
+                    continue
                 for q_name in quantile_names:
                     key = f"{h_name}_{q_name}"
-                    out_path = out_dir / f"prediction_{h_year}_{q_name}_blended.tif"
+                    out_path = out_dir / f"{prefix}prediction_{h_year}_{q_name}_blended.tif"
                     with rasterio.open(out_path, 'w', **out_profile) as dst:
                         dst.write(out_horizons[key], 1)
                     out_paths[key] = out_path
@@ -1633,12 +2215,15 @@ if __name__ == "__main__":
             print(f"  Tiles skipped (no data/outside region): {tiles_skipped:,}")
             print(f"Output dimensions: {Hwin} × {Wwin} pixels")
             print(f"Valid output pixels: {num_valid_pixels:,} ({valid_percent:.1f}%)")
-            print(f"\nOutput files (12 total: 3 quantiles × 4 horizons):")
+            print(f"\nOutput files ({len(out_paths)} written):")
             for h_name, h_year in zip(horizon_names, horizon_years):
+                if not any(f"{h_name}_{q}" in out_paths for q in quantile_names):
+                    continue
                 print(f"  {h_year}:")
                 for q_name in quantile_names:
                     key = f"{h_name}_{q_name}"
-                    print(f"    {q_name}: {out_paths[key]}")
+                    if key in out_paths:
+                        print(f"    {q_name}: {out_paths[key]}")
             print(f"\nTotal time: {int(elapsed_total//60):02d}:{int(elapsed_total%60):02d}")
             print("="*70 + "\n")
 
@@ -1650,12 +2235,31 @@ if __name__ == "__main__":
                     src.close()
             for src in stat_srcs:
                 src.close()
+            if ctx_src is not None:
+                ctx_src.close()
+
+            return infer_model
 
     # Run prediction if requested
     if run_large_area_prediction:
+        _release_dataloaders()
         # Use provided checkpoint, or best from training
         pred_checkpoint = checkpoint_path if checkpoint_path else checkpoint_cb.best_model_path
-        if pred_checkpoint:
+        if pred_checkpoint and args.predict_all_windows:
+            # One checkpoint load, all 4 hindcast windows; prefix keeps outputs from colliding
+            # (the same target year is produced by several windows).
+            base_prefix = args.predict_output_prefix or ""
+            cached_model = None
+            for win in HINDCAST_WINDOWS:
+                win_prefix = f"{base_prefix}w{win[-1]}_"
+                print(f"\n{'#'*70}\n# WINDOW {win} -> prefix '{win_prefix}'\n{'#'*70}")
+                cached_model = _predict_region_and_write(
+                    pred_checkpoint,
+                    input_years_override=list(win),
+                    output_prefix=win_prefix,
+                    infer_model=cached_model,
+                )
+        elif pred_checkpoint:
             _predict_region_and_write(pred_checkpoint)
         else:
             print("\n⚠️  No checkpoint available for prediction!")

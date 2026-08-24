@@ -7,15 +7,20 @@ This project implements a **ConvLSTM-based spatio-temporal forecasting** pipelin
 ### Key Features
 
 - **Multi-horizon forecasting**: 5yr, 10yr, 15yr, 20yr ahead predictions
-- **Uncertainty quantification**: Probabilistic predictions with calibrated confidence intervals
-- **Independent prediction heads**: Separate neural networks for central estimate vs. uncertainty bounds
+- **Residual central head**: predicts the *change* from t0 through a zero-initialised skip, so training starts at exact persistence
+- **Structurally monotone intervals**: quantile heads emit cumulative non-negative half-widths around a detached centre, so `lower <= central <= upper` always holds and spread cannot narrow with lead time
+- **Long-range change context**: 8 channels derived from precomputed distance-to-past-change, reaching well beyond the trunk's ~10 px receptive radius
+- **Spatial k-fold cross-validation**: five contiguous 512 px fold territories, larger than the ~300 px residual correlation length, so held-out skill is honest
 - **Rich covariates**: 11 dynamic variables (HM components + GDP + population) and 7 static variables (elevation, climate, protected areas)
-- **Per-variable normalization**: Handles vastly different scales (GDP in billions, HM in 0-1 range)
-- **Location encoding**: Learnable positional embeddings for spatial awareness
+- **Shared normalization sidecar**: one `norm_stats.json` across every fold and the production model
+- **Cloud-optimized outputs**: verified COGs with overviews
 - **W&B integration**: Comprehensive experiment tracking and visualization
 
 ## Documentation
-- **[Technical Documentation](docs/simple_model_architecture_and_training.md)** - Detailed guide with implementation code
+
+- **[Model architecture and training](docs/model_architecture.md)** - the shipped ConvLSTM: heads, context channels, k-fold recipe, what the flags mean, and which flags are settled dead ends
+- **[Fitting and running the model](docs/fitting_running_model.md)** - the runbook: environment, derived inputs, every script in order, the COG step, and the eight gates that prove a code change
+- **[Technical Documentation](docs/simple_model_architecture_and_training.md)** - superseded; the pre-k-fold model, kept for history
 
 **Topics covered:**
 - **Input Data**: Dynamic variables, static covariates, location encoding
@@ -30,44 +35,59 @@ This project implements a **ConvLSTM-based spatio-temporal forecasting** pipelin
 
 ```
 spatio_temporal/
-├── config/                         # Configuration files
-│   ├── config.yaml                 # Main training config
-│   ├── sweep_config.yaml           # W&B hyperparameter sweep config
-│   ├── region_to_predict.geojson   # Region boundaries for prediction
-│   └── region_to_predict_small.geojson
+├── config/
+│   ├── config.yaml                      # only inference.region_geojson is read
+│   ├── sweep_config.yaml                # W&B hyperparameter sweep config
+│   ├── region_to_predict_large.geojson  # the global extent -- what products use
+│   ├── region_to_predict.geojson        # southern Africa, for fast iteration
+│   └── region_smoke_aligned.geojson     # tile-phase-aligned window for gate S5/S6
 │
 ├── data/
-│   └── raw/
-│       └── hm_global/              # Global training data
-│           ├── HM_YEAR_VARIABLE_1000.tiff  # Dynamic variables (1990-2020)
-│           └── hm_static_VARIABLE_1000.tiff # Static covariates
+│   ├── norm_stats.json                  # normalisation sidecar, shared by every model
+│   ├── conv_update/PROVENANCE.json      # checkpoints, flags and sources for the products
+│   ├── global/ -> (bulk storage)        # stitched rasters, forecast rasters, the COGs
+│   └── raw/hm_global/                   # global training data
+│       ├── HM_YEAR_VARIABLE_1000.tiff   # dynamic variables (1990-2020)
+│       ├── hm_static_VARIABLE_1000.tiff # static covariates
+│       ├── change_context_wYEAR_1000.tif# 2 bands: past change, distance to past change
+│       ├── split_mask_1000.tif          # 70/10/10/10 train/val/test/calib
+│       └── fold_mask_b4_1000.tif        # five contiguous 512 px fold territories
 │
 ├── src/
-│   ├── models/                     # Model architecture
-│   │   ├── spatiotemporal_predictor.py  # Main ConvLSTM + independent heads
-│   │   ├── lightning_module.py     # PyTorch Lightning wrapper
-│   │   ├── convlstm.py            # ConvLSTM implementation
-│   │   ├── pinball_loss.py        # Quantile regression loss
-│   │   ├── laplacian_pyramid_loss.py
+│   ├── models/
+│   │   ├── spatiotemporal_predictor.py  # ConvLSTM trunk + central and quantile heads
+│   │   ├── lightning_module.py          # PyTorch Lightning wrapper, manual optimization
+│   │   ├── convlstm.py                  # ConvLSTM cell (optional per-layer dilation)
+│   │   ├── change_weights.py            # the 8 change-context channels, distance bands
+│   │   ├── pinball_loss.py              # quantile regression loss
+│   │   ├── losses.py                    # Laplacian pyramid loss
 │   │   └── histogram_loss.py
-│   ├── locationencoder/           # Spatial position encoding
-│   ├── evaluation/                # Evaluation utilities
-│   ├── preprocessing/             # Data preprocessing
-│   └── utils/                     # Helper functions
+│   ├── prediction/
+│   │   └── stitch.py                    # fold stitching: holdout and mean modes
+│   ├── locationencoder/                 # spherical-harmonic position encoding
+│   ├── evaluation/ preprocessing/ utils/
 │
-├── scripts/                       # Main scripts
-│   ├── train_lightning.py        # Training + prediction pipeline
-│   ├── torchgeo_dataloader.py   # Data loading with per-variable normalization
-│   └── create_validity_mask.py  # NaN/no-data handling
+├── scripts/
+│   ├── train_lightning.py               # training + prediction pipeline
+│   ├── run_hindcast_folds.py            # k-fold orchestration: train/predict, then stitch
+│   ├── torchgeo_dataloader.py           # data loading, split/fold filtering, normalisation
+│   ├── create_validity_mask.py          # split mask and k-fold mask construction
+│   ├── prepare_change_context.py        # the change-context rasters (build once)
+│   ├── make_cogs.py                     # COG conversion with a verify pass
+│   ├── make_product_cogs.sh             # the three product sets
+│   ├── check_checkpoint_fingerprint.py  # prove a checkpoint is the shipped architecture
+│   ├── diagnose_central_field.py        # skill vs persistence, stratified
+│   └── compare_central_runs.py          # compare two runs, flags byte-identical results
 │
-├── tests/                        # Unit tests
+├── tests/                               # pytest, flat, synthetic tensors
 │
-├── docs/                         # Documentation
-│   └── model_architecture_and_training.md  # 📘 Complete technical guide
+├── docs/
+│   ├── model_architecture.md            # the shipped model
+│   ├── fitting_running_model.md         # the runbook and the eight gates
+│   ├── simple_model_architecture_and_training.md  # superseded
+│   └── pinball_loss_gradient_isolation.md         # superseded for the shipped config
 │
-├── requirements.txt              # Python dependencies
-├── environment.yml               # Conda environment
-└── setup.py                      # Package setup
+└── setup.py
 ```
 
 ## Setup
@@ -146,113 +166,195 @@ python scripts/train_lightning.py \
   --max_epochs 50 \
   --batch_size 8 \
   --hidden_dim 64 \
-  --num_layers 2
+  --num_layers 4 \
+  --central_residual True --central_context True \
+  --monotone_quantile_width True --quantile_context True
 ```
+
+Even the minimal invocation carries the four architecture flags. Without them this is a
+different model — see "Full Training with All Options" below.
 
 #### Full Training with All Options
 
+**The four architecture flags are not optional, and argparse defaults are not the shipped
+configuration** — `--central_residual` defaults to `False`, under which the central head
+predicts absolute HM and reconstructs the baseline through the trunk. A k=5 run launched on
+defaults scored h=5 skill −0.50 against +0.13 with the flags set.
+
+```bash
+ARCH="--central_residual True --central_context True \
+      --monotone_quantile_width True --quantile_context True"
+HP="--hidden_dim 64 --num_layers 4 --kernel_size 3 --locenc_out_channels 8 \
+--locenc_legendre_polys 10 --ssim_weight 0.2 --laplacian_weight 0.3 \
+--histogram_weight 1.0 --histogram_lambda_w2 0.1 --histogram_warmup_epochs 0"
+
+# One cross-validation fold: fold 1 held out of training entirely, fold 2 for validation.
+python scripts/train_lightning.py \
+  --max_epochs 150 --train_chips 100 --val_chips 40 --val_stride 1024 \
+  --batch_size 8 --num_workers 3 --devices 1 --seed 42 \
+  --fold_mask data/raw/hm_global/fold_mask_b4_1000.tif --exclude_fold 1 --n_folds 5 \
+  --norm_stats_json data/norm_stats.json \
+  $HP $ARCH
+```
+
+Verify the fingerprint in the log before trusting the run:
+
+```
+FOLD-CV MODE: holding out fold 1 (out-of-sample), validating on fold 2
+  ConvLSTM grad norm: 0.000000 (from central loss only)
+```
+
+`ConvLSTM grad norm: 0.000000` is what `--central_residual` looks like — the trunk gets no
+gradient from the central loss. On defaults it reads ~0.04 with an initial central loss 20x
+higher.
+
+#### The production model
+
+The forward model has no held-out geography to protect, so `--train_all_splits True` uses every
+valid chip instead of the 70% train split. It is ignored under `--exclude_fold`, so it can never
+pull a held-out fold back into training.
+
 ```bash
 python scripts/train_lightning.py \
-  --max_epochs 100 \
-  --train_chips 500 \
-  --val_chips 100 \
-  --batch_size 8 \
-  --hidden_dim 64 \
-  --num_layers 2 \
-  --num_workers 4 \
-  --ssim_weight 2.0 \
-  --laplacian_weight 1.0 \
-  --histogram_weight 0.67 \
-  --histogram_warmup_epochs 20 \
-  --use_location_encoder true \
-  --locenc_out_channels 8 \
-  --predict_after_training true \
-  --predict_region config/region_to_predict.geojson
+  --max_epochs 150 --train_chips 100 --val_chips 40 --val_stride 1024 \
+  --batch_size 8 --num_workers 3 --devices 1 --seed 42 --train_all_splits True \
+  --norm_stats_json data/norm_stats.json $HP $ARCH
 ```
+
+The log must print `PRODUCTION MODE: training on EVERY chip in the split mask` and must **not**
+print `FOLD-CV MODE`.
 
 #### Quick Development Run (Smoke Test)
 
 ```bash
 python scripts/train_lightning.py \
-  --fast_dev_run \
-  --batch_size 2 \
-  --hidden_dim 16
+  --max_epochs 2 --train_chips 8 --val_chips 8 --batch_size 2 --num_workers 2 \
+  --val_stride 1024 --disable_wandb \
+  --run_full_set_evaluation False --run_large_area_prediction False \
+  --fold_mask data/raw/hm_global/fold_mask_b4_1000.tif --exclude_fold 1 \
+  --norm_stats_json data/norm_stats.json $HP $ARCH
 ```
 
 ### Key Training Arguments
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--max_epochs` | 100 | Number of training epochs |
+| `--central_residual` | false | **Set true.** Central head predicts change from t0 via a zero-init skip |
+| `--central_context` | false | **Set true.** 8 change-context channels into the central heads |
+| `--quantile_context` | false | **Set true.** Same 8 channels into the quantile heads |
+| `--monotone_quantile_width` | false | **Set true.** Cumulative half-widths around a detached centre |
+| `--fold_mask` | None | Fold-id raster; with `--exclude_fold` it replaces the split mask |
+| `--exclude_fold` | None | Fold held out of both training and validation |
+| `--n_folds` | 5 | Number of folds |
+| `--val_fold` | None | Validation fold; defaults to `(exclude_fold % n_folds) + 1` |
+| `--train_all_splits` | false | Train on every valid chip. Ignored under `--exclude_fold` |
+| `--norm_stats_json` | None | Normalisation sidecar, shared by every fold and the production model |
+| `--val_stride` | `--stride` | Grid stride for val/test. 1024 gives 131 chips globally |
+| `--max_epochs` | 100 | Number of training epochs (0 = predict only) |
 | `--train_chips` | 200 | Chips sampled per training epoch |
-| `--val_chips` | 40 | Chips sampled per validation epoch |
 | `--batch_size` | 8 | Batch size for training/validation |
 | `--hidden_dim` | 64 | ConvLSTM hidden dimension |
-| `--num_layers` | 2 | Number of ConvLSTM layers |
-| `--num_workers` | 0 | Data loader workers (0=single-threaded) |
-| `--ssim_weight` | 2.0 | Weight for SSIM loss |
-| `--laplacian_weight` | 1.0 | Weight for Laplacian pyramid loss |
-| `--histogram_weight` | 0.67 | Weight for histogram loss |
-| `--use_location_encoder` | true | Use learnable spatial position encoding |
-| `--predict_after_training` | true | Run prediction after training completes |
+| `--num_layers` | 2 | ConvLSTM layers (**production uses 4**) |
+| `--checkpoint_monitor` | `val_total_loss` | Includes pinball, so a quantile-only change also moves the selected central field. Use `val_central_loss` for central-only A/Bs |
+| `--seed` | 42 | Not sufficient for determinism — cuDNN algorithm selection varies run to run |
+
+Many further flags exist from a 22-experiment sweep that adopted none of them. They all default
+to off; see `docs/model_architecture.md` §9 before turning one on.
 
 ### Making Predictions with Existing Checkpoint
 
-#### Option 1: Load from W&B Artifact
+The architecture flags are **still required** under `--max_epochs 0`: the model is built from
+the CLI args before the state dict is loaded into it. Without them the load fails with
+`size mismatch for model.central_heads.0.0.weight: [64, 72, 3, 3] vs [64, 64, 3, 3]`.
+
+Check a checkpoint first:
 
 ```bash
-python scripts/train_lightning.py \
-  --checkpoint "model-xxxxxx:v0" \
-  --max_epochs 0 \
-  --predict_after_training true \
-  --predict_region config/region_to_predict.geojson \
-  --predict_stride 64 \
-  --predict_batch_size 16
+python scripts/check_checkpoint_fingerprint.py \
+  --manifest data/conv_update/PROVENANCE.json \
+  --control artifacts/model-khrpthgy:v0/model.ckpt
 ```
 
-**How to find your W&B artifact name:**
-1. Go to your W&B project: https://wandb.ai/glennwithtwons/spatio-temporal-convlstm
-2. Click on a run
-3. Go to "Artifacts" tab
-4. Copy the artifact name (e.g., `model-xxxxxx:v0`)
+The control must be **REJECTED**; without it the check has not been shown to reject anything.
 
-#### Option 2: Load from Local Checkpoint File
+#### Forecast 2025-2040 from a production checkpoint
 
 ```bash
-python scripts/train_lightning.py \
-  --checkpoint "checkpoints/best_model.ckpt" \
-  --max_epochs 0 \
-  --predict_after_training true \
-  --predict_region config/region_to_predict.geojson
+python scripts/train_lightning.py --max_epochs 0 --devices 1 \
+  --checkpoint spatio-temporal-convlstm/6zkppztt/checkpoints/epoch=12-step=169.ckpt \
+  --norm_stats_json data/norm_stats.json \
+  --run_full_set_evaluation False --run_large_area_prediction True \
+  --predict_region config/region_to_predict_large.geojson \
+  --predict_stride 64 --predict_batch_size 32 \
+  --predict_output_dir data/global/forecast_preds \
+  --predict_input_years 2010,2015,2020 --predict_output_prefix "" \
+  $HP $ARCH
+```
+
+#### Fold hindcast, all five folds across both GPUs
+
+```bash
+python scripts/run_hindcast_folds.py --stage train --max_epochs 0 \
+  --folds 1,2,3,4,5 --gpus 0,1 --windows 2000 \
+  --region config/region_to_predict_large.geojson \
+  --output_root data/global --norm_stats_json data/norm_stats.json \
+  --fold_checkpoints "$CKPTS" --extra_train_args "$ARCH"
+
+python scripts/run_hindcast_folds.py --stage stitch --stitch_mode holdout \
+  --folds 1,2,3,4,5 --windows 2000 --output_root data/global --disable_wandb
 ```
 
 #### Prediction Arguments
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--predict_region` | None | Path to GeoJSON file defining prediction area |
+| `--predict_region` | None | GeoJSON defining the prediction area |
 | `--predict_stride` | 64 | Stride between tiles for overlap blending |
 | `--predict_batch_size` | 16 | Tiles processed in parallel on GPU |
+| `--predict_input_years` | None | e.g. `2010,2015,2020`; targets are +5/10/15/20 |
+| `--predict_output_dir` | `data/predictions` | Where rasters are written |
+| `--predict_output_prefix` | None | Prepended to every filename, e.g. `fold1_w2000_` |
+| `--predict_max_target_year` | None | Skip horizons past the last observed year |
+| `--predict_restrict_mask` / `--predict_restrict_values` | None | Predict only the given fold's territory (~5x cheaper, exact for kept pixels) |
+| `--predict_all_windows` | false | All four hindcast windows on one checkpoint load |
 
 #### Prediction Output
 
-For each horizon (5yr, 10yr, 15yr, 20yr), three GeoTIFF files are created:
+For each horizon, three single-band float32 GeoTIFFs with `nodata=NaN`:
 
 ```
-data/predictions/REGION_NAME/
+data/global/forecast_preds/
 ├── prediction_2025_lower_blended.tif    # Lower 2.5% quantile
 ├── prediction_2025_central_blended.tif  # Central estimate
 ├── prediction_2025_upper_blended.tif    # Upper 97.5% quantile
-├── prediction_2030_lower_blended.tif
-├── prediction_2030_central_blended.tif
-├── prediction_2030_upper_blended.tif
-... (and so on for 2035, 2040)
+... (and so on for 2030, 2035, 2040)
 ```
 
 **Uncertainty mapping:**
 ```python
-uncertainty = upper - lower  # Width of 95% confidence interval
+uncertainty = upper - lower  # Width of the 95% interval
 ```
+
+### Published products
+
+Three sets of twelve cloud-optimized GeoTIFFs under `data/global/`, all **raw model output with
+no recalibration** — this branch has no calibration layer.
+
+```bash
+./scripts/make_product_cogs.sh
+```
+
+| set | directory | years | inputs | sample status |
+|---|---|---|---|---|
+| out-of-fold hindcast | `cogs_hindcast/hm_hindcast_{year}_{q}.tif` | 2005, 2010, 2015, 2020 | 1990/1995/2000 | out-of-sample everywhere; **the only set that may be scored** |
+| fold-mean hindcast | `cogs_hindcast_mean/hm_hindcast_mean_{year}_{q}.tif` | 2005, 2010, 2015, 2020 | 1990/1995/2000 | **in-sample** — four of five folds trained on any pixel. Seamless; display only |
+| forecast | `cogs_forecast/hm_forecast_{year}_{q}.tif` | 2025, 2030, 2035, 2040 | 2010/2015/2020 | production model; no fold, no mosaic, no seam |
+
+`{q}` is `central`, `lower` or `upper`. The fold-mean set is seamless because it averages all
+five folds at every pixel, which also makes its interval narrower than any single fold's — it
+discards the between-fold spread rather than adding it. Never score it.
+
+Provenance for all three is in `data/conv_update/PROVENANCE.json`.
 
 ### Experiment Tracking (W&B)
 
@@ -287,37 +389,70 @@ We forecast the Human Modification (HM) index, a spatially explicit measure of a
 
 ## Model Architecture
 
-### Independent Prediction Heads
+See **[docs/model_architecture.md](docs/model_architecture.md)** for the full account. In brief:
 
-The model uses **12 separate neural network heads** (3 per horizon):
+### Trunk
 
-```
-ConvLSTM → Shared representation
-           ↓
-    ┌──────┼──────┐
-    ↓      ↓      ↓
- Lower  Central Upper
-  Head    Head   Head
-    ↓      ↓      ↓
-  2.5%   Best   97.5%
-         Est.
-```
+4-layer ConvLSTM, `hidden_dim 64`, 3x3 kernels, fed 11 dynamic + 7 static channels plus 8
+optional location-encoder channels. Its receptive radius is only ~10 px, which is why the
+long-range change context is supplied as an explicit covariate rather than learned.
 
-**Central heads**: Full-size (hidden_dim → hidden_dim → 1), optimized for accuracy + spatial patterns  
-**Quantile heads**: Smaller (hidden_dim → hidden_dim/2 → 1), optimized only for uncertainty bounds
+### Heads
 
-### Loss Function
+12 heads, 3 per horizon, all reading the trunk's last hidden state concatenated with the 8
+change-context channels (in-channels 72, not 64):
 
 ```
-Central prediction receives:
-  MSE + 2.0×SSIM + 1.0×Laplacian + 0.67×Histogram
-
-Lower quantile receives:
-  Pinball loss (q=0.025)
-
-Upper quantile receives:
-  Pinball loss (q=0.975)
+ConvLSTM -> last hidden state (+ 8 change-context channels)
+           |
+    +------+------+
+    v      v      v
+ Lower  Central  Upper
+  head    head    head
+    |      |       |
+   2.5%  best    97.5%
+         est.
 ```
+
+**Central head** (`hidden_dim -> hidden_dim -> 1`): predicts the *change* from t0, added to HM
+at t0 through a zero-initialised skip. Training therefore starts at exact persistence, and
+"nothing happens" — the right answer for 53-73% of pixels — costs nothing to say.
+
+**Quantile heads** (`hidden_dim -> hidden_dim/2 -> 1`): emit non-negative half-width
+*increments* through a softplus, accumulated across horizons around the **detached** central
+prediction. Two properties follow structurally rather than by clipping: `lower <= central <=
+upper` always holds, and spread cannot narrow with lead time.
+
+### Loss
+
+```
+Central objective (trunk + central heads):
+  MSE + 0.2*SSIM + 0.3*Laplacian + 1.0*Histogram
+
+Quantile objective (quantile heads only):
+  Pinball(q=0.025) + Pinball(q=0.975)
+```
+
+The two are gradient-isolated: the central forecast enters the quantile heads detached, so the
+pinball objective shapes the interval without moving the central field. The fingerprint is the
+startup line `ConvLSTM grad norm: 0.000000`.
+
+### Skill
+
+Measured globally on held-out geography, against **persistence** — the median 20-year HM change
+is 0.0001, so pooled RMSE can look fine while the model loses to predicting no change at all.
+
+| horizon | skill vs persistence |
+|---|---|
+| +5 yr | +0.110 |
+| +10 yr | +0.183 |
+| +15 yr | +0.226 |
+| +20 yr | +0.222 |
+
+### Known defect
+
+`P(dHM > 0.05)` beyond 100 px from past change reads about 0.034 of observed. This is a property
+of the quantile heads — far-band half-widths are ~0.004, so +0.05 is ~12 half-widths out.
 
 ## Contributing
 
