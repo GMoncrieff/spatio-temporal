@@ -5,67 +5,38 @@ and 2.5/97.5 quantile intervals at +5/+10/+15/+20 yr, plus a post-hoc ensemble l
 (`src/ensemble/`) that adds spatial and temporal coherence on top of the per-pixel
 marginals.
 
-Active branch: **`ensemble`**. **The model is frozen; the remaining work is the global
-product.** Read **`docs/global_final_phase.md` first** — it is the plan, and it says what may
-and may not be changed. Then `docs/ensemble_model_outline.md` (and its illustrated HTML
-edition) for the whole method and a row-by-row explanation of the scorecard.
+Active branch: **`ensemble`**. **The model is frozen and the global product is BUILT and
+PUBLISHED.** Three documents supersede everything else and stand on their own:
 
-For the measurement record — including the negative results, which are load-bearing and are
-most of it — see `docs/improvement_plan.md` (this round, stage by stage),
-`docs/stage_a_instruments.md` (the scoring instruments and why five were rewritten),
-`docs/model_phase.md` (22 ConvLSTM experiments, all dead), `docs/validator_scaling.md`
-(the evaluation harness), and `docs/central_field_baseline.md`.
+- **`docs/global_ensemble_methodology.md`** — the method: the ConvLSTM, the calibration and
+  marginal fitting, and the ensemble generation. Start here.
+- **`docs/global_scorecard.md`** — every evaluation on the card: what it tests, what failure
+  would look like, where its threshold came from, and what the system scored.
+- **`docs/fitting_running_model.md`** — the runbook: setup, data requirements, and every script
+  in order with measured cost, plus how to produce the figures.
 
-Superseded and kept only for history: `docs/global_scorecard.md` (112/146, the old lineage),
-`docs/reference_card.md` (103/136, two calibration layers), `docs/current_progress.md`.
+`docs/background/` holds the superseded development record — 22 dead ConvLSTM experiments, the
+regional lineage, the instrument rewrites and the phase plans. **None of it describes the
+current product**, and the three documents above do not depend on it. Consult it only for the
+history of why a choice was made.
 
 ## Where the project is
 
-**The model is accepted and frozen. The remaining work is the global product.**
-`docs/global_final_phase.md` is the plan and the document to start from.
+**The global product is built, scored and published.** Experiment **`g1_foldb4`**, artifacts on
+the HDD at `data/ensemble/exp/g1_foldb4`. Card: **99/134 scored rows**. Deliverables: hindcast
+and forecast ensembles at M=400 as icechunk, 24 verified COGs (`cogs_hindcast/`,
+`cogs_forecast/`) plus a seamless fold-mean display set (`cogs_hindcast_mean/`). Production
+model is `spatio-temporal-convlstm/6zkppztt/checkpoints/epoch=12-step=169.ckpt`, trained on
+every chip via `--train_all_splits`.
 
-The accepted configuration is **`c1_foldb4`** — five folds on the 512 px fold mask, one
-unified calibration layer, marginal at `u_bound 0.999`. Its card is **107/136 on Africa**,
-the best in the project's history and the first with a single calibration layer.
-`docs/ensemble_model_outline.md` describes the whole chain and explains every scorecard row.
+**The one thing to take up next** is not a model change: `predict_change_rates.py` and the
+sampled M=400 ensemble disagree on the far band (0.000000 against 0.034). Those two
+implementations have agreed to 1-11% every previous time, so the gap localises a bug to one of
+them, and the far field cannot be worked on until it is settled.
 
-**The five fold checkpoints are already trained on GLOBAL chips.** Only the *prediction
-extent* was Africa. Exact paths in `data/ensemble/exp/c1_foldb4/FOLD_CHECKPOINTS.json`.
-**Global hindcasts therefore need no retraining** — `run_hindcast_folds.py --fold_checkpoints
-… --max_epochs 0` is the predict-only path, ~5 h for k=5 against ~10 h if retrained by reflex.
-
-### What the last round established
-
-- **The fold mask is honest now and it was nearly free.** 512 px blocks put **31.9%** of
-  held-out pixels beyond one residual correlation length, against **0.0%** under the old 128 px
-  checkerboard, and cost at most 0.9 skill points (h=5 unchanged). The leak it removes is real
-  but modest: within the new mask, h=20 skill falls **+0.239 → +0.188** with distance from
-  trained-on data. Rule 19 is now a number, not a worry.
-- **The far field is fixed on the increase side.** `P(Δ>0.05)` beyond 100 px went **0.107 →
-  1.36** of observed across the round; near/remote contrast is 1.138. Two levers did it: the
-  marginal's `u_bound` raised to 0.999 on every band, and the calibration separating remote
-  land that can develop from remote land that cannot.
-- **One calibration layer, not two.** Distance band × predicted change × HM level, monotone in
-  horizon, with a per-pixel cumulative max after apply. Adopted for **simplicity** — held out,
-  every axis choice sits within 0.9% of doing nothing.
-- **T4.2 is structural now** (0.802 → 0.995) and was never a model defect: the raw heads are
-  0.980 monotone and the *calibration* was breaking it.
-
-### What is still wrong, and why it is not being chased
-
-- **Over-dispersion at aggregate scale** — T2.5 rejected 4/4, T7.3 at 1.77, T2.2/T2.4
-  saturated at 1.000. Three instruments agreeing. This is the clearest remaining model defect
-  and it is **out of scope for this phase**.
-- **T3.2 at 0.104** of the structure budget; the short-lag reading is 0.269, so the shortfall
-  is specifically long-range.
-- **T8.1 at 10-30 px overshoots at 2.28** — correcting every band was slightly too aggressive
-  there. Excluding band 3 is untested and is the one calibration question worth re-taking
-  globally.
-- **T5.1 fails at h=5/h=10 and it is not settled whether generation or the gate is at fault.**
-  Its tolerance scales with the marginal shape's slope at the median, which tightens when
-  `u_bound` rises. **Do not tune the field to pass it.**
-- **T8.4 in the far band** rests on **88 observed events globally and one on Africa**. Not
-  fittable; do not chase.
+**The far field is the known headline defect** — `P(Δ>0.05)` beyond 100 px reads 0.034 of
+observed. It is a property of the model's quantile heads (half-widths ~0.004 there, so +0.05 is
+~12 half-widths out), not of the calibration, and no post-hoc layer reaches it.
 
 ## Environment and scale
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Which class axes does the half-width rescaling actually earn its place on?
 
-Stage D of ``docs/improvement_plan.md``. The two recalibration layers are keyed on
+Stage D of ``docs/background/improvement_plan.md``. The two recalibration layers are keyed on
 different axes — conformal on ``horizon x dhat x HM x biome``, width factors on
 ``horizon x band x dhat x HM`` out to 10 px — so unifying them is a *measurement* of which
 axis carries signal, not a refactor. This scores candidate width-factor fits against each

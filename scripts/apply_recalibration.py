@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -227,7 +228,7 @@ def recalibrate_one(
     }
 
 
-def enforce_horizon_monotonicity(out_dir, suffix="_recal"):
+def enforce_horizon_monotonicity(out_dir, suffix="_recal", block_rows: int = 512):
     """Make each pixel's half-widths non-decreasing across horizons, in place.
 
     **Why this cannot live in the fit.** Constraining the factor table stops any *class*
@@ -242,44 +243,82 @@ def enforce_horizon_monotonicity(out_dir, suffix="_recal"):
 
     Applied to the half-widths about the central forecast, separately per side, so the
     central raster is untouched and T5.1's median identity is unaffected.
+
+    **Streamed by row block.** The cummax runs along the horizon axis and is independent
+    between pixels, so a block carries exactly the same result as a whole-raster pass. It is
+    written that way because the whole-raster spelling holds ``3 x H`` full-grid float64
+    arrays plus their ``np.stack`` copies plus four accumulators -- over 200 GB on the
+    17111 x 40000 grid, which OOM-killed a global run. On a regional extent it was ~20 GB and
+    invisible. Equivalence against the whole-raster version is asserted in
+    ``tests/test_horizon_monotonicity_streaming.py``.
     """
     out_dir = Path(out_dir)
     groups = {}
-    for cen in sorted(out_dir.glob(f"*_prediction_*_central{suffix}.tif")):
+    # Two naming conventions reach this function. Hindcast rasters carry the input window,
+    # "w2000_prediction_2005"; production rasters do not, "prediction_2025". The glob used to
+    # require the prefix, so it matched no production file at all and this pass was a silent
+    # no-op on the forward product -- which would have shipped without the per-pixel cumulative
+    # max that makes T4.2 structural. It was never noticed because no production model existed.
+    for cen in sorted(out_dir.glob(f"*prediction_*_central{suffix}.tif")):
         stem = cen.name.replace(f"_central{suffix}.tif", "")
-        base = int(stem.split("_")[0][1:])
+        head = stem.split("_")[0]
+        base = int(head[1:]) if (head.startswith("w") and head[1:].isdigit()) else None
         year = int(stem.split("_")[-1])
-        groups.setdefault(base, []).append((year - base, stem))
+        # Production years all belong to one forecast window, so they form one group; the sort
+        # key only has to order the horizons, and target year does that either way.
+        groups.setdefault(base, []).append((year, stem))
     total_lifted = n_px = 0
     for base, items in sorted(groups.items()):
         items.sort()
         if len(items) < 2:
             continue
-        cen, lo, up, prof = [], [], [], None
-        for _, stem in items:
-            with rasterio.open(out_dir / f"{stem}_central{suffix}.tif") as sc:
-                cen.append(sc.read(1).astype(np.float64)); prof = sc.profile.copy()
-            with rasterio.open(out_dir / f"{stem}_lower{suffix}.tif") as sl:
-                lo.append(sl.read(1).astype(np.float64))
-            with rasterio.open(out_dir / f"{stem}_upper{suffix}.tif") as su:
-                up.append(su.read(1).astype(np.float64))
-        C, L, U = np.stack(cen), np.stack(lo), np.stack(up)
-        valid = np.isfinite(C).all(0) & np.isfinite(L).all(0) & np.isfinite(U).all(0) & (C >= 0).all(0)
-        hu = np.maximum(U - C, 0.0)
-        hl = np.maximum(C - L, 0.0)
-        hu2 = np.maximum.accumulate(hu, axis=0)
-        hl2 = np.maximum.accumulate(hl, axis=0)
-        lifted = ((hu2 > hu + 1e-12) | (hl2 > hl + 1e-12))
-        total_lifted += int(lifted[:, valid].any(axis=0).sum())
-        n_px += int(valid.sum())
-        for i, (_, stem) in enumerate(items):
-            new_up = np.where(valid, np.clip(C[i] + hu2[i], 0.0, 1.0), U[i])
-            new_lo = np.where(valid, np.clip(C[i] - hl2[i], 0.0, 1.0), L[i])
-            for arr, name in ((new_lo, "lower"), (new_up, "upper")):
-                with rasterio.open(out_dir / f"{stem}_{name}{suffix}.tif", "w", **prof) as dst:
-                    dst.write(arr.astype(prof["dtype"]), 1)
-        print(f"  w{base}: {len(items)} horizons, "
-              f"{100 * lifted[:, valid].any(axis=0).mean():.1f}% of pixels widened somewhere")
+        stems = [s for _, s in items]
+        with rasterio.open(out_dir / f"{stems[0]}_central{suffix}.tif") as s0:
+            H, W = s0.height, s0.width
+            prof = s0.profile.copy()
+        srcs_c = [rasterio.open(out_dir / f"{s}_central{suffix}.tif") for s in stems]
+        srcs_l = [rasterio.open(out_dir / f"{s}_lower{suffix}.tif") for s in stems]
+        srcs_u = [rasterio.open(out_dir / f"{s}_upper{suffix}.tif") for s in stems]
+        # Write to siblings and swap at the end: the sources stay readable while streaming.
+        tmp_l = [out_dir / f"{s}_lower{suffix}.mono.tmp.tif" for s in stems]
+        tmp_u = [out_dir / f"{s}_upper{suffix}.mono.tmp.tif" for s in stems]
+        dst_l = [rasterio.open(p_, "w", **prof) for p_ in tmp_l]
+        dst_u = [rasterio.open(p_, "w", **prof) for p_ in tmp_u]
+        g_lifted = g_valid = 0
+        try:
+            for r0 in range(0, H, block_rows):
+                rr = min(block_rows, H - r0)
+                win = Window(0, r0, W, rr)
+                C = np.stack([s.read(1, window=win).astype(np.float64) for s in srcs_c])
+                L = np.stack([s.read(1, window=win).astype(np.float64) for s in srcs_l])
+                U = np.stack([s.read(1, window=win).astype(np.float64) for s in srcs_u])
+                valid = (np.isfinite(C).all(0) & np.isfinite(L).all(0)
+                         & np.isfinite(U).all(0) & (C >= 0).all(0))
+                hu = np.maximum(U - C, 0.0)
+                hl = np.maximum(C - L, 0.0)
+                hu2 = np.maximum.accumulate(hu, axis=0)
+                hl2 = np.maximum.accumulate(hl, axis=0)
+                lifted = ((hu2 > hu + 1e-12) | (hl2 > hl + 1e-12))
+                g_lifted += int(lifted[:, valid].any(axis=0).sum())
+                g_valid += int(valid.sum())
+                for i in range(len(stems)):
+                    new_up = np.where(valid, np.clip(C[i] + hu2[i], 0.0, 1.0), U[i])
+                    new_lo = np.where(valid, np.clip(C[i] - hl2[i], 0.0, 1.0), L[i])
+                    dst_l[i].write(new_lo.astype(prof["dtype"]), 1, window=win)
+                    dst_u[i].write(new_up.astype(prof["dtype"]), 1, window=win)
+        finally:
+            for s in srcs_c + srcs_l + srcs_u:
+                s.close()
+            for d in dst_l + dst_u:
+                d.close()
+        for i, s in enumerate(stems):
+            os.replace(tmp_l[i], out_dir / f"{s}_lower{suffix}.tif")
+            os.replace(tmp_u[i], out_dir / f"{s}_upper{suffix}.tif")
+        total_lifted += g_lifted
+        n_px += g_valid
+        label = f"w{base}" if base is not None else "production"
+        print(f"  {label}: {len(items)} horizons, "
+              f"{100 * g_lifted / max(g_valid, 1):.1f}% of pixels widened somewhere")
     if n_px:
         print(f"  horizon monotonicity enforced on {total_lifted:,} of {n_px:,} pixels "
               f"({100 * total_lifted / n_px:.1f}%)")

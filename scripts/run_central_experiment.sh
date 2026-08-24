@@ -37,7 +37,7 @@ ROOT="data/ensemble/exp/${NAME}"
 REGION="${REGION:-config/region_to_predict_small.geojson}"
 # The k-fold mask the run trains, restricts prediction and stitches against. Defaults to the
 # production 128 px checkerboard every existing checkpoint was trained on. Stage C of
-# docs/improvement_plan.md points this at fold_mask_b4_1000.tif (512 px blocks), which puts
+# docs/background/improvement_plan.md points this at fold_mask_b4_1000.tif (512 px blocks), which puts
 # 31.9% of held-out pixels beyond one residual correlation length instead of 0.0% — and
 # which makes every earlier checkpoint and scorecard non-comparable, so it is set explicitly
 # and never by default.

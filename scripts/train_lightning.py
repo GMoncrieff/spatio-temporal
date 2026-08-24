@@ -214,6 +214,17 @@ if __name__ == "__main__":
              "for train/val chip selection",
     )
     parser.add_argument(
+        "--train_all_splits",
+        type=lambda x: (str(x).lower() == 'true'), nargs='?', const=True, default=False,
+        help="Train on EVERY valid chip in the split mask, ignoring the 70/10/10/10 "
+             "train/val/test/calib partition. This is the production setting: the forward "
+             "model has no held-out geography to protect, so restricting it to split 1 "
+             "throws away 30%% of the world for nothing. Validation still runs on split 2, "
+             "which is now in-sample -- that is unavoidable for a production model and is "
+             "why the configuration is validated by k-fold instead. Ignored in fold-CV mode "
+             "(--exclude_fold), where holding geography out is the whole point.",
+    )
+    parser.add_argument(
         "--exclude_fold",
         type=int,
         default=None,
@@ -573,6 +584,13 @@ if __name__ == "__main__":
     # out-of-sample; one other fold serves as the validation set for checkpoint selection.
     train_split_value, train_exclude = 1, None
     val_split_value, test_split_value = 2, 3
+    if args.train_all_splits and args.exclude_fold is None:
+        # None/None is the dataset's "all data" case (torchgeo_dataloader: "None=all data").
+        train_split_value, train_exclude = None, None
+        print("=" * 70)
+        print("PRODUCTION MODE: training on EVERY chip in the split mask")
+        print("  no geography held out; validation on split 2 is in-sample by construction")
+        print("=" * 70)
     if args.fold_mask is not None and args.exclude_fold is not None:
         if not os.path.exists(args.fold_mask):
             raise FileNotFoundError(f"--fold_mask not found: {args.fold_mask}")

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end driver for the spatiotemporal residual ensemble (docs/ensemble_uncertainty_plan.md).
+# End-to-end driver for the spatiotemporal residual ensemble (docs/background/ensemble_uncertainty_plan.md).
 #
 # Phase 0 (fold retraining + hindcast prediction) is the long pole and is run separately by
 # scripts/run_hindcast_folds.py; everything downstream of it is here.

@@ -19,7 +19,7 @@
 #                          "none"     the two-piece normal.
 #                          "measured" the configuration this phase settled on: pooled body,
 #                                     upper tail bound 0.999 out to 100 px and 0.975 beyond,
-#                                     lower bound held at 0.025. See docs/next_phase_marginals.md
+#                                     lower bound held at 0.025. See docs/background/next_phase_marginals.md
 #                                     section 5.8 for why each of those three is what it is.
 #                          <number>   a single symmetric bound, for sweeping.
 #   SUFFIX=<tag>           suffix the ensemble/validation outputs, so two marginal

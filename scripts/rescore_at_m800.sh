@@ -7,7 +7,7 @@
 # the member sample, and their Monte-Carlo tolerances tighten as 1/sqrt(M). The marginal phase
 # found an M=100 comparison between two marginal families that *reversed* at M=400 for exactly
 # this reason, so a configuration whose residual is spikier is penalised more at fixed M.
-# docs/model_phase.md section 5.3 measured E5's shape slope at the median falling 24-43%
+# docs/background/model_phase.md section 5.3 measured E5's shape slope at the median falling 24-43%
 # against the baseline's, and predicted that its two lost rows recover at higher M.
 #
 # **Both configurations have to be rescored**, or the comparison swaps one confound for

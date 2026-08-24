@@ -336,7 +336,7 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         The published triple already *is* a two-piece normal's median and bounds, so fitting
         it by log score is a strictly different objective on the same parameterisation
         rather than a different product. The centre is detached: the central head keeps its
-        RMSE-optimal target, which docs/next_phase_marginals.md section 6.2 measured as
+        RMSE-optimal target, which docs/background/next_phase_marginals.md section 6.2 measured as
         costing ~10% of skill to move.
 
         Returned split in two so the existing per-side logging keeps working; the halves are
