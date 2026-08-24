@@ -93,6 +93,21 @@ Two consequences, both structural rather than enforced afterwards:
   non-decreasing by construction.
 - **`lower ≤ central ≤ upper` always holds**, rather than being clipped into place later.
 
+**Both guarantees are properties of the model's output, and the second survives everything
+downstream. The first does not quite survive the write.** Predictions are clipped to [0, 1]
+before they are written, because HM is bounded there. Interval width is `w_lower + w_upper` —
+the central term cancels — so it is non-decreasing in model space by construction, and
+averaging (overlap blending, fold-mean stitching) is linear and preserves that. The clip is
+not linear. Where the upper bound has already saturated at 1.0 and the central estimate keeps
+rising, the interval can narrow.
+
+Measured on the shipped products over a 2.07 Mpx land window: **3,149 pixels (0.15%) narrow at
+some horizon, worst magnitude 0.02, and every one of them touches the clip** — 100% have
+`upper ≥ 0.999` at +20 yr, against 0.4% of all valid pixels. Among the 2,000,387 pixels that
+never touch a clip at any horizon, narrowing occurs **zero** times. So this is the bound of the
+HM range asserting itself, not a defect in the heads; an interval whose top is already at 1
+cannot widen upward.
+
 The quantile loss is pinball at 0.025 and 0.975, and it is **gradient-isolated from the
 trunk** — the central forecast enters the quantile heads detached, so the pinball objective
 shapes the interval without moving the central field.
