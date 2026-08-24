@@ -5,6 +5,9 @@ The ConvLSTM that produces this branch's central forecast and 2.5/97.5 intervals
 the model itself — that branch's calibration and 400-member ensemble layers are not here, so
 the products on this branch are the heads' own output, uncalibrated.
 
+This describes what the model *is*. For what changed relative to `main` and why, see
+[`model_update.md`](model_update.md); for how to run it, [`fitting_running_model.md`](fitting_running_model.md).
+
 ---
 
 ## 1. What it consumes and emits

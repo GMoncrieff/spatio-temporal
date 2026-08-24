@@ -4,6 +4,15 @@
 
 This project implements a **ConvLSTM-based spatio-temporal forecasting** pipeline with **quantile regression** for uncertainty quantification of the Human Modification (HM) index. The model predicts future HM values at **four forecast horizons** (5, 10, 15, 20 years) with **three predictions per horizon**: lower quantile (2.5%), central estimate, and upper quantile (97.5%).
 
+The central head predicts the *change* from t0 rather than the level, the interval is built
+structurally around it, and held-out geography comes from five-fold cross-validation on
+contiguous 512 px territories. Measured globally on 184.5M out-of-sample pixels, skill against
+persistence is **+0.043 / +0.174 / +0.212 / +0.222** at +5/+10/+15/+20 years, with pooled
+interval coverage of 94.9-95.6% against a 95% target and no calibration layer.
+
+If you are coming from `main`, read **[docs/model_update.md](docs/model_update.md)** — the model
+and the training recipe both changed, and `main` checkpoints will not load.
+
 ### Key Features
 
 - **Multi-horizon forecasting**: 5yr, 10yr, 15yr, 20yr ahead predictions
@@ -18,18 +27,11 @@ This project implements a **ConvLSTM-based spatio-temporal forecasting** pipelin
 
 ## Documentation
 
+- **[What changed from `main`](docs/model_update.md)** - the model and fitting differences, why each was made, and what it means for anything trained on `main`
 - **[Model architecture and training](docs/model_architecture.md)** - the shipped ConvLSTM: heads, context channels, k-fold recipe, what the flags mean, and which flags are settled dead ends
 - **[Fitting and running the model](docs/fitting_running_model.md)** - the runbook: environment, derived inputs, every script in order, the COG step, and the eight gates that prove a code change
 - **[Technical Documentation](docs/simple_model_architecture_and_training.md)** - superseded; the pre-k-fold model, kept for history
-
-**Topics covered:**
-- **Input Data**: Dynamic variables, static covariates, location encoding
-- **Data Transformations**: Per-variable normalization, NaN handling, data leakage prevention
-- **Model Architecture**: ConvLSTM, independent prediction heads, design decisions
-- **Loss Functions**: MSE, SSIM, Laplacian, Histogram (with warmup), Pinball loss
-- **Training**: Hyperparameters, optimization, early stopping, W&B tracking
-- **Accuracy Assessment**: Evaluation metrics, validation protocols, visualization
-- **Prediction**: Tile-based processing, output formats, GIS integration
+- **[Pinball loss gradient isolation](docs/pinball_loss_gradient_isolation.md)** - superseded for the shipped configuration, where the isolation is structural; still describes the path taken when `--monotone_quantile_width` is off
 
 ## Project Structure
 
@@ -148,6 +150,32 @@ hm_static_iucn_strict_1000.tiff  # Protected areas
 ...
 ```
 
+**Derived inputs** — build these once, before training. They are not optional: the change
+context supplies the 8 channels that take the heads from 64 to 72 input channels, and the fold
+mask is what makes held-out geography honest.
+
+```bash
+# Change context: 2 bands per window (signed past change, distance to past change).
+# Must be computed on the FULL raster -- inside a 128 px chip the 100 px radius
+# saturates into "is there any change anywhere in this chip".
+python scripts/prepare_change_context.py --out_dir data/raw/hm_global
+# -> change_context_w{2000,2005,2010,2015,2020}_1000.tif  (~2.2 GB each)
+
+# Split mask (70/10/10/10) and the k-fold mask.
+python scripts/create_validity_mask.py
+# -> validity_mask_1000.tif, split_mask_1000.tif
+
+python scripts/create_validity_mask.py --folds_only --k 5 --fold_block_chips 4 \
+  --fold_mask_out data/raw/hm_global/fold_mask_b4_1000.tif
+```
+
+`--fold_block_chips 4` gives 4 x 128 = 512 px fold territories. That has to exceed the ~300 px
+residual correlation length; at `1` the folds are a 128 px checkerboard and every held-out tile
+sits inside the correlation length of tiles its own model trained on.
+
+All rasters share one grid: **17,111 x 40,000 px, EPSG:4326, 0.009 deg (~1 km)**, origin
+(-180, 83.997). Any mismatch fails loudly at the first read.
+
 ### 3. W&B Setup (Optional but Recommended)
 
 ```bash
@@ -249,7 +277,7 @@ python scripts/train_lightning.py \
 | `--val_fold` | None | Validation fold; defaults to `(exclude_fold % n_folds) + 1` |
 | `--train_all_splits` | false | Train on every valid chip. Ignored under `--exclude_fold` |
 | `--norm_stats_json` | None | Normalisation sidecar, shared by every fold and the production model |
-| `--val_stride` | `--stride` | Grid stride for val/test. 1024 gives 131 chips globally |
+| `--val_stride` | `--stride` | Grid stride for val/test. At 1024, fold 2 of the b4 mask gives 131 chips; production split 2 gives 58 |
 | `--max_epochs` | 100 | Number of training epochs (0 = predict only) |
 | `--train_chips` | 200 | Chips sampled per training epoch |
 | `--batch_size` | 8 | Batch size for training/validation |

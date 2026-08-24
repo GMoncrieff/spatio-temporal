@@ -8,6 +8,10 @@ ensemble on top of the same ConvLSTM; **none of that is on this branch**, so the
 are the model's own central estimate and 2.5/97.5 quantile heads, uncalibrated. Where a step
 below has a calibration counterpart on that branch, it is called out.
 
+The model itself is documented in [`model_architecture.md`](model_architecture.md), and what
+changed relative to `main` — including why `main` checkpoints will not load — in
+[`model_update.md`](model_update.md).
+
 ---
 
 ## 0. Environment and hardware
