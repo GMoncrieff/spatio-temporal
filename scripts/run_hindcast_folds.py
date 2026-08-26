@@ -282,7 +282,13 @@ def stitch_all(args, folds, windows):
             target_year = base + h
             if target_year > MAX_OBSERVED_YEAR:
                 continue
-            for q in QUANTILES:
+            # The distributional head writes a 64-band quantile-function raster beside the
+            # triple. Detected rather than flagged: a stitch stage that silently dropped it
+            # would leave the triple and the quantile function describing different runs.
+            quantiles = list(QUANTILES)
+            if any(pred_dir.glob(f"fold*_w{base}_prediction_{target_year}_qf_blended.tif")):
+                quantiles.append("qf")
+            for q in quantiles:
                 fold_paths = {}
                 for f in folds:
                     p = pred_dir / f"fold{f}_w{base}_prediction_{target_year}_{q}_blended.tif"

@@ -68,6 +68,12 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
         exclude_split_values=None,
         norm_stats=None,
         context_pattern=None,
+        chip_weights=None,
+        chip_sampling="uniform",
+        chip_weight_alpha=4.0,
+        hm_context_pattern=None,
+        hm_context_stats=(),
+        hm_context_radii=(3, 30, 100),
     ):
         self.hm_files = hm_files
         self.component_files = component_files
@@ -98,6 +104,19 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
         # a 100 px radius means 100 km of geography rather than the edge of a 128 px chip.
         self.context_pattern = context_pattern
         self._ctx_srcs = None
+        # Stratified chip sampling. Defaults reproduce uniform sampling exactly.
+        self.chip_weights = chip_weights
+        self.chip_sampling = str(chip_sampling)
+        self.chip_weight_alpha = float(chip_weight_alpha)
+        # Neighbourhood-HM context: mean and max HM within each radius, precomputed on the
+        # full raster by scripts/prepare_hm_context.py. Bands are selected by (stat, radius)
+        # from the raster's own tags, so a mismatch between what the model asks for and what
+        # the raster holds fails loudly instead of reading the wrong band.
+        self.hm_context_pattern = hm_context_pattern
+        self.hm_context_stats = tuple(hm_context_stats or ())
+        self.hm_context_radii = tuple(hm_context_radii)
+        self._hmctx_srcs = None
+        self._hm_band_idx = None
 
         # Split mask for train/val/test separation
         self.split_mask_file = split_mask_file
@@ -270,6 +289,55 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
             for var_name in HM_VARS:
                 print(f"  {var_name}: mean={self.comp_means[var_name]:.6e}, std={self.comp_stds[var_name]:.6e}")
         
+    def _hm_context_bands(self, src):
+        """Band indices for the requested (stat, radius) pairs, cached per worker."""
+        if self._hm_band_idx is None:
+            from prepare_hm_context import band_indices
+            self._hm_band_idx = band_indices(src.tags(), self.hm_context_stats,
+                                             self.hm_context_radii)
+        return self._hm_band_idx
+
+    def _init_chip_sampling(self):
+        """Sampling probabilities over the already-fold-filtered chip positions.
+
+        Positions come from ``valid_split_positions``, which the fold mask has already
+        filtered, so stratifying adds **no new leak surface**: it changes how often a
+        permitted chip is drawn, never which chips are permitted. The weights themselves are
+        a function of position computed from input-window covariates only.
+
+        ``_pos_correction`` is the importance weight that takes the estimator back to the
+        population: uniform probability over stratified probability. Applied, the model still
+        targets the natural distribution and the stratification only improves the optimiser's
+        exposure to rare chips. Left off, the model targets a utility-weighted distribution
+        instead -- a different estimand, and the run is labelled as such.
+        """
+        self._pos_cdf = None
+        self._pos_correction = None
+        if getattr(self, "chip_sampling", "uniform") != "stratified" or self.mode == "grid":
+            return
+        if self.valid_split_positions is None:
+            raise ValueError("--chip_sampling stratified needs a split or fold mask")
+        if not self.chip_weights:
+            raise ValueError("--chip_sampling stratified needs --chip_weights")
+        tab = np.load(self.chip_weights)
+        w_tab, cs = tab["w"], int(tab["chip_size"])
+        if cs != self.chip_size:
+            raise ValueError(f"chip weights built at {cs} px, dataset uses {self.chip_size}")
+        ii = np.clip(np.array([i for i, _ in self.valid_split_positions]) // cs,
+                     0, w_tab.shape[0] - 1)
+        jj = np.clip(np.array([j for _, j in self.valid_split_positions]) // cs,
+                     0, w_tab.shape[1] - 1)
+        w = w_tab[ii, jj].astype(np.float64)
+        w = w / max(w.mean(), 1e-12)
+        p = 1.0 + float(self.chip_weight_alpha) * w
+        p = p / p.sum()
+        self._pos_cdf = np.cumsum(p)
+        self._pos_correction = ((1.0 / p.size) / p).astype(np.float32)
+        print(f"  Stratified chip sampling: alpha={self.chip_weight_alpha}, "
+              f"{p.size} positions, sampling ratio max/min "
+              f"{p.max() / p.min():.1f}, correction range "
+              f"[{self._pos_correction.min():.3f}, {self._pos_correction.max():.3f}]")
+
     def _init_split_positions(self, chip_size, stride):
         # Precompute valid positions for split if using split mask
         # Positions are filtered in BOTH random and grid mode. Grid mode previously ignored
@@ -297,6 +365,8 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
                     f"No valid positions found for split_value={self.split_value} / "
                     f"exclude_split_values={self.exclude_split_values}. Check split mask."
                 )
+
+        self._init_chip_sampling()
 
         # Precompute all chip positions if not random
         if self.mode == "grid":
@@ -378,6 +448,17 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
                 p = self.context_pattern.format(year=y)
                 if os.path.exists(p):
                     self._ctx_srcs[y] = rasterio.open(p)
+        if (self.hm_context_stats and self.hm_context_pattern is not None
+                and self._hmctx_srcs is None):
+            self._hmctx_srcs = {}
+            for y in years:
+                p = self.hm_context_pattern.format(year=y)
+                if os.path.exists(p):
+                    self._hmctx_srcs[y] = rasterio.open(p)
+            if not self._hmctx_srcs:
+                raise FileNotFoundError(
+                    f"--hm_context_stats was requested but no raster matched "
+                    f"{self.hm_context_pattern}; run scripts/prepare_hm_context.py first")
 
     def __len__(self):
         if self.mode == "grid":
@@ -404,6 +485,7 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
             input_t_idxs = [self.year_to_idx[y] for y in input_years]
             target_t_idxs = [self.year_to_idx.get(y, None) for y in target_years]  # None for missing years
             
+            chip_weight = 1.0
             if self.mode == "grid":
                 t, i, j = self.chip_positions[idx]
             else:
@@ -413,7 +495,12 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
                 # If using splits, sample from pre-computed valid positions
                 if self.valid_split_positions is not None:
                     # Randomly select a valid chip position
-                    pos_idx = np.random.randint(0, len(self.valid_split_positions))
+                    if self._pos_cdf is not None:
+                        pos_idx = int(min(np.searchsorted(self._pos_cdf, np.random.random()),
+                                          len(self.valid_split_positions) - 1))
+                        chip_weight = float(self._pos_correction[pos_idx])
+                    else:
+                        pos_idx = np.random.randint(0, len(self.valid_split_positions))
                     i, j = self.valid_split_positions[pos_idx]
                     # Add small random offset within chip for diversity.
                     # Skipped when excluding folds: a jittered chip could reach into the
@@ -505,6 +592,23 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
                         np.nan_to_num(src.read(2, window=win, masked=True).filled(np.nan), nan=1e4),
                     ], axis=0).astype(np.float32)
 
+            hm_ctx_arr = None
+            if self.hm_context_stats and self.hm_context_pattern is not None:
+                src = (self._hmctx_srcs or {}).get(input_years[-1])
+                if src is not None:
+                    win = rasterio.windows.Window(j, i, self.chip_size, self.chip_size)
+                    bands = self._hm_context_bands(src)
+                    raw = src.read(bands, window=win).astype(np.float32)
+                    # int16 x 1/32767 with -32768 as nodata. Nodata becomes 0: "no development
+                    # nearby", which is what open water and the poles are.
+                    hm_ctx_arr = np.where(raw == -32768, 0.0, raw * np.float32(1.0 / 32767.0))
+            if hm_ctx_arr is None and self.hm_context_stats and self.hm_context_pattern:
+                # Filled here rather than in either branch: the two sample dicts must carry
+                # exactly the same keys or the default collate fails the moment one sample in
+                # a batch takes the fallback path.
+                n_hm = len(self.hm_context_stats) * len(self.hm_context_radii)
+                hm_ctx_arr = np.zeros((n_hm, self.chip_size, self.chip_size), dtype=np.float32)
+
             if all_valid:
                 sample = {
                     "input_dynamic": torch.from_numpy(input_dynamic).float(),
@@ -515,9 +619,12 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
                     "input_years": input_years,
                     "target_years": target_years,
                     "end_year": end_year,
+                    "chip_weight": torch.tensor(chip_weight, dtype=torch.float32),
                 }
                 if context_arr is not None:
                     sample["change_context"] = torch.from_numpy(context_arr).float()
+                if hm_ctx_arr is not None:
+                    sample["hm_context"] = torch.from_numpy(hm_ctx_arr).float()
                 sample.update(targets)  # Add all horizon targets
                 return sample
         # If all attempts fail, return anyway (will be masked out in loss).
@@ -532,12 +639,15 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
             "input_years": input_years,
             "target_years": target_years,
             "end_year": end_year,
+            "chip_weight": torch.tensor(chip_weight, dtype=torch.float32),
         }
         if self.context_pattern is not None:
             if context_arr is None:
                 context_arr = np.zeros((2, self.chip_size, self.chip_size), dtype=np.float32)
                 context_arr[1] = 1e4          # "no past change anywhere near"
             sample["change_context"] = torch.from_numpy(context_arr).float()
+        if hm_ctx_arr is not None:
+            sample["hm_context"] = torch.from_numpy(hm_ctx_arr).float()
         sample.update(targets)  # Add all horizon targets
         return sample
 
@@ -566,6 +676,12 @@ def get_dataloader(
     exclude_split_values=None,
     norm_stats=None,
     context_pattern=None,
+    chip_weights=None,
+    chip_sampling="uniform",
+    chip_weight_alpha=4.0,
+    hm_context_pattern=None,
+    hm_context_stats=(),
+    hm_context_radii=(3, 30, 100),
 ):
     """
     Create a DataLoader for the Human Footprint dataset.
@@ -597,6 +713,12 @@ def get_dataloader(
         split_mask_file=split_mask_file,
         split_value=split_value,
         exclude_split_values=exclude_split_values,
+        chip_weights=chip_weights,
+        chip_sampling=chip_sampling,
+        chip_weight_alpha=chip_weight_alpha,
+        hm_context_pattern=hm_context_pattern,
+        hm_context_stats=hm_context_stats,
+        hm_context_radii=hm_context_radii,
         norm_stats=norm_stats,
         context_pattern=context_pattern,
     )

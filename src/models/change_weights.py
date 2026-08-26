@@ -83,12 +83,34 @@ def class_balanced_weights(
 
 
 CONTEXT_RADII = (1, 3, 10, 30, 100)
-N_CONTEXT_CHANNELS = len(CONTEXT_RADII) + 3
+# Radii and statistics for the neighbourhood-HM channels. Threshold-free by design: a mean at
+# radius r says both how close development is and how much of it there is, where a distance to
+# an HM cutoff says only the first and needs a cutoff nothing justifies.
+HM_CONTEXT_RADII = (3, 30, 100)
+
+
+def context_channel_count(context_radii=CONTEXT_RADII, hm_stats=(), hm_radii=HM_CONTEXT_RADII):
+    """How many channels :func:`quantile_context_from_distance` will emit.
+
+    This used to be the constant ``N_CONTEXT_CHANNELS``, read at two places to size the head
+    input convolutions. It is a function now because round 2 makes the radii configurable and
+    adds neighbourhood-HM channels — and a head sized for one count fed a tensor of another is a
+    shape error at best and a silently zeroed covariate at worst.
+    """
+    n = len(tuple(context_radii)) + 3
+    if hm_stats:
+        n += len(tuple(hm_stats)) * len(tuple(hm_radii))
+    return n
+
+
+N_CONTEXT_CHANNELS = context_channel_count()
 
 
 def quantile_context_from_distance(dist: torch.Tensor, past_change: torch.Tensor,
                                    hm_now: torch.Tensor | None = None,
-                                   radii=CONTEXT_RADII):
+                                   radii=CONTEXT_RADII,
+                                   hm_context: torch.Tensor | None = None,
+                                   hm_stats=(), hm_radii=HM_CONTEXT_RADII):
     """Context features from a *full-raster* distance-to-past-change band.
 
     Occupancy within radius r is simply ``dist <= r``, so no pooling is involved and the
@@ -98,13 +120,31 @@ def quantile_context_from_distance(dist: torch.Tensor, past_change: torch.Tensor
     0.752 mean occupancy for a single past-change pixel — which is an artifact of framing,
     not geography.
 
-    Returns [B, len(radii) + 3, H, W]: occupancy per radius, log1p distance, the signed
-    past change, and the current HM level.
+    ``hm_context`` carries the neighbourhood-HM bands — mean and max HM within each radius —
+    already selected and ordered by the dataloader, and is appended verbatim after the four
+    families above. They are passed raw on [0, 1], matching the occupancy indicators and the
+    signed past change; ``hm_now`` alone is in normalized units, which is inherited behaviour
+    left untouched so the round-1 baseline stays reproducible.
+
+    Returns ``[B, context_channel_count(...), H, W]``: occupancy per radius, log1p distance,
+    the signed past change, the current HM level, then the neighbourhood-HM bands.
     """
     feats = [(dist <= float(r)).to(dist.dtype) for r in radii]
     feats.append(torch.log1p(dist.clamp(min=0.0)) / 10.0)
     feats.append(past_change)
     feats.append(hm_now if hm_now is not None else torch.zeros_like(past_change))
+    if hm_stats:
+        want = len(tuple(hm_stats)) * len(tuple(hm_radii))
+        if hm_context is None:
+            raise ValueError(
+                f"hm_context is required for stats={tuple(hm_stats)} radii={tuple(hm_radii)} "
+                f"({want} bands) but none was supplied")
+        if hm_context.shape[1] != want:
+            raise ValueError(
+                f"hm_context has {hm_context.shape[1]} bands, expected {want} for "
+                f"stats={tuple(hm_stats)} radii={tuple(hm_radii)}")
+    if hm_context is not None:
+        feats.append(hm_context.to(dist.dtype))
     return torch.cat(feats, dim=1)
 
 

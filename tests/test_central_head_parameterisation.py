@@ -146,12 +146,24 @@ def test_central_context_changes_the_central_prediction():
     assert not torch.allclose(a, b), "central heads ignore the context they were given"
 
 
-def test_missing_context_is_tolerated():
-    """Inference paths without a context raster must not crash, they must see zeros."""
+def test_missing_context_is_refused():
+    """A missing context raster must fail, not quietly become zeros.
+
+    This test asserted the opposite until 2026-08-25. Tolerating the absence meant a run that
+    never wired the context through trained on a zeroed covariate and produced a perfectly
+    plausible-looking result — and the round-2 context is configurable in width, so an
+    off-by-one band selection became a live way to get the wrong covariate rather than a
+    hypothetical one. The behaviour was changed deliberately; see
+    docs/superpowers/specs/2026-08-25-distributional-round-2-design.md §5.2.
+    """
     model = build(central_context_channels=N_CTX, quantile_context_channels=N_CTX)
     dyn, stat, ctx = inputs()
+    with pytest.raises(RuntimeError, match="context"):
+        with torch.no_grad():
+            model(dyn, stat, quantile_context=None)
+    # ...and the supplied case still works, or this would pass for the wrong reason.
     with torch.no_grad():
-        pred = model(dyn, stat, quantile_context=None)
+        pred = model(dyn, stat, quantile_context=ctx)
     assert pred.shape == (B, 12, H, W)
     assert torch.isfinite(pred).all()
 

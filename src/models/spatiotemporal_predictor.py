@@ -5,6 +5,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from ..locationencoder import LocationEncoder
 from .convlstm import ConvLSTM
+from torch.utils.checkpoint import checkpoint
+from .quantile_spline import (
+    U_KNOTS_DEFAULT,
+    n_spline_params,
+    normal_height_bias,
+    rebuild,
+    splines_from_output,
+)
 
 class SpatioTemporalPredictor(nn.Module):
     """
@@ -50,7 +58,14 @@ class SpatioTemporalPredictor(nn.Module):
                  width_head_mode: str = 'per_horizon',
                  central_target_transform: str = 'none',
                  central_transform_scale: float = 0.01,
-                 initial_width_normalized: float = 0.065):
+                 initial_width_normalized: float = 0.065,
+                 head_family: str = 'triple',
+                 spline_u_knots=None,
+                 spline_learn_slopes: bool = True,
+                 spline_mean_nodes: int = 8,
+                 spline_checkpoint: bool = True,
+                 shape_head_hidden_layers: int = 1,
+                 shape_head_width: int = 0):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_static_channels = int(num_static_channels)
@@ -166,10 +181,32 @@ class SpatioTemporalPredictor(nn.Module):
         self.central_target_transform = str(central_target_transform)
         self.central_transform_scale = float(central_transform_scale)
 
-        def _head(in_ch, mid_ch, out_ch):
+        # 'triple' emits (lower, central, upper) and nothing else -- the frozen product.
+        # 'spline' additionally emits a full per-pixel quantile function, and derives the
+        # triple *from* it, so every existing consumer of the first 12 channels keeps working
+        # while the post-hoc width calibration and marginal reshaping become unnecessary.
+        if head_family not in ('triple', 'spline'):
+            raise ValueError(f"unknown head_family {head_family!r}")
+        self.head_family = str(head_family)
+        self.spline_learn_slopes = bool(spline_learn_slopes)
+        self.spline_mean_nodes = int(spline_mean_nodes)
+        self.spline_checkpoint = bool(spline_checkpoint)
+        knots = U_KNOTS_DEFAULT if spline_u_knots is None else tuple(spline_u_knots)
+        self.register_buffer('spline_u_knots', torch.tensor(knots, dtype=torch.float32),
+                             persistent=True)
+        # HM is an index on [0, 1], but the model works in normalized space, so the support
+        # constraint has to be carried in the same units. These are buffers rather than the
+        # plain attributes `hm_mean`/`hm_std` that the rest of the codebase uses because they
+        # must survive a checkpoint round trip: a spline restored without its support bounds
+        # would silently emit quantiles outside the physical range.
+        self.register_buffer('hm_norm', torch.tensor([0.0, 1.0]), persistent=True)
+        self.register_buffer('hm_norm_set', torch.tensor(False), persistent=True)
+
+        def _head(in_ch, mid_ch, out_ch, hidden_layers=None):
+            n_hidden = self.head_hidden_layers if hidden_layers is None else int(hidden_layers)
             layers = [nn.Conv2d(in_ch, mid_ch, kernel_size=3, padding=1, bias=True),
                       nn.ReLU(inplace=True)]
-            for _ in range(self.head_hidden_layers - 1):
+            for _ in range(n_hidden - 1):
                 layers += [nn.Conv2d(mid_ch, mid_ch, kernel_size=3, padding=1, bias=True),
                            nn.ReLU(inplace=True)]
             layers.append(nn.Conv2d(mid_ch, out_ch, kernel_size=1, bias=True))
@@ -201,6 +238,35 @@ class SpatioTemporalPredictor(nn.Module):
         n_modules = self.num_horizons if self.width_head_mode == 'per_horizon' else 1
         self.lower_heads = nn.ModuleList([_head(q_in, q_mid, n_out) for _ in range(n_modules)])
         self.upper_heads = nn.ModuleList([_head(q_in, q_mid, n_out) for _ in range(n_modules)])
+
+        if self.head_family == 'spline':
+            n_knots = self.spline_u_knots.numel()
+            n_bins = n_knots - 1
+            self.n_spline_params = n_spline_params(n_knots, self.spline_learn_slopes)
+            n_shape = self.n_spline_params - 2
+            # One width head and one shape head per horizon, at the same half-trunk width as
+            # the quantile heads they replace.
+            self.width_heads = nn.ModuleList([_head(q_in, q_mid, 1)
+                                              for _ in range(self.num_horizons)])
+            # The shape head carries the whole distribution's form: 27 outputs from q_mid
+            # channels at the default. These two flags size it independently of the other
+            # heads, because --head_hidden_layers goes through the shared factory and would
+            # confound a shape-head experiment with a change to the central head.
+            s_width = int(shape_head_width) or q_mid
+            self.shape_heads = nn.ModuleList([
+                _head(q_in, s_width, n_shape, hidden_layers=shape_head_hidden_layers)
+                for _ in range(self.num_horizons)])
+            # `scale` is the *full* 95% width, where initial_width_normalized is a half-width.
+            b0 = math.log(math.expm1(max(2.0 * self.initial_width_normalized, 1e-4)))
+            for head in self.width_heads:
+                nn.init.constant_(head[-1].bias, b0)
+            hb = normal_height_bias(self.spline_u_knots)
+            for head in self.shape_heads:
+                nn.init.zeros_(head[-1].weight)
+                nn.init.zeros_(head[-1].bias)
+                head[-1].bias.data[:n_bins] = hb
+                # Slopes start at softplus(0), which the Fritsch-Carlson alternative would
+                # also give up to a constant; the heights carry the shape at init.
         if self.monotone_quantile_width:
             heads = list(self.lower_heads) + list(self.upper_heads)
             if self.width_head_mode in ('power', 'power_plus'):
@@ -245,6 +311,26 @@ class SpatioTemporalPredictor(nn.Module):
             return self.initial_width_normalized * torch.exp(raw.clamp(-6.0, 6.0))
         return F.softplus(raw)
 
+    def set_norm_stats(self, hm_mean, hm_std):
+        """Record the HM normalisation so the spline's support can be expressed in it."""
+        self.hm_norm.data = torch.tensor([float(hm_mean), float(hm_std)],
+                                         device=self.hm_norm.device)
+        self.hm_norm_set.data = torch.tensor(True, device=self.hm_norm_set.device)
+
+    def spline_clamp(self):
+        """HM's physical range [0, 1], expressed in the model's normalized units.
+
+        Refuses to guess. An unclamped spline trains and predicts perfectly happily while
+        emitting negative HM in its lower tail, and nothing downstream would object -- the
+        rasters would simply carry impossible values in the 2.5% quantile of remote pixels.
+        """
+        if not bool(self.hm_norm_set):
+            raise RuntimeError(
+                "head_family='spline' needs the HM normalisation: call "
+                "model.set_norm_stats(hm_mean, hm_std) before the first forward pass.")
+        mean, std = self.hm_norm[0], self.hm_norm[1]
+        return float((0.0 - mean) / std), float((1.0 - mean) / std)
+
     def forward(self, input_dynamic, input_static, lonlat=None, quantile_context=None):
         # input_dynamic: [B, T, C_d, H, W]
         # input_static: [B, C_s, H, W]
@@ -272,11 +358,22 @@ class SpatioTemporalPredictor(nn.Module):
         def _with_context(n_channels):
             if n_channels <= 0:
                 return last_hidden
+            # Refuse rather than substitute zeros. The old behaviour trained happily on a
+            # zeroed covariate whenever the context raster was not wired through, which reads
+            # downstream as a real result; and now that the channel count varies with the
+            # flags, an off-by-one band selection is a live way to get the wrong covariate
+            # rather than a hypothetical one.
             if quantile_context is None:
-                ctx = last_hidden.new_zeros(B, n_channels, H, W)
-            else:
-                ctx = quantile_context.to(last_hidden.dtype)
-            return torch.cat([last_hidden, ctx], dim=1)
+                raise RuntimeError(
+                    f"this model expects {n_channels} context channels but none was supplied. "
+                    f"Pass change_context (and hm_context, if configured) through the batch; "
+                    f"a zeroed covariate is not a safe default.")
+            if quantile_context.shape[1] != n_channels:
+                raise RuntimeError(
+                    f"context has {quantile_context.shape[1]} channels, this model expects "
+                    f"{n_channels}. Check --context_radii / --hm_context_stats against the "
+                    f"checkpoint they were trained with.")
+            return torch.cat([last_hidden, quantile_context.to(last_hidden.dtype)], dim=1)
 
         q_input = _with_context(self.quantile_context_channels)
         c_input = _with_context(self.central_context_channels)
@@ -310,6 +407,9 @@ class SpatioTemporalPredictor(nn.Module):
                 return q_input
             dhat = (central.detach() - hm_t0) * self.dhat_context_scale
             return torch.cat([q_input, dhat, dhat.abs()], dim=1)
+
+        if self.head_family == 'spline':
+            return self._forward_spline(centrals, _q_input_for)
 
         # Half-widths per horizon, non-decreasing in lead time by construction.
         w_lo, w_up = [], []
@@ -375,3 +475,50 @@ class SpatioTemporalPredictor(nn.Module):
         # Channel ordering: [lower_5yr, central_5yr, upper_5yr, lower_10yr, central_10yr, upper_10yr, ...]
         pred = torch.cat(preds, dim=1)
         return pred
+
+    def _forward_spline(self, centrals, q_input_for):
+        """Emit the triple *and* the quantile function behind it.
+
+        Output is ``[B, 12 + 4 * P, H, W]``. The first 12 channels keep the historical
+        ``(lower, central, upper) x 4`` order, so every existing reader -- the prediction
+        writer, the stitcher, the scorers, the T1/T2 scorecard rows -- is untouched. They are
+        now *derived* from the spline rather than predicted alongside it, which is what makes
+        the ensemble a representation of the published maps instead of a second product.
+
+        Channel 1 of each horizon is ``E[Q]``, not the median. The mean is the RMSE-optimal
+        point estimate and this residual is strongly right-skewed, so the two differ; that
+        also means the published central is no longer the midpoint of the published interval,
+        and on a heavily skewed pixel it can even fall outside it. That is honest rather than
+        convenient, and the scorer reports how often it happens.
+        """
+        clamp = self.spline_clamp()
+        blocks = []
+        cum = None
+        for h_idx in range(self.num_horizons):
+            qi = q_input_for(centrals[h_idx])
+            # Non-negative increments accumulated across horizons: the 95% width cannot
+            # shrink with lead time (T4.2), by construction rather than by a later pass.
+            step = F.softplus(self.width_heads[h_idx](qi))
+            cum = step if cum is None else cum + step
+            blocks.append(torch.cat([centrals[h_idx], cum, self.shape_heads[h_idx](qi)], dim=1))
+        block = torch.cat(blocks, dim=1)
+
+        splines = splines_from_output(block, self.num_horizons, self.spline_u_knots,
+                                      learn_slopes=self.spline_learn_slopes,
+                                      clamp=clamp, n_triple=0)
+        n_nodes = self.spline_mean_nodes
+        u_knots = self.spline_u_knots
+
+        def _mean(anchor, scale, v_knots, derivs):
+            return rebuild(anchor, scale, v_knots, derivs, u_knots, clamp).mean(n_nodes=n_nodes)
+
+        preds = []
+        for sp in splines:
+            lower, _, upper = sp.triple()
+            if self.spline_checkpoint and torch.is_grad_enabled():
+                central = checkpoint(_mean, sp.anchor, sp.scale, sp.v_knots, sp.derivs,
+                                     use_reentrant=False)
+            else:
+                central = sp.mean(n_nodes=n_nodes)
+            preds.extend([lower.unsqueeze(1), central.unsqueeze(1), upper.unsqueeze(1)])
+        return torch.cat(preds + [block], dim=1)

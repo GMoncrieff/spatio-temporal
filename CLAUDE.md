@@ -1,51 +1,73 @@
 # Working notes for this repository
 
-Spatiotemporal Human Modification (HM) forecasting: a ConvLSTM producing a central forecast
-and 2.5/97.5 quantile intervals at +5/+10/+15/+20 yr, plus a post-hoc ensemble layer
-(`src/ensemble/`) that adds spatial and temporal coherence on top of the per-pixel
-marginals.
+Spatiotemporal Human Modification (HM) forecasting. **Two systems live here and it matters
+which one you are working on.**
 
-Active branch: **`ensemble`**. **The model is frozen and the global product is BUILT and
-PUBLISHED.** Three documents supersede everything else and stand on their own:
+Active branch: **`dist-convlstm`**.
 
-- **`docs/global_ensemble_methodology.md`** — the method: the ConvLSTM, the calibration and
-  marginal fitting, and the ensemble generation. Start here.
-- **`docs/global_scorecard.md`** — every evaluation on the card: what it tests, what failure
-  would look like, where its threshold came from, and what the system scored.
-- **`docs/fitting_running_model.md`** — the runbook: setup, data requirements, and every script
-  in order with measured cost, plus how to produce the figures.
+## 1. The published product — frozen, complete, do not change
 
-`docs/background/` holds the superseded development record — 22 dead ConvLSTM experiments, the
-regional lineage, the instrument rewrites and the phase plans. **None of it describes the
-current product**, and the three documents above do not depend on it. Consult it only for the
-history of why a choice was made.
+Branch `ensemble`, experiment **`g1_foldb4`**. A ConvLSTM emitting `(lower, central, upper)` at
++5/+10/+15/+20 yr, plus a four-stage post-hoc chain (`src/ensemble/`) — width calibration,
+empirical marginal, spatial spectrum, AR(1) horizon coupling — and a 400-member ensemble.
+**99/134 scorecard rows.** Artifacts on the HDD at `data/ensemble/exp/g1_foldb4`; checkpoints in
+`data/ensemble/production/FOLD_CHECKPOINTS.json`.
 
-## Where the project is
+Three documents supersede everything else and stand on their own:
 
-**The global product is built, scored and published.** Experiment **`g1_foldb4`**, artifacts on
-the HDD at `data/ensemble/exp/g1_foldb4`. Card: **99/134 scored rows**. Deliverables: hindcast
-and forecast ensembles at M=400 as icechunk, 24 verified COGs (`cogs_hindcast/`,
-`cogs_forecast/`) plus a seamless fold-mean display set (`cogs_hindcast_mean/`). Production
-model is `spatio-temporal-convlstm/6zkppztt/checkpoints/epoch=12-step=169.ckpt`, trained on
-every chip via `--train_all_splits`.
+- **`docs/global_ensemble_methodology.md`** — the method. Start here.
+- **`docs/global_scorecard.md`** — every evaluation: what it tests, what failure looks like,
+  where its threshold came from, what it scored.
+- **`docs/fitting_running_model.md`** — the runbook, with measured cost per stage.
 
-**The one thing to take up next** is not a model change: `predict_change_rates.py` and the
-sampled M=400 ensemble disagree on the far band (0.000000 against 0.034). Those two
-implementations have agreed to 1-11% every previous time, so the gap localises a bug to one of
-them, and the far field cannot be worked on until it is settled.
+Its three named defects: aggregate over-dispersion, long-range structure at 0.230 of budget, and
+**the far field emitting 0.034 of the observed rate of new development beyond 100 px**. The last
+is a property of the quantile heads — far-band half-widths are ~0.004, so +0.05 is ~12
+half-widths out — and no post-hoc layer reaches it. That defect is why system 2 exists.
 
-**The far field is the known headline defect** — `P(Δ>0.05)` beyond 100 px reads 0.034 of
-observed. It is a property of the model's quantile heads (half-widths ~0.004 there, so +0.05 is
-~12 half-widths out), not of the calibration, and no post-hoc layer reaches it.
+One open question, never settled: `predict_change_rates.py` and the sampled M=400 ensemble
+disagree on the far band (0.000000 against 0.034), where they had agreed to 1-11% every previous
+time. It blocks far-field work *on the frozen product* only.
+
+## 2. Active work — the end-to-end distributional model
+
+Branch **`dist-convlstm`**. The model emits a full per-pixel quantile function `Q_h(u|x)` and
+that function *is* the product: no conformal scaling, no width factors, no empirical marginal
+reshaping, no horizon-monotonicity pass. A monotone rational-quadratic spline over absolute HM
+with **fixed tail-dense knots**, anchored at persistence through the existing zero-init residual
+head, with a cumulative scale so spread cannot shrink with lead time, trained on CRPS.
+
+- **`docs/dist_model_phase.md`** — round 1: the method, every result, every null.
+- **`docs/dist_scorecard.md`** — every metric explained in plain terms with its measured value.
+- **`docs/superpowers/specs/2026-08-25-distributional-round-2-design.md`** — round 2's design.
+
+**Round 1 adopted nothing but established three things**, all properties of the design rather
+than of a knob: the model beats persistence as a full distribution by ~13% at every horizon and
+its published triple reproduces its own quantile function exactly; **pure CRPS costs nothing
+centrally** (`--mu_mse_weight 0` leaves `rmse5` inside a 2%-wide band); and **the trunk must hear
+the distributional objective** (isolating it leaves RMSE intact while `crps_skill5` collapses
+0.13 → 0.059). Separately, NLL collapses to a point mass at the width floor — the *opposite*
+direction to the incumbent's Gaussian-NLL failure, which inflated widths 7x.
+
+**Why nothing was adopted, and the round's real finding:** `tail_reach20` varies by **4.3 within
+one configuration**, so six of ten variants were undecidable. Worse, three baseline replicates
+all landed in one mode and made the band read 0.86 — four times too tight. And `tail_reach20`
+and `pit_ks5` correlate at **r = 0.691** across 13 runs, so three knobs that each looked like
+"trades calibration for tail reach" were one axis seen three times.
+
+**Round 2 is implemented, tested and PAUSED before its Phase 1 stability gate.** Nothing is
+committed. Resume with `./scripts/run_dist_gate.sh` — see §The loops.
 
 ## Environment and scale
 
 - Conda env **`spatio-temporal-dl`**, not base:
   `/home/glenn/miniforge3/envs/spatio-temporal-dl/bin/python`.
-- **Screening is regional, but southern Africa is blind to the far field.** Southern Africa
-  (1.86 Mpx) is a fast A/B *for near-field questions only*: its observed far-field change rate is
-  0.0000, so any experiment aimed at what the model does beyond ~100 px from past change will
-  read as "no effect" there whatever it actually did. **Screen far-field work on Africa**
+- **Screening is regional, and southern Africa's far-field band is EMPTY.** Measured
+  2026-08-24: the >100 px distance band contains **zero pixels**, not merely a zero change
+  rate. So a far-field row there is structurally absent, not quiet, and no experiment aimed at
+  what the model does beyond ~100 px can report anything. Band 4 (30-100 px, 147,721 px) is the
+  furthest measurable proxy, observed `P(Δ>0.05)` = 0.00225 at h=20. Southern Africa (1.86 Mpx)
+  remains the right fast A/B for everything else. **Screen far-field work on Africa**
   (63.1 Mpx), which has a real far-field rate. The globe (17111 x 40000 = 684 Mpx grid, 184.6M
   valid px) stays for the published product only.
 - **Global cost, projected from the Africa run** (which is the only continental measurement
@@ -61,8 +83,8 @@ observed. It is a property of the model's quantile heads (half-widths ~0.004 the
   pre-`--central_residual` lineage (its ensembles, residuals and validation), the global null,
   and Africa's three M=400 stores — every one of them regenerates from recorded seeds.
   **`data/ensemble/hindcast/stitched/` was deliberately kept**: it is the *main-branch
-  architecture* global hindcast and the baseline for the old-vs-new comparison. Root has
-  ~90 GB free; southern-Africa ensembles at M=400 are ~3 GB
+  architecture* global hindcast and the baseline for the old-vs-new comparison. Root has **~201 GB free** (2026-08-25);
+  southern-Africa ensembles at M=400 are ~3 GB
   each, so delete superseded ones (they regenerate from recorded seeds in ~3 min). Africa at
   M=400 is ~85 GB per ensemble and belongs on the HDD — pass the HDD path directly as
   `--out`, never a symlink, since the store's directory gets cleared with `shutil.rmtree`
@@ -91,6 +113,12 @@ observed. It is a property of the model's quantile heads (half-widths ~0.004 the
 | **score calibration variants on held-out folds** | `scripts/score_width_variants.py --score_folds 4,5 --variants …` | ~15 min |
 | **check a calibration keeps the far-field tail** | `scripts/band_tail_audit.py --variants …` | seconds |
 | **score a screened configuration**, central *and* width, no ensemble | `scripts/score_model_experiment.py` | ~40 s (5 min on Africa) |
+| **one distributional experiment** (train held-out folds, predict, stitch) | `BASE_ARGS=... ./scripts/run_central_experiment.sh <name> 0,1 1,2 "<flags>"` | ~50 min, 2 folds in parallel |
+| **score a distributional model**, no ensemble | `scripts/score_distributional_model.py --stitched_dir … --folds 1,2` | ~2 min |
+| **rank runs against the measured floor** | `scripts/compare_dist_runs.py` | seconds |
+| **the stability gate** (4 configs x 3 seeds, judged on *spread*) | `./scripts/run_dist_gate.sh` | ~10 h |
+| **the round-2 slate** (needs `GATE_FLAGS`; refuses without it) | `GATE_FLAGS=… SEEDS=… ./scripts/run_dist_phase2.sh` | ~13-20 h |
+| **build the neighbourhood-HM covariate** (once) | `scripts/prepare_hm_context.py` | 2:45 per base year, 0.75 GB each |
 
 `run_region_loop.sh` re-derives the recalibration, spectrum and AR(1) coupling from *that
 model's own* residuals. Never carry them over between configurations. `SHAPE=<u_bound>`
@@ -147,11 +175,12 @@ disagreement localises the bug to the generation path.
     stratum is 6% of the region against 40% of Africa. Regional iteration is right for speed,
     but a stratified finding measured only there is provisional. Only w2000 reaches +20 yr
     whatever the geography, so every h=20 number is in-sample in time.
-    **This cost the project a whole phase.** Southern Africa's observed far-field change rate is
-    0.0000, so "the ensemble emits zero change beyond 100 px" was recorded as a *win* there — and
-    is a 44x under-prediction globally, where the observed rate is 0.0021 at h=20. All 22 model
-    experiments were screened against that blind spot. A metric that reads 0 on the screening
-    region cannot rank anything.
+    **This cost the project a whole phase.** Southern Africa's far-field band holds **zero
+    pixels** (measured 2026-08-24; earlier notes said "rate 0.0000", which understated it), so
+    "the ensemble emits zero change beyond 100 px" was recorded as a *win* there — and is a 44x
+    under-prediction globally, where the observed rate is 0.0021 at h=20. All 22 model
+    experiments were screened against that blind spot. A metric with no denominator on the
+    screening region cannot rank anything.
 15. **A regional working set can hide a quadratic.** `validate_ensemble.py` allocated
     `(M, H, W)` float64 for the block-mean pass, which at `--block_sizes 1,10,100` is the
     pixel grid: 6 GB on southern Africa's 1.86 Mpx at M=400 and unremarkable, 50 GB on
@@ -269,12 +298,53 @@ disagreement localises the bug to the generation path.
     skill (0.191 → 0.171 at h=20). Make the interval asymmetric about the unmoved centre
     instead — an uncentred width factor does exactly that, at no cost to the central field.
 
+29. **Three replicates can all land in one mode, and the band you measure is then far too
+    narrow.** Three baseline seeds gave a `tail_reach20` spread of 0.86; three replicates of a
+    *variant* of the same configuration gave **4.3**. Every bar applied against the first number
+    was wrong, and the round's only apparent winner failed its own replication. If a floor's
+    replicates agree suspiciously well, suspect the sample before believing the band. This is
+    rule 20's problem one level deeper: not "is the floor large" but "did I sample it".
+30. **Two metrics that look independent can be one axis.** `tail_reach20` and `pit_ks5` correlate
+    at **r = 0.691** across 13 runs. Three separate knobs each appeared to trade calibration for
+    tail reach; they were all landing at different points on one axis every run sits on.
+    Correlate the metrics across runs before reading N knobs as N findings.
+31. **A metric failure and a model failure are indistinguishable from the outside.** A degenerate
+    u-grid — two output levels equal after the writer's `%.8g` tag rounding — made a segment slope
+    0/0 and CRPS `NaN` for every pixel. Rule 3 again, and the fix is to put the check where the
+    cause is one line away: the reader now refuses a non-increasing grid rather than passing NaN
+    downstream.
+32. **"The flags I passed" is not "the flags that took effect."** `run_hindcast_folds.py` injects
+    the incumbent's own loss weights into every fold command and `--extra_train_args` is appended
+    last, so **anything `BASE_ARGS` does not name is silently inherited**. A floor run trained
+    with SSIM and Laplacian active while the slate defined its baseline as probabilistic-alone;
+    caught at 35 min by reading the run's own `LOSS WEIGHTS` banner. `scripts/dist_base_args.sh`
+    holds the baseline once and `verify_loss_weights` reads it back out of the log. Rule 25 in a
+    new costume.
+33. **A lever whose signature only reaches W&B cannot be verified from a log.** A cosine-schedule
+    fingerprint would have false-alarmed on every legitimate run until an explicit print was
+    added. Before writing a check, confirm the thing it greps for is actually emitted — and
+    prove the check fires on a control, or it checks nothing.
+34. **The second implementation earns its keep, third time now.** A closed-form CRPS was wrong by
+    a *relative* error of ~1: the crossing point clips to a segment end far more often than it
+    lands inside one, so the second piece's error at its own origin is not zero. Only a dense
+    numerical reference sharing no code with it caught this.
+35. **Check a filename before writing to it.** `tests/test_round2_flags.py` already existed — the
+    incumbent's round 2 — and was overwritten by picking the obvious name. Restored from git; the
+    distributional one is `test_dist_round2_flags.py`.
+
 ## Conventions
 
 - Flat argparse, no config framework. New flags are additive and default to today's
   behaviour; the boolean idiom is
   `type=lambda x: (str(x).lower()=='true'), nargs='?', const=True, default=…`.
 - Tests are flat in `tests/`, pytest, `sys.path.insert(0, parent)` + absolute imports,
-  synthetic tensors. 7 pre-existing failures in the legacy suite are stale (they assert a
-  4-channel output from a model that emits 12) and fail identically with this branch stashed.
+  synthetic tensors. **The suite stands at 318 passed / 7 failed**; those 7 are stale legacy
+  tests (they assert a 4-channel output from a model that emits 12) and fail identically with
+  this branch stashed. Any other failure is yours.
 - Scripts write to `data/ensemble/exp/<name>/` so configurations never collide.
+- **The distributional lineage keeps its own drivers and scorers**, none of which touch the
+  frozen product's: `run_dist_gate.sh`, `run_dist_phase2.sh`, `run_dist_floor.sh`,
+  `run_dist_replicate.sh` (all sourcing `dist_base_args.sh`), `score_distributional_model.py`,
+  `compare_dist_runs.py`, `prepare_hm_context.py`. `score_model_experiment.py` is deliberately
+  left untouched and still worth running — its `k_up` table is an independent width check on
+  the emitted triple, and two instruments sharing no code is how a bug gets localised.

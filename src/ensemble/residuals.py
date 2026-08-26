@@ -261,41 +261,73 @@ def stitch_fold_predictions(
     srcs = {f: rasterio.open(fold_paths[f]) for f in fold_ids}
     ref = srcs[fold_ids[0]]
     profile = ref.profile.copy()
-    profile.update(dtype="float32", count=1, nodata=nodata, compress="deflate", BIGTIFF="YES")
+    # Multi-band and integer sources pass straight through: the quantile-function raster the
+    # distributional head writes is 64 int16 bands, and the fold select is per pixel and
+    # entirely band-agnostic. Single-band float sources keep the historical float32/NaN
+    # profile exactly, so the scored product is untouched.
+    n_bands = int(ref.count)
+    is_float = np.issubdtype(np.dtype(ref.dtypes[0]), np.floating)
+    out_dtype = "float32" if is_float else ref.dtypes[0]
+    out_nodata = nodata if is_float else ref.nodata
+    profile.update(dtype=out_dtype, count=n_bands, nodata=out_nodata,
+                   compress="deflate", BIGTIFF="YES")
     for f, s in srcs.items():
         if (s.height, s.width) != (ref.height, ref.width) or s.transform != ref.transform:
             raise ValueError(f"Fold {f} raster geometry differs from fold {fold_ids[0]}")
+
+    # Dataset tags and band descriptions travel with the data. The quantile-function raster
+    # carries its u grid in a tag, and that tag *is* the contract: without it the levels the
+    # bands stand for are unknown, and a reader that guessed them would silently score a
+    # different grid from the one the model wrote. Nothing else in this pipeline had tags, so
+    # the omission was invisible until the first multi-band stitch.
+    src_tags = {k: v for k, v in ref.tags().items() if k != "AREA_OR_POINT"}
+    src_descs = list(ref.descriptions)
 
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     n_written = 0
     with rasterio.open(fold_mask_path) as mask_src:
         mask_win, row_off, col_off = _aligned_window(profile, mask_src)
         with rasterio.open(out_path, "w", **profile) as dst:
+            if src_tags:
+                dst.update_tags(**src_tags)
+            for bi, desc in enumerate(src_descs):
+                if desc:
+                    dst.set_band_description(bi + 1, desc)
+            fill = np.nan if is_float else out_nodata
+
+            def _valid(a):
+                return np.isfinite(a) if is_float else (a != out_nodata)
+
             for r0 in range(0, ref.height, block_rows):
                 rows = min(block_rows, ref.height - r0)
-                out = np.full((rows, ref.width), np.nan, dtype=np.float32)
+                win = Window(0, r0, ref.width, rows)
+                out = np.full((n_bands, rows, ref.width), fill, dtype=out_dtype)
                 fmask = mask_src.read(
                     1, window=Window(col_off, row_off + r0, ref.width, rows), boundless=True, fill_value=0
                 )
                 if mode == "mean":
-                    acc = np.zeros((rows, ref.width), dtype=np.float64)
-                    cnt = np.zeros((rows, ref.width), dtype=np.int32)
+                    acc = np.zeros((n_bands, rows, ref.width), dtype=np.float64)
+                    cnt = np.zeros((n_bands, rows, ref.width), dtype=np.int32)
                     for f in fold_ids:
-                        vals = srcs[f].read(1, window=Window(0, r0, ref.width, rows))
-                        ok = np.isfinite(vals)
+                        vals = srcs[f].read(window=win)
+                        ok = _valid(vals)
                         acc[ok] += vals[ok]
                         cnt[ok] += 1
                     got = cnt > 0
-                    out[got] = (acc[got] / cnt[got]).astype(np.float32)
+                    mean_vals = acc[got] / cnt[got]
+                    out[got] = (mean_vals if is_float
+                                else np.rint(mean_vals)).astype(out_dtype)
                 else:
                     for f in fold_ids:
                         sel = fmask == f
                         if not sel.any():
                             continue
-                        vals = srcs[f].read(1, window=Window(0, r0, ref.width, rows))
-                        out[sel] = vals[sel]
-                n_written += int(np.isfinite(out).sum())
-                dst.write(out, 1, window=Window(0, r0, ref.width, rows))
+                        vals = srcs[f].read(window=win)
+                        out[:, sel] = vals[:, sel]
+                # Counted on the first band so the number keeps its historical meaning
+                # (valid pixels), rather than becoming valid pixels times band count.
+                n_written += int(_valid(out[0]).sum())
+                dst.write(out, window=win)
     for s in srcs.values():
         s.close()
     return {"path": str(out_path), "n_valid_px": n_written, "mode": mode}

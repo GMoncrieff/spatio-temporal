@@ -122,6 +122,84 @@ def test_stitch_picks_the_fold_that_held_the_pixel_out(tmp_path):
     assert info["n_valid_px"] == 64
 
 
+def _write_bands(path, arr, dtype="int16", nodata=-32768):
+    profile = {
+        "driver": "GTiff", "height": arr.shape[1], "width": arr.shape[2], "count": arr.shape[0],
+        "dtype": dtype, "crs": "EPSG:4326", "transform": from_origin(-180, 84, 0.009, 0.009),
+        "nodata": nodata,
+    }
+    with rasterio.open(path, "w", **profile) as dst:
+        dst.write(arr.astype(dtype))
+    return str(path)
+
+
+def test_stitch_carries_every_band_of_a_multiband_integer_raster(tmp_path):
+    """The quantile-function raster is 64 int16 bands, and the fold select is band-agnostic.
+
+    A stitcher that quietly kept band 1 would leave the published triple describing one model
+    and the quantile function behind it describing another -- and both rasters would look
+    perfectly well formed.
+    """
+    fold_mask = np.zeros((8, 8), dtype=np.uint8)
+    fold_mask[:4] = 1
+    fold_mask[4:] = 2
+    mask_path = _write(tmp_path / "folds_mb.tif", fold_mask, dtype="uint8")
+    n_bands = 5
+    a1 = np.stack([np.full((8, 8), 100 + b) for b in range(n_bands)])
+    a2 = np.stack([np.full((8, 8), 200 + b) for b in range(n_bands)])
+    p1 = _write_bands(tmp_path / "qf1.tif", a1)
+    p2 = _write_bands(tmp_path / "qf2.tif", a2)
+    out = tmp_path / "qf_stitched.tif"
+    info = stitch_fold_predictions({1: p1, 2: p2}, mask_path, str(out))
+    with rasterio.open(out) as s:
+        got = s.read()
+        assert s.count == n_bands
+        assert s.dtypes[0] == "int16"
+        assert s.nodata == -32768
+    for b in range(n_bands):
+        assert np.all(got[b, :4] == 100 + b)
+        assert np.all(got[b, 4:] == 200 + b)
+    # Counted on band 1, so the number keeps meaning "valid pixels", not pixels x bands.
+    assert info["n_valid_px"] == 64
+
+
+def test_stitch_carries_dataset_tags_and_band_descriptions(tmp_path):
+    """The quantile-function raster keeps its u grid in a tag, and that tag is the contract.
+
+    Without it the levels the 64 bands stand for are unknown, and any reader that guessed
+    them would silently score a different grid from the one the model wrote. Nothing else in
+    this pipeline carries tags, so the omission was invisible until the first multi-band
+    stitch -- where it stopped a floor run one replicate in.
+    """
+    fold_mask = np.ones((4, 4), dtype=np.uint8)
+    mask_path = _write(tmp_path / "folds_tags.tif", fold_mask, dtype="uint8")
+    arr = np.stack([np.full((4, 4), 7), np.full((4, 4), 9)])
+    src = tmp_path / "tagged.tif"
+    _write_bands(src, arr)
+    with rasterio.open(src, "r+") as ds:
+        ds.update_tags(u_levels="0.025,0.975", head_family="spline")
+        ds.set_band_description(1, "u=0.025")
+        ds.set_band_description(2, "u=0.975")
+    out = tmp_path / "tagged_stitched.tif"
+    stitch_fold_predictions({1: str(src)}, mask_path, str(out))
+    with rasterio.open(out) as s:
+        assert s.tags()["u_levels"] == "0.025,0.975"
+        assert s.tags()["head_family"] == "spline"
+        assert s.descriptions == ("u=0.025", "u=0.975")
+
+
+def test_stitch_mean_mode_averages_every_band(tmp_path):
+    fold_mask = np.ones((4, 4), dtype=np.uint8)
+    mask_path = _write(tmp_path / "folds_mean.tif", fold_mask, dtype="uint8")
+    p1 = _write_bands(tmp_path / "m1.tif", np.stack([np.full((4, 4), 10), np.full((4, 4), 20)]))
+    p2 = _write_bands(tmp_path / "m2.tif", np.stack([np.full((4, 4), 20), np.full((4, 4), 40)]))
+    out = tmp_path / "m_stitched.tif"
+    stitch_fold_predictions({1: p1, 2: p2}, mask_path, str(out), mode="mean")
+    with rasterio.open(out) as s:
+        got = s.read()
+    assert np.all(got[0] == 15) and np.all(got[1] == 30)
+
+
 def test_kfold_splits_partition_every_chip_exactly_once(tmp_path, monkeypatch):
     import importlib
 

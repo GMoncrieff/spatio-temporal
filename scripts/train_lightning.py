@@ -38,6 +38,19 @@ def _csv_ints(spec):
     return [int(x) for x in str(spec).split(",")]
 
 
+def _csv_strs(v):
+    return tuple(x.strip() for x in str(v).split(",") if x.strip()) if v else ()
+
+
+def _n_context_channels(args):
+    """Head input width. Was the constant N_CONTEXT_CHANNELS; the radii and the
+    neighbourhood-HM channels are configurable now, so it is a function of the flags."""
+    from src.models.change_weights import context_channel_count
+    return context_channel_count(_csv_ints(args.context_radii) or (1, 3, 10, 30, 100),
+                                 _csv_strs(args.hm_context_stats),
+                                 _csv_ints(args.hm_context_radii) or (3, 30, 100))
+
+
 def _experiment_kwargs(args):
     """Model-phase flags, as constructor kwargs. Every default is today's behaviour."""
     return dict(
@@ -53,11 +66,32 @@ def _experiment_kwargs(args):
         weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,
         weight_avg_last=args.weight_avg_last,
+        abort_on_nonfinite=args.abort_on_nonfinite,
         head_hidden_layers=args.head_hidden_layers,
         width_head_mode=args.width_head_mode,
         central_target_transform=args.central_target_transform,
         quantile_loss=args.quantile_loss,
         histogram_soft=args.histogram_soft,
+        head_family=args.head_family,
+        dist_loss=args.dist_loss,
+        crps_nodes=args.crps_nodes,
+        crps_tail_lam=args.crps_tail_weight,
+        crps_tail_u0=args.crps_tail_u0,
+        crps_tail_p=args.crps_tail_p,
+        mu_mse_weight=args.mu_mse_weight,
+        spline_learn_slopes=(args.spline_slopes == 'learned'),
+        spline_mean_nodes=args.spline_mean_nodes,
+        spline_checkpoint=args.spline_checkpoint,
+        chip_weight_correct=args.chip_sampling_correct,
+        spline_knots=args.spline_knots,
+        crps_tail_lam_lo=args.crps_tail_weight_lo,
+        crps_tail_u0_lo=args.crps_tail_u0_lo,
+        shape_head_hidden_layers=args.shape_head_hidden_layers,
+        shape_head_width=args.shape_head_width,
+        context_radii=_csv_ints(args.context_radii),
+        hm_context_stats=_csv_strs(args.hm_context_stats),
+        hm_context_radii=_csv_ints(args.hm_context_radii),
+        isolate_shape_grad=args.isolate_shape_grad,
     )
 from torchgeo_dataloader import get_dataloader, hm_files, component_files, static_files, years
 
@@ -316,7 +350,7 @@ if __name__ == "__main__":
     # --- Model-phase experiment flags. All additive; defaults reproduce today's model. ---
     parser.add_argument(
         "--checkpoint_monitor", type=str, default="val_total_loss",
-        choices=["val_total_loss", "val_central_loss", "val_loss"],
+        choices=["val_total_loss", "val_central_loss", "val_loss", "val_crps"],
         help="Metric ModelCheckpoint selects on. val_total_loss (the default) includes "
              "pinball and the histogram term, so a quantile-only change still selects a "
              "different epoch and therefore a different central field; central-only A/Bs "
@@ -399,6 +433,142 @@ if __name__ == "__main__":
         help="Use the differentiable soft-binned histogram. The default hard binning "
              "carries no gradient at all, so the histogram term has never trained anything.",
     )
+    # --- The distributional head. 'triple' (the default) is the frozen product exactly. ---
+    parser.add_argument(
+        "--head_family", type=str, default="triple", choices=["triple", "spline"],
+        help="'spline' replaces the (lower, central, upper) triple with a full per-pixel "
+             "quantile function trained end to end, so the post-hoc width calibration and "
+             "empirical marginal reshaping have nothing left to do. The triple is still "
+             "emitted, derived from the spline, so every downstream reader is unchanged.",
+    )
+    parser.add_argument(
+        "--dist_loss", type=str, default="crps", choices=["crps", "nll"],
+        help="Objective for the spline head. CRPS is an integral of pinball losses and "
+             "inherits their bounded influence per pixel, which is why it survives a "
+             "residual with kurtosis ~1e3 where Gaussian NLL inflated the fitted widths by "
+             "7x (docs/background/model_phase.md 6.3).",
+    )
+    parser.add_argument(
+        "--crps_nodes", type=int, default=6,
+        help="Gauss-Legendre nodes per u-bin. Six keeps the quadrature error below the int16 "
+             "storage quantum of 3e-5, so the objective is finer than the product it trains; "
+             "three is 1.1e-4 and coarser. Lower it only if memory demands it.",
+    )
+    parser.add_argument(
+        "--crps_tail_weight", type=float, default=0.0,
+        help="lambda in w(u) = 1 + lambda * ((u-u0)/(1-u0))_+^p. Each pinball term keeps its "
+             "own optimum whatever the weight, so a u-weighting changes where the optimiser "
+             "spends effort and never the target -- unlike stratified sampling, which does "
+             "move the target and carries an importance correction.",
+    )
+    parser.add_argument(
+        "--predict_qf_levels", type=int, default=64,
+        help="Bands in the quantile-function raster written beside the triple by the spline "
+             "head. 0 disables it. The grid is normal-spaced with 0.025/0.5/0.975 pinned, so "
+             "the qf reproduces the published bounds exactly.",
+    )
+    parser.add_argument(
+        "--spline_checkpoint",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=True,
+        help="Recompute the spline quadratures in the backward pass instead of storing them. "
+             "Measured: 22.4 GB of a 24.6 GB card without it at the production batch size. "
+             "Mathematically identical; off only for debugging.",
+    )
+    # ---- stratified chip sampling ------------------------------------------------
+    parser.add_argument(
+        "--chip_sampling", type=str, default="uniform",
+        choices=["uniform", "stratified"],
+        help="'stratified' draws training chips with probability rising in the chip's past "
+             "change, so rare movers are presented consistently. It samples only from "
+             "positions the fold mask already permits, so it adds no leak surface.",
+    )
+    parser.add_argument(
+        "--chip_weights", type=str, default="data/ensemble/chip_weights_128.npz",
+        help="Per-chip weight table from scripts/build_chip_weights.py.",
+    )
+    parser.add_argument(
+        "--chip_weight_alpha", type=float, default=4.0,
+        help="p(chip) proportional to 1 + alpha * w, with w normalised to mean 1.",
+    )
+    parser.add_argument(
+        "--chip_sampling_correct",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=True,
+        help="Importance-correct the stratified sampler back to the population. Reweighting "
+             "samples moves the target distribution, unlike reweighting quantile levels; "
+             "False deliberately targets a utility-weighted distribution instead, and the "
+             "run is labelled as such.",
+    )
+    # ---- round 2: knot grid, two-sided tail weight, shape-head capacity, HM context ----
+    parser.add_argument(
+        "--spline_knots", type=str, default="default14",
+        choices=["default14", "body_dense", "deep_lower"],
+        help="Named knot grid. 'body_dense' adds 0.35/0.45/0.55/0.65: the default grid has "
+             "three knots between u=0.10 and u=0.90 while 53%% of pixels move by less than "
+             "0.001 over twenty years, and cov50 is the worst-calibrated coverage level. "
+             "'deep_lower' adds 0.0001/0.9999, for P(u<0.001) reading 7x nominal at h=20.",
+    )
+    parser.add_argument(
+        "--crps_tail_weight_lo", type=float, default=0.0,
+        help="Lower-side mirror of --crps_tail_weight. The model is braced for growth that "
+             "does not come and blindsided by declines; this puts optimiser effort there.",
+    )
+    parser.add_argument("--crps_tail_u0_lo", type=float, default=0.05)
+    parser.add_argument(
+        "--shape_head_hidden_layers", type=int, default=1,
+        help="Depth of the shape head only. --head_hidden_layers goes through the shared "
+             "factory and would confound this with a change to the central head.",
+    )
+    parser.add_argument(
+        "--shape_head_width", type=int, default=0,
+        help="Width of the shape head; 0 means hidden_dim // 2, today's value.",
+    )
+    parser.add_argument(
+        "--context_radii", type=str, default="1,3,10,30,100",
+        help="Occupancy radii for the distance-to-past-change band.",
+    )
+    parser.add_argument(
+        "--hm_context_stats", type=str, default="",
+        help="Neighbourhood-HM statistics to feed the heads, e.g. 'mean,max'. Empty (the "
+             "default) reproduces the round-1 eight-channel context exactly. The model has "
+             "never had any information about the LEVEL of development around a pixel — only "
+             "where past change happened — and development spreads from development.",
+    )
+    parser.add_argument("--hm_context_radii", type=str, default="3,30,100")
+    parser.add_argument(
+        "--hm_context_pattern", type=str,
+        default="data/raw/hm_global/hm_context_w{year}_1000.tif",
+        help="Built by scripts/prepare_hm_context.py, on the full raster: a 201x201 window "
+             "cannot be evaluated inside a 128 px chip.",
+    )
+    parser.add_argument("--crps_tail_u0", type=float, default=0.95)
+    parser.add_argument("--crps_tail_p", type=float, default=2.0)
+    parser.add_argument(
+        "--mu_mse_weight", type=float, default=1.0,
+        help="Weight on MSE(E[Q], y). The published central forecast IS E[Q] -- the mean is "
+             "the RMSE-optimal point estimate and this residual is right-skewed, so it is "
+             "not the median -- and CRPS presses on it only indirectly. 0 is the pure-CRPS "
+             "ablation.",
+    )
+    parser.add_argument(
+        "--spline_slopes", type=str, default="learned", choices=["learned", "fritsch"],
+        help="'fritsch' derives every knot slope from the adjacent secants "
+             "(monotonicity-preserving, zero parameters) instead of learning them.",
+    )
+    parser.add_argument(
+        "--spline_mean_nodes", type=int, default=8,
+        help="Quadrature nodes per bin for E[Q]. Eight, not four: the spline is a rational "
+             "function and a steep bin converges slowly.",
+    )
+    parser.add_argument(
+        "--isolate_shape_grad",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=False,
+        help="Keep the distributional loss out of the trunk, as the pinball loss is kept out "
+             "today. Off by default: the point of an end-to-end model is that the trunk hears "
+             "the objective. On, it is the ablation that measures what that costs.",
+    )
     parser.add_argument("--lr", type=float, default=1e-3, help="Adam learning rate")
     parser.add_argument(
         "--lr_schedule", type=str, default="none", choices=["none", "cosine"],
@@ -421,6 +591,16 @@ if __name__ == "__main__":
         help="Which checkpoint prediction uses: the monitored best (default) or the state "
              "at the end of training. 'final' is the coherent choice with an annealed "
              "learning rate or with weight averaging.",
+    )
+    parser.add_argument(
+        "--abort_on_nonfinite",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=True,
+        help="Stop with an error if the weights go non-finite. A diverged run is otherwise "
+             "SILENT: ModelCheckpoint never selects a NaN epoch, so the run falls back to its "
+             "last healthy checkpoint, finishes, and scores normally. Six of the "
+             "distributional round-1 runs died this way and were published anyway. False "
+             "restores the old silent behaviour.",
     )
     parser.add_argument("--grad_clip", type=float, default=0.0,
                         help="Global grad-norm clip applied after the two backward passes, "
@@ -634,6 +814,12 @@ if __name__ == "__main__":
         persistent_workers=True if args.num_workers > 0 else False,
         split_mask_file=split_mask_file,
         context_pattern=(args.context_pattern if _wants_context(args) else None),
+        hm_context_pattern=(args.hm_context_pattern if _wants_context(args) else None),
+        hm_context_stats=_csv_strs(args.hm_context_stats),
+        hm_context_radii=_csv_ints(args.hm_context_radii) or (3, 30, 100),
+        chip_weights=args.chip_weights,
+        chip_sampling=args.chip_sampling,
+        chip_weight_alpha=args.chip_weight_alpha,
         split_value=train_split_value,  # Train split (None in fold-CV mode)
         exclude_split_values=train_exclude,
         norm_stats=cached_norm_stats,
@@ -662,6 +848,9 @@ if __name__ == "__main__":
         persistent_workers=True if args.num_workers > 0 else False,
         split_mask_file=split_mask_file,
         context_pattern=(args.context_pattern if _wants_context(args) else None),
+        hm_context_pattern=(args.hm_context_pattern if _wants_context(args) else None),
+        hm_context_stats=_csv_strs(args.hm_context_stats),
+        hm_context_radii=_csv_ints(args.hm_context_radii) or (3, 30, 100),
         split_value=val_split_value,  # Validation split
         norm_stats=cached_norm_stats,
     )
@@ -681,6 +870,9 @@ if __name__ == "__main__":
         persistent_workers=True if args.num_workers > 0 else False,
         split_mask_file=split_mask_file,
         context_pattern=(args.context_pattern if _wants_context(args) else None),
+        hm_context_pattern=(args.hm_context_pattern if _wants_context(args) else None),
+        hm_context_stats=_csv_strs(args.hm_context_stats),
+        hm_context_radii=_csv_ints(args.hm_context_radii) or (3, 30, 100),
         split_value=test_split_value,  # Test split
         norm_stats=cached_norm_stats,
     )
@@ -696,10 +888,10 @@ if __name__ == "__main__":
         print(f"Loading model from checkpoint: {checkpoint_path}")
         print("="*70)
         overrides = dict(
-            quantile_context_channels=(N_CONTEXT_CHANNELS if args.quantile_context else 0),
+            quantile_context_channels=(_n_context_channels(args) if args.quantile_context else 0),
             quantile_class_weighting=args.quantile_class_weighting,
             freeze_trunk=args.freeze_trunk,
-            central_context_channels=(N_CONTEXT_CHANNELS if args.central_context else 0),
+            central_context_channels=(_n_context_channels(args) if args.central_context else 0),
             central_residual=args.central_residual,
             monotone_quantile_width=args.monotone_quantile_width,
             **_experiment_kwargs(args),
@@ -754,10 +946,10 @@ if __name__ == "__main__":
             histogram_weight=args.histogram_weight,
             histogram_lambda_w2=args.histogram_lambda_w2,
             histogram_warmup_epochs=args.histogram_warmup_epochs,
-            quantile_context_channels=(N_CONTEXT_CHANNELS if args.quantile_context else 0),
+            quantile_context_channels=(_n_context_channels(args) if args.quantile_context else 0),
             quantile_class_weighting=args.quantile_class_weighting,
             freeze_trunk=args.freeze_trunk,
-            central_context_channels=(N_CONTEXT_CHANNELS if args.central_context else 0),
+            central_context_channels=(_n_context_channels(args) if args.central_context else 0),
             central_residual=args.central_residual,
             monotone_quantile_width=args.monotone_quantile_width,
             **_experiment_kwargs(args),
@@ -846,6 +1038,13 @@ if __name__ == "__main__":
     print(f"SSIM weight:       {args.ssim_weight}")
     print(f"Laplacian weight:  {args.laplacian_weight}")
     print(f"Histogram weight:  {args.histogram_weight} (warmup: {args.histogram_warmup_epochs} epochs)")
+    if _wants_context(args):
+        # Printed because the round-2 covariate IS a channel count: a run that silently fell
+        # back to the eight-channel context would read as "the covariate does nothing".
+        print(f"Context channels:  {_n_context_channels(args)} "
+              f"(radii {args.context_radii}"
+              + (f", hm {args.hm_context_stats} @ {args.hm_context_radii}"
+                 if _csv_strs(args.hm_context_stats) else ", no hm context") + ")")
     print("="*60 + "\n")
     # Set normalization stats for physical-scale MAE logging
     if hasattr(train_loader, 'dataset'):
@@ -853,6 +1052,10 @@ if __name__ == "__main__":
         if hasattr(ds, 'hm_mean') and hasattr(ds, 'hm_std'):
             model.hm_mean = ds.hm_mean
             model.hm_std = ds.hm_std
+            # The spline needs them as buffers, not plain attributes: HM's physical range
+            # [0, 1] is its support constraint, and it has to be carried in normalized units
+            # through a checkpoint round trip.
+            model.model.set_norm_stats(ds.hm_mean, ds.hm_std)
 
     # Callbacks
     checkpoint_cb = ModelCheckpoint(monitor=args.checkpoint_monitor, save_top_k=1, mode='min')
@@ -913,6 +1116,17 @@ if __name__ == "__main__":
     # checkpoint on disk is not the model we mean to publish. Save the end state and point
     # every downstream consumer at it.
     if args.checkpoint_select == 'final' or args.weight_avg_last > 0:
+        # These two paths repoint prediction at the end-of-training weights, which bypasses the
+        # monitored checkpoint entirely -- so the fallback that (silently) protects a normal run
+        # from a diverged one is not there. Check before publishing, not after.
+        import torch as _torch
+        _bad = [n for n, p in model.named_parameters() if not _torch.isfinite(p).all()]
+        if _bad and args.abort_on_nonfinite:
+            raise RuntimeError(
+                f"refusing to publish end-of-training weights: {len(_bad)} non-finite tensors "
+                f"(e.g. {_bad[:3]}). Training diverged, and unlike the monitored checkpoint "
+                f"this path has no earlier epoch to fall back to, so prediction would run on "
+                f"NaN.")
         _final = os.path.join(os.getcwd(), 'models', 'checkpoints',
                               f'final_fold{args.exclude_fold}_{os.getpid()}.ckpt')
         trainer.save_checkpoint(_final)
@@ -982,7 +1196,16 @@ if __name__ == "__main__":
                     if lonlat is not None:
                         lonlat = lonlat.to(device)
                     # Get predictions from model: [B, 12, H, W] (4 horizons × 3 quantiles)
-                    preds_all = best_model(input_dynamic_clean, input_static_clean, lonlat=lonlat)
+                    # The context tensors were missing here, so under --central_context /
+                    # --quantile_context these W&B test metrics were computed with every
+                    # context channel silently zeroed. The model refuses that now, which is
+                    # how the omission surfaced.
+                    _cc = batch.get('change_context')
+                    _hc = batch.get('hm_context')
+                    preds_all = best_model(
+                        input_dynamic_clean, input_static_clean, lonlat=lonlat,
+                        change_context=_cc.to(device) if _cc is not None else None,
+                        hm_context=_hc.to(device) if _hc is not None else None)
                     
                     # Extract quantile predictions for each horizon
                     # Channel ordering: [lower_5yr, central_5yr, upper_5yr, lower_10yr, central_10yr, upper_10yr, ...]
@@ -1828,12 +2051,8 @@ if __name__ == "__main__":
             if not active_horizons:
                 print("⚠ No horizons within --predict_max_target_year; skipping this window.")
                 return infer_model
-            accum_horizons = {}
-            for h in active_horizons:
-                for q in quantile_names:
-                    key = f"{h}_{q}"
-                    accum_horizons[key] = np.zeros((Hwin, Wwin), dtype=np.float32)
-
+            # Accumulators are allocated after the model is loaded, because how many there
+            # are depends on the head family: the spline head adds one per quantile level.
             wsum = np.zeros((Hwin, Wwin), dtype=np.float32)
             nodata_mask_total = np.zeros((Hwin, Wwin), dtype=bool)
 
@@ -1858,6 +2077,21 @@ if __name__ == "__main__":
             hm_srcs = [rasterio.open(p) for p in hm_files]
             comp_srcs = {y: [rasterio.open(p) for p in component_files[y]] for y in years} if include_components else {y: [] for y in years}
             stat_srcs = [rasterio.open(p) for p in static_list_paths]
+            hm_ctx_src, hm_ctx_bands = None, None
+            if (_wants_context(args) and args.hm_context_pattern
+                    and _csv_strs(args.hm_context_stats)):
+                from prepare_hm_context import band_indices
+                hm_path = args.hm_context_pattern.format(year=base_year)
+                if not os.path.exists(hm_path):
+                    raise FileNotFoundError(
+                        f"--hm_context_stats was requested but {hm_path} is missing; "
+                        f"run scripts/prepare_hm_context.py first")
+                hm_ctx_src = rasterio.open(hm_path)
+                hm_ctx_bands = band_indices(hm_ctx_src.tags(),
+                                            _csv_strs(args.hm_context_stats),
+                                            _csv_ints(args.hm_context_radii) or (3, 30, 100))
+                print(f"HM context: {hm_path} bands {hm_ctx_bands}")
+
             ctx_src = None
             if _wants_context(args) and args.context_pattern:
                 ctx_path = args.context_pattern.format(year=base_year)
@@ -1892,6 +2126,24 @@ if __name__ == "__main__":
                 infer_model.eval()
                 print(f"✓ Model loaded on device: {device}")
             infer_model = infer_model.to(device)
+
+            # The quantile-function raster: one band per u-level, written only by the spline
+            # head. The triple is *derived* from this, and 0.025 / 0.975 are levels of this
+            # grid, so the two agree exactly rather than approximately.
+            qf_u = None
+            qf_names = []
+            if getattr(args, 'predict_qf_levels', 0) and \
+                    getattr(infer_model.model, 'head_family', 'triple') == 'spline':
+                from src.models.quantile_spline import output_u_grid, splines_from_output
+                qf_u = output_u_grid(int(args.predict_qf_levels))
+                qf_names = [f"qf{i:03d}" for i in range(len(qf_u))]
+                print(f"  Quantile function: {len(qf_u)} levels, "
+                      f"u in [{qf_u[0]:.5f}, {qf_u[-1]:.5f}], "
+                      f"{len(qf_u) * len(active_horizons)} accumulators")
+            accum_horizons = {
+                f"{h}_{q}": np.zeros((Hwin, Wwin), dtype=np.float32)
+                for h in active_horizons for q in list(quantile_names) + qf_names
+            }
 
             # Optional restriction mask: skip tiles that do not overlap the requested values.
             # Used for fold hindcasts, where only the held-out fold's pixels are consumed.
@@ -1964,6 +2216,7 @@ if __name__ == "__main__":
                 # Prepare batch data
                 batch_inputs_dyn = []
                 batch_contexts = []
+                batch_hm_contexts = []
                 batch_inputs_stat = []
                 batch_lonlats = []
                 batch_metadata = []  # Store (i, j, hi, wj, li0, lj0, li1, lj1, valid_mask, input_invalid_mask)
@@ -2072,6 +2325,22 @@ if __name__ == "__main__":
                             padded[:, :hi, :wj] = cx
                             cx = padded
                         batch_contexts.append(cx)
+                    if hm_ctx_src is not None:
+                        raw = hm_ctx_src.read(hm_ctx_bands, window=win).astype(np.float32)
+                        hm_cx = np.where(raw == -32768, 0.0,
+                                         raw * np.float32(1.0 / 32767.0)).astype(np.float32)
+                        if hi < tile or wj < tile:
+                            # Every other source above pads its edge tiles to the full tile;
+                            # this one did not, so a region whose extent is not a whole number
+                            # of strides handed np.stack a (bands, hi, wj) among (bands, tile,
+                            # tile) and it refused. Training never saw this because chips are
+                            # always full size -- only the prediction path tiles to an edge.
+                            # Zero is what this block already substitutes for the raster's own
+                            # -32768 nodata sentinel.
+                            padded = np.zeros((len(hm_ctx_bands), tile, tile), dtype=np.float32)
+                            padded[:, :hi, :wj] = hm_cx
+                            hm_cx = padded
+                        batch_hm_contexts.append(hm_cx)
                     batch_inputs_dyn.append(in_dyn)
                     batch_inputs_stat.append(in_stat)
                     batch_lonlats.append(lonlat_hw2)
@@ -2088,10 +2357,29 @@ if __name__ == "__main__":
                         torch.from_numpy(np.stack(batch_contexts, axis=0)).to(device)
                         if batch_contexts else None
                     )
+                    batch_hm_tensor = (
+                        torch.from_numpy(np.stack(batch_hm_contexts, axis=0)).to(device)
+                        if batch_hm_contexts else None
+                    )
+                    batch_qf = None
                     with torch.no_grad():
                         batch_preds = infer_model(batch_dyn_tensor, batch_stat_tensor,
                                                   lonlat=batch_lonlat_tensor,
-                                                  change_context=batch_ctx_tensor)  # [B, 12, H, W]
+                                                  change_context=batch_ctx_tensor,
+                                                  hm_context=batch_hm_tensor)  # [B, 12, H, W]
+                        if qf_u is not None:
+                            # Evaluated once per batch, decoded by the *same* function the
+                            # loss uses, so the raster and the objective cannot drift apart.
+                            m_ = infer_model.model
+                            u_t = torch.as_tensor(qf_u, dtype=batch_preds.dtype,
+                                                  device=batch_preds.device)
+                            batch_qf = [
+                                sp.ppf(u_t).movedim(-1, 1).cpu().numpy()   # [B, n_u, H, W]
+                                for sp in splines_from_output(
+                                    batch_preds, m_.num_horizons, m_.spline_u_knots,
+                                    learn_slopes=m_.spline_learn_slopes,
+                                    clamp=m_.spline_clamp())
+                            ]
                     
                     # Process each tile in the batch
                     for tile_idx, (i, j, hi, wj, li0, lj0, li1, lj1, valid_mask, input_invalid_mask) in enumerate(batch_metadata):
@@ -2121,6 +2409,13 @@ if __name__ == "__main__":
                             preds_horizons[f"{h_name}_lower"] = pred_lower
                             preds_horizons[f"{h_name}_central"] = pred_central
                             preds_horizons[f"{h_name}_upper"] = pred_upper
+
+                            if qf_u is not None:
+                                qf = batch_qf[h_idx][tile_idx, :, :hi, :wj]
+                                qf = qf * hm_std + hm_mean
+                                qf[:, input_invalid_mask] = np.nan
+                                for li, lname in enumerate(qf_names):
+                                    preds_horizons[f"{h_name}_{lname}"] = qf[li]
                         
                         # Distance-to-edge weights within tile
                         interior = valid_mask.astype(np.uint8)
@@ -2153,7 +2448,12 @@ if __name__ == "__main__":
             m = wsum > 0
             out_horizons = {}
             for h_name in active_horizons:
-                for q_name in quantile_names:
+                # The quantile levels blend on exactly the same weights as the triple. A
+                # weighted average of monotone sequences is monotone, so the blended
+                # quantile function is still a quantile function -- and because 0.025 and
+                # 0.975 are levels of the grid, the blended bands reproduce the blended
+                # lower/upper rasters rather than merely approximating them.
+                for q_name in list(quantile_names) + qf_names:
                     key = f"{h_name}_{q_name}"
                     out_h = np.full((Hwin, Wwin), np.nan, dtype=np.float32)
                     out_h[m] = (accum_horizons[key][m] / wsum[m]).astype(np.float32)
@@ -2200,6 +2500,27 @@ if __name__ == "__main__":
                         dst.write(out_horizons[key], 1)
                     out_paths[key] = out_path
                     print(f"  ✓ {h_year} {q_name}: {out_path}")
+
+                if qf_names:
+                    # One multi-band raster per horizon rather than 64 files. int16 x 1/32767
+                    # is the ensemble's own storage convention: HM is bounded on [0, 1], so
+                    # this is lossless to 3e-5, far below any quantity of interest.
+                    qf_profile = out_profile.copy()
+                    qf_profile.update(count=len(qf_names), dtype='int16', nodata=-32768,
+                                      tiled=True, blockxsize=256, blockysize=256)
+                    qf_path = out_dir / f"{prefix}prediction_{h_year}_qf_blended.tif"
+                    with rasterio.open(qf_path, 'w', **qf_profile) as dst:
+                        for li, lname in enumerate(qf_names):
+                            band = out_horizons[f"{h_name}_{lname}"]
+                            q = np.where(np.isfinite(band),
+                                         np.round(band * 32767.0), -32768)
+                            dst.write(np.clip(q, -32768, 32767).astype(np.int16), li + 1)
+                            dst.set_band_description(li + 1, f"u={qf_u[li]:.6f}")
+                        dst.update_tags(u_levels=",".join(repr(float(v)) for v in qf_u),
+                                        scale_factor="3.0518509e-05",
+                                        head_family="spline")
+                    out_paths[f"{h_name}_qf"] = qf_path
+                    print(f"  ✓ {h_year} qf: {qf_path} ({len(qf_names)} bands)")
             
             # Final summary
             elapsed_total = time.time() - start_time
@@ -2233,6 +2554,8 @@ if __name__ == "__main__":
                 src.close()
             if ctx_src is not None:
                 ctx_src.close()
+            if hm_ctx_src is not None:
+                hm_ctx_src.close()
 
             return infer_model
 
