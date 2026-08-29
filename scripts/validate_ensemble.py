@@ -112,6 +112,13 @@ def parse_args(argv=None):
     ap.add_argument("--years", default="2005,2010,2015,2020")
     ap.add_argument("--base_year", type=int, default=2000)
     ap.add_argument("--recal_dir", default="data/ensemble/hindcast/recal")
+    ap.add_argument("--qf_dir", default=None,
+                    help="Directory of the model's 64-band quantile-function rasters. Given "
+                         "this, T3 recovers normal scores through Q itself and T5 scores the "
+                         "sample median against Q(0.5) with a tolerance built from dQ/du — "
+                         "instead of inverting a two-piece normal the ensemble was never "
+                         "drawn from.")
+    ap.add_argument("--qf_pattern", default="w{base}_prediction_{year}_qf.tif")
     ap.add_argument("--recal_pattern", default="w{base}_prediction_{year}_{q}_recal.tif")
     ap.add_argument("--central_pattern", default="w{base}_prediction_{year}_central_recal.tif")
     ap.add_argument("--observed_pattern", default=str(HM_DIR / "HM_{year}_AA_1000.tiff"))
@@ -204,6 +211,93 @@ def _tile_grid(store, H, W, budget_bytes=1.2e9):
     return rows, tile_w
 
 
+# ------------------------------------------------------------------ quantile-function marginal
+#
+# The ensemble may be drawn from the distributional model's own per-pixel quantile function
+# rather than from a two-piece normal fitted to the published triple. Every T5 tolerance and the
+# whole of T3 are written in terms of dx/dz for that two-piece normal, so scoring a qf-drawn
+# ensemble with them measures the assumption and not the ensemble: on the e1 Africa run that
+# read a member normal-score variance of 5.95 against a target of 1.0 +/- 0.15, and a T5.1 gate
+# that cannot pass, because the sample median estimates Q(0.5) while the gate compares it to the
+# central head -- a different quantity here (mean |Q(0.5) - central| = 0.0105 at h=20, a third
+# of that horizon's RMSE).
+#
+# Three things are needed and all three come off the stored grid with no fitting:
+#   * the reference quantiles Q(0.025), Q(0.5), Q(0.975);
+#   * dx/dz = dQ/du * phi(z), the local scale that turns a normal-score standard error into
+#     value units -- the exact analogue of `sigma * shape_slope` for the two-piece normal;
+#   * F_qf(v), to recover a member's normal score as Phi^-1(F(v)).
+
+QF_INT16_SCALE = 1.0 / 32767.0
+
+
+def qf_read_window(path, win):
+    """``(u_levels, Q)`` for one window, ``Q`` as ``[n_levels, rr, cw]`` in HM units."""
+    with rasterio.open(path) as src:
+        u = np.array([float(v) for v in src.tags()["u_levels"].split(",")], dtype=np.float64)
+        q = src.read(window=win).astype(np.float32)
+        nod = src.nodata
+    q = np.where(q == nod, np.nan, q) * np.float32(QF_INT16_SCALE)
+    return u, q
+
+
+def qf_quantile_at(u, q, level):
+    """``Q(level)`` by linear interpolation between the two stored levels bracketing it."""
+    j = int(np.clip(np.searchsorted(u, level), 1, u.size - 1))
+    t = (level - u[j - 1]) / (u[j] - u[j - 1])
+    return q[j - 1] + t * (q[j] - q[j - 1])
+
+
+def qf_dx_dz(u, q, level):
+    """``dx/dz`` at ``level``: the local slope of Q in u, times the normal density there.
+
+    This is what the two-piece normal supplies as ``sigma``, and the empirical shape as
+    ``sigma * S'(z)``. Taken as a central difference over the stored grid, which is the same
+    resolution the ensemble was sampled on, so the tolerance is never finer than the forecast
+    it is testing.
+    """
+    from scipy.stats import norm as _norm
+    j = int(np.clip(np.searchsorted(u, level), 1, u.size - 1))
+    lo, hi = max(j - 1, 0), min(j + 1, u.size - 1)
+    dq_du = (q[hi] - q[lo]) / max(u[hi] - u[lo], 1e-12)
+    return np.maximum(dq_du * _norm.pdf(_norm.ppf(level)), 1e-9)
+
+
+def qf_recover_z(values, u, q):
+    """``z = Phi^-1(F(v))`` against each pixel's own quantile function.
+
+    ``values`` is ``[n_px]`` and ``q`` is ``[n_levels, n_px]``. Ties resolve to the
+    **mid-distribution** point: the quantile function is clipped at HM=0, so a real atom sits
+    there, and a one-sided convention would map every member inside the atom to the top of it
+    and report a spurious skew in exactly the quiet pixels that dominate this region.
+    """
+    from scipy.stats import norm as _norm
+    n = q.shape[0]
+    ar = np.arange(values.size)
+
+    def _u_at(k):
+        k = np.clip(k, 1, n - 1)
+        q0, q1 = q[k - 1, ar], q[k, ar]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            w = np.where(q1 > q0, (values - q0) / (q1 - q0), 0.0)
+        return u[k - 1] + np.clip(w, 0.0, 1.0) * (u[k] - u[k - 1])
+
+    below = (q < values[None, :]).sum(axis=0)
+    at_or_below = (q <= values[None, :]).sum(axis=0)
+    uu = np.clip(0.5 * (_u_at(below) + _u_at(at_or_below)), u[0], u[-1])
+    return _norm.ppf(uu)
+
+
+def qf_path_for(args, year):
+    """The quantile-function raster for one year, or None when the run has no qf marginal."""
+    if not getattr(args, "qf_dir", None):
+        return None
+    p = Path(args.qf_dir) / args.qf_pattern.format(base=args.base_year, year=year)
+    if not p.exists():
+        raise SystemExit(f"--qf_dir given but {p} is missing")
+    return p
+
+
 def stage_gates(args, store, attrs, years, paths, out_dir, card, block_rows=None):
     """T5.1/T5.2/T5.3 in one streaming pass, which also writes the percentile rasters."""
     print("\n=== T5 · hard gates (median / tails / mask) ===")
@@ -273,6 +367,9 @@ def stage_gates(args, store, attrs, years, paths, out_dir, card, block_rows=None
     summary = []
     for hi, year in enumerate(years):
         slope_tbl = _slopes(year)
+        qf_file = qf_path_for(args, year)
+        if qf_file is not None:
+            print(f"  {year}: T5 references Q(0.5)/Q(0.025)/Q(0.975) from {qf_file.name}")
         with rasterio.open(paths[year]["central"]) as c:
             profile = c.profile.copy()
         # Tiled output so the chunk-aligned windowed writes land on whole blocks rather
@@ -296,6 +393,22 @@ def stage_gates(args, store, attrs, years, paths, out_dir, card, block_rows=None
                     cen = csrc.read(1, window=win).astype(np.float32)
                     low = lsrc.read(1, window=win).astype(np.float32)
                     upp = usrc.read(1, window=win).astype(np.float32)
+                    # With a quantile-function marginal the gate's references and its scale
+                    # both come off Q. The published lower/upper ARE Q(0.025)/Q(0.975) (checked
+                    # on e1: max |difference| 1.5e-5, half a storage quantum), so only the
+                    # median moves -- but it moves at every pixel, which is the whole reason
+                    # T5.1 could not pass before.
+                    dxdz_lo = dxdz_med = dxdz_hi = None
+                    if qf_file is not None:
+                        u_lv, qw = qf_read_window(qf_file, win)
+                        cen_ref = qf_quantile_at(u_lv, qw, 0.5)
+                        low = qf_quantile_at(u_lv, qw, 0.025)
+                        upp = qf_quantile_at(u_lv, qw, 0.975)
+                        dxdz_lo = qf_dx_dz(u_lv, qw, 0.025)
+                        dxdz_med = qf_dx_dz(u_lv, qw, 0.5)
+                        dxdz_hi = qf_dx_dz(u_lv, qw, 0.975)
+                    else:
+                        cen_ref = cen
                     q = np.asarray(store[:, hi, r0:r0 + rr, c0:c0 + cw])
                     ens_valid = (q != INT16_SENTINEL).all(axis=0)
                     cen_valid = np.isfinite(cen)
@@ -328,12 +441,17 @@ def stage_gates(args, store, attrs, years, paths, out_dir, card, block_rows=None
                     sig_r = np.maximum((upp - cen) / 1.959964, 1e-9)
                     sig_l = np.maximum((cen - low) / 1.959964, 1e-9)
                     sigma_local = np.where(med >= cen, sig_r, sig_l)
-                    tol_med = 3.0 * med_sigma_z * sigma_local * sl_med + quant_tol
-                    n_med_ok += int((np.abs(med - cen)[ok] <= tol_med[ok]).sum())
-                    n_med_exact += int((np.abs(med - cen)[ok] <= quant_tol).sum())
+                    if dxdz_med is not None:
+                        tol_med = 3.0 * med_sigma_z * dxdz_med + quant_tol
+                        tol_lo = 3.0 * mc_sigma_z * dxdz_lo
+                        tol_hi = 3.0 * mc_sigma_z * dxdz_hi
+                    else:
+                        tol_med = 3.0 * med_sigma_z * sigma_local * sl_med + quant_tol
+                        tol_lo = mc_sigma_z * np.maximum(cen - low, 1e-9) / 1.96 * 3.0 * sl_lo
+                        tol_hi = mc_sigma_z * half / 1.96 * 3.0 * sl_hi
+                    n_med_ok += int((np.abs(med - cen_ref)[ok] <= tol_med[ok]).sum())
+                    n_med_exact += int((np.abs(med - cen_ref)[ok] <= quant_tol).sum())
                     sum_halfwidth += float(half[ok].sum())
-                    tol_lo = mc_sigma_z * np.maximum(cen - low, 1e-9) / 1.96 * 3.0 * sl_lo
-                    tol_hi = mc_sigma_z * half / 1.96 * 3.0 * sl_hi
                     n_lo_ok += int((np.abs(p25 - low)[ok] <= tol_lo[ok]).sum())
                     n_hi_ok += int((np.abs(p975 - upp)[ok] <= tol_hi[ok]).sum())
         finally:
@@ -351,7 +469,8 @@ def stage_gates(args, store, attrs, years, paths, out_dir, card, block_rows=None
         print(f"  {year}: median≡central {100*f_med:.3f}% within MC ({100*f_med_exact:.2f}% "
               f"exact) | p2.5 {100*f_lo:.1f}% | p97.5 {100*f_hi:.1f}% | "
               f"mask mismatches {n_mask_mismatch:,}")
-        card.add("T5.1", f"median==central ({year})", f_med, ">=0.995 (MC-scaled, hard gate)",
+        med_ref = "Q(0.5)" if qf_path_for(args, year) is not None else "central"
+        card.add("T5.1", f"median=={med_ref} ({year})", f_med, ">=0.995 (MC-scaled, hard gate)",
                  f_med >= 0.995,
                  note=f"{100*f_med_exact:.2f}% exact to quantization; the distributional "
                       f"median is exact by construction, the sample median of M={M} is not",
@@ -756,7 +875,11 @@ def _build_z_field(args, store, attrs, hi, year, paths, scratch, budget_bytes):
     """
     M, nH, H, W = store.shape
     shape, band_full = _shape_context(args, year)
-    if shape is not None:
+    qf_file = qf_path_for(args, year)
+    if qf_file is not None:
+        print(f"  normal scores recovered through the model's own quantile function "
+              f"({qf_file.name})")
+    elif shape is not None:
         print("  normal scores recovered through the empirical shape"
               + (", per distance band" if band_full is not None else ""))
     z = np.memmap(scratch / "z.f8", dtype=np.float64, mode="w+", shape=(H, W))
@@ -780,7 +903,23 @@ def _build_z_field(args, store, attrs, hi, year, paths, scratch, budget_bytes):
             sr = np.maximum((upp - cen) / cop.Z975, 1e-6)
             mem = agg.member_slice(store, attrs, 0, hi, window=(r0, r0 + rr, 0, W))
             b = band_full[r0:r0 + rr] if band_full is not None else None
-            zt = recover_z(mem, cen, sl, sr, shape=shape, band=b)
+            if qf_file is not None:
+                # Invert the marginal the members were actually drawn from. Inverting the
+                # two-piece normal instead does not fail loudly: it returns a finite field
+                # whose variance is the ratio of the two marginals' tail weights, which on
+                # e1 read 5.95 against a target of 1.0 and dragged T3.2's variogram score
+                # with it.
+                _u, _q = qf_read_window(qf_file, Window(0, r0, W, rr))
+                flat = mem.reshape(-1)
+                qflat = _q.reshape(_q.shape[0], -1)
+                good = np.isfinite(flat) & np.isfinite(qflat[0]) & np.isfinite(qflat[-1])
+                zflat = np.full(flat.shape, np.nan, dtype=np.float64)
+                if good.any():
+                    zflat[good] = qf_recover_z(flat[good].astype(np.float64),
+                                               _u, qflat[:, good].astype(np.float64))
+                zt = zflat.reshape(mem.shape)
+            else:
+                zt = recover_z(mem, cen, sl, sr, shape=shape, band=b)
             z[r0:r0 + rr] = zt
             spread[r0:r0 + rr] = np.where(np.isfinite(sl) & np.isfinite(sr),
                                           (sl + sr) * 0.5, np.nan)

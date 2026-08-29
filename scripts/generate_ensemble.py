@@ -45,6 +45,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.ensemble.copula import (  # noqa: E402
     DEFAULT_SCALE, INT16_SENTINEL, Z975, read_shape_artifact, shape_bounds, stack_shapes,
 )
+
+# The quantile-function raster's own quantum. Same number as DEFAULT_SCALE, spelled from the
+# raster's side: the writer stores round(value / INT16_SCALE) as int16.
+INT16_SCALE = 1.0 / 32767.0
 from src.ensemble.aggregate import ARRAY_NAME  # noqa: E402
 from src.ensemble.validate import DIST_LABELS, distance_band  # noqa: E402
 
@@ -86,6 +90,12 @@ def parse_args(argv=None):
                          "(scripts/fit_marginal_shape.py). Without it the marginal is the "
                          "two-piece normal, whose body carries ~3x too much moderate "
                          "change for this residual.")
+    ap.add_argument("--qf_dir", default=None,
+                    help="Directory of the distributional model's 64-band quantile-function "
+                         "rasters. With this, the ensemble's marginal IS the model's own "
+                         "Q_h(u|x): no two-piece normal, no empirical shape, no width factor. "
+                         "Mutually exclusive with --marginal_shape.")
+    ap.add_argument("--qf_pattern", default="prediction_{year}_qf.tif")
     ap.add_argument("--spectral_fits", default=None,
                     help="JSON from scripts/fit_field_spectra.py. Matching the observed "
                          "power spectrum rather than the variogram is what gives members "
@@ -181,6 +191,66 @@ def load_marginals(paths, years, cache_dir, dist_raster=None):
             compact[y][name] = str(p)
         del arrays, cen, low, upp
     return compact, valid, idx, profile
+
+
+def load_quantile_functions(qf_paths, years, cache_dir, idx):
+    """Compact per-valid-pixel quantile functions, memory-mapped for the workers.
+
+    The distributional model's forecast *is* ``Q_h(u|x)``, so the ensemble's marginal is read
+    from the model's own 64-band raster rather than fitted to a triple. Kept int16 exactly as
+    stored (scale ``INT16_SCALE``): 64 levels x 35.6M px is 4.6 GB per horizon as int16 and
+    9.1 GB as float32, and the worker dequantizes the two bands it gathers instead of the slab.
+
+    Returns ``(paths_by_year, u_levels)``. The u-grid is shared by every raster and every
+    pixel — ``output_u_grid`` defines it in one place — which is what makes the lookup a
+    ``searchsorted`` on a 1-D tensor instead of a per-pixel search.
+    """
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    out, u_ref = {}, None
+    for y in years:
+        with rasterio.open(qf_paths[y]) as src:
+            tags = src.tags()
+            if "u_levels" not in tags:
+                raise SystemExit(f"{qf_paths[y]} carries no u_levels tag; not a quantile-"
+                                 f"function raster (was --predict_qf_levels 0 set?)")
+            u = np.array([float(v) for v in tags["u_levels"].split(",")], dtype=np.float64)
+            if np.diff(u).min() <= 0:
+                raise SystemExit(f"{qf_paths[y]}: u levels are not strictly increasing")
+            if u_ref is None:
+                u_ref = u
+            elif not np.array_equal(u, u_ref):
+                raise SystemExit(f"{qf_paths[y]}: u grid differs from {years[0]}'s; the "
+                                 f"horizons would be sampled on different grids")
+            q = src.read().reshape(u.size, -1)[:, idx]
+        p = cache_dir / f"{y}_qf.npy"
+        np.save(p, np.ascontiguousarray(q))
+        out[y] = str(p)
+        del q
+    return out, u_ref
+
+
+def qf_from_z_torch(z, u_levels, Q, scale, clip=(0.0, 1.0)):
+    """Map a standard-normal field through each pixel's own quantile function.
+
+    ``u = Phi(z)`` then ``Q(u)`` by linear interpolation between the two stored levels that
+    bracket it. Only those two bands are gathered per pixel, so the slab is never dequantized
+    whole. Draws beyond the grid's ends (u outside [1e-4, 1-1e-4], i.e. |z| > 3.72) clamp to
+    the outermost stored quantile: the raster is the forecast, and extrapolating past it would
+    invent tail the model did not emit.
+    """
+    # Imported here, not at module scope: this file sets PYTORCH_CUDA_ALLOC_CONF before torch
+    # is imported anywhere, and a module-level import would defeat that.
+    import torch
+
+    u = 0.5 * (1.0 + torch.erf(z * 0.7071067811865476))
+    j = torch.searchsorted(u_levels, u.contiguous()).clamp_(1, u_levels.numel() - 1)
+    u0, u1 = u_levels[j - 1], u_levels[j]
+    t = ((u - u0) / (u1 - u0)).clamp_(0.0, 1.0)
+    ar = torch.arange(z.numel(), device=z.device)
+    q0 = Q[j - 1, ar].to(torch.float32) * scale
+    q1 = Q[j, ar].to(torch.float32) * scale
+    return torch.clamp(q0 + t * (q1 - q0), clip[0], clip[1])
 
 
 def with_bounds(shape):
@@ -293,10 +363,22 @@ def worker(worker_id, gpu, member_ids, cfg, session=None):
     # Marginals stay pinned on the host and only the horizon in flight is moved to the
     # GPU: all four years at once is ~9 GB, which does not coexist with the FFT working
     # set on a 24 GB card.
-    marg_cpu = {
-        y: {k: torch.from_numpy(np.load(v)) for k, v in compact[y].items()}
-        for y in years
-    }
+    qf_cfg = cfg.get("qf")
+    if qf_cfg:
+        # int16 on the host, memory-mapped: 64 levels x 35.6M px is 4.6 GB per horizon, and
+        # four horizons resident on a 24 GB card would not coexist with the FFT working set.
+        # The slab in flight is uploaded per (member, horizon) -- ~0.5 s against the field
+        # generation it sits beside.
+        qf_cpu = {y: np.load(p, mmap_mode="r") for y, p in qf_cfg["paths"].items()}
+        u_levels_t = torch.as_tensor(np.asarray(qf_cfg["u_levels"]), device=device,
+                                     dtype=torch.float32)
+        marg_cpu = {}
+    else:
+        qf_cpu, u_levels_t = None, None
+        marg_cpu = {
+            y: {k: torch.from_numpy(np.load(v)) for k, v in compact[y].items()}
+            for y in years
+        }
     scatter = np.full(H * W, INT16_SENTINEL, dtype=np.int16)
 
     # The shape grids are the same for every member, so upload them once rather than on
@@ -342,10 +424,17 @@ def worker(worker_id, gpu, member_ids, cfg, session=None):
                 z = rho * prev + np.sqrt(max(0.0, 1 - rho ** 2)) * eps
             prev = z
 
-            mg = {k: v.to(device, non_blocking=True) for k, v in marg_cpu[y].items()}
-            vals = marginal_from_z_torch(z, mg["loc"], mg["scale_left"], mg["scale_right"],
-                                         shape=shapes_dev.get(h), band=band_t)
-            del mg
+            if qf_cpu is not None:
+                Q = torch.as_tensor(np.ascontiguousarray(qf_cpu[y]), device=device)
+                vals = qf_from_z_torch(z, u_levels_t, Q, qf_cfg["scale"])
+                del Q
+                if device.startswith("cuda"):
+                    torch.cuda.empty_cache()
+            else:
+                mg = {k: v.to(device, non_blocking=True) for k, v in marg_cpu[y].items()}
+                vals = marginal_from_z_torch(z, mg["loc"], mg["scale_left"], mg["scale_right"],
+                                             shape=shapes_dev.get(h), band=band_t)
+                del mg
             q = torch.clamp(torch.round(vals / cfg["scale"]), INT16_SENTINEL + 1, 32767)
             q = q.to(torch.int16).cpu().numpy()
             del vals
@@ -366,6 +455,10 @@ def main(argv=None):
         print("⚠ Recalibrated bounds not found for every year; falling back to the raw heads "
               "for those years. Phase 1.5 must be final before the production run.")
 
+    if args.qf_dir and args.marginal_shape:
+        raise SystemExit("--qf_dir and --marginal_shape are two different marginals; the "
+                         "distributional model's quantile function IS its marginal, and "
+                         "reshaping it with an empirical fit would undo the point of it.")
     print("Loading marginals ...")
     cache_dir = Path(args.out).parent / (Path(args.out).stem + "_marginals")
     compact, valid, idx, profile = load_marginals(paths, years, cache_dir, args.dist_raster)
@@ -412,9 +505,25 @@ def main(argv=None):
         "field_params": {str(k): v for k, v in fps.items()},
         "rho": {str(k): v for k, v in rho.items()},
         "seed": args.seed,
-        "marginal": "median-spliced two-piece normal; ppf(0.5)=central by construction",
+        "marginal": ("per-pixel quantile function read from the model (no post-hoc "
+                     "reshaping)" if args.qf_dir else
+                     "median-spliced two-piece normal; ppf(0.5)=central by construction"),
+        "qf_dir": str(args.qf_dir) if args.qf_dir else None,
         "sources": {str(y): {k: str(v) for k, v in paths[y].items()} for y in years},
     })
+
+    qf_cfg = None
+    if args.qf_dir:
+        qf_paths = {y: str(Path(args.qf_dir) / args.qf_pattern.format(year=y)) for y in years}
+        missing = [p for p in qf_paths.values() if not Path(p).exists()]
+        if missing:
+            raise SystemExit(f"--qf_dir given but these are missing: {missing}")
+        print(f"  marginal: the model's own quantile function, from {args.qf_dir}")
+        qf_map, u_levels = load_quantile_functions(qf_paths, years, cache_dir, idx)
+        qf_cfg = {"paths": qf_map, "u_levels": [float(v) for v in u_levels],
+                  "scale": float(INT16_SCALE)}
+        print(f"    {len(u_levels)} levels, u in [{u_levels[0]:.5f}, {u_levels[-1]:.5f}] "
+              f"— draws beyond that clamp to the outermost stored quantile")
 
     shapes, banded = {}, False
     if args.marginal_shape and Path(args.marginal_shape).exists():
@@ -454,7 +563,7 @@ def main(argv=None):
         "years": years, "horizons": horizons, "shape": (H, W), "compact": compact,
         "idx": str(cache_dir / "idx.npy"), "out": str(out_path), "field_params": fps, "rho": rho,
         "seed": args.seed, "scale": DEFAULT_SCALE, "wrap_lon": bool(wrap),
-        "independent": bool(args.independent), "shapes": shapes,
+        "independent": bool(args.independent), "shapes": shapes, "qf": qf_cfg,
         "band": str(band_path) if (band_path and banded) else None,
     }
 

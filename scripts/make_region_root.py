@@ -45,12 +45,19 @@ def region_window(geojson: Path, reference: Path) -> Window:
                 ys.append(y)
     with rasterio.open(reference) as src:
         win = from_bounds(min(xs), min(ys), max(xs), max(ys), transform=src.transform)
-        win = win.round_offsets().round_lengths()
-        # clamp to the raster
-        col_off = max(0, int(win.col_off))
-        row_off = max(0, int(win.row_off))
-        width = min(int(win.width), src.width - col_off)
-        height = min(int(win.height), src.height - row_off)
+        # Floor the top-left and ceil the bottom-right -- an OUTER box, which is exactly what
+        # train_lightning.py's prediction path does with the same GeoJSON. The previous
+        # `round_offsets().round_lengths()` rounds to NEAREST, so whenever a region edge lands
+        # short of a pixel centre the root comes out one row or column smaller than the
+        # rasters it has to align with. Africa cropped to 8111 rows against the predictions'
+        # 8112; southern Africa happened to round the same way, which is why this survived.
+        # The cost is not a warning: it surfaced as an IndexError deep inside the coverage
+        # audit (943 against 944), and would have mis-indexed the distance band in
+        # generate_ensemble.py without any error at all.
+        col_off = max(0, int(np.floor(win.col_off)))
+        row_off = max(0, int(np.floor(win.row_off)))
+        width = min(int(np.ceil(win.col_off + win.width)), src.width) - col_off
+        height = min(int(np.ceil(win.row_off + win.height)), src.height) - row_off
     return Window(col_off, row_off, width, height)
 
 
