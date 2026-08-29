@@ -31,6 +31,7 @@ for SEED in $SEEDS; do
   verify_loss_weights "data/ensemble/logs/hindcast_fold${FIRST_FOLD}_${NAME}.log" "$NAME"
   $PY -u scripts/score_distributional_model.py \
       --stitched_dir "data/ensemble/exp/${NAME}/stitched" \
-      --label "$NAME" --folds "$FOLDS" --out_dir "$SCORE_DIR"
+      --label "$NAME" --folds "$FOLDS" --out_dir "$SCORE_DIR" \
+      --fold_mask "$FOLD_MASK"
 done
 echo "=== floor complete: ${SCORE_DIR}/summary_${PREFIX}_s*.json"

@@ -34,8 +34,10 @@ for SEED in $SEEDS; do
   # Prove the lever engaged. A replicate whose flag silently did nothing reads exactly
   # like a lever that has no effect, which is how this project lost a k=5 run once.
   verify_gate_flags "data/ensemble/logs/hindcast_fold${FIRST_FOLD}_${RUN}.log" "$RUN" "$FLAGS"
+  verify_spline_head "data/ensemble/logs/hindcast_fold${FIRST_FOLD}_${RUN}.log" "$RUN" "$FLAGS"
   $PY -u scripts/score_distributional_model.py \
       --stitched_dir "data/ensemble/exp/${RUN}/stitched" \
-      --label "$RUN" --folds "$FOLDS" --out_dir "$SCORE_DIR"
+      --label "$RUN" --folds "$FOLDS" --out_dir "$SCORE_DIR" \
+      --fold_mask "$FOLD_MASK"
 done
 echo "=== replicates complete: ${SCORE_DIR}"

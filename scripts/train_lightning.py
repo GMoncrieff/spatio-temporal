@@ -51,6 +51,24 @@ def _n_context_channels(args):
                                  _csv_ints(args.hm_context_radii) or (3, 30, 100))
 
 
+def _spline_head_banner(args):
+    """The one line that fingerprints the distributional head, or None for the triple head.
+
+    e9 (``--spline_slopes fritsch``) and e10 (``--spline_knots lean9``) ARE the head's
+    parameter count, so a run whose flag silently failed to engage would read as "the lever
+    does nothing" -- the shape this project has twice mistaken for a finding. Extracted to a
+    function so the check that greps this line and the code that prints it can be tested
+    against each other, rather than a check being written against text nobody emits.
+    """
+    if getattr(args, "head_family", "triple") != "spline":
+        return None
+    from src.models.quantile_spline import knot_preset, n_spline_params
+    k = knot_preset(args.spline_knots)
+    n = n_spline_params(len(k), args.spline_slopes == "learned")
+    return (f"Spline head:       knots {args.spline_knots} (n={len(k)}, bins={len(k) - 1}), "
+            f"slopes {args.spline_slopes}, {n} params/horizon")
+
+
 def _experiment_kwargs(args):
     """Model-phase flags, as constructor kwargs. Every default is today's behaviour."""
     return dict(
@@ -80,6 +98,7 @@ def _experiment_kwargs(args):
         crps_tail_p=args.crps_tail_p,
         mu_mse_weight=args.mu_mse_weight,
         spline_learn_slopes=(args.spline_slopes == 'learned'),
+        spline_cumulative_width=args.spline_cumulative_width,
         spline_mean_nodes=args.spline_mean_nodes,
         spline_checkpoint=args.spline_checkpoint,
         chip_weight_correct=args.chip_sampling_correct,
@@ -503,11 +522,13 @@ if __name__ == "__main__":
     # ---- round 2: knot grid, two-sided tail weight, shape-head capacity, HM context ----
     parser.add_argument(
         "--spline_knots", type=str, default="default14",
-        choices=["default14", "body_dense", "deep_lower"],
+        choices=["default14", "body_dense", "deep_lower", "lean9"],
         help="Named knot grid. 'body_dense' adds 0.35/0.45/0.55/0.65: the default grid has "
              "three knots between u=0.10 and u=0.90 while 53%% of pixels move by less than "
              "0.001 over twenty years, and cov50 is the worst-calibrated coverage level. "
-             "'deep_lower' adds 0.0001/0.9999, for P(u<0.001) reading 7x nominal at h=20.",
+             "'deep_lower' adds 0.0001/0.9999, for P(u<0.001) reading 7x nominal at h=20. "
+             "'lean9' is a strict subset instead: 8 bins, no 0.001/0.999, asking whether the "
+             "tail resolution is information or only capacity.",
     )
     parser.add_argument(
         "--crps_tail_weight_lo", type=float, default=0.0,
@@ -602,6 +623,28 @@ if __name__ == "__main__":
              "distributional round-1 runs died this way and were published anyway. False "
              "restores the old silent behaviour.",
     )
+    parser.add_argument(
+        "--predict_subsample_blocks", type=int, default=0,
+        help="SCREEN MODE: predict only N randomly chosen 128 px blocks of the region instead "
+             "of all of it. 0 (the default) predicts everything, today's behaviour. This is "
+             "intersected into the same restriction mask the fold hindcast already uses, so "
+             "every tile overlapping a kept block is still processed and kept pixels get "
+             "EXACTLY the blended value a full run would give -- the screen is exact on the "
+             "pixels it keeps, not an approximation of them. Measured on southern Africa: 24 "
+             "of 59 blocks reproduces the full-raster ranking at r=0.99 on tail_reach20. On "
+             "Africa a 200-block screen is 3.3M px, ~5x the pixels of southern Africa's ENTIRE "
+             "scored area, at ~1.3% of the prediction cost.")
+    parser.add_argument("--predict_subsample_seed", type=int, default=0)
+    parser.add_argument(
+        "--spline_cumulative_width",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=True,
+        help="True (default) accumulates non-negative width increments across horizons so the "
+             "95 percent width cannot shrink with lead time (T4.2), by construction rather "
+             "than by a later pass. False gives each horizon an independent scale, letting "
+             "spread shrink -- the ablation that asks whether that constraint is load-bearing "
+             "or merely tidy. This is the only monotonicity the model IMPOSES; Q(u) increasing "
+             "in u is structural to the spline and is unaffected.")
     parser.add_argument("--grad_clip", type=float, default=0.0,
                         help="Global grad-norm clip applied after the two backward passes, "
                              "0 disables it (today's behaviour)")
@@ -1045,6 +1088,9 @@ if __name__ == "__main__":
               f"(radii {args.context_radii}"
               + (f", hm {args.hm_context_stats} @ {args.hm_context_radii}"
                  if _csv_strs(args.hm_context_stats) else ", no hm context") + ")")
+    _spline_banner = _spline_head_banner(args)
+    if _spline_banner:
+        print(_spline_banner)
     print("="*60 + "\n")
     # Set normalization stats for physical-scale MAE logging
     if hasattr(train_loader, 'dataset'):
@@ -2160,6 +2206,25 @@ if __name__ == "__main__":
                 restrict_win = np.isin(restrict_win, restrict_values)
                 print(f"Restriction mask: {args.predict_restrict_mask} values={restrict_values} "
                       f"({restrict_win.sum():,} of {restrict_win.size:,} px kept)")
+
+            if int(getattr(args, "predict_subsample_blocks", 0)) > 0:
+                _B = 128
+                _nby, _nbx = (Hwin + _B - 1) // _B, (Wwin + _B - 1) // _B
+                _base = restrict_win if restrict_win is not None else bbox_mask
+                # Only blocks that carry predictable pixels are candidates; otherwise the
+                # sample is mostly ocean and its effective size is a fiction.
+                _cand = [(by, bx) for by in range(_nby) for bx in range(_nbx)
+                         if _base[by * _B:(by + 1) * _B, bx * _B:(bx + 1) * _B].any()]
+                _rng = np.random.default_rng(int(args.predict_subsample_seed))
+                _pick = _rng.permutation(len(_cand))[:int(args.predict_subsample_blocks)]
+                _keep = np.zeros((Hwin, Wwin), dtype=bool)
+                for _i in _pick:
+                    _by, _bx = _cand[_i]
+                    _keep[_by * _B:(_by + 1) * _B, _bx * _B:(_bx + 1) * _B] = True
+                restrict_win = _keep if restrict_win is None else (restrict_win & _keep)
+                print(f"SCREEN MODE: {len(_pick)} of {len(_cand)} candidate {_B}px blocks "
+                      f"(seed {args.predict_subsample_seed}); "
+                      f"{int(restrict_win.sum()):,} px kept for prediction")
             
             def lonlat_grid_for_window(i0: int, j0: int, hi: int, wj: int):
                 rows = np.arange(i0, i0 + hi)
@@ -2446,20 +2511,43 @@ if __name__ == "__main__":
             print("\n" + "-"*70)
             print("Blending overlapping tiles for all horizons and quantiles...")
             m = wsum > 0
-            out_horizons = {}
-            for h_name in active_horizons:
-                # The quantile levels blend on exactly the same weights as the triple. A
-                # weighted average of monotone sequences is monotone, so the blended
-                # quantile function is still a quantile function -- and because 0.025 and
-                # 0.975 are levels of the grid, the blended bands reproduce the blended
-                # lower/upper rasters rather than merely approximating them.
-                for q_name in list(quantile_names) + qf_names:
-                    key = f"{h_name}_{q_name}"
-                    out_h = np.full((Hwin, Wwin), np.nan, dtype=np.float32)
-                    out_h[m] = (accum_horizons[key][m] / wsum[m]).astype(np.float32)
-                    # Clamp predictions to valid range [0, 1]
-                    out_h[m] = np.clip(out_h[m], 0.0, 1.0)
-                    out_horizons[key] = out_h
+
+            # Blend one raster at a time, at the moment it is written, instead of building a
+            # dict of every horizon x quantile level first.
+            #
+            # There are len(active_horizons) * (3 + n_qf_levels) accumulators -- 268 for a
+            # four-horizon window at 64 levels. On southern Africa (1.86 Mpx) a full second
+            # copy is 2 GB and invisible. On Africa (63.1 Mpx) each array is 0.252 GB, so the
+            # copy is 67.6 GB, and because np.full touches every page it is ALL resident,
+            # while accum_horizons (np.zeros) stays sparse over ocean. Measured peak was
+            # ~98 GB for one fold; two folds in parallel were OOM-killed by the kernel with
+            # no traceback. Blending on demand removes that copy entirely: peak becomes the
+            # sparse accumulators plus one temporary.
+            #
+            # The arithmetic is unchanged -- same expression, evaluated later -- so the
+            # written values are identical. The quantile levels blend on exactly the same
+            # weights as the triple. A weighted average of monotone sequences is monotone, so
+            # the blended quantile function is still a quantile function, and because 0.025
+            # and 0.975 are levels of the grid the blended bands reproduce the blended
+            # lower/upper rasters rather than merely approximating them.
+            # In screen mode the kept blocks are exact, but every PROCESSED TILE writes its
+            # whole 128 px extent, so a halo around each block also comes out finite -- with
+            # incomplete blending, because the tiles that would have contributed to it were
+            # skipped. Measured: kept pixels agree with a full run to 3.6e-7 (float32 summation
+            # order), the halo to only 3.1e-3, which is the size of the signal. In the ordinary
+            # fold hindcast the halo is harmless because it falls outside the fold and the
+            # stitcher drops it; here it falls INSIDE the fold, so the scorer would take it.
+            _screen_mask = restrict_win if int(
+                getattr(args, "predict_subsample_blocks", 0)) > 0 else None
+
+            def _blend(key):
+                out_h = np.full((Hwin, Wwin), np.nan, dtype=np.float32)
+                out_h[m] = (accum_horizons[key][m] / wsum[m]).astype(np.float32)
+                # Clamp predictions to valid range [0, 1]
+                out_h[m] = np.clip(out_h[m], 0.0, 1.0)
+                if _screen_mask is not None:
+                    out_h[~_screen_mask] = np.nan
+                return out_h
             
             # Calculate statistics
             num_valid_pixels = m.sum()
@@ -2497,7 +2585,7 @@ if __name__ == "__main__":
                     key = f"{h_name}_{q_name}"
                     out_path = out_dir / f"{prefix}prediction_{h_year}_{q_name}_blended.tif"
                     with rasterio.open(out_path, 'w', **out_profile) as dst:
-                        dst.write(out_horizons[key], 1)
+                        dst.write(_blend(key), 1)
                     out_paths[key] = out_path
                     print(f"  ✓ {h_year} {q_name}: {out_path}")
 
@@ -2511,7 +2599,7 @@ if __name__ == "__main__":
                     qf_path = out_dir / f"{prefix}prediction_{h_year}_qf_blended.tif"
                     with rasterio.open(qf_path, 'w', **qf_profile) as dst:
                         for li, lname in enumerate(qf_names):
-                            band = out_horizons[f"{h_name}_{lname}"]
+                            band = _blend(f"{h_name}_{lname}")
                             q = np.where(np.isfinite(band),
                                          np.round(band * 32767.0), -32768)
                             dst.write(np.clip(q, -32768, 32767).astype(np.int16), li + 1)

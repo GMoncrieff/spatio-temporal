@@ -52,7 +52,10 @@ for NAME in $ORDER; do
   FLAGS="${SLATE[$NAME]:-}"
   if [ -z "$FLAGS" ]; then echo "unknown variant $NAME" >&2; exit 2; fi
   for SEED in $SEEDS; do
-    RUN="${NAME}_s${SEED}"
+    # PREFIX keeps two regions' slates apart. Without it an Africa run named e1_s45 finds a
+    # SOUTHERN AFRICA summary of the same name, skips itself, and the comparison silently mixes
+    # regions -- or worse, overwrites the other region's result where the seeds overlap.
+    RUN="${PREFIX:-}${NAME}_s${SEED}"
     if [ -f "${SCORE_DIR}/summary_${RUN}.json" ]; then
       echo "=== ${RUN} already scored, skipping"; continue
     fi
@@ -66,7 +69,8 @@ for NAME in $ORDER; do
     verify_context_channels "$LOG" "$RUN" "$FLAGS"
     $PY -u scripts/score_distributional_model.py \
         --stitched_dir "data/ensemble/exp/${RUN}/stitched" \
-        --label "$RUN" --folds "$FOLDS" --out_dir "$SCORE_DIR"
+        --label "$RUN" --folds "$FOLDS" --out_dir "$SCORE_DIR" \
+      --fold_mask "$FOLD_MASK"
   done
 done
 echo "=== phase 2 complete: ${SCORE_DIR}"

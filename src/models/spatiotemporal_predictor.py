@@ -62,6 +62,7 @@ class SpatioTemporalPredictor(nn.Module):
                  head_family: str = 'triple',
                  spline_u_knots=None,
                  spline_learn_slopes: bool = True,
+                 spline_cumulative_width: bool = True,
                  spline_mean_nodes: int = 8,
                  spline_checkpoint: bool = True,
                  shape_head_hidden_layers: int = 1,
@@ -189,6 +190,7 @@ class SpatioTemporalPredictor(nn.Module):
             raise ValueError(f"unknown head_family {head_family!r}")
         self.head_family = str(head_family)
         self.spline_learn_slopes = bool(spline_learn_slopes)
+        self.spline_cumulative_width = bool(spline_cumulative_width)
         self.spline_mean_nodes = int(spline_mean_nodes)
         self.spline_checkpoint = bool(spline_checkpoint)
         knots = U_KNOTS_DEFAULT if spline_u_knots is None else tuple(spline_u_knots)
@@ -499,7 +501,11 @@ class SpatioTemporalPredictor(nn.Module):
             # Non-negative increments accumulated across horizons: the 95% width cannot
             # shrink with lead time (T4.2), by construction rather than by a later pass.
             step = F.softplus(self.width_heads[h_idx](qi))
-            cum = step if cum is None else cum + step
+            # spline_cumulative_width=False makes each horizon's scale independent, so the
+            # 95% width is free to SHRINK with lead time. That is the one monotonicity this
+            # model imposes rather than inherits: Q(u) increasing in u is structural to the
+            # spline (softmax bin heights, positive derivatives) and is untouched here.
+            cum = step if (cum is None or not self.spline_cumulative_width) else cum + step
             blocks.append(torch.cat([centrals[h_idx], cum, self.shape_heads[h_idx](qi)], dim=1))
         block = torch.cat(blocks, dim=1)
 

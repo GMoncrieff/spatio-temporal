@@ -376,6 +376,14 @@ def main(argv=None):
     ap.add_argument("--fold_mask", default=str(REGION_ROOT / "fold_mask.tif"))
     ap.add_argument("--context_pattern",
                     default="data/raw/hm_global/change_context_w{year}_1000.tif")
+    ap.add_argument("--subsample_blocks", type=int, default=0,
+                   help="Score only N randomly chosen 128 px blocks of the grid instead of "
+                        "every pixel. 0 (the default) is today's behaviour. This exists to "
+                        "answer one question: can a cheap chip-sample screen stand in for the "
+                        "full-raster score? Blocks rather than random pixels, because a "
+                        "screen forward-passes contiguous chips and neighbouring pixels are "
+                        "strongly correlated -- random pixels would flatter the estimate.")
+    ap.add_argument("--subsample_seed", type=int, default=0)
     ap.add_argument("--min_count", type=int, default=2000,
                     help="Strata thinner than this are written out but kept out of the "
                          "headline summary, where a 40-pixel cell would otherwise swing it.")
@@ -393,6 +401,42 @@ def main(argv=None):
             ref = {"transform": src.transform, "width": src.width, "height": src.height}
         fold_sel = np.isin(_read_like(args.fold_mask, ref), want)
         print(f"Scoring folds {want}: {int(fold_sel.sum()):,} px of the grid")
+        # A fold mask from the wrong region silently scores a subset and reports a number that
+        # looks fine. Measured: the default REGION_ROOT mask covers only southern Africa, so an
+        # Africa run scored 680,594 of its 2,474,010 predicted pixels -- every "Africa" figure
+        # would have been a southern-Africa figure wearing an Africa label. The stitcher writes
+        # only held-out-fold pixels, so on a correct pairing essentially every finite pixel is
+        # selected; a large shortfall means the mask does not match the rasters.
+        with rasterio.open(rows[0]["path_central"]) as _src:
+            _finite = np.isfinite(_src.read(1, masked=True).filled(np.nan))
+        _cov = float((fold_sel & _finite).sum()) / max(int(_finite.sum()), 1)
+        if _cov < 0.5:
+            raise SystemExit(
+                f"FATAL: --fold_mask {args.fold_mask} selects only {_cov:.1%} of the "
+                f"{int(_finite.sum()):,} finite pixels in {rows[0]['path_central']}. "
+                f"That mask does not cover these rasters -- pass the one prediction used "
+                f"(the distributional drivers pass $FOLD_MASK).")
+        print(f"  fold mask covers {_cov:.1%} of the finite pixels")
+
+    if args.subsample_blocks > 0:
+        with rasterio.open(rows[0]["path_central"]) as src:
+            H, W = src.height, src.width
+        B = 128
+        nby, nbx = (H + B - 1) // B, (W + B - 1) // B
+        keep = np.zeros((H, W), dtype=bool)
+        # Only blocks that actually carry scorable pixels are candidates, or the sample is
+        # mostly ocean and the effective size is a fiction.
+        base = fold_sel if fold_sel is not None else np.ones((H, W), dtype=bool)
+        cand = [(by, bx) for by in range(nby) for bx in range(nbx)
+                if base[by * B:(by + 1) * B, bx * B:(bx + 1) * B].any()]
+        rng = np.random.default_rng(args.subsample_seed)
+        pick = rng.permutation(len(cand))[:args.subsample_blocks]
+        for i in pick:
+            by, bx = cand[i]
+            keep[by * B:(by + 1) * B, bx * B:(bx + 1) * B] = True
+        fold_sel = keep if fold_sel is None else (fold_sel & keep)
+        print(f"Subsample: {len(pick)} of {len(cand)} candidate {B}px blocks, "
+              f"{int(fold_sel.sum()):,} px scored")
 
     dist_recs, central_recs, consist_recs = [], [], []
     for row in rows:

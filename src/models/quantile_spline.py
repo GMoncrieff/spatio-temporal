@@ -47,8 +47,9 @@ U_KNOTS_DEFAULT = (
 
 U_LO, U_MID, U_HI = 0.025, 0.5, 0.975
 
-# Named knot grids. `default14` is round 1's, and every other preset is a superset of it, so a
-# preset can only add resolution and never move an existing knot.
+# Named knot grids. `default14` is round 1's, and every other preset is a subset or a superset
+# of it -- never a re-placement -- so a preset can only add or remove resolution and no knot
+# ever moves. That is what makes a preset A/B readable: the difference is the knots themselves.
 #
 # `body_dense` corrects a choice round 1 got wrong. The default grid has exactly three knots
 # between u = 0.10 and u = 0.90, while 53% of pixels move by less than 0.001 over twenty years:
@@ -58,8 +59,18 @@ U_LO, U_MID, U_HI = 0.025, 0.5, 0.975
 #
 # `deep_lower` targets the other named defect: `P(u<0.001)` reads 0.0076 at h=20 against a
 # nominal 0.001, so observations fall below the deepest quantile the grid can express.
+#
+# `lean9` goes the other way, and tests the premise the whole grid rests on. Tail knots create
+# *capacity*, not information: ordinary CRPS integrates over u, so the deepest intervals
+# contribute little to the population score while the head still has to estimate them. It drops
+# 0.001, 0.05, 0.25, 0.75, 0.95 and 0.999 -- 14 bins to 8, 29 parameters per horizon to 17 with
+# learned slopes -- and is a strict SUBSET of `default14`, so nothing moves and the comparison
+# is only "was that resolution load-bearing". Round 1 refused this experiment (as D9) because a
+# null would have meant "under-powered" against southern Africa's 40-89% h=20 bands; the Africa
+# floor is ~5x tighter at n=6, so a null is readable now.
 KNOT_PRESETS = {
     "default14": U_KNOTS_DEFAULT,
+    "lean9": (0.0, 0.005, 0.025, 0.10, 0.5, 0.90, 0.975, 0.99, 1.0),
     "body_dense": tuple(sorted(set(U_KNOTS_DEFAULT) | {0.35, 0.45, 0.55, 0.65})),
     "deep_lower": tuple(sorted(set(U_KNOTS_DEFAULT) | {0.0001, 0.9999})),
 }

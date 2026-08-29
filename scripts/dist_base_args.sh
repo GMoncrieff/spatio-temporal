@@ -95,6 +95,40 @@ verify_gate_flags() {
   [ "$ok" = 1 ]
 }
 
+# Prove the distributional HEAD is the one that was asked for. e9 and e10 are the head's
+# parameter count and nothing else, so a preset or slope mode that silently failed to engage
+# would read as "the lever does nothing". The line it greps is printed by
+# `_spline_head_banner` in train_lightning.py and unit-tested against this pattern, because a
+# check written against text nobody emits checks nothing.
+verify_spline_head() {
+  local log="$1" name="$2" flags="$3" line want
+  case "$flags" in
+    *--spline_slopes*|*--spline_knots*) ;;
+    *) return 0 ;;
+  esac
+  line=$(grep -o "Spline head:.*" "$log" | tail -1)
+  if [ -z "$line" ]; then
+    echo "FATAL: ${name} set a spline-head flag and the log has no 'Spline head:' line." >&2
+    return 1
+  fi
+  case "$flags" in
+    *--spline_slopes\ fritsch*)
+      case "$line" in
+        *"slopes fritsch"*) ;;
+        *) echo "FATAL: ${name} asked for fritsch slopes; log says: ${line}" >&2; return 1 ;;
+      esac ;;
+  esac
+  case "$flags" in
+    *--spline_knots\ *)
+      want=$(sed -E 's/.*--spline_knots ([A-Za-z0-9_]+).*/\1/' <<<"$flags")
+      case "$line" in
+        *"knots ${want} "*) ;;
+        *) echo "FATAL: ${name} asked for knots ${want}; log says: ${line}" >&2; return 1 ;;
+      esac ;;
+  esac
+  echo "  ✓ ${name} ${line}"
+}
+
 # Prove the covariate reached the model. E1 is the round's headline experiment and its whole
 # content is twelve context channels instead of eight; a run that silently fell back to eight
 # would read as "the covariate does nothing".

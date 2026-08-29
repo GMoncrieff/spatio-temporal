@@ -52,6 +52,20 @@ REPORTED = ["cov95_5", "cov95_20", "pit_gt_0999_20", "tail_reach20",
             "qf_vs_triple_max", "central_outside_interval"]
 
 
+def collapse_seeds(df: pd.DataFrame, pattern: str = r"_s\d+$"):
+    """Collapse replicate rows to one row per configuration, metric by metric.
+
+    A three-seed *range* is not a statistic: on the six-seed Africa floor a three-seed range
+    swings 17.5x across draws from one configuration, against 1.1x for the median. So a
+    variant is ranked on its median, and the median is taken independently per metric -- no
+    single seed's row is selected, because a run can be the middle one on ``crps_skill5`` and
+    the extreme one on ``tail_reach20``.
+    """
+    base = df.index.to_series().str.replace(pattern, "", regex=True)
+    med = df.select_dtypes(include="number").groupby(base).median()
+    return med, df.groupby(base).size()
+
+
 def load(score_dir: str) -> pd.DataFrame:
     rows = []
     for path in sorted(glob.glob(os.path.join(score_dir, "summary_*.json"))):
@@ -68,13 +82,32 @@ def main(argv=None):
     ap.add_argument("--score_dir", default="data/ensemble/exp/dist_scores")
     ap.add_argument("--baseline", default=r"^d0_s\d+$",
                     help="Regex selecting the baseline replicates whose spread is the floor.")
+    ap.add_argument("--include", default=None,
+                    help="Regex a variant label must match to be ranked. The floor is a "
+                         "property of the configuration AND of the extent it was measured "
+                         "on, so use this to keep another region's runs out of the table.")
+    ap.add_argument("--group_seeds", action="store_true",
+                    help="Rank each configuration on the MEDIAN of its replicates rather "
+                         "than one row per seed.")
     args = ap.parse_args(argv)
 
     df = load(args.score_dir)
     base = df[[bool(re.match(args.baseline, str(i))) for i in df.index]]
     others = df[[not bool(re.match(args.baseline, str(i))) for i in df.index]]
 
+    if args.include:
+        others = others[[bool(re.search(args.include, str(i))) for i in others.index]]
+        if others.empty:
+            raise SystemExit(f"--include {args.include!r} matched no variant")
+    per_seed = others
+    n_seeds = pd.Series(1, index=others.index, dtype=int)
+    if args.group_seeds:
+        others, n_seeds = collapse_seeds(others)
+
     print(f"baseline replicates: {list(base.index)}")
+    if args.group_seeds:
+        print("variants ranked on the median of: "
+              + ", ".join(f"{k} (n={v})" for k, v in n_seeds.items()))
     if len(base) < 2:
         raise SystemExit(
             "fewer than two baseline replicates: the floor is a property of THIS "
@@ -100,15 +133,24 @@ def main(argv=None):
         for label, v in others[metric].items():
             if not np.isfinite(v) or direction == "none":
                 continue
-            margin = (v - hi) if direction == "up" else (lo - v)
-            if width > 0 and margin > width:
-                hits.append(f"{label} {v:.5f} (+{margin / width:.1f}x)")
+            # The bar is two-sided and the same size on both sides: a value must sit more
+            # than one floor-width past the floor's edge *in the direction being claimed*.
+            # It was not always: WORSE used to be measured from the floor's BEST edge, which
+            # made it fire one whole width earlier than "better" did. Of the eight WORSE
+            # verdicts on the Africa slate under that rule, seven sat 0.04x-0.78x past the
+            # floor -- inside the margin the other side of the same test has to exceed.
+            better = (v - hi) if direction == "up" else (lo - v)
+            worse = (lo - v) if direction == "up" else (v - hi)
+            if width > 0 and better > width:
+                hits.append(f"{label} {v:.5f} (+{better / width:.1f}x)")
                 if powered:
                     verdicts.setdefault(label, []).append(f"{metric} better")
                 else:
                     verdicts.setdefault(label, []).append(f"{metric} better (weak row)")
-            elif width > 0 and -margin > width:
-                verdicts.setdefault(label, []).append(f"{metric} WORSE")
+            elif width > 0 and worse > width:
+                tag = f"{metric} WORSE ({worse / width:.1f}x)"
+                verdicts.setdefault(label, []).append(
+                    tag if powered else tag + " (weak row)")
         note = "-" if direction == "none" else (", ".join(hits) if hits else "-")
         print(f"{metric:<22}{lo:>11.5f}{hi:>11.5f}{width:>10.5f}{rel:>7.0%}"
               f"{'  ok' if powered else ' WEAK':>7}   {note}")
@@ -117,8 +159,12 @@ def main(argv=None):
     print("every run, every metric (read the rows, not a count)")
     print("=" * 96)
     cols = [m for m, _ in METRICS if m in df.columns] + [c for c in REPORTED if c in df.columns]
+    table = pd.concat([base[cols], per_seed[cols]])
     with pd.option_context("display.width", 200, "display.max_columns", 50):
-        print(df[cols].to_string(float_format=lambda v: f"{v:.5f}"))
+        print(table.to_string(float_format=lambda v: f"{v:.5f}"))
+        if args.group_seeds:
+            print("\nthe same variants, collapsed to the median that was judged")
+            print(others.reindex(columns=cols).to_string(float_format=lambda v: f"{v:.5f}"))
 
     print("\n" + "=" * 96)
     print("verdicts (a variant must clear the bar on a metric that matters, and replicate)")
