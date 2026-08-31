@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate docs/dist_scorecard.md for one configuration, from its own scored CSVs.
+"""Generate docs/dist_global_scorecard.md for one configuration, from its own scored CSVs.
 
 Every number is computed here from data/ensemble/exp/dist_scores/{dist,central,consistency}_*.csv,
 so the prose and the tables cannot drift apart. Regenerate after any rescore; do not hand-edit
@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 
 SCORES = "data/ensemble/exp/dist_scores"
-OUT = "docs/dist_scorecard.md"
+OUT = "docs/dist_global_scorecard.md"
 H = [5, 10, 15, 20]
 BANDS = ["0-1", "1-3", "3-10", "10-30", "30-100", ">100"]
 

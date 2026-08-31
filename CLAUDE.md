@@ -18,12 +18,11 @@ empirical marginal, spatial spectrum, AR(1) horizon coupling — and a 400-membe
 **99/134 scorecard rows.** Artifacts on the HDD at `data/ensemble/exp/g1_foldb4`; checkpoints in
 `data/ensemble/production/FOLD_CHECKPOINTS.json`.
 
-Three documents supersede everything else and stand on their own:
-
-- **`docs/global_ensemble_methodology.md`** — the method. Start here.
-- **`docs/global_scorecard.md`** — every evaluation: what it tests, what failure looks like,
-  where its threshold came from, what it scored.
-- **`docs/fitting_running_model.md`** — the runbook, with measured cost per stage.
+Its methodology and runbook have been **rewritten for the distributional system** that
+supersedes it — `docs/global_methodology.md` and `docs/fitting_running_model.md` now describe
+the current product, not this one. `docs/global_scorecard.md`, which recorded this product's
+134 evaluation rows, was **deleted** on 2026-08-31; the numbers quoted in this file and in
+`docs/background/` are the surviving record of it.
 
 Its three named defects: aggregate over-dispersion, long-range structure at 0.230 of budget, and
 **the far field emitting 0.034 of the observed rate of new development beyond 100 px**. The last
@@ -39,7 +38,15 @@ time. It blocks far-field work *on the frozen product* only.
 Branch **`dist-convlstm`**. **Model phase and ensemble phase are both CLOSED** (2026-08-28,
 2026-08-30). `e1` is the model; `V4b` is the ensemble — PIT-space spectrum, `--long_weight 0`,
 `--copula t --copula_df 7 --copula_w_draw stratified`. Full writeup `docs/dist_ensemble_phase.md`.
-Current work is the **global production hindcast + 2025-2040 forecast**.
+
+**The global ConvLSTM phase is COMPLETE (2026-08-31)**: k=5 out-of-sample global hindcast
+(13.4 h, 25/25 fingerprints verified), 40 stitched rasters at 184,573,321 px each, a
+ConvLSTM-only scorecard, an all-data forward model forecasting 2025-2040, 24 COGs and two
+quantile icechunk stores uploaded to Box and hash-verified.
+**Current work is the global V4b ensemble — step 5 onward — which has NOT started.**
+Driver ready: `scripts/run_global_dist_ensemble.sh`. Read the `global-production-phase` memory
+first; it carries the measured costs, the disk envelope and the three traps that driver exists
+to avoid.
 
 The model emits a full per-pixel quantile function `Q_h(u|x)` and
 that function *is* the product: no conformal scaling, no width factors, no empirical marginal
@@ -48,7 +55,8 @@ with **fixed tail-dense knots**, anchored at persistence through the existing ze
 head, with a cumulative scale so spread cannot shrink with lead time, trained on CRPS.
 
 - **`docs/dist_model_phase.md`** — round 1: the method, every result, every null.
-- **`docs/dist_scorecard.md`** — every metric explained in plain terms with its measured value.
+- **`docs/dist_global_scorecard.md`** — the **global** model scorecard: every metric explained in
+  plain terms with its measured value. Supersedes the Africa edition.
 - **`docs/superpowers/specs/2026-08-25-distributional-round-2-design.md`** — round 2's design.
 
 **Round 1 adopted nothing but established three things**, all properties of the design rather
