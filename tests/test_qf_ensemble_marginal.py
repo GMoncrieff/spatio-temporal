@@ -102,3 +102,126 @@ def test_the_sampled_marginal_reproduces_the_stored_one(n):
         emp = float(torch.quantile(vals, level))
         from scipy.stats import norm
         assert abs(emp - (mu[0] + sd[0] * norm.ppf(level))) < 0.01, level
+
+
+# ------------------------------------------------------------------ the Student-t copula
+#
+# The whole claim of a t-copula here is that it changes the JOINT behaviour and leaves every
+# pixel's marginal exactly where it was. That is not a soft property: T1, T5 and
+# check_qf_ensemble's discrete sandwich all assume the marginal is the model's own quantile
+# function, and they must not move. These pin the claim rather than trusting it.
+
+
+def test_t_cdf_table_matches_scipy():
+    from scipy.stats import t as _t
+    from scripts.generate_ensemble import t_cdf_table
+
+    for df in (4.0, 7.0, 30.0):
+        g, c = t_cdf_table(df)
+        probe = np.linspace(-11.5, 11.5, 4001)
+        got = np.interp(probe, g, c)
+        assert np.abs(got - _t.cdf(probe, df)).max() < 1e-6, df
+
+
+def test_t_copula_leaves_the_marginal_uniform():
+    """``T_df(z / sqrt(chi2_df/df))`` is uniform by definition. If it is not, the marginal moved.
+
+    Drawn one pixel per ``w`` so the sample is i.i.d. Pooling many pixels under a shared ``w``
+    — which is what a member is — makes the draws *clustered*, and KS on clustered data is
+    anti-conservative: 500k samples from 5000 w values reports KS = 0.0025, p = 0.005 for a
+    construction that is exactly right. Verified by running the identical draws through
+    scipy alone, which returns the same statistic to five decimals.
+    """
+    from scipy.stats import kstest
+    from scripts.generate_ensemble import t_cdf_table, u_from_t_torch
+
+    df = 7.0
+    g, c = t_cdf_table(df)
+    grid, cdf = torch.as_tensor(g), torch.as_tensor(c)
+    rng = np.random.default_rng(0)
+    n = 400_000
+    w = (rng.chisquare(df, size=n) / df).astype(np.float32)
+    z = rng.standard_normal(n).astype(np.float32)
+    # u_from_t_torch takes one scalar w; the vectorised equivalent is the same arithmetic.
+    zt = torch.as_tensor(z / np.sqrt(w))
+    j = torch.searchsorted(grid, zt.contiguous()).clamp_(1, grid.numel() - 1)
+    t = ((zt - grid[j - 1]) / (grid[j] - grid[j - 1])).clamp_(0.0, 1.0)
+    u = (cdf[j - 1] + t * (cdf[j] - cdf[j - 1])).numpy()
+
+    assert u.min() > 0.0 and u.max() < 1.0
+    ks = kstest(u, "uniform")
+    assert ks.pvalue > 0.01, ks
+
+
+def test_t_copula_table_matches_scipy_on_the_worker_path():
+    """The scalar-w path the worker actually runs, against scipy's own t CDF."""
+    from scipy.stats import t as _t
+    from scripts.generate_ensemble import t_cdf_table, u_from_t_torch
+
+    df = 7.0
+    g, c = t_cdf_table(df)
+    grid, cdf = torch.as_tensor(g), torch.as_tensor(c)
+    rng = np.random.default_rng(3)
+    worst = 0.0
+    for _ in range(40):
+        w = float(rng.chisquare(df) / df)
+        z = rng.standard_normal(2000).astype(np.float32)
+        got = u_from_t_torch(torch.as_tensor(z), w, grid, cdf).numpy().astype(np.float64)
+        ref = _t.cdf(z.astype(np.float64) / np.sqrt(w), df)
+        worst = max(worst, float(np.abs(got - ref).max()))
+    assert worst < 1e-5, worst
+
+
+def test_t_copula_is_tail_dependent_where_gaussian_is_not():
+    """Members must co-move into their tails more often than under a Gaussian copula.
+
+    The measurable version: the *fraction of pixels a member puts above u = 0.975* is a
+    constant 2.5% in expectation either way, but under a shared chi2 factor its spread
+    across members is far larger — that spread is the compound-extreme behaviour the
+    ecoregion-coverage rows are short of.
+    """
+    from scipy.stats import norm
+    from scripts.generate_ensemble import t_cdf_table, u_from_t_torch
+
+    df, n_px, n_mem = 7.0, 20_000, 200
+    g, c = t_cdf_table(df)
+    grid, cdf = torch.as_tensor(g), torch.as_tensor(c)
+    rng = np.random.default_rng(1)
+
+    gauss, tcop = [], []
+    for m in range(n_mem):
+        z = torch.as_tensor(rng.standard_normal(n_px).astype(np.float32))
+        gauss.append(float((norm.cdf(z.numpy()) > 0.975).mean()))
+        w = float(rng.chisquare(df) / df)
+        tcop.append(float((u_from_t_torch(z, w, grid, cdf).numpy() > 0.975).mean()))
+    gauss, tcop = np.array(gauss), np.array(tcop)
+
+    assert abs(gauss.mean() - 0.025) < 0.004, gauss.mean()
+    assert abs(tcop.mean() - 0.025) < 0.006, tcop.mean()
+    assert tcop.std() > 4 * gauss.std(), (tcop.std(), gauss.std())
+
+
+def test_stratified_chi2_factor_matches_its_target_law_at_finite_M():
+    """The per-member tail factor is reused at every pixel, so its *realised* law is what counts.
+
+    An i.i.d. draw of M chi2 values has a sample mean that is off by O(1/sqrt(M)), and because
+    the same M values are applied at all 13.8M pixels that error does not average away — it
+    biases every published interval. Measured on the M=400 t-copula run: the realised marginal
+    CDF sat +0.0033 above target at u = 0.944, narrowing intervals ~6% and flattering T2.8.
+    Stratifying the draw over the chi2 quantile function fixes the realised law exactly at any
+    M while staying independent of the field.
+    """
+    from scipy.stats import chi2
+
+    df, M = 7.0, 400
+    rng = np.random.default_rng(1)
+    strat = chi2.ppf((np.arange(M) + 0.5) / M, df) / df
+    iid = rng.chisquare(df, size=M) / df
+
+    assert abs(strat.mean() - 1.0) < 1e-3, strat.mean()
+    # The stratified draw is an order of magnitude closer to the target mean than an i.i.d.
+    # one, which is the whole point; the i.i.d. sample here is 3.4% low.
+    assert abs(strat.mean() - 1.0) < 0.1 * abs(iid.mean() - 1.0)
+    # A permutation must not change the multiset, only which member gets which factor.
+    perm = strat[rng.permutation(M)]
+    assert np.allclose(np.sort(perm), np.sort(strat))

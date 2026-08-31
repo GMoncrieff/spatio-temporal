@@ -39,7 +39,7 @@ from src.ensemble import aggregate as agg  # noqa: E402
 from compare_marginal_renders import HM_DIR, pick_windows, read_like  # noqa: E402
 
 
-def spread_windows(d_obs, size=768, n=3, n_candidates=400, seed=0):
+def spread_windows(d_obs, size=768, n=3, n_candidates=400, seed=0, min_land=0.6):
     """``n`` windows spanning the observed-change spectrum, busiest first.
 
     ``pick_windows`` returns the two extremes, which is the right choice when the question
@@ -59,7 +59,7 @@ def spread_windows(d_obs, size=768, n=3, n_candidates=400, seed=0):
         c0 = int(rng.integers(0, max(1, W - size)))
         sub = d_obs[r0:r0 + size, c0:c0 + size]
         finite = np.isfinite(sub)
-        if finite.mean() < 0.6:
+        if finite.mean() < min_land:
             continue
         cands.append((float(np.nanmean(np.abs(sub))), (r0, c0)))
     if not cands:
@@ -77,6 +77,10 @@ def main(argv=None):
     ap.add_argument("--ensemble", required=True)
     ap.add_argument("--label", default="measured marginal")
     ap.add_argument("--recal_dir", required=True)
+    ap.add_argument("--suffix", default="_recal",
+                    help="Filename suffix on the triple: '_recal' for the post-hoc chain's "
+                         "recalibrated rasters, '' for the distributional lineage, whose "
+                         "published bounds ARE Q(0.025)/Q(0.975) and are never recalibrated.")
     ap.add_argument("--base_year", type=int, default=2000)
     ap.add_argument("--years", default="2005,2010,2015,2020")
     ap.add_argument("--size", type=int, default=768)
@@ -84,6 +88,11 @@ def main(argv=None):
     ap.add_argument("--seed", type=int, default=0,
                     help="Picks the random members; fixed so the figure is reproducible.")
     ap.add_argument("--out_dir", required=True)
+    ap.add_argument("--min_land", type=float, default=0.6,
+                    help="Minimum finite fraction a candidate window must carry. Lower it for "
+                         "a holdout-stitched hindcast, which is a fold checkerboard: on Africa "
+                         "with folds 1-2 the densest 768 px window is 0.498 finite, so the 0.6 "
+                         "default rejects every candidate and renders nothing.")
     ap.add_argument("--n_windows", type=int, default=0,
                     help="Instead of the default busiest/quietest pair, take this many "
                          "windows spanning the observed-change spectrum — busiest, then "
@@ -118,20 +127,21 @@ def main(argv=None):
     figures = {}
     for hi, year in enumerate(years):
         stem = f"w{args.base_year}_prediction_{year}"
-        with rasterio.open(Path(args.recal_dir) / f"{stem}_central_recal.tif") as s:
+        with rasterio.open(Path(args.recal_dir) / f"{stem}_central{args.suffix}.tif") as s:
             ref = {"transform": s.transform, "width": s.width, "height": s.height}
             cen = s.read(1).astype(np.float64)
-        low = read_like(Path(args.recal_dir) / f"{stem}_lower_recal.tif", ref)
-        upp = read_like(Path(args.recal_dir) / f"{stem}_upper_recal.tif", ref)
+        low = read_like(Path(args.recal_dir) / f"{stem}_lower{args.suffix}.tif", ref)
+        upp = read_like(Path(args.recal_dir) / f"{stem}_upper{args.suffix}.tif", ref)
         hm0 = read_like(HM_DIR / f"HM_{args.base_year}_AA_1000.tiff", ref)
         obs = read_like(HM_DIR / f"HM_{year}_AA_1000.tiff", ref)
         valid = np.isfinite(cen) & np.isfinite(hm0) & np.isfinite(obs)
         d_obs_full = np.where(valid, obs - hm0, np.nan)
 
         if args.n_windows > 0:
-            wins = spread_windows(d_obs_full, size=args.size, n=args.n_windows)
+            wins = spread_windows(d_obs_full, size=args.size, n=args.n_windows,
+                                  min_land=args.min_land)
         else:
-            wins = pick_windows(d_obs_full, size=args.size)
+            wins = pick_windows(d_obs_full, size=args.size, min_land=args.min_land)
         for wname, (r0, c0) in wins.items():
             sl = (slice(r0, r0 + args.size), slice(c0, c0 + args.size))
             win = (r0, r0 + args.size, c0, c0 + args.size)

@@ -96,6 +96,35 @@ def parse_args(argv=None):
                          "Q_h(u|x): no two-piece normal, no empirical shape, no width factor. "
                          "Mutually exclusive with --marginal_shape.")
     ap.add_argument("--qf_pattern", default="prediction_{year}_qf.tif")
+    ap.add_argument("--horizon_corr", default=None,
+                    help="JSON with 'horizons' and a full correlation matrix 'R', from "
+                         "src.ensemble.residuals.horizon_correlation_matrix. Replaces the "
+                         "AR(1) chain with a separable space x horizon covariance "
+                         "C_space(d).R_hh', which carries each horizon's spatial spectrum and "
+                         "reproduces R exactly, both by construction. Mutually exclusive with "
+                         "the AR(1) path; --rho_json is then only a scoring reference.")
+    ap.add_argument("--copula", default="gaussian", choices=["gaussian", "t"],
+                    help="Dependence family. 't' scales the correlated Gaussian field by one "
+                         "shared chi2_df/df draw per member and maps it through the Student-t "
+                         "CDF, which is tail *dependent* where a Gaussian copula is not. Every "
+                         "pixel's marginal is unchanged by construction. Requires --qf_dir.")
+    ap.add_argument("--copula_w_draw", default="stratified",
+                    choices=["stratified", "iid"],
+                    help="How the per-member chi2 factor is drawn. 'iid' is the textbook "
+                         "sampler and is WRONG at finite M for this purpose: the same M draws "
+                         "are reused at every pixel, so the realised across-member mixture is "
+                         "the empirical law of those M values, not the target one. Measured at "
+                         "M=400, df=7: the realised CDF sits +0.0033 above target at u=0.944, "
+                         "which narrows every published interval by ~6% and flatters T2.8. "
+                         "'stratified' takes w_m = chi2.ppf((m+0.5)/M)/df in random order, so "
+                         "the realised mixture matches the target law exactly at any M while "
+                         "staying independent of the field.")
+    ap.add_argument("--copula_df", type=float, default=7.0,
+                    help="Degrees of freedom for --copula t. 7 was measured, not chosen: the "
+                         "observation's standardised position within the member ecoregion-mean "
+                         "distribution has kurtosis 4.2-5.2 at h=10/15/20 on the e1 Africa "
+                         "hindcast (Gaussian is 3.0), and 3 + 6/(nu-4) inverts to nu = 6.7-8.9, "
+                         "7.1 at h=20.")
     ap.add_argument("--spectral_fits", default=None,
                     help="JSON from scripts/fit_field_spectra.py. Matching the observed "
                          "power spectrum rather than the variogram is what gives members "
@@ -222,15 +251,57 @@ def load_quantile_functions(qf_paths, years, cache_dir, idx):
             elif not np.array_equal(u, u_ref):
                 raise SystemExit(f"{qf_paths[y]}: u grid differs from {years[0]}'s; the "
                                  f"horizons would be sampled on different grids")
-            q = src.read().reshape(u.size, -1)[:, idx]
-        p = cache_dir / f"{y}_qf.npy"
-        np.save(p, np.ascontiguousarray(q))
+            p = cache_dir / f"{y}_qf.npy"
+            # Band by band into a memmap, never the whole raster. src.read() on the global
+            # grid is 64 x 684.4 Mpx x 2 B = 87.6 GB, and the gather that follows it another
+            # 23.6 GB -- against 125 GB of DRAM. On Africa the same call is 8.1 GB, which is
+            # why it survived every regional run. One band is 1.37 GB and the compacted
+            # result is written straight to disk, so the peak is the band.
+            q = np.lib.format.open_memmap(p, mode="w+", dtype=np.int16,
+                                          shape=(int(u.size), int(idx.size)))
+            for bi in range(int(u.size)):
+                q[bi] = src.read(bi + 1).reshape(-1)[idx]
+            q.flush()
+            del q
         out[y] = str(p)
-        del q
     return out, u_ref
 
 
-def qf_from_z_torch(z, u_levels, Q, scale, clip=(0.0, 1.0)):
+def t_cdf_table(df, zmax=12.0, n=240001):
+    """``(grid, T_df(grid))`` for mapping a t-variate to its probability rank on GPU.
+
+    torch has no Student-t CDF, and calling scipy per member on 13.8M pixels would add most
+    of an hour to a run. The CDF is smooth, so a dense table plus linear interpolation is
+    exact to ~1e-9 at this spacing — and the accuracy that matters is bounded anyway: the
+    stored quantile grid truncates at u = 1e-4, and ``T_7(-12) = 1.0e-6`` is already past
+    it, so everything beyond the table's ends clamps to the outermost stored quantile
+    exactly as a Gaussian draw of ``|z| > 3.72`` does.
+    """
+    from scipy.stats import t as _t
+    g = np.linspace(-zmax, zmax, n).astype(np.float64)
+    return g.astype(np.float32), _t.cdf(g, df).astype(np.float32)
+
+
+def u_from_t_torch(z, w, grid, cdf):
+    """``u = T_df(z / sqrt(w))`` — the Student-t copula's probability rank.
+
+    ``z`` is the correlated standard-normal field and ``w`` a single ``chi2_df / df`` draw
+    shared by every pixel and every horizon of one member. That is the whole construction:
+    a Gaussian copula scaled by one common random factor, which is what makes a t-copula
+    tail *dependent* where a Gaussian one is not. Because ``z / sqrt(w)`` is marginally
+    ``t_df`` by definition, ``T_df`` of it is exactly uniform — so **every pixel's marginal
+    is untouched**, and only the joint behaviour changes. The per-pixel gates (T5, and
+    check_qf_ensemble's sandwich) must pass unchanged; if they move, this is wrong.
+    """
+    import torch
+    zt = z * float(1.0 / np.sqrt(w))
+    j = torch.searchsorted(grid, zt.contiguous()).clamp_(1, grid.numel() - 1)
+    g0, g1 = grid[j - 1], grid[j]
+    t = ((zt - g0) / (g1 - g0)).clamp_(0.0, 1.0)
+    return cdf[j - 1] + t * (cdf[j] - cdf[j - 1])
+
+
+def qf_from_z_torch(z, u_levels, Q, scale, clip=(0.0, 1.0), u=None):
     """Map a standard-normal field through each pixel's own quantile function.
 
     ``u = Phi(z)`` then ``Q(u)`` by linear interpolation between the two stored levels that
@@ -243,7 +314,9 @@ def qf_from_z_torch(z, u_levels, Q, scale, clip=(0.0, 1.0)):
     # is imported anywhere, and a module-level import would defeat that.
     import torch
 
-    u = 0.5 * (1.0 + torch.erf(z * 0.7071067811865476))
+    # ``u`` is supplied when the copula is not Gaussian; the Gaussian path is unchanged.
+    if u is None:
+        u = 0.5 * (1.0 + torch.erf(z * 0.7071067811865476))
     j = torch.searchsorted(u_levels, u.contiguous()).clamp_(1, u_levels.numel() - 1)
     u0, u1 = u_levels[j - 1], u_levels[j]
     t = ((u - u0) / (u1 - u0)).clamp_(0.0, 1.0)
@@ -396,12 +469,58 @@ def worker(worker_id, gpu, member_ids, cfg, session=None):
                              if k != "n" and np.ndim(v) > 0 else v)
                          for k, v in sh.items()}
 
+    # One table per worker, not per member. Only built when the copula is not Gaussian.
+    t_grid = t_cdf = None
+    if cfg.get("copula", "gaussian") == "t":
+        import torch as _torch
+        _g, _c = t_cdf_table(cfg["copula_df"])
+        t_grid = _torch.as_tensor(_g, device=device)
+        t_cdf = _torch.as_tensor(_c, device=device)
+
+    # Separable space x horizon: one shared spatial spectrum, and the horizons coupled by a
+    # Cholesky factor of the full correlation matrix rather than an AR(1) chain. Under the AR
+    # recursion horizon h carries `rho^2 S_{h-1} + (1 - rho^2) S_h`, not S_h; under this it
+    # carries the shared spectrum exactly and reproduces R exactly. Both by construction.
+    chol_L = None
+    if cfg.get("horizon_corr") is not None and not cfg["independent"]:
+        import torch as _torch
+        chol_L = _torch.as_tensor(
+            np.linalg.cholesky(np.asarray(cfg["horizon_corr"], dtype=np.float64)).astype(np.float32),
+            device=device)
+
     for m in member_ids:
         t0 = time.time()
         prev = None
+        # One chi2 draw per MEMBER, shared across every horizon and every pixel: the member
+        # is one story, so its tail factor has to be one number. Seeded off the member index
+        # alone, so a member regenerates identically however the run is sharded.
+        w_m = 1.0
+        if cfg.get("copula", "gaussian") == "t":
+            w_m = float(cfg["copula_w"][m])
+        z_sep = None
+        if chol_L is not None:
+            eps_all = []
+            for h_ in horizons:
+                fp_ = cfg["field_params"][h_]
+                f_ = generate_correlated_field(
+                    H, W, fp_["ranges_px"], fp_["weights"], fp_["nugget"],
+                    wrap_lon=cfg["wrap_lon"], device=device,
+                    seed=cfg["seed"] + 1_000_003 * m + 101 * h_, return_torch=True,
+                    kernel=fp_.get("kernel", "gaussian"), nu=fp_.get("nu", 0.5))
+                eps_all.append(f_.reshape(-1)[idx_t].clone())
+                del f_
+                if device.startswith("cuda"):
+                    torch.cuda.empty_cache()
+            z_sep = chol_L @ torch.stack(eps_all)
+            del eps_all
+            if device.startswith("cuda"):
+                torch.cuda.empty_cache()
+
         for hi, (h, y) in enumerate(zip(horizons, years)):
             seed = cfg["seed"] + 1_000_003 * m + 101 * h
-            if cfg["independent"]:
+            if z_sep is not None:
+                eps = None          # the fields were drawn above, jointly
+            elif cfg["independent"]:
                 gen = torch.Generator(device=device)
                 gen.manual_seed(seed)
                 eps = torch.randn(idx_t.shape[0], generator=gen, device=device)
@@ -417,7 +536,9 @@ def worker(worker_id, gpu, member_ids, cfg, session=None):
                 if device.startswith("cuda"):
                     torch.cuda.empty_cache()
 
-            if prev is None:
+            if z_sep is not None:
+                z = z_sep[hi]
+            elif prev is None:
                 z = eps
             else:
                 rho = float(cfg["rho"].get(h, 0.9))
@@ -426,7 +547,10 @@ def worker(worker_id, gpu, member_ids, cfg, session=None):
 
             if qf_cpu is not None:
                 Q = torch.as_tensor(np.ascontiguousarray(qf_cpu[y]), device=device)
-                vals = qf_from_z_torch(z, u_levels_t, Q, qf_cfg["scale"])
+                u_m = (u_from_t_torch(z, w_m, t_grid, t_cdf)
+                       if t_grid is not None else None)
+                vals = qf_from_z_torch(z, u_levels_t, Q, qf_cfg["scale"], u=u_m)
+                del u_m
                 del Q
                 if device.startswith("cuda"):
                     torch.cuda.empty_cache()
@@ -509,6 +633,7 @@ def main(argv=None):
                      "reshaping)" if args.qf_dir else
                      "median-spliced two-piece normal; ppf(0.5)=central by construction"),
         "qf_dir": str(args.qf_dir) if args.qf_dir else None,
+        "copula": args.copula, "copula_df": float(args.copula_df),
         "sources": {str(y): {k: str(v) for k, v in paths[y].items()} for y in years},
     })
 
@@ -565,7 +690,53 @@ def main(argv=None):
         "seed": args.seed, "scale": DEFAULT_SCALE, "wrap_lon": bool(wrap),
         "independent": bool(args.independent), "shapes": shapes, "qf": qf_cfg,
         "band": str(band_path) if (band_path and banded) else None,
+        "copula": args.copula, "copula_df": float(args.copula_df),
+        "horizon_corr": None, "copula_w": None,
     }
+    if args.copula == "t":
+        from scipy.stats import chi2 as _chi2
+        _rng = np.random.default_rng(args.seed + 7_777_777)
+        if args.copula_w_draw == "stratified":
+            _w = _chi2.ppf((np.arange(args.members) + 0.5) / args.members,
+                           args.copula_df) / args.copula_df
+            _w = _w[_rng.permutation(args.members)]
+        else:
+            _w = _rng.chisquare(args.copula_df, size=args.members) / args.copula_df
+        cfg["copula_w"] = [float(x) for x in _w]
+        print(f"  chi2 factor: {args.copula_w_draw}, mean {_w.mean():.4f} "
+              f"(target 1.0), min {_w.min():.4f}, max {_w.max():.4f}")
+    if args.horizon_corr:
+        blob = json.load(open(args.horizon_corr))
+        hz = [int(x) for x in blob["horizons"]]
+        if hz != list(horizons):
+            raise SystemExit(f"--horizon_corr covers {hz}, this run needs {list(horizons)}")
+        R_ = np.asarray(blob["R"], dtype=np.float64)
+        np.linalg.cholesky(R_)          # refuse a non-PSD matrix here, not inside a worker
+        cfg["horizon_corr"] = R_.tolist()
+        store.attrs["horizon_corr"] = {"R": R_.tolist(), "horizons": hz,
+                                       "source": str(args.horizon_corr)}
+        off = R_[np.triu_indices_from(R_, k=1)]
+        print(f"  separable space x horizon: R from {args.horizon_corr}, "
+              f"off-diagonal {off.min():.3f}-{off.max():.3f}, "
+              f"adjacent {', '.join(f'{R_[i, i+1]:.3f}' for i in range(len(hz)-1))}")
+    if args.copula == "t":
+        if not args.qf_dir:
+            raise SystemExit("--copula t needs --qf_dir: it supplies u directly, and the "
+                             "two-piece path takes z")
+        if args.independent:
+            # The null must keep the marginals and drop the dependence. A t-copula's shared
+            # chi2 factor IS dependence, so applying it here would give the null domain-scale
+            # structure and quietly flatter the correlated ensemble in T3.2/T3.3.
+            print("  --copula t ignored for --independent: the null stays Gaussian, which is "
+                  "the same marginal and no dependence")
+            cfg["copula"] = "gaussian"
+            # attrs were written from the CLI value above; record what actually ran, so a
+            # reader of the null store is not told it carries a dependence it does not have.
+            store.attrs["copula"] = "gaussian"
+            store.attrs["copula_requested"] = "t"
+        else:
+            print(f"  copula: Student-t, df={args.copula_df} "
+                  f"(one chi2_{args.copula_df:g}/{args.copula_df:g} factor per member)")
 
     gpus = [int(g) for g in args.gpus.split(",") if g.strip() != ""] if args.gpus else [None]
     assignment = assign_members(args.members, len(gpus))
@@ -599,6 +770,10 @@ def main(argv=None):
             for m in range(args.members)
         ],
         "rho": rho, "field_params": {str(k): v for k, v in fps.items()},
+        "copula": args.copula, "copula_df": float(args.copula_df),
+        "copula_w_draw": args.copula_w_draw,
+        "copula_w": ({str(m): float(v) for m, v in enumerate(cfg["copula_w"])}
+                     if args.copula == "t" else None),
         "years": years, "wrap_lon": bool(wrap), "independent_null": bool(args.independent),
         "minutes": elapsed / 60.0,
     }

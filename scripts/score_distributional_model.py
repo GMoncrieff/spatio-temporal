@@ -47,6 +47,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import rasterio
+from rasterio.windows import Window
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent))
@@ -70,17 +71,16 @@ OBS_MAG_LABELS = ["<-0.01", "[-0.01,0.001)", "[0.001,0.01)", "[0.01,0.05)", ">=0
 
 # ----------------------------------------------------------------------------- the raster
 
-def read_qf(path: str):
-    """Return ``(u_levels, Q)`` with ``Q`` as ``[n_levels, H, W]`` float32, NaN outside data."""
+def qf_levels(path: str):
+    """The ``u`` grid of a quantile-function raster, validated, without reading any pixels."""
     with rasterio.open(path) as src:
         tags = src.tags()
         if "u_levels" not in tags:
             raise SystemExit(f"{path} carries no u_levels tag; not a quantile-function raster")
         u = np.array([float(v) for v in tags["u_levels"].split(",")], dtype=np.float64)
-        q = src.read().astype(np.float32)
-        nod = src.nodata
-    if q.shape[0] != u.size:
-        raise SystemExit(f"{path}: {q.shape[0]} bands against {u.size} u levels")
+        n_bands, nod = src.count, src.nodata
+    if n_bands != u.size:
+        raise SystemExit(f"{path}: {n_bands} bands against {u.size} u levels")
     # A zero-width segment makes the piecewise-linear slope 0/0, and CRPS comes back NaN for
     # every pixel -- a metric failure indistinguishable from a model failure at a glance. Fail
     # here instead, where the cause is one line away.
@@ -90,7 +90,25 @@ def read_qf(path: str):
             f"{path}: u levels are not strictly increasing (min gap {gaps.min():.3e} at "
             f"index {int(gaps.argmin())}, u={u[int(gaps.argmin())]!r}). Check the writer's "
             f"tag precision and output_u_grid's dedupe tolerance.")
-    q = np.where(q == nod, np.nan, q) * np.float32(INT16_SCALE)
+    return u, nod
+
+
+def read_qf(path: str, row_off: int = 0, n_rows: int | None = None):
+    """``(u_levels, Q)`` with ``Q`` as ``[n_levels, n_rows, W]`` float32, NaN outside data.
+
+    ``row_off``/``n_rows`` read one horizontal band instead of the whole raster. Reading it
+    whole is 64 x 684.4 Mpx x 4 B = 175 GB on the global grid, and the nodata replacement
+    used to double that. Africa's grid is 63.1 Mpx, where the same call is 16 GB and
+    invisible -- a working set regional scale never exercised. The scale is applied in place
+    for the same reason.
+    """
+    u, nod = qf_levels(path)
+    with rasterio.open(path) as src:
+        win = None if n_rows is None else Window(0, row_off, src.width, n_rows)
+        q = src.read(window=win).astype(np.float32)
+    if nod is not None:
+        q[q == nod] = np.nan
+    q *= np.float32(INT16_SCALE)
     return u, q
 
 
@@ -191,29 +209,100 @@ def crps_piecewise_linear(u, q, y, chunk: int = 250_000):
 
 # ------------------------------------------------------------------------------- one row
 
-def load_row(row, fold_sel):
-    with rasterio.open(row["path_central"]) as src:
-        ref = {"transform": src.transform, "width": src.width, "height": src.height}
-    central = _read(row["path_central"])
-    lower = _read(row["path_lower"])
-    upper = _read(row["path_upper"])
-    observed = _read_like(row["path_observed"], ref)
-    hm_t0 = _read_like(row["path_baseline"], ref)
-    dist = _read_like(row["path_context"], ref, band=2)
-    u, qf = read_qf(row["path_qf"])
+def _read_band(path, row_off, n_rows):
+    """``_read`` restricted to a horizontal band of the raster's own grid."""
+    with rasterio.open(path) as src:
+        arr = src.read(1, window=Window(0, row_off, src.width, n_rows)).astype(np.float64)
+        nod = src.nodata
+    if nod is not None and np.isfinite(nod):
+        arr = np.where(arr == nod, np.nan, arr)
+    return arr
 
-    ok = (np.isfinite(central) & np.isfinite(observed) & np.isfinite(hm_t0)
-          & np.isfinite(lower) & np.isfinite(upper) & np.isfinite(dist)
-          & np.isfinite(qf).all(axis=0))
-    if fold_sel is not None:
-        ok = ok & fold_sel
-    return u, dict(
-        qf=qf[:, ok], central=central[ok], observed=observed[ok], hm_t0=hm_t0[ok],
-        lower=lower[ok], upper=upper[ok], dist=dist[ok], band=distance_band(dist[ok]),
-        dhat_idx=np.digitize((central - hm_t0)[ok], DHAT_BINS[1:-1]),
-        hm_idx=np.digitize(hm_t0[ok], HM_BINS[1:-1]),
-        obs_idx=np.digitize((observed - hm_t0)[ok], OBS_MAG_BINS[1:-1]),
-    )
+
+def _read_like_band(path, ref, row_off, n_rows, band: int = 1):
+    """``_read_like`` restricted to a band: a global raster on the reference grid's rows."""
+    with rasterio.open(path) as src:
+        col_off = int(round((ref["transform"].c - src.transform.c) / src.transform.a))
+        r_off = int(round((ref["transform"].f - src.transform.f) / src.transform.e))
+        arr = src.read(band, window=Window(col_off, r_off + row_off, ref["width"], n_rows),
+                       boundless=True, fill_value=np.nan).astype(np.float64)
+        nod = src.nodata
+    if nod is not None and np.isfinite(nod):
+        arr = np.where(arr == nod, np.nan, arr)
+    return np.where(arr < -1e6, np.nan, arr)
+
+
+def _cat(parts, key):
+    return np.concatenate([p[key] for p in parts]) if len(parts) > 1 else parts[0][key]
+
+
+def load_row(row, fold_sel, row_chunk: int = 0):
+    """Compacted per-pixel arrays, the per-pixel scores, and the qf-vs-triple consistency.
+
+    Streamed by horizontal band. The quantile-function raster is 64 bands, so holding one
+    window-year whole is 175 GB on the 17111 x 40000 global grid against 16 GB on Africa --
+    the third working set in this project that regional scale could not see. Everything the
+    scorer computes per pixel is pixel-independent, and every stratum is a mean over a
+    boolean mask, so banding changes nothing but the peak.
+
+    ``consistency`` is folded in here because it needs the quantile function, which does not
+    survive the band it was read in: the two max rows reduce with ``max`` and the outside-
+    interval rate is a count-weighted mean, both exact.
+    """
+    with rasterio.open(row["path_central"]) as src:
+        H, W = src.height, src.width
+        ref = {"transform": src.transform, "width": W, "height": H}
+    u = qf_levels(row["path_qf"])[0]
+    step = row_chunk if row_chunk and row_chunk > 0 else H
+
+    parts, pps = [], []
+    lo_max = up_max = 0.0
+    n_out = n_tot = 0
+    for r0 in range(0, H, step):
+        nr = min(step, H - r0)
+        central = _read_band(row["path_central"], r0, nr)
+        lower = _read_band(row["path_lower"], r0, nr)
+        upper = _read_band(row["path_upper"], r0, nr)
+        observed = _read_like_band(row["path_observed"], ref, r0, nr)
+        hm_t0 = _read_like_band(row["path_baseline"], ref, r0, nr)
+        dist = _read_like_band(row["path_context"], ref, r0, nr, band=2)
+        _, qf = read_qf(row["path_qf"], r0, nr)
+
+        ok = (np.isfinite(central) & np.isfinite(observed) & np.isfinite(hm_t0)
+              & np.isfinite(lower) & np.isfinite(upper) & np.isfinite(dist)
+              & np.isfinite(qf).all(axis=0))
+        if fold_sel is not None:
+            ok = ok & fold_sel[r0:r0 + nr]
+        if not ok.any():
+            del qf
+            continue
+        cell = dict(
+            qf=qf[:, ok], central=central[ok], observed=observed[ok], hm_t0=hm_t0[ok],
+            lower=lower[ok], upper=upper[ok], band=distance_band(dist[ok]),
+            dhat_idx=np.digitize((central - hm_t0)[ok], DHAT_BINS[1:-1]),
+            hm_idx=np.digitize(hm_t0[ok], HM_BINS[1:-1]),
+            obs_idx=np.digitize((observed - hm_t0)[ok], OBS_MAG_BINS[1:-1]),
+        )
+        del qf, central, lower, upper, observed, hm_t0, dist
+        c = consistency(u, cell)
+        lo_max = max(lo_max, c["qf_vs_lower_max"])
+        up_max = max(up_max, c["qf_vs_upper_max"])
+        n_here = cell["central"].size
+        n_out += c["central_outside_interval"] * n_here
+        n_tot += n_here
+        pps.append(per_pixel(u, cell))
+        del cell["qf"]
+        parts.append(cell)
+
+    if not parts:
+        empty = np.zeros(0)
+        return u, {k: empty for k in ("central", "observed", "hm_t0", "lower", "upper",
+                                      "band", "dhat_idx", "hm_idx", "obs_idx")}, {}, {}
+    cell = {k: _cat(parts, k) for k in parts[0]}
+    pp = {k: _cat(pps, k) for k in pps[0]}
+    cons = {"qf_vs_lower_max": lo_max, "qf_vs_upper_max": up_max,
+            "central_outside_interval": n_out / n_tot if n_tot else np.nan}
+    return u, cell, pp, cons
 
 
 def consistency(u, cell):
@@ -384,6 +473,13 @@ def main(argv=None):
                         "screen forward-passes contiguous chips and neighbouring pixels are "
                         "strongly correlated -- random pixels would flatter the estimate.")
     ap.add_argument("--subsample_seed", type=int, default=0)
+    ap.add_argument("--row_chunk", type=int, default=0,
+                    help="Read and score the rasters in bands of this many rows instead of "
+                         "whole. 0 (the default) is today's behaviour. The quantile-function "
+                         "raster is 64 bands, so one global window-year read whole is 175 GB "
+                         "against 16 GB on Africa. Every per-pixel quantity is pixel-"
+                         "independent and every stratum is a mean over a boolean mask, so "
+                         "this changes the peak and nothing else.")
     ap.add_argument("--min_count", type=int, default=2000,
                     help="Strata thinner than this are written out but kept out of the "
                          "headline summary, where a 40-pixel cell would otherwise swing it.")
@@ -440,18 +536,17 @@ def main(argv=None):
 
     dist_recs, central_recs, consist_recs = [], [], []
     for row in rows:
-        u, cell = load_row(row, fold_sel)
+        u, cell, pp, cons = load_row(row, fold_sel, args.row_chunk)
         n = cell["observed"].size
         print(f"  w{row['base_year']} h={row['horizon']:2d}  {n:,} px")
         if n == 0:
             continue
         consist_recs.append({"label": args.label, "window": row["window"],
-                             "horizon": row["horizon"], "n": n, **consistency(u, cell)})
+                             "horizon": row["horizon"], "n": n, **cons})
         resid = cell["observed"] - cell["central"]
         obs_change = cell["observed"] - cell["hm_t0"]
         pred_change = cell["central"] - cell["hm_t0"]
         covered = (cell["observed"] >= cell["lower"]) & (cell["observed"] <= cell["upper"])
-        pp = per_pixel(u, cell)
         for stratum, label, sel in strata(cell):
             base = {"label": args.label, "window": row["window"],
                     "horizon": row["horizon"], "stratum": stratum, "bin": label}

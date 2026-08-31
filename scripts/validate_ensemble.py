@@ -266,26 +266,39 @@ def qf_dx_dz(u, q, level):
 def qf_recover_z(values, u, q):
     """``z = Phi^-1(F(v))`` against each pixel's own quantile function.
 
-    ``values`` is ``[n_px]`` and ``q`` is ``[n_levels, n_px]``. Ties resolve to the
-    **mid-distribution** point: the quantile function is clipped at HM=0, so a real atom sits
-    there, and a one-sided convention would map every member inside the atom to the top of it
-    and report a spurious skew in exactly the quiet pixels that dominate this region.
+    Delegates to ``src.ensemble.residuals.qf_normal_score``. The kernel moved there when
+    Phase 2 gained the option of fitting its spectrum to the observation's own PIT normal
+    score: the validator recovers *member* scores with it and the fitter recovers the
+    *observation's*, and two copies of the mid-distribution tie convention -- which exists
+    because the marginal has a real atom at HM = 0 -- is exactly the pair that drifts apart.
     """
-    from scipy.stats import norm as _norm
-    n = q.shape[0]
-    ar = np.arange(values.size)
+    from src.ensemble.residuals import qf_normal_score
+    return qf_normal_score(values, u, q)
 
-    def _u_at(k):
-        k = np.clip(k, 1, n - 1)
-        q0, q1 = q[k - 1, ar], q[k, ar]
-        with np.errstate(invalid="ignore", divide="ignore"):
-            w = np.where(q1 > q0, (values - q0) / (q1 - q0), 0.0)
-        return u[k - 1] + np.clip(w, 0.0, 1.0) * (u[k] - u[k - 1])
 
-    below = (q < values[None, :]).sum(axis=0)
-    at_or_below = (q <= values[None, :]).sum(axis=0)
-    uu = np.clip(0.5 * (_u_at(below) + _u_at(at_or_below)), u[0], u[-1])
-    return _norm.ppf(uu)
+def qf_population_spread(u, q):
+    """Standard deviation of the member marginal, straight from the quantile function.
+
+    The sampler draws ``x = Q(Phi(z))`` with Q linearly interpolated between the two stored
+    levels bracketing u and clamped to the outermost one beyond them
+    (``generate_ensemble.qf_from_z_torch``). So x's law is a piecewise-linear quantile
+    function carrying an atom of mass ``u[0]`` at ``Q[0]`` and ``1 - u[-1]`` at ``Q[-1]``,
+    and both of its moments are exact in closed form -- no quadrature, and no two-piece
+    normal the members were never drawn from.
+    """
+    q = np.asarray(q, dtype=np.float64)
+    # Centred on the stored median before the moments are taken. HM sits on [0, 1] and most
+    # of this region's pixels have a spread near 1e-3, so an uncentred ``m2 - m1^2`` cancels
+    # to ~1e-16 and reports a 1e-8 spread for a marginal that is exactly degenerate.
+    c = q[q.shape[0] // 2]
+    m1 = u[0] * (q[0] - c) + (1.0 - u[-1]) * (q[-1] - c)
+    m2 = u[0] * (q[0] - c) ** 2 + (1.0 - u[-1]) * (q[-1] - c) ** 2
+    for j in range(q.shape[0] - 1):
+        du = u[j + 1] - u[j]
+        lo, hi = q[j] - c, q[j + 1] - c
+        m1 = m1 + du * 0.5 * (lo + hi)
+        m2 = m2 + du * (lo * lo + lo * hi + hi * hi) / 3.0
+    return np.sqrt(np.maximum(m2 - m1 * m1, 0.0))
 
 
 def qf_path_for(args, year):
@@ -771,6 +784,40 @@ def _read_sampled(path, rows, cols, band_rows=1024):
             a = s.read(1, window=Window(0, r0, W, rr)).astype(np.float32)
             out[sel] = a[rows[sel] - r0][:, cols]
     return out
+
+
+def _qf_sampled(path, rows, cols, band_rows=1024):
+    """``(u_levels, Q[n_levels, len(rows), len(cols)])`` on a scattered sample.
+
+    The band-wise analogue of ``_read_sampled``: T4's sample is 2000 x 2000 scattered rows
+    and columns, and materialising 64 full-resolution bands to index it would be 16 GB on
+    the Africa grid.
+    """
+    with rasterio.open(path) as s:
+        H, W, n = s.height, s.width, s.count
+        u = np.array([float(v) for v in s.tags()["u_levels"].split(",")], dtype=np.float64)
+        nod = s.nodata
+        out = np.empty((n, len(rows), len(cols)), dtype=np.float32)
+        rows = np.asarray(rows)
+        for r0 in range(0, H, band_rows):
+            rr = min(band_rows, H - r0)
+            sel = np.flatnonzero((rows >= r0) & (rows < r0 + rr))
+            if sel.size == 0:
+                continue
+            a = s.read(window=Window(0, r0, W, rr)).astype(np.float32)
+            out[:, sel] = a[:, rows[sel] - r0][:, :, cols]
+    out = np.where(out == nod, np.nan, out) * np.float32(QF_INT16_SCALE)
+    return u, out
+
+
+def _qf_recover_z_grid(v, u, qflat):
+    """``qf_recover_z`` over one member's 2-D sample, NaN-safe, keeping the sample's shape."""
+    flat = np.asarray(v, dtype=np.float64).reshape(-1)
+    good = np.isfinite(flat) & np.isfinite(qflat[0]) & np.isfinite(qflat[-1])
+    out = np.full(flat.shape, np.nan)
+    if good.any():
+        out[good] = qf_recover_z(flat[good], u, qflat[:, good].astype(np.float64))
+    return out.reshape(np.shape(v))
 
 
 def _marginal_arrays(paths, year, rows=None, cols=None):
@@ -1766,7 +1813,7 @@ def stage_temporal(args, store, attrs, years, paths, out_dir, card, member_block
     cols = np.sort(rng.choice(W, size=min(W, 2000), replace=False))
     nr, nc = len(rows), len(cols)
 
-    marg, shapes = {}, {}
+    marg, shapes, qf = {}, {}, {}
     for hi, year in enumerate(years):
         marg[hi] = _marginal_arrays(paths, year, rows, cols)
         # T4 measures the AR(1) coupling of the *normal scores*, so it has to undo the
@@ -1777,6 +1824,15 @@ def stage_temporal(args, store, attrs, years, paths, out_dir, card, member_block
         if band is not None:
             band = band[np.ix_(rows, cols)]
         shapes[hi] = (shape, band)
+        # ...and the same argument again, one marginal family further out. A qf-drawn
+        # ensemble inverted through a two-piece normal reports an attenuated correlation,
+        # because the map from member value to normal score is the wrong one. T3 and T5
+        # already carry this branch; T4 was the site that did not, so its rows on the e1
+        # card were scoring the assumption rather than the ensemble.
+        qfp = qf_path_for(args, year)
+        qf[hi] = _qf_sampled(qfp, rows, cols) if qfp is not None else None
+    if any(v is not None for v in qf.values()):
+        print(f"  normal scores recovered through Q ({qf[0][0].size} stored levels)")
 
     # T4.1: pooled cross-products per adjacent horizon pair, on the finite-in-both mask.
     pair = {a: np.zeros(6) for a in range(nH - 1)}     # n, sx, sy, sxy, sxx, syy
@@ -1796,10 +1852,16 @@ def stage_temporal(args, store, attrs, years, paths, out_dir, card, member_block
             v = _sampled_member_block(store, attrs, m0, m1, hi, rows, cols)
             cen, sl, sr = marg[hi]
             shape, band = shapes[hi]
-            # recover_z's per-band branch indexes with a 2-D mask, so it is applied one
-            # member at a time rather than across the block.
-            z_blk[hi] = np.stack([recover_z(v[i], cen, sl, sr, shape=shape, band=band)
-                                  for i in range(v.shape[0])])
+            if qf[hi] is not None:
+                u_lv, qw = qf[hi]
+                qflat = qw.reshape(qw.shape[0], -1)
+                z_blk[hi] = np.stack([_qf_recover_z_grid(v[i], u_lv, qflat)
+                                      for i in range(v.shape[0])])
+            else:
+                # recover_z's per-band branch indexes with a 2-D mask, so it is applied one
+                # member at a time rather than across the block.
+                z_blk[hi] = np.stack([recover_z(v[i], cen, sl, sr, shape=shape, band=band)
+                                      for i in range(v.shape[0])])
             fin = np.isfinite(v)
             for i in range(v.shape[0]):
                 f = fin[i]
@@ -1852,7 +1914,8 @@ def stage_temporal(args, store, attrs, years, paths, out_dir, card, member_block
     # the standard normal. Gauss-Hermite is exact for the two-piece normal and converges fast
     # through the shape, and it sees the [0,1] clip the sampler applies, so it is the same
     # quantity the members estimate — without their noise.
-    pop = np.stack([population_spread(*marg[hi], *shapes[hi]) for hi in range(nH)])
+    pop = np.stack([qf_population_spread(*qf[hi]) if qf[hi] is not None
+                    else population_spread(*marg[hi], *shapes[hi]) for hi in range(nH)])
 
     ok_pop = np.isfinite(pop).all(axis=0)
     mono_pop = np.all(np.diff(pop, axis=0) >= -1e-9, axis=0)
@@ -1867,8 +1930,8 @@ def stage_temporal(args, store, attrs, years, paths, out_dir, card, member_block
           f"the {M}-member sample reproduces {100*frac:.2f}%")
     card.add("T4.2", "population spread non-decreasing in horizon", frac_pop, ">= 0.99",
              bool(np.isfinite(frac_pop) and frac_pop >= 0.99),
-             note=f"marginals integrated against N(0,1); the {M}-member sample "
-                  f"estimate is {frac:.4f}", knob="T4.2")
+             note=f"{'quantile function integrated in closed form' if qf[0] is not None else 'marginals integrated against N(0,1)'}; "
+                  f"the {M}-member sample estimate is {frac:.4f}", knob="T4.2")
     # Reported, not gated: the sample statistic the old gate used. Its shortfall against the
     # population value is Monte-Carlo noise modulated by M and rho, so there is no
     # M-independent threshold to put on it.

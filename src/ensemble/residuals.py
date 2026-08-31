@@ -207,6 +207,87 @@ def fit_rank_gaussian_transform(observed_hm_sample, n_knots: int = 1500) -> Rank
 # --------------------------------------------------------------------------------------
 # Fold stitching
 # --------------------------------------------------------------------------------------
+QF_INT16_SCALE = 1.0 / 32767.0
+
+
+def qf_normal_score(values, u, q):
+    """``z = Phi^-1(F(v))`` against each pixel's own quantile function.
+
+    ``values`` is ``[n_px]`` and ``q`` is ``[n_levels, n_px]``, both already restricted to
+    finite pixels. Ties resolve to the **mid-distribution** point: the quantile function is
+    clipped at HM = 0, so a real atom sits there, and a one-sided convention would map every
+    value inside the atom to the top of it and report a spurious skew in exactly the quiet
+    pixels that dominate this region.
+
+    This is the numeric kernel behind ``scripts/validate_ensemble.qf_recover_z``, which
+    delegates here. One implementation on purpose: the validator recovers member scores with
+    it and Phase 2 fits the spectrum to an observation's score with it, and two copies of a
+    mid-distribution convention is exactly the kind of pair that drifts.
+    """
+    from scipy.stats import norm as _norm
+    values = np.asarray(values, dtype=np.float64)
+    q = np.asarray(q, dtype=np.float64)
+    n = q.shape[0]
+    ar = np.arange(values.size)
+
+    def _u_at(k):
+        k = np.clip(k, 1, n - 1)
+        q0, q1 = q[k - 1, ar], q[k, ar]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            w = np.where(q1 > q0, (values - q0) / (q1 - q0), 0.0)
+        return u[k - 1] + np.clip(w, 0.0, 1.0) * (u[k] - u[k - 1])
+
+    below = (q < values[None, :]).sum(axis=0)
+    at_or_below = (q <= values[None, :]).sum(axis=0)
+    uu = np.clip(0.5 * (_u_at(below) + _u_at(at_or_below)), u[0], u[-1])
+    return _norm.ppf(uu)
+
+
+def pit_normal_field(qf_path, observed_path, block_rows: int = 512):
+    """``Phi^-1(F_qf(y))`` on the prediction grid: the field the copula's latent *is*.
+
+    The dependence model is a copula, so the quantity whose spatial structure it has to
+    reproduce is the observation's probability rank under the forecast -- not a residual in
+    HM units, and not a residual divided by an interval half-width. Phase 2 has been fitting
+    ``(y - central) / sigma`` with ``sigma`` read off Q(0.025)/Q(0.5)/Q(0.975), which uses
+    three of the sixty-four stored levels and assumes the rest is symmetric. HM is bounded
+    below, 40% of Africa sits in ``[0, 0.01)``, and the atom at HM = 0 is real, so the
+    assumption fails hardest in the pixels that dominate the count -- and those pixels set
+    the nugget and the shortest-range weight.
+
+    Measured on the e1 Africa hindcast (``scripts/diag_pit_vs_width_residual.py``): the two
+    spaces disagree by 0.10-0.15 of total variance on the 4-50 px share, against a
+    realisation-noise floor of 0.044, and the width-standardised field carries a 0.62-sigma
+    region-wide mean at h=20 where the PIT field carries 0.03.
+
+    NaN where the observation or the quantile function is invalid.
+    """
+    with rasterio.open(qf_path) as qsrc, rasterio.open(observed_path) as osrc:
+        H, W = qsrc.height, qsrc.width
+        u = np.array([float(v) for v in qsrc.tags()["u_levels"].split(",")], dtype=np.float64)
+        if not np.all(np.diff(u) > 0):
+            raise ValueError(f"{qf_path}: u_levels is not strictly increasing")
+        nod = qsrc.nodata
+        prof = {"transform": qsrc.transform, "width": W, "height": H}
+        _, row_off, col_off = _aligned_window(prof, osrc)
+        out = np.full((H, W), np.nan, dtype=np.float32)
+        for r0 in range(0, H, block_rows):
+            rr = min(block_rows, H - r0)
+            q = qsrc.read(window=Window(0, r0, W, rr)).astype(np.float32)
+            q = np.where(q == nod, np.nan, q) * np.float32(QF_INT16_SCALE)
+            y = osrc.read(1, window=Window(col_off, row_off + r0, W, rr),
+                          boundless=True, fill_value=np.nan).astype(np.float64)
+            y = np.where(y < 0, np.nan, y)
+            qf, yf = q.reshape(q.shape[0], -1), y.reshape(-1)
+            good = np.isfinite(yf) & np.isfinite(qf[0]) & np.isfinite(qf[-1])
+            z = np.full(yf.shape, np.nan)
+            if good.any():
+                z[good] = qf_normal_score(yf[good], u, qf[:, good])
+            out[r0:r0 + rr] = z.reshape(rr, W).astype(np.float32)
+            del q, y, qf, yf, z
+    return out
+
+
 def _aligned_window(ref_profile, mask_src):
     """Window of ``mask_src`` matching the reference raster's extent (both on the HM grid)."""
     t = ref_profile["transform"]
@@ -476,6 +557,85 @@ def _stripe_pairs(path_a, path_b, stripe_h: int, stride: int, offset: int):
     if not out_a:
         return None
     return np.concatenate(out_a), np.concatenate(out_b)
+
+
+def horizon_correlation_matrix(manifest, horizons=(5, 10, 15, 20),
+                               stripe_h: int = 64, stride: int = 512, offset: int = 0):
+    """The full ``len(horizons) x len(horizons)`` correlation of the residual normal scores.
+
+    ``horizon_autocorrelation`` returns only the adjacent-pair rho that feeds the AR(1) chain.
+    A **separable** space-horizon covariance needs the whole matrix:
+
+        Cov{Z_h(s), Z_h'(s')} = C_space(||s - s'||) . R_{h,h'}
+
+    which reproduces ``R`` exactly and leaves every horizon carrying the shared spatial
+    spectrum, where the AR(1) recursion gives horizon *h* a mixture
+    ``rho^2 S_{h-1} + (1 - rho^2) S_h`` instead. Measured on the e1 Africa PIT fits that
+    mixture costs up to 0.044 of the 4-50 px variance share at h=20 — right at the
+    realisation-noise floor, so this is a construction fix rather than a large effect.
+
+    Read on the same deterministic full-width stripes as the adjacent-pair estimator, and
+    restricted to pixels finite in **every** horizon so the matrix is one consistent sample
+    rather than four differently-masked ones. Only the w2000 window reaches +20 yr, so the
+    full matrix comes from that window alone; shorter-horizon blocks are pooled across every
+    window that has them.
+
+    Returns ``(R, meta)`` with ``R`` symmetric, unit-diagonal and projected to the nearest
+    positive-semidefinite matrix if the raw estimate is not (an eigenvalue clip; the
+    correction is reported so a silently repaired matrix is visible).
+    """
+    import pandas as pd
+
+    df = manifest if isinstance(manifest, pd.DataFrame) else read_manifest(manifest)
+    horizons = list(horizons)
+    best, best_n = None, -1
+    for window, grp in df.groupby("window"):
+        paths = []
+        for h in horizons:
+            row = grp[grp["horizon"] == h]
+            if row.empty:
+                paths = None
+                break
+            paths.append(row.iloc[0]["path_res_z"])
+        if paths is None:
+            continue
+        cols, srcs = [], [rasterio.open(pth) for pth in paths]
+        try:
+            H, W = srcs[0].height, srcs[0].width
+            for r0 in range(offset % stride, H, stride):
+                rr = min(stripe_h, H - r0)
+                if rr <= 0:
+                    continue
+                win = Window(0, r0, W, rr)
+                blk = np.stack([sc.read(1, window=win).ravel() for sc in srcs])
+                ok = np.isfinite(blk).all(axis=0)
+                if ok.any():
+                    cols.append(blk[:, ok])
+        finally:
+            for sc in srcs:
+                sc.close()
+        if not cols:
+            continue
+        Z = np.concatenate(cols, axis=1)
+        if Z.shape[1] > best_n:
+            best, best_n = (window, Z), Z.shape[1]
+    if best is None:
+        raise ValueError("no window carries every horizon; cannot form R")
+
+    window, Z = best
+    R = np.corrcoef(Z)
+    R = 0.5 * (R + R.T)
+    ev = np.linalg.eigvalsh(R)
+    meta = {"window": str(window), "n_pairs": int(Z.shape[1]), "horizons": horizons,
+            "min_eigenvalue": float(ev.min()), "psd_repaired": False}
+    if ev.min() < 1e-10:
+        w, V = np.linalg.eigh(R)
+        R = V @ np.diag(np.clip(w, 1e-10, None)) @ V.T
+        d = np.sqrt(np.diag(R))
+        R = R / np.outer(d, d)
+        meta["psd_repaired"] = True
+    np.fill_diagonal(R, 1.0)
+    return R, meta
 
 
 def horizon_autocorrelation(manifest, n_sample_px: int = 2_000_000, random_seed: int = 42,

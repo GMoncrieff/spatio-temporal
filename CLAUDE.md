@@ -5,6 +5,11 @@ which one you are working on.**
 
 Active branch: **`dist-convlstm`**.
 
+> **SUPERSEDED 2026-08-30.** The global production phase replaces this product; its *artifacts*
+> (`g1_foldb4`, `c1_foldb4`, `africa_k5`, `data/ensemble/hindcast/`) are authorised for deletion.
+> The three documents below remain the authority on method and stay. See the
+> `global-production-phase` memory before deleting anything.
+
 ## 1. The published product — frozen, complete, do not change
 
 Branch `ensemble`, experiment **`g1_foldb4`**. A ConvLSTM emitting `(lower, central, upper)` at
@@ -31,7 +36,12 @@ time. It blocks far-field work *on the frozen product* only.
 
 ## 2. Active work — the end-to-end distributional model
 
-Branch **`dist-convlstm`**. The model emits a full per-pixel quantile function `Q_h(u|x)` and
+Branch **`dist-convlstm`**. **Model phase and ensemble phase are both CLOSED** (2026-08-28,
+2026-08-30). `e1` is the model; `V4b` is the ensemble — PIT-space spectrum, `--long_weight 0`,
+`--copula t --copula_df 7 --copula_w_draw stratified`. Full writeup `docs/dist_ensemble_phase.md`.
+Current work is the **global production hindcast + 2025-2040 forecast**.
+
+The model emits a full per-pixel quantile function `Q_h(u|x)` and
 that function *is* the product: no conformal scaling, no width factors, no empirical marginal
 reshaping, no horizon-monotonicity pass. A monotone rational-quadratic spline over absolute HM
 with **fixed tail-dense knots**, anchored at persistence through the existing zero-init residual

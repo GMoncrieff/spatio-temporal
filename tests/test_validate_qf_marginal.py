@@ -84,3 +84,137 @@ def test_an_atom_maps_to_the_middle_of_its_plateau():
     # mid-distribution: u should land in the middle of the tied range, not at its top
     assert norm.cdf(z)[0] < frac_at_zero + 1e-9
     assert norm.cdf(z)[0] > 0.0
+
+
+# --------------------------------------------------------------- T4.2's population spread
+#
+# T4.2 asks whether the ensemble gets more uncertain further out. That is a property of the
+# marginal's *law*, not of any finite sample, so it is computed without members. It was
+# computed by integrating a two-piece normal against N(0,1) even when the members came from
+# a quantile function — the same defect these tests were written for one stage over, at the
+# one site that had no qf branch.
+
+
+def _sampler_law(u, q, z):
+    """What ``generate_ensemble.qf_from_z_torch`` does, in numpy, for reference.
+
+    Linear interpolation between the two stored levels bracketing ``Phi(z)``, clamped to the
+    outermost stored quantile beyond the grid. Shares no code with the closed form.
+    """
+    uu = norm.cdf(z)
+    j = np.clip(np.searchsorted(u, uu), 1, u.size - 1)
+    t = np.clip((uu - u[j - 1]) / (u[j] - u[j - 1]), 0.0, 1.0)
+    return q[j - 1] + t * (q[j] - q[j - 1])
+
+
+def test_population_spread_matches_a_draw_from_the_same_law():
+    """The closed form must agree with a dense sample of the law it claims to integrate."""
+    from scripts.validate_ensemble import qf_population_spread
+
+    rng = np.random.default_rng(0)
+    q = _normal_qf(0.2, 0.05, 3)
+    q[:, 1] = norm.ppf(U) * 0.2 + 0.5          # a wider pixel
+    q[:, 2] = np.clip(norm.ppf(U) * 0.1, 0, 1)  # a pixel with a real atom at 0
+
+    z = rng.standard_normal(400_000)
+    got = qf_population_spread(U, q)
+    ref = np.array([_sampler_law(U, q[:, i], z).std() for i in range(q.shape[1])])
+    assert np.allclose(got, ref, rtol=0.01), f"{got} vs {ref}"
+
+
+def test_population_spread_recovers_a_normal_sigma():
+    """A normal marginal on the stored grid must read back its own sigma."""
+    from scripts.validate_ensemble import qf_population_spread
+
+    for sd in (0.01, 0.05, 0.2):
+        got = float(qf_population_spread(U, _normal_qf(0.5, sd, 1))[0])
+        # The grid truncates at u = 1e-4 (losing tail variance) and joins the levels with
+        # chords (adding some back on a convex tail). The net is +0.08%, and it is scale-free
+        # for a location-scale family, so it is a property of the forecast as stored rather
+        # than of this estimator.
+        assert 0.99 <= got / sd <= 1.01, f"sd={sd}: {got / sd}"
+
+
+def test_population_spread_of_a_degenerate_marginal_is_zero():
+    from scripts.validate_ensemble import qf_population_spread
+
+    q = np.full((U.size, 4), 0.31)
+    assert np.allclose(qf_population_spread(U, q), 0.0, atol=1e-12)
+
+
+# ------------------------------------------------- the PIT kernel Phase 2 now shares with T3
+#
+# `scripts/validate_ensemble.qf_recover_z` recovers a *member's* normal score; Phase 2's
+# `--fit_space pit` recovers the *observation's* from the same quantile function. They are the
+# same map and there is one implementation, in `src.ensemble.residuals.qf_normal_score`. These
+# pin the property that makes the copula's latent well posed at all.
+
+
+def test_the_validator_and_phase2_share_one_kernel():
+    """Two copies of the mid-distribution tie convention would drift. There is one."""
+    from src.ensemble.residuals import qf_normal_score
+
+    rng = np.random.default_rng(3)
+    q = _normal_qf(0.4, 0.08, 50)
+    v = rng.uniform(q[0], q[-1])
+    assert np.array_equal(qf_recover_z(v, U, q), qf_normal_score(v, U, q))
+
+
+def _sampler_law_per_pixel(u, q, z):
+    """``_sampler_law`` when every pixel has its own quantile function. ``q`` is [levels, n]."""
+    uu = norm.cdf(z)
+    j = np.clip(np.searchsorted(u, uu), 1, u.size - 1)
+    t = np.clip((uu - u[j - 1]) / (u[j] - u[j - 1]), 0.0, 1.0)
+    ar = np.arange(z.size)
+    return q[j - 1, ar] + t * (q[j, ar] - q[j - 1, ar])
+
+
+def test_pit_of_a_draw_from_the_forecast_is_standard_normal():
+    """If the observation is drawn from the forecast, its PIT normal score is N(0,1).
+
+    This is the whole justification for fitting the dependence model in PIT space: the
+    latent the copula samples has this law by construction. The width-standardised residual
+    only has it when the marginal is symmetric, which this one deliberately is not.
+    """
+    from src.ensemble.residuals import qf_normal_score
+
+    rng = np.random.default_rng(11)
+    n = 40_000
+    sd = rng.uniform(0.002, 0.05, n)
+    loc = rng.uniform(0.0, 0.06, n)
+    # Bounded below at 0, which is where this project's atom lives.
+    q = np.clip(norm.ppf(U)[:, None] * sd[None, :] + loc[None, :], 0.0, 1.0)
+    y = _sampler_law_per_pixel(U, q, rng.standard_normal(n))
+    z = qf_normal_score(y, U, q)
+    z = z[np.isfinite(z)]
+    assert abs(z.mean()) < 0.03, z.mean()
+    assert 0.9 < z.var() < 1.1, z.var()
+
+
+def test_the_width_form_inherits_a_skew_the_pit_form_does_not():
+    """The two fit spaces are not the same field, and the difference is the marginal's skew.
+
+    Phase 2 fitted ``(y - central)/sigma`` with sigma from the interval half-widths, which
+    reads three of the sixty-four stored levels and assumes the rest is symmetric. On a
+    right-skewed marginal that leaves a location error in the field whose spectrum is being
+    fitted; on the real e1 residual it is a 0.62-sigma region-wide mean at h=20.
+    """
+    from src.ensemble.copula import Z975
+    from src.ensemble.residuals import qf_normal_score
+
+    rng = np.random.default_rng(5)
+    n = 40_000
+    zl = norm.ppf(U)
+    # A short lower half-width and a long upper one: HM's actual shape near the floor.
+    q = np.clip(0.05 + np.where(zl < 0, 0.004, 0.06)[:, None] * zl[:, None], 0.0, 1.0) \
+        * np.ones((1, n))
+    y = _sampler_law_per_pixel(U, q, rng.standard_normal(n))
+
+    cen = q[U.size // 2]
+    sigma = np.maximum(np.where(y >= cen, q[-1] - cen, cen - q[0]), 1e-6) / Z975
+    width_form = (y - cen) / sigma
+    pit_form = qf_normal_score(y, U, q)
+
+    assert abs(pit_form.mean()) < abs(width_form.mean()), \
+        f"pit {pit_form.mean():+.4f} vs width {width_form.mean():+.4f}"
+    assert 0.9 < pit_form.var() < 1.1, pit_form.var()

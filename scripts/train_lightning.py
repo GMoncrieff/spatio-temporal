@@ -16,6 +16,43 @@ from src.models.lightning_module import SpatioTemporalLightningModule
 from src.models.change_weights import N_CONTEXT_CHANNELS
 
 
+def plan_row_bands(r0, r1, stride, tile, row_chunk):
+    """Split rows [r0, r1) into bands for the large-area prediction accumulators.
+
+    Returns [(keep_a, keep_b, acc_r0, acc_r1, tile_starts), ...]. The band KEEPS rows
+    [keep_a, keep_b) -- every output row belongs to exactly one band -- and ACCUMULATES over
+    rows [acc_r0, acc_r1), which must cover every tile that touches a kept row, i.e. every
+    tile start in (keep_a - tile, keep_b). That is what makes the blend weights over the kept
+    rows complete, so a banded run writes the same values as an unbanded one.
+
+    ``row_chunk == 0`` gives a single band spanning the whole region, which is exactly the
+    behaviour before banding existed.
+
+    Why this exists: accum_horizons is len(active_horizons) * (3 + n_qf_levels) full-window
+    float32 arrays -- 268 for a four-horizon window at 64 quantile levels. Each is 2.55 GiB
+    on the 17111 x 40000 global grid. np.zeros is lazily paged, so the cost is the pages the
+    tiles touch: measured at 185 GiB for one global fold, on a box with 125 GB that runs two
+    folds at once. Africa's 63.1 Mpx grid puts the same 268 accumulators at ~22 GB, and the
+    only configuration ever run globally was the 12-accumulator triple head -- a working set
+    regional scale never exercised.
+    """
+    if row_chunk and row_chunk % 256:
+        raise ValueError("--predict_row_chunk must be a multiple of 256 so band boundaries "
+                         "land on the output raster's block grid")
+    step = row_chunk or max(1, r1 - r0)
+    bands = []
+    for a in range(r0, r1, step):
+        b = min(a + step, r1)
+        starts = [i for i in range(r0, r1, stride) if i < b and i + tile > a]
+        if not starts:
+            continue
+        # max(b, ...) covers the kept rows even if stride > tile leaves a gap the unbanded
+        # path would have left as NaN; without it the blend slice is short and the windowed
+        # write fails on shape rather than on content.
+        bands.append((a, b, starts[0], min(r1, max(b, starts[-1] + tile)), starts))
+    return bands
+
+
 def _wants_context(args):
     """True when any head is configured to read the past-change context rasters.
 
@@ -485,6 +522,18 @@ if __name__ == "__main__":
         help="Bands in the quantile-function raster written beside the triple by the spline "
              "head. 0 disables it. The grid is normal-spaced with 0.025/0.5/0.975 pinned, so "
              "the qf reproduces the published bounds exactly.",
+    )
+    parser.add_argument(
+        "--predict_row_chunk", type=int, default=0,
+        help="Process large-area prediction in bands of this many rows instead of holding "
+             "the whole region's accumulators at once. 0 (default) keeps today's behaviour. "
+             "There are len(active_horizons) * (3 + --predict_qf_levels) accumulators -- 268 "
+             "for a four-horizon window at 64 levels -- and each is a full-window float32 "
+             "array, 2.55 GiB on the 17111x40000 global grid. Measured resident (touched 4 "
+             "KiB pages, not the virtual size) is 185 GiB for one global fold, on a 125 GB "
+             "box running two folds at once. A band keeping rows [a, b) accumulates every "
+             "tile that covers them, so the blend weights are complete and the written "
+             "values are identical to an unchunked run.",
     )
     parser.add_argument(
         "--spline_checkpoint",
@@ -2099,8 +2148,8 @@ if __name__ == "__main__":
                 return infer_model
             # Accumulators are allocated after the model is loaded, because how many there
             # are depends on the head family: the spline head adds one per quantile level.
-            wsum = np.zeros((Hwin, Wwin), dtype=np.float32)
-            nodata_mask_total = np.zeros((Hwin, Wwin), dtype=bool)
+            # They are also allocated per row band when --predict_row_chunk is set, so both
+            # accum_horizons and wsum live inside the band loop below.
 
             # Stats and config captured from the training dataset before it is released
             # (see PREDICT_STATS below) — prediction must not keep the dataloaders and
@@ -2186,10 +2235,8 @@ if __name__ == "__main__":
                 print(f"  Quantile function: {len(qf_u)} levels, "
                       f"u in [{qf_u[0]:.5f}, {qf_u[-1]:.5f}], "
                       f"{len(qf_u) * len(active_horizons)} accumulators")
-            accum_horizons = {
-                f"{h}_{q}": np.zeros((Hwin, Wwin), dtype=np.float32)
-                for h in active_horizons for q in list(quantile_names) + qf_names
-            }
+            accum_keys = [f"{h}_{q}" for h in active_horizons
+                          for q in list(quantile_names) + qf_names]
 
             # Optional restriction mask: skip tiles that do not overlap the requested values.
             # Used for fold hindcasts, where only the held-out fold's pixels are consumed.
@@ -2258,308 +2305,40 @@ if __name__ == "__main__":
             print(f"  Input years: {input_years}")
             print()
             
-            # Collect all tile coordinates first
-            tile_coords = []
-            for i in range(r0, r1, stride):
-                for j in range(c0, c1, stride):
-                    tile_coords.append((i, j))
-            
+            # ---------------------------------------------------------------------------
+            # Row banding. accum_horizons is len(active_horizons) * (3 + n_qf_levels) arrays
+            # -- 268 for a four-horizon window at 64 quantile levels -- and each spans the
+            # whole region: 2.55 GiB on the 17111 x 40000 global grid. np.zeros is lazily
+            # paged, so what matters is the pages the tiles touch, measured at 185 GiB for
+            # one global fold (kept pixels dilated by the tile halo, 4 KiB pages, 2.3x
+            # amplification over useful data). The box has 125 GB and runs two folds at once.
+            # Africa's grid is 63.1 Mpx, where the same 268 accumulators are ~22 GB, and the
+            # only configuration ever run globally was the 12-accumulator triple head -- so
+            # this is a working set regional scale never exercised.
+            #
+            # A band keeping rows [a, b) accumulates every tile that covers one of them, i.e.
+            # every tile start in (a - tile, b), so the blend weights over [a, b) are complete
+            # and the written values are identical to an unbanded run. The tiles in the halo
+            # are computed twice, which costs tile/row_chunk extra GPU work.
+            _row_chunk = int(getattr(args, "predict_row_chunk", 0) or 0)
+            _bands = plan_row_bands(r0, r1, stride, tile, _row_chunk)
+            if _row_chunk:
+                _acc_gib = max(b[3] - b[2] for b in _bands) * Wwin * 4 / 2**30
+                print(f"  Row banding: {len(_bands)} bands of {_row_chunk} rows; "
+                      f"{len(accum_keys)} accumulators x {_acc_gib:.3f} GiB "
+                      f"= {len(accum_keys) * _acc_gib:.1f} GiB worst case")
+
             batch_size = args.predict_batch_size
             print(f"  Batch size: {batch_size} tiles")
-            
+            total_tiles = sum(len(b[4]) for b in _bands) * len(range(c0, c1, stride))
             tiles_processed = 0
             tiles_skipped = 0
             tiles_with_valid = 0
             last_percent = -1
             tile_start_time = time.time()
 
-            # Process tiles in batches
-            for batch_start in range(0, len(tile_coords), batch_size):
-                batch_end = min(batch_start + batch_size, len(tile_coords))
-                batch_tiles = tile_coords[batch_start:batch_end]
-                
-                # Prepare batch data
-                batch_inputs_dyn = []
-                batch_contexts = []
-                batch_hm_contexts = []
-                batch_inputs_stat = []
-                batch_lonlats = []
-                batch_metadata = []  # Store (i, j, hi, wj, li0, lj0, li1, lj1, valid_mask, input_invalid_mask)
-                
-                for i, j in batch_tiles:
-                    hi = min(tile, r1 - i)
-                    wj = min(tile, c1 - j)
-                    if hi <= 0 or wj <= 0:
-                        continue
-                    # Local indices in accum arrays
-                    li0, lj0 = i - r0, j - c0
-                    li1, lj1 = li0 + hi, lj0 + wj
-                    submask = bbox_mask[li0:li1, lj0:lj1]
-                    if not np.any(submask):
-                        tiles_processed += 1
-                        tiles_skipped += 1
-                        continue
-                    # Cheap pre-read rejection (before any raster IO) for restricted runs
-                    if restrict_win is not None and not restrict_win[li0:li1, lj0:lj1].any():
-                        tiles_processed += 1
-                        tiles_skipped += 1
-                        continue
-                    win = Window(j, i, wj, hi)
-                    # Build inputs
-                    dyn_ts = []
-                    for t_idx, y in zip(t_idxs, input_years):
-                        channels = []
-                        arr_hm = hm_srcs[t_idx].read(1, window=win, masked=True).filled(np.nan)
-                        # Data is already in [0, 1] range
-                        channels.append((arr_hm - hm_mean) / hm_std)
-                        if include_components and comp_srcs.get(y, []):
-                            for var_idx, (var_name, src) in enumerate(zip(HM_VARS, comp_srcs[y])):
-                                carr = src.read(1, window=win, masked=True).filled(np.nan)
-                                # Replace NaN with 0 BEFORE normalization (missing = no pressure/activity)
-                                carr = np.nan_to_num(carr, nan=0.0)
-                                # Use per-variable normalization (CRITICAL for GDP/population)
-                                channels.append((carr - comp_means[var_name]) / comp_stds[var_name])
-                        dyn_ts.append(np.stack(channels, axis=0))  # [C_dyn, hi, wj]
-                    input_dynamic_np = np.stack(dyn_ts, axis=0)  # [T, C_dyn, hi, wj]
-                    static_chs = []
-                    # Static file order: [ele, tas, tasmin, pr, dpi_dsi, iucn_nostrict, iucn_strict]
-                    nan_to_zero_static = {0, 4, 5, 6}  # ele, dpi_dsi, iucn_nostrict, iucn_strict
-                    for static_idx, src in enumerate(stat_srcs):
-                        sarr = src.read(1, window=win, masked=True).filled(np.nan)
-                        # Replace NaN with 0 for specific variables (before normalization)
-                        if static_idx in nan_to_zero_static:
-                            sarr = np.nan_to_num(sarr, nan=0.0)
-                        # Use per-variable normalization (CRITICAL for different scales)
-                        static_chs.append((sarr - static_means[static_idx]) / static_stds[static_idx])
-                    input_static_np = np.stack(static_chs, axis=0) if static_chs else np.zeros((0, hi, wj), dtype=np.float32)
-
-                    # Valid mask for prediction (less strict than training)
-                    # Only require HM channel (index 0) to be valid across all timesteps
-                    # Component channels can be NaN (will be replaced with 0.0)
-                    hm_valid_all_times = np.isfinite(input_dynamic_np[:, 0, :, :]).all(axis=0)  # [H, W]
-                    # Only require first static channel (elevation) to be valid
-                    stat_valid = np.isfinite(input_static_np[0]) if static_chs else np.ones((hi, wj), dtype=bool)
-                    valid_mask = submask & hm_valid_all_times & stat_valid
-                    if not np.any(valid_mask):
-                        tiles_processed += 1
-                        tiles_skipped += 1
-                        continue
-                    
-                    tiles_with_valid += 1
-                    tiles_processed += 1
-                    
-                    # Track which pixels had valid inputs (BEFORE replacing NaN)
-                    # This matches the validation code approach (lines 465-467)
-                    dynamic_has_nan = ~np.isfinite(input_dynamic_np).all(axis=(0, 1))  # [hi, wj]
-                    static_has_nan = ~np.isfinite(input_static_np).all(axis=0) if static_chs else np.zeros((hi, wj), dtype=bool)
-                    input_invalid_mask = dynamic_has_nan | static_has_nan  # Pixels to mask in predictions
-                    
-                    # Add to batch
-                    # Replace NaN with 0.0 in normalized space = mean in original space
-                    in_dyn = np.nan_to_num(input_dynamic_np, nan=0.0).astype(np.float32)
-                    in_stat = np.nan_to_num(input_static_np, nan=0.0).astype(np.float32)
-                    lonlat_hw2 = lonlat_grid_for_window(i, j, hi, wj)
-                    
-                    # Pad to tile size if needed (for edge tiles)
-                    if hi < tile or wj < tile:
-                        # Pad dynamic: [T, C, hi, wj] -> [T, C, tile, tile]
-                        T, C = in_dyn.shape[:2]
-                        in_dyn_padded = np.zeros((T, C, tile, tile), dtype=np.float32)
-                        in_dyn_padded[:, :, :hi, :wj] = in_dyn
-                        in_dyn = in_dyn_padded
-                        
-                        # Pad static: [C, hi, wj] -> [C, tile, tile]
-                        C_stat = in_stat.shape[0]
-                        in_stat_padded = np.zeros((C_stat, tile, tile), dtype=np.float32)
-                        in_stat_padded[:, :hi, :wj] = in_stat
-                        in_stat = in_stat_padded
-                        
-                        # Pad lonlat: [hi, wj, 2] -> [tile, tile, 2]
-                        lonlat_padded = np.zeros((tile, tile, 2), dtype=np.float32)
-                        lonlat_padded[:hi, :wj, :] = lonlat_hw2
-                        lonlat_hw2 = lonlat_padded
-                    
-                    if ctx_src is not None:
-                        cx = np.stack([
-                            np.nan_to_num(ctx_src.read(1, window=win, masked=True).filled(np.nan), nan=0.0),
-                            np.nan_to_num(ctx_src.read(2, window=win, masked=True).filled(np.nan), nan=1e4),
-                        ], axis=0).astype(np.float32)
-                        if hi < tile or wj < tile:
-                            padded = np.zeros((2, tile, tile), dtype=np.float32)
-                            padded[1] = 1e4
-                            padded[:, :hi, :wj] = cx
-                            cx = padded
-                        batch_contexts.append(cx)
-                    if hm_ctx_src is not None:
-                        raw = hm_ctx_src.read(hm_ctx_bands, window=win).astype(np.float32)
-                        hm_cx = np.where(raw == -32768, 0.0,
-                                         raw * np.float32(1.0 / 32767.0)).astype(np.float32)
-                        if hi < tile or wj < tile:
-                            # Every other source above pads its edge tiles to the full tile;
-                            # this one did not, so a region whose extent is not a whole number
-                            # of strides handed np.stack a (bands, hi, wj) among (bands, tile,
-                            # tile) and it refused. Training never saw this because chips are
-                            # always full size -- only the prediction path tiles to an edge.
-                            # Zero is what this block already substitutes for the raster's own
-                            # -32768 nodata sentinel.
-                            padded = np.zeros((len(hm_ctx_bands), tile, tile), dtype=np.float32)
-                            padded[:, :hi, :wj] = hm_cx
-                            hm_cx = padded
-                        batch_hm_contexts.append(hm_cx)
-                    batch_inputs_dyn.append(in_dyn)
-                    batch_inputs_stat.append(in_stat)
-                    batch_lonlats.append(lonlat_hw2)
-                    batch_metadata.append((i, j, hi, wj, li0, lj0, li1, lj1, valid_mask, input_invalid_mask))
-                
-                # Process batch on GPU if we have any valid tiles
-                if len(batch_inputs_dyn) > 0:
-                    # Stack into batch tensors
-                    batch_dyn_tensor = torch.from_numpy(np.stack(batch_inputs_dyn, axis=0)).to(device)  # [B, T, C, H, W]
-                    batch_stat_tensor = torch.from_numpy(np.stack(batch_inputs_stat, axis=0)).to(device)  # [B, C, H, W]
-                    batch_lonlat_tensor = torch.from_numpy(np.stack(batch_lonlats, axis=0)).to(device)  # [B, H, W, 2]
-                    
-                    batch_ctx_tensor = (
-                        torch.from_numpy(np.stack(batch_contexts, axis=0)).to(device)
-                        if batch_contexts else None
-                    )
-                    batch_hm_tensor = (
-                        torch.from_numpy(np.stack(batch_hm_contexts, axis=0)).to(device)
-                        if batch_hm_contexts else None
-                    )
-                    batch_qf = None
-                    with torch.no_grad():
-                        batch_preds = infer_model(batch_dyn_tensor, batch_stat_tensor,
-                                                  lonlat=batch_lonlat_tensor,
-                                                  change_context=batch_ctx_tensor,
-                                                  hm_context=batch_hm_tensor)  # [B, 12, H, W]
-                        if qf_u is not None:
-                            # Evaluated once per batch, decoded by the *same* function the
-                            # loss uses, so the raster and the objective cannot drift apart.
-                            m_ = infer_model.model
-                            u_t = torch.as_tensor(qf_u, dtype=batch_preds.dtype,
-                                                  device=batch_preds.device)
-                            batch_qf = [
-                                sp.ppf(u_t).movedim(-1, 1).cpu().numpy()   # [B, n_u, H, W]
-                                for sp in splines_from_output(
-                                    batch_preds, m_.num_horizons, m_.spline_u_knots,
-                                    learn_slopes=m_.spline_learn_slopes,
-                                    clamp=m_.spline_clamp())
-                            ]
-                    
-                    # Process each tile in the batch
-                    for tile_idx, (i, j, hi, wj, li0, lj0, li1, lj1, valid_mask, input_invalid_mask) in enumerate(batch_metadata):
-                        # Extract quantile predictions for this tile (crop to actual size if padded)
-                        # batch_preds: [B, 12, H, W] where 12 = 4 horizons × 3 quantiles
-                        # Channel ordering: [lower_5yr, central_5yr, upper_5yr, lower_10yr, ...]
-                        preds_horizons = {}
-                        for h_idx, h_name in enumerate(horizon_names):
-                            if h_name not in active_horizons:
-                                continue
-                            # Extract 3 quantiles for this horizon
-                            pred_lower = batch_preds[tile_idx, 3*h_idx, :hi, :wj].detach().cpu().numpy()
-                            pred_central = batch_preds[tile_idx, 3*h_idx+1, :hi, :wj].detach().cpu().numpy()
-                            pred_upper = batch_preds[tile_idx, 3*h_idx+2, :hi, :wj].detach().cpu().numpy()
-                            
-                            # Denormalize to [0, 1] scale
-                            pred_lower = pred_lower * hm_std + hm_mean
-                            pred_central = pred_central * hm_std + hm_mean
-                            pred_upper = pred_upper * hm_std + hm_mean
-                            
-                            # CRITICAL: Mask predictions where inputs had NaN (same as validation code)
-                            pred_lower[input_invalid_mask] = np.nan
-                            pred_central[input_invalid_mask] = np.nan
-                            pred_upper[input_invalid_mask] = np.nan
-                            
-                            # Store with keys matching accumulator dict
-                            preds_horizons[f"{h_name}_lower"] = pred_lower
-                            preds_horizons[f"{h_name}_central"] = pred_central
-                            preds_horizons[f"{h_name}_upper"] = pred_upper
-
-                            if qf_u is not None:
-                                qf = batch_qf[h_idx][tile_idx, :, :hi, :wj]
-                                qf = qf * hm_std + hm_mean
-                                qf[:, input_invalid_mask] = np.nan
-                                for li, lname in enumerate(qf_names):
-                                    preds_horizons[f"{h_name}_{lname}"] = qf[li]
-                        
-                        # Distance-to-edge weights within tile
-                        interior = valid_mask.astype(np.uint8)
-                        interior[[0, -1], :] = 0
-                        interior[:, [0, -1]] = 0
-                        weights = distance_transform_edt(interior)
-                        weights = np.where(valid_mask, weights, 0.0)
-                        
-                        if weights.max() > 0:
-                            # Accumulate each horizon-quantile combination
-                            for key, pred in preds_horizons.items():
-                                accum_horizons[key][li0:li1, lj0:lj1] += pred * weights
-                            wsum[li0:li1, lj0:lj1] += weights
-                        nodata_mask_total[li0:li1, lj0:lj1] |= ~valid_mask
-                
-                # Progress indicator (after each batch)
-                percent = int(100 * tiles_processed / total_tiles)
-                if percent != last_percent and percent % 5 == 0:
-                    elapsed = time.time() - tile_start_time
-                    tiles_per_sec = tiles_processed / elapsed if elapsed > 0 else 0
-                    eta_sec = (total_tiles - tiles_processed) / tiles_per_sec if tiles_per_sec > 0 else 0
-                    print(f"  Progress: {percent:3d}% ({tiles_processed:,}/{total_tiles:,} tiles) | "
-                          f"Speed: {tiles_per_sec:.1f} tiles/s | "
-                          f"ETA: {int(eta_sec//60):02d}:{int(eta_sec%60):02d}")
-                    last_percent = percent
-
-            # Final blend for all horizon-quantile combinations
-            print("\n" + "-"*70)
-            print("Blending overlapping tiles for all horizons and quantiles...")
-            m = wsum > 0
-
-            # Blend one raster at a time, at the moment it is written, instead of building a
-            # dict of every horizon x quantile level first.
-            #
-            # There are len(active_horizons) * (3 + n_qf_levels) accumulators -- 268 for a
-            # four-horizon window at 64 levels. On southern Africa (1.86 Mpx) a full second
-            # copy is 2 GB and invisible. On Africa (63.1 Mpx) each array is 0.252 GB, so the
-            # copy is 67.6 GB, and because np.full touches every page it is ALL resident,
-            # while accum_horizons (np.zeros) stays sparse over ocean. Measured peak was
-            # ~98 GB for one fold; two folds in parallel were OOM-killed by the kernel with
-            # no traceback. Blending on demand removes that copy entirely: peak becomes the
-            # sparse accumulators plus one temporary.
-            #
-            # The arithmetic is unchanged -- same expression, evaluated later -- so the
-            # written values are identical. The quantile levels blend on exactly the same
-            # weights as the triple. A weighted average of monotone sequences is monotone, so
-            # the blended quantile function is still a quantile function, and because 0.025
-            # and 0.975 are levels of the grid the blended bands reproduce the blended
-            # lower/upper rasters rather than merely approximating them.
-            # In screen mode the kept blocks are exact, but every PROCESSED TILE writes its
-            # whole 128 px extent, so a halo around each block also comes out finite -- with
-            # incomplete blending, because the tiles that would have contributed to it were
-            # skipped. Measured: kept pixels agree with a full run to 3.6e-7 (float32 summation
-            # order), the halo to only 3.1e-3, which is the size of the signal. In the ordinary
-            # fold hindcast the halo is harmless because it falls outside the fold and the
-            # stitcher drops it; here it falls INSIDE the fold, so the scorer would take it.
-            _screen_mask = restrict_win if int(
-                getattr(args, "predict_subsample_blocks", 0)) > 0 else None
-
-            def _blend(key):
-                out_h = np.full((Hwin, Wwin), np.nan, dtype=np.float32)
-                out_h[m] = (accum_horizons[key][m] / wsum[m]).astype(np.float32)
-                # Clamp predictions to valid range [0, 1]
-                out_h[m] = np.clip(out_h[m], 0.0, 1.0)
-                if _screen_mask is not None:
-                    out_h[~_screen_mask] = np.nan
-                return out_h
-            
-            # Calculate statistics
-            num_valid_pixels = m.sum()
-            num_total_pixels = Hwin * Wwin
-            valid_percent = 100 * num_valid_pixels / num_total_pixels
-            
-            print(f"✓ Blending complete")
-            print(f"  Valid pixels: {num_valid_pixels:,} / {num_total_pixels:,} ({valid_percent:.1f}%)")
-            print(f"  Generated 12 predictions (3 quantiles × 4 horizons)")
-
-            # Write GeoTIFF for each horizon-quantile combination
-            print("\nWriting output GeoTIFFs...")
+            # Outputs are opened once and written band by band. With one band this is a
+            # single full-array write, which is exactly what the unbanded path did.
             out_profile = ref.profile.copy()
             out_profile.update({
                 'height': Hwin,
@@ -2567,8 +2346,23 @@ if __name__ == "__main__":
                 'transform': ref_transform * Affine.translation(c0, r0),
                 'count': 1,
                 'dtype': 'float32',
-                'compress': 'deflate'
+                'compress': 'deflate',
+                # GDAL's BIGTIFF default is IF_NEEDED, which cannot switch to BigTIFF for a
+                # COMPRESSED raster because it cannot predict the compressed size -- so every
+                # output here was a classic TIFF capped at 4 GiB. The 64-band quantile
+                # function over all 184.6M land pixels wants ~15 GB and died at
+                # `TIFFAppendToStrip: Maximum TIFF file size exceeded` partway through band 9
+                # of 34, leaving files that read back as all-finite ZEROS past the failure --
+                # plausible data, not an error. The fold hindcast escaped by 27 MB: its
+                # largest quantile raster is 4,267,991,319 bytes against a 4,294,967,296
+                # ceiling, 99.37%. stitch_fold_predictions has always set this; the
+                # prediction writer never did.
+                'BIGTIFF': 'YES',
             })
+            if _row_chunk:
+                # A banded write must land on block boundaries; the single-band rasters
+                # inherit the reference raster's layout otherwise.
+                out_profile.update(tiled=True, blockxsize=256, blockysize=256)
             out_dir = Path(args.predict_output_dir) if args.predict_output_dir else (
                 Path(os.getcwd()) / 'data' / 'predictions'
             )
@@ -2577,38 +2371,354 @@ if __name__ == "__main__":
             max_year = args.predict_max_target_year
 
             out_paths = {}
+            _writers = {}
             for h_name, h_year in zip(horizon_names, horizon_years):
                 if h_name not in active_horizons:
                     print(f"  · {h_year}: skipped (> --predict_max_target_year {max_year})")
                     continue
                 for q_name in quantile_names:
                     key = f"{h_name}_{q_name}"
-                    out_path = out_dir / f"{prefix}prediction_{h_year}_{q_name}_blended.tif"
-                    with rasterio.open(out_path, 'w', **out_profile) as dst:
-                        dst.write(_blend(key), 1)
-                    out_paths[key] = out_path
-                    print(f"  ✓ {h_year} {q_name}: {out_path}")
-
+                    p = out_dir / f"{prefix}prediction_{h_year}_{q_name}_blended.tif"
+                    _writers[key] = rasterio.open(p, 'w', **out_profile)
+                    out_paths[key] = p
                 if qf_names:
                     # One multi-band raster per horizon rather than 64 files. int16 x 1/32767
                     # is the ensemble's own storage convention: HM is bounded on [0, 1], so
                     # this is lossless to 3e-5, far below any quantity of interest.
                     qf_profile = out_profile.copy()
                     qf_profile.update(count=len(qf_names), dtype='int16', nodata=-32768,
-                                      tiled=True, blockxsize=256, blockysize=256)
-                    qf_path = out_dir / f"{prefix}prediction_{h_year}_qf_blended.tif"
-                    with rasterio.open(qf_path, 'w', **qf_profile) as dst:
+                                      tiled=True, blockxsize=256, blockysize=256,
+                                      BIGTIFF='YES')
+                    p = out_dir / f"{prefix}prediction_{h_year}_qf_blended.tif"
+                    d = rasterio.open(p, 'w', **qf_profile)
+                    for li, lname in enumerate(qf_names):
+                        d.set_band_description(li + 1, f"u={qf_u[li]:.6f}")
+                    d.update_tags(u_levels=",".join(repr(float(v)) for v in qf_u),
+                                  scale_factor="3.0518509e-05", head_family="spline")
+                    _writers[f"{h_name}_qf"] = d
+                    out_paths[f"{h_name}_qf"] = p
+
+            num_valid_pixels = 0
+            for _bi, (_keep_a, _keep_b, _acc_r0, _acc_r1, _band_starts) in enumerate(_bands):
+                _accH = _acc_r1 - _acc_r0
+                if _row_chunk:
+                    print(f"\n--- band {_bi + 1}/{len(_bands)}: keep rows "
+                          f"[{_keep_a}, {_keep_b}), accumulate [{_acc_r0}, {_acc_r1}) ---")
+                accum_horizons = {k: np.zeros((_accH, Wwin), dtype=np.float32)
+                                  for k in accum_keys}
+                wsum = np.zeros((_accH, Wwin), dtype=np.float32)
+                # Views, not copies: the full-window masks stay allocated once.
+                _bbox_c = bbox_mask[_acc_r0 - r0:_acc_r1 - r0]
+                _restrict_c = None if restrict_win is None else \
+                    restrict_win[_acc_r0 - r0:_acc_r1 - r0]
+                # Tiles this band must accumulate: every tile covering a kept row.
+                tile_coords = []
+                for i in _band_starts:
+                    for j in range(c0, c1, stride):
+                        tile_coords.append((i, j))
+            
+            
+
+                # Process tiles in batches
+                for batch_start in range(0, len(tile_coords), batch_size):
+                    batch_end = min(batch_start + batch_size, len(tile_coords))
+                    batch_tiles = tile_coords[batch_start:batch_end]
+                
+                    # Prepare batch data
+                    batch_inputs_dyn = []
+                    batch_contexts = []
+                    batch_hm_contexts = []
+                    batch_inputs_stat = []
+                    batch_lonlats = []
+                    batch_metadata = []  # Store (i, j, hi, wj, li0, lj0, li1, lj1, valid_mask, input_invalid_mask)
+                
+                    for i, j in batch_tiles:
+                        hi = min(tile, _acc_r1 - i)
+                        wj = min(tile, c1 - j)
+                        if hi <= 0 or wj <= 0:
+                            continue
+                        # Local indices in accum arrays
+                        li0, lj0 = i - _acc_r0, j - c0
+                        li1, lj1 = li0 + hi, lj0 + wj
+                        submask = _bbox_c[li0:li1, lj0:lj1]
+                        if not np.any(submask):
+                            tiles_processed += 1
+                            tiles_skipped += 1
+                            continue
+                        # Cheap pre-read rejection (before any raster IO) for restricted runs
+                        if _restrict_c is not None and not _restrict_c[li0:li1, lj0:lj1].any():
+                            tiles_processed += 1
+                            tiles_skipped += 1
+                            continue
+                        win = Window(j, i, wj, hi)
+                        # Build inputs
+                        dyn_ts = []
+                        for t_idx, y in zip(t_idxs, input_years):
+                            channels = []
+                            arr_hm = hm_srcs[t_idx].read(1, window=win, masked=True).filled(np.nan)
+                            # Data is already in [0, 1] range
+                            channels.append((arr_hm - hm_mean) / hm_std)
+                            if include_components and comp_srcs.get(y, []):
+                                for var_idx, (var_name, src) in enumerate(zip(HM_VARS, comp_srcs[y])):
+                                    carr = src.read(1, window=win, masked=True).filled(np.nan)
+                                    # Replace NaN with 0 BEFORE normalization (missing = no pressure/activity)
+                                    carr = np.nan_to_num(carr, nan=0.0)
+                                    # Use per-variable normalization (CRITICAL for GDP/population)
+                                    channels.append((carr - comp_means[var_name]) / comp_stds[var_name])
+                            dyn_ts.append(np.stack(channels, axis=0))  # [C_dyn, hi, wj]
+                        input_dynamic_np = np.stack(dyn_ts, axis=0)  # [T, C_dyn, hi, wj]
+                        static_chs = []
+                        # Static file order: [ele, tas, tasmin, pr, dpi_dsi, iucn_nostrict, iucn_strict]
+                        nan_to_zero_static = {0, 4, 5, 6}  # ele, dpi_dsi, iucn_nostrict, iucn_strict
+                        for static_idx, src in enumerate(stat_srcs):
+                            sarr = src.read(1, window=win, masked=True).filled(np.nan)
+                            # Replace NaN with 0 for specific variables (before normalization)
+                            if static_idx in nan_to_zero_static:
+                                sarr = np.nan_to_num(sarr, nan=0.0)
+                            # Use per-variable normalization (CRITICAL for different scales)
+                            static_chs.append((sarr - static_means[static_idx]) / static_stds[static_idx])
+                        input_static_np = np.stack(static_chs, axis=0) if static_chs else np.zeros((0, hi, wj), dtype=np.float32)
+
+                        # Valid mask for prediction (less strict than training)
+                        # Only require HM channel (index 0) to be valid across all timesteps
+                        # Component channels can be NaN (will be replaced with 0.0)
+                        hm_valid_all_times = np.isfinite(input_dynamic_np[:, 0, :, :]).all(axis=0)  # [H, W]
+                        # Only require first static channel (elevation) to be valid
+                        stat_valid = np.isfinite(input_static_np[0]) if static_chs else np.ones((hi, wj), dtype=bool)
+                        valid_mask = submask & hm_valid_all_times & stat_valid
+                        if not np.any(valid_mask):
+                            tiles_processed += 1
+                            tiles_skipped += 1
+                            continue
+                    
+                        tiles_with_valid += 1
+                        tiles_processed += 1
+                    
+                        # Track which pixels had valid inputs (BEFORE replacing NaN)
+                        # This matches the validation code approach (lines 465-467)
+                        dynamic_has_nan = ~np.isfinite(input_dynamic_np).all(axis=(0, 1))  # [hi, wj]
+                        static_has_nan = ~np.isfinite(input_static_np).all(axis=0) if static_chs else np.zeros((hi, wj), dtype=bool)
+                        input_invalid_mask = dynamic_has_nan | static_has_nan  # Pixels to mask in predictions
+                    
+                        # Add to batch
+                        # Replace NaN with 0.0 in normalized space = mean in original space
+                        in_dyn = np.nan_to_num(input_dynamic_np, nan=0.0).astype(np.float32)
+                        in_stat = np.nan_to_num(input_static_np, nan=0.0).astype(np.float32)
+                        lonlat_hw2 = lonlat_grid_for_window(i, j, hi, wj)
+                    
+                        # Pad to tile size if needed (for edge tiles)
+                        if hi < tile or wj < tile:
+                            # Pad dynamic: [T, C, hi, wj] -> [T, C, tile, tile]
+                            T, C = in_dyn.shape[:2]
+                            in_dyn_padded = np.zeros((T, C, tile, tile), dtype=np.float32)
+                            in_dyn_padded[:, :, :hi, :wj] = in_dyn
+                            in_dyn = in_dyn_padded
+                        
+                            # Pad static: [C, hi, wj] -> [C, tile, tile]
+                            C_stat = in_stat.shape[0]
+                            in_stat_padded = np.zeros((C_stat, tile, tile), dtype=np.float32)
+                            in_stat_padded[:, :hi, :wj] = in_stat
+                            in_stat = in_stat_padded
+                        
+                            # Pad lonlat: [hi, wj, 2] -> [tile, tile, 2]
+                            lonlat_padded = np.zeros((tile, tile, 2), dtype=np.float32)
+                            lonlat_padded[:hi, :wj, :] = lonlat_hw2
+                            lonlat_hw2 = lonlat_padded
+                    
+                        if ctx_src is not None:
+                            cx = np.stack([
+                                np.nan_to_num(ctx_src.read(1, window=win, masked=True).filled(np.nan), nan=0.0),
+                                np.nan_to_num(ctx_src.read(2, window=win, masked=True).filled(np.nan), nan=1e4),
+                            ], axis=0).astype(np.float32)
+                            if hi < tile or wj < tile:
+                                padded = np.zeros((2, tile, tile), dtype=np.float32)
+                                padded[1] = 1e4
+                                padded[:, :hi, :wj] = cx
+                                cx = padded
+                            batch_contexts.append(cx)
+                        if hm_ctx_src is not None:
+                            raw = hm_ctx_src.read(hm_ctx_bands, window=win).astype(np.float32)
+                            hm_cx = np.where(raw == -32768, 0.0,
+                                             raw * np.float32(1.0 / 32767.0)).astype(np.float32)
+                            if hi < tile or wj < tile:
+                                # Every other source above pads its edge tiles to the full tile;
+                                # this one did not, so a region whose extent is not a whole number
+                                # of strides handed np.stack a (bands, hi, wj) among (bands, tile,
+                                # tile) and it refused. Training never saw this because chips are
+                                # always full size -- only the prediction path tiles to an edge.
+                                # Zero is what this block already substitutes for the raster's own
+                                # -32768 nodata sentinel.
+                                padded = np.zeros((len(hm_ctx_bands), tile, tile), dtype=np.float32)
+                                padded[:, :hi, :wj] = hm_cx
+                                hm_cx = padded
+                            batch_hm_contexts.append(hm_cx)
+                        batch_inputs_dyn.append(in_dyn)
+                        batch_inputs_stat.append(in_stat)
+                        batch_lonlats.append(lonlat_hw2)
+                        batch_metadata.append((i, j, hi, wj, li0, lj0, li1, lj1, valid_mask, input_invalid_mask))
+                
+                    # Process batch on GPU if we have any valid tiles
+                    if len(batch_inputs_dyn) > 0:
+                        # Stack into batch tensors
+                        batch_dyn_tensor = torch.from_numpy(np.stack(batch_inputs_dyn, axis=0)).to(device)  # [B, T, C, H, W]
+                        batch_stat_tensor = torch.from_numpy(np.stack(batch_inputs_stat, axis=0)).to(device)  # [B, C, H, W]
+                        batch_lonlat_tensor = torch.from_numpy(np.stack(batch_lonlats, axis=0)).to(device)  # [B, H, W, 2]
+                    
+                        batch_ctx_tensor = (
+                            torch.from_numpy(np.stack(batch_contexts, axis=0)).to(device)
+                            if batch_contexts else None
+                        )
+                        batch_hm_tensor = (
+                            torch.from_numpy(np.stack(batch_hm_contexts, axis=0)).to(device)
+                            if batch_hm_contexts else None
+                        )
+                        batch_qf = None
+                        with torch.no_grad():
+                            batch_preds = infer_model(batch_dyn_tensor, batch_stat_tensor,
+                                                      lonlat=batch_lonlat_tensor,
+                                                      change_context=batch_ctx_tensor,
+                                                      hm_context=batch_hm_tensor)  # [B, 12, H, W]
+                            if qf_u is not None:
+                                # Evaluated once per batch, decoded by the *same* function the
+                                # loss uses, so the raster and the objective cannot drift apart.
+                                m_ = infer_model.model
+                                u_t = torch.as_tensor(qf_u, dtype=batch_preds.dtype,
+                                                      device=batch_preds.device)
+                                batch_qf = [
+                                    sp.ppf(u_t).movedim(-1, 1).cpu().numpy()   # [B, n_u, H, W]
+                                    for sp in splines_from_output(
+                                        batch_preds, m_.num_horizons, m_.spline_u_knots,
+                                        learn_slopes=m_.spline_learn_slopes,
+                                        clamp=m_.spline_clamp())
+                                ]
+                    
+                        # Process each tile in the batch
+                        for tile_idx, (i, j, hi, wj, li0, lj0, li1, lj1, valid_mask, input_invalid_mask) in enumerate(batch_metadata):
+                            # Extract quantile predictions for this tile (crop to actual size if padded)
+                            # batch_preds: [B, 12, H, W] where 12 = 4 horizons × 3 quantiles
+                            # Channel ordering: [lower_5yr, central_5yr, upper_5yr, lower_10yr, ...]
+                            preds_horizons = {}
+                            for h_idx, h_name in enumerate(horizon_names):
+                                if h_name not in active_horizons:
+                                    continue
+                                # Extract 3 quantiles for this horizon
+                                pred_lower = batch_preds[tile_idx, 3*h_idx, :hi, :wj].detach().cpu().numpy()
+                                pred_central = batch_preds[tile_idx, 3*h_idx+1, :hi, :wj].detach().cpu().numpy()
+                                pred_upper = batch_preds[tile_idx, 3*h_idx+2, :hi, :wj].detach().cpu().numpy()
+                            
+                                # Denormalize to [0, 1] scale
+                                pred_lower = pred_lower * hm_std + hm_mean
+                                pred_central = pred_central * hm_std + hm_mean
+                                pred_upper = pred_upper * hm_std + hm_mean
+                            
+                                # CRITICAL: Mask predictions where inputs had NaN (same as validation code)
+                                pred_lower[input_invalid_mask] = np.nan
+                                pred_central[input_invalid_mask] = np.nan
+                                pred_upper[input_invalid_mask] = np.nan
+                            
+                                # Store with keys matching accumulator dict
+                                preds_horizons[f"{h_name}_lower"] = pred_lower
+                                preds_horizons[f"{h_name}_central"] = pred_central
+                                preds_horizons[f"{h_name}_upper"] = pred_upper
+
+                                if qf_u is not None:
+                                    qf = batch_qf[h_idx][tile_idx, :, :hi, :wj]
+                                    qf = qf * hm_std + hm_mean
+                                    qf[:, input_invalid_mask] = np.nan
+                                    for li, lname in enumerate(qf_names):
+                                        preds_horizons[f"{h_name}_{lname}"] = qf[li]
+                        
+                            # Distance-to-edge weights within tile
+                            interior = valid_mask.astype(np.uint8)
+                            interior[[0, -1], :] = 0
+                            interior[:, [0, -1]] = 0
+                            weights = distance_transform_edt(interior)
+                            weights = np.where(valid_mask, weights, 0.0)
+                        
+                            if weights.max() > 0:
+                                # Accumulate each horizon-quantile combination
+                                for key, pred in preds_horizons.items():
+                                    accum_horizons[key][li0:li1, lj0:lj1] += pred * weights
+                                wsum[li0:li1, lj0:lj1] += weights
+                
+                    # Progress indicator (after each batch)
+                    percent = int(100 * tiles_processed / total_tiles)
+                    if percent != last_percent and percent % 5 == 0:
+                        elapsed = time.time() - tile_start_time
+                        tiles_per_sec = tiles_processed / elapsed if elapsed > 0 else 0
+                        eta_sec = (total_tiles - tiles_processed) / tiles_per_sec if tiles_per_sec > 0 else 0
+                        print(f"  Progress: {percent:3d}% ({tiles_processed:,}/{total_tiles:,} tiles) | "
+                              f"Speed: {tiles_per_sec:.1f} tiles/s | "
+                              f"ETA: {int(eta_sec//60):02d}:{int(eta_sec%60):02d}")
+                        last_percent = percent
+                # ---- blend and write this band -------------------------------------
+                m = wsum > 0
+
+                # Blend one raster at a time, at the moment it is written, instead of
+                # building a dict of every horizon x quantile level first.
+                #
+                # On southern Africa (1.86 Mpx) a full second copy is 2 GB and invisible. On
+                # Africa (63.1 Mpx) each array is 0.252 GB, so the copy is 67.6 GB, and
+                # because np.full touches every page it is ALL resident, while
+                # accum_horizons (np.zeros) stays sparse over ocean. Measured peak was ~98 GB
+                # for one fold; two folds in parallel were OOM-killed by the kernel with no
+                # traceback. Blending on demand removes that copy entirely.
+                #
+                # The arithmetic is unchanged -- same expression, evaluated later -- so the
+                # written values are identical. The quantile levels blend on exactly the same
+                # weights as the triple. A weighted average of monotone sequences is
+                # monotone, so the blended quantile function is still a quantile function,
+                # and because 0.025 and 0.975 are levels of the grid the blended bands
+                # reproduce the blended lower/upper rasters rather than merely approximating
+                # them.
+                # In screen mode the kept blocks are exact, but every PROCESSED TILE writes
+                # its whole 128 px extent, so a halo around each block also comes out finite
+                # -- with incomplete blending, because the tiles that would have contributed
+                # to it were skipped. Measured: kept pixels agree with a full run to 3.6e-7
+                # (float32 summation order), the halo to only 3.1e-3, which is the size of
+                # the signal. In the ordinary fold hindcast the halo is harmless because it
+                # falls outside the fold and the stitcher drops it; here it falls INSIDE the
+                # fold, so the scorer would take it.
+                _screen_mask = _restrict_c if int(
+                    getattr(args, "predict_subsample_blocks", 0)) > 0 else None
+                _k0, _k1 = _keep_a - _acc_r0, _keep_b - _acc_r0
+                _win = Window(0, _keep_a - r0, Wwin, _keep_b - _keep_a)
+
+                def _blend(key):
+                    out_h = np.full((_accH, Wwin), np.nan, dtype=np.float32)
+                    out_h[m] = (accum_horizons[key][m] / wsum[m]).astype(np.float32)
+                    # Clamp predictions to valid range [0, 1]
+                    out_h[m] = np.clip(out_h[m], 0.0, 1.0)
+                    if _screen_mask is not None:
+                        out_h[~_screen_mask] = np.nan
+                    return out_h[_k0:_k1]
+
+                num_valid_pixels += int(m[_k0:_k1].sum())
+                for h_name in active_horizons:
+                    for q_name in quantile_names:
+                        key = f"{h_name}_{q_name}"
+                        _writers[key].write(_blend(key), 1, window=_win)
+                    if qf_names:
+                        d = _writers[f"{h_name}_qf"]
                         for li, lname in enumerate(qf_names):
                             band = _blend(f"{h_name}_{lname}")
                             q = np.where(np.isfinite(band),
                                          np.round(band * 32767.0), -32768)
-                            dst.write(np.clip(q, -32768, 32767).astype(np.int16), li + 1)
-                            dst.set_band_description(li + 1, f"u={qf_u[li]:.6f}")
-                        dst.update_tags(u_levels=",".join(repr(float(v)) for v in qf_u),
-                                        scale_factor="3.0518509e-05",
-                                        head_family="spline")
-                    out_paths[f"{h_name}_qf"] = qf_path
-                    print(f"  ✓ {h_year} qf: {qf_path} ({len(qf_names)} bands)")
+                            d.write(np.clip(q, -32768, 32767).astype(np.int16),
+                                    li + 1, window=_win)
+
+                del accum_horizons, wsum, m
+                accum_horizons = None
+
+            for d in _writers.values():
+                d.close()
+            for key, p in out_paths.items():
+                print(f"  ✓ {key}: {p}")
+            num_total_pixels = Hwin * Wwin
+            valid_percent = 100 * num_valid_pixels / num_total_pixels
+            print(f"✓ Blending complete")
+            print(f"  Valid pixels: {num_valid_pixels:,} / {num_total_pixels:,} "
+                  f"({valid_percent:.1f}%)")
             
             # Final summary
             elapsed_total = time.time() - start_time

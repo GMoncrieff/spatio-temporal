@@ -45,8 +45,15 @@ def translate(src: Path, dst: Path) -> None:
         raise SystemExit(f"gdal_translate failed for {src}:\n{r.stderr.strip()[-2000:]}")
 
 
-def verify(src: Path, dst: Path, n_windows: int = 12, seed: int = 42) -> str:
-    """Assert the COG is a COG, and that it carries the same numbers as its source."""
+def verify(src: Path, dst: Path, n_windows: int = 12, seed: int = 42,
+           min_px: int = 0) -> str:
+    """Assert the COG is a COG, and that it carries the same numbers as its source.
+
+    ``min_px`` guards against a vacuous pass. The value comparison only runs where the source
+    is finite, and the global grid is 73% ocean, so a dozen random windows can all land on
+    nodata and the check reports success having compared nothing. Regionally the sample was
+    almost all land and the hole never showed.
+    """
     info = subprocess.run(["gdalinfo", str(dst)], capture_output=True, text=True).stdout
     if "LAYOUT=COG" not in info:
         raise SystemExit(f"{dst} is not reported as LAYOUT=COG")
@@ -80,6 +87,11 @@ def verify(src: Path, dst: Path, n_windows: int = 12, seed: int = 42) -> str:
                 d = float(np.nanmax(np.abs(xa[m] - xb[m])))
                 raise SystemExit(f"{dst}: values differ at row {r0}, col {c0} (max |diff| {d})")
             checked += int(m.sum())
+    if checked < min_px:
+        raise SystemExit(
+            f"{dst}: only {checked:,} valid pixels were compared against a floor of "
+            f"{min_px:,} -- the sample landed on nodata and verified nothing. Raise "
+            f"--verify_windows.")
     ovr = info.split("Overviews:")[1].split("\n")[0].strip()
     return f"COG, overviews {ovr}, {checked:,} valid px verified identical"
 
@@ -96,6 +108,12 @@ def main(argv=None):
     ap.add_argument("--src_pattern",
                     default="w{base}_prediction_{year}_{q}_recal.tif")
     ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--verify_windows", type=int, default=12,
+                    help="1024 px windows sampled per raster for the value comparison")
+    ap.add_argument("--min_verified_px", type=int, default=0,
+                    help="Fail if fewer than this many valid pixels were actually compared. "
+                         "The comparison skips nodata, and on a 73%%-ocean global grid a "
+                         "random sample can verify nothing while reporting success.")
     args = ap.parse_args(argv)
 
     src_dir, out_dir = Path(args.src_dir), Path(args.out_dir)
@@ -111,7 +129,8 @@ def main(argv=None):
                 print(f"  {dst.name} exists, skipping (use --overwrite)")
             else:
                 translate(src, dst)
-            print(f"  {dst.name}  ({dst.stat().st_size / 1e9:.2f} GB)  {verify(src, dst)}")
+            print(f"  {dst.name}  ({dst.stat().st_size / 1e9:.2f} GB)  "
+                  f"{verify(src, dst, n_windows=args.verify_windows, min_px=args.min_verified_px)}")
             written.append(dst)
 
     print(f"\n✓ {len(written)} COGs -> {out_dir}")

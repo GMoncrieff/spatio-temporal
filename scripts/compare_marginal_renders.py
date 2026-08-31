@@ -56,6 +56,12 @@ def pick_windows(d_obs, size=768, n=2, min_land=0.6, n_candidates=400):
 
     The candidate count is raised with it: at 60 draws a 60%-land requirement can leave the
     quiet slot filled by whatever survived rather than by the quietest land window.
+
+    ``min_land`` is a parameter and not a constant because a **holdout-stitched hindcast is
+    sparse by construction**: with k=5 folds and only folds 1 and 2 predicted, 21.8% of the
+    Africa grid is finite and the densest 768 px window reaches 0.498. At the 0.6 default every
+    candidate is rejected, the window dict comes back empty, and the caller renders nothing
+    while reporting success.
     """
     H, W = d_obs.shape
     rng = np.random.default_rng(0)
