@@ -48,6 +48,11 @@ METRICS = [
 # clears" is not evidence of no effect, and this project has already mistaken one for the
 # other. CLAUDE.md rule 5.
 UNDERPOWERED = 0.25
+# The other end of the same problem. A baseline band narrower than this fraction of its own
+# level has not measured the configuration's run-to-run floor; it has measured a metric the
+# seeds did not happen to move. Differences on such a row are reported as "floor unmeasured"
+# rather than as wins, because "the margin exceeded a band of width zero" is not a finding.
+DEGENERATE_REL = 1e-4
 REPORTED = ["cov95_5", "cov95_20", "pit_gt_0999_20", "tail_reach20",
             "qf_vs_triple_max", "central_outside_interval"]
 
@@ -129,6 +134,13 @@ def main(argv=None):
         level = float(np.mean(np.abs(vals))) or 1.0
         rel = width / level
         powered = rel <= UNDERPOWERED
+        # A band that is *too narrow* is as unreadable as one that is too wide, and it fails
+        # in the more dangerous direction: with width ~0 every variant clears "margin exceeds
+        # the band's own width", so a metric the seeds happen not to move declares wins for
+        # everything. That is not infinite sensitivity, it is an unmeasured floor. Added for
+        # the conv-spline gates, several of which can sit at an identical value across three
+        # seeds while still differing between configurations.
+        degenerate = width <= 0 or rel < DEGENERATE_REL
         hits = []
         for label, v in others[metric].items():
             if not np.isfinite(v) or direction == "none":
@@ -141,19 +153,23 @@ def main(argv=None):
             # floor -- inside the margin the other side of the same test has to exceed.
             better = (v - hi) if direction == "up" else (lo - v)
             worse = (lo - v) if direction == "up" else (v - hi)
-            if width > 0 and better > width:
+            if degenerate:
+                if v != lo or v != hi:
+                    hits.append(f"{label} {v:.5f} (floor unmeasured)")
+                    verdicts.setdefault(label, []).append(f"{metric} moved (floor unmeasured)")
+            elif better > width:
                 hits.append(f"{label} {v:.5f} (+{better / width:.1f}x)")
                 if powered:
                     verdicts.setdefault(label, []).append(f"{metric} better")
                 else:
                     verdicts.setdefault(label, []).append(f"{metric} better (weak row)")
-            elif width > 0 and worse > width:
+            elif worse > width:
                 tag = f"{metric} WORSE ({worse / width:.1f}x)"
                 verdicts.setdefault(label, []).append(
                     tag if powered else tag + " (weak row)")
         note = "-" if direction == "none" else (", ".join(hits) if hits else "-")
         print(f"{metric:<22}{lo:>11.5f}{hi:>11.5f}{width:>10.5f}{rel:>7.0%}"
-              f"{'  ok' if powered else ' WEAK':>7}   {note}")
+              f"{'DEGEN' if degenerate else ('  ok' if powered else ' WEAK'):>7}   {note}")
 
     print("\n" + "=" * 96)
     print("every run, every metric (read the rows, not a count)")

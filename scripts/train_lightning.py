@@ -1185,6 +1185,17 @@ if __name__ == "__main__":
               f"(radii {args.context_radii}"
               + (f", hm {args.hm_context_stats} @ {args.hm_context_radii}"
                  if _csv_strs(args.hm_context_stats) else ", no hm context") + ")")
+        # The b1 modification's fingerprint. Which *consumers* get the context, not merely
+        # how many channels it has: under --central_residual the ConvLSTM takes no gradient
+        # from the central loss, so a trunk that never received the covariate looks exactly
+        # like a trunk that received it and ignored it. This line is the only place a log
+        # reader can tell them apart, and scripts/conv_spline_base.sh greps for it.
+        _consumers = [n for n, on in (("trunk", args.trunk_context),
+                                      ("central", args.central_context),
+                                      ("quantile", args.quantile_context)) if on]
+        print(f"Context consumers: {', '.join(_consumers) or 'NONE'}"
+              + ("   [trunk context ON]" if args.trunk_context
+                 else "   [trunk context off]"))
     _spline_banner = _spline_head_banner(args)
     if _spline_banner:
         print(_spline_banner)

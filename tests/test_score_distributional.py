@@ -149,3 +149,46 @@ def test_output_grid_is_strictly_increasing_and_carries_the_gates():
         assert np.all(np.diff(u) > 0)
         for gate in (0.025, 0.5, 0.975):
             assert np.isclose(u, gate).any(), f"n={n} lost the {gate} gate"
+
+
+# ------------------------------------------------------------ conv-spline: the two gates
+
+def test_gate_stats_are_produced_and_named_for_both_readings():
+    """The scorecard must actually carry the gates, under both the export and ref readings.
+
+    A gate computed in a side script is a gate that stops being run. This checks it is wired
+    into the scorer's own record, and that the two readings are separately named -- reporting
+    only one is how an export-grid re-spacing (E0) gets recorded as a model fix.
+    """
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+    from score_distributional_model import gate_stats
+
+    u, q = grid_and_q(n_px=2000)
+    rng = np.random.default_rng(7)
+    y = np.array([np.interp(v, u, q[:, i]) for i, v in enumerate(rng.random(q.shape[1]))])
+    cell = {"qf": q, "observed": y, "hm_t0": np.full(y.size, 0.2)}
+    out = gate_stats(u, cell, np.ones(y.size, dtype=bool))
+
+    for stat in ("needle_mass_median", "needle_mass_p90", "max_density_p99", "over_f_max_frac"):
+        for reading in ("export", "ref"):
+            assert f"{stat}_{reading}" in out, f"missing {stat}_{reading}"
+    for k in ("pit_rms_se_20", "pit_rms_se_60", "pit_growth_vs_noise",
+              "zero_leak_neg_ratio", "zero_leak_pos_ratio"):
+        assert k in out, f"missing {k}"
+
+
+def test_gate_stats_declines_a_stratum_too_small_to_measure():
+    """A PIT histogram over 40 pixels is noise. Return nothing rather than a number."""
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+    from score_distributional_model import gate_stats
+
+    u, q = grid_and_q(n_px=2000)
+    y = q[32]
+    cell = {"qf": q, "observed": y, "hm_t0": np.full(y.size, 0.2)}
+    sel = np.zeros(y.size, dtype=bool)
+    sel[:40] = True
+    assert gate_stats(u, cell, sel) == {}

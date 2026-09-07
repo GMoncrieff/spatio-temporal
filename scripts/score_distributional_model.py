@@ -55,6 +55,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 from src.strata import (  # noqa: E402
     DHAT_BINS, DHAT_LABELS, DIST_LABELS, HM_BINS, HM_LABELS, distance_band,
 )
+from src.strata import OBS_MAG_BINS as _OBS_MAG_BINS  # noqa: E402
+from src.strata import OBS_MAG_LABELS  # noqa: E402
+from src.qf_diagnostics import fence_gate, pit_structure, zero_leak  # noqa: E402
 from diagnose_central_field import (  # noqa: E402
     HORIZONS, MAX_OBSERVED_YEAR, WINDOWS, HM_DIR, _read, _read_like,
 )
@@ -65,8 +68,9 @@ INT16_SCALE = 1.0 / 32767.0
 # The three exceedance questions the product is actually asked, in HM units.
 THRESHOLDS = ((0.01, "hi"), (0.05, "hi"), (-0.01, "lo"))
 COVERAGE_LEVELS = (0.50, 0.80, 0.95, 0.99)
-OBS_MAG_BINS = np.array([-np.inf, -0.01, 0.001, 0.01, 0.05, np.inf])
-OBS_MAG_LABELS = ["<-0.01", "[-0.01,0.001)", "[0.001,0.01)", "[0.01,0.05)", ">=0.05"]
+# Imported, not re-declared: this stratum lived in two files with two different conventions
+# (signed here, absolute in src/strata.py), which is rule 9 forming again in a new place.
+OBS_MAG_BINS = np.array(_OBS_MAG_BINS)
 
 
 # ----------------------------------------------------------------------------- the raster
@@ -359,6 +363,21 @@ def per_pixel(u, cell):
     return out
 
 
+def gate_stats(u, cell, sel):
+    """The two conv-spline gates over one stratum: the picket fence and PIT structure.
+
+    These are why the phase exists, so they sit beside CRPS rather than in a side script --
+    a diagnostic that has to be remembered is one that stops being run.
+    """
+    if sel.sum() < 100:
+        return {}
+    q = cell["qf"][:, sel]
+    out = fence_gate(u, q)
+    out.update(pit_structure(pit(u, q, cell["observed"][sel])))
+    out.update(zero_leak(u, q, cell["observed"][sel], cell["hm_t0"][sel]))
+    return out
+
+
 def dist_stats(pp, sel):
     """Aggregate the per-pixel quantities over one stratum."""
     n = int(sel.sum())
@@ -550,7 +569,12 @@ def main(argv=None):
         for stratum, label, sel in strata(cell):
             base = {"label": args.label, "window": row["window"],
                     "horizon": row["horizon"], "stratum": stratum, "bin": label}
-            dist_recs.append({**base, **dist_stats(pp, sel)})
+            # The gates are per-stratum but expensive (they re-read the qf), so they are
+            # computed for the pooled row and the distance bands only -- the axes the phase
+            # is judged on. Everything else stays on the cheap per-pixel path.
+            gates = (gate_stats(u, cell, sel)
+                     if stratum in ("pooled", "obs_change") else {})
+            dist_recs.append({**base, **dist_stats(pp, sel), **gates})
             central_recs.append({**base, **central_stats(
                 resid[sel], obs_change[sel], pred_change[sel], covered[sel])})
 
@@ -582,6 +606,16 @@ def main(argv=None):
         summary[f"pit_gt_0999_{h}"] = wmean(p, "pit_gt_0999")
         summary[f"cov95_{h}"] = wmean(p, "cov95")
         summary[f"tail_reach{h}"] = wmean(p, "tail_reach_median")
+        # The two conv-spline gates, pooled. Both fence readings, because reporting one is
+        # how an export-grid re-spacing gets recorded as a model fix.
+        for k in ("needle_mass_median_export", "needle_mass_p90_export",
+                  "max_density_p99_export", "over_f_max_frac_export",
+                  "needle_mass_median_ref", "needle_mass_p90_ref",
+                  "max_density_p99_ref", "over_f_max_frac_ref",
+                  "pit_rms_se_20", "pit_rms_se_60", "pit_growth_vs_noise",
+                  "pit_mean", "zero_leak_neg_ratio"):
+            if k in p.columns:
+                summary[f"{k}_{h}"] = wmean(p, k)
         c = pooled(central_df, h)
         summary[f"rmse{h}"] = wmean(c, "rmse")
         summary[f"skill{h}"] = wmean(c, "skill")
@@ -607,6 +641,24 @@ def main(argv=None):
               f"{summary[f'pit_gt_0999_{h}']:>10.5f} {summary[f'cov95_{h}']:>7.4f} "
               f"{summary[f'tail_reach{h}']:>7.2f} {summary[f'rmse{h}']:>9.6f} "
               f"{summary[f'skill{h}']:>8.4f}")
+    print("\n" + "-" * 78)
+    print("conv-spline gates: the picket fence and PIT structure")
+    print("-" * 78)
+    print(f"{'h':>3} {'needle p50':>11} {'needle p90':>11} {'maxdens p99':>12} "
+          f"{'>f_max':>8} | {'ref p50':>9} {'ref maxd':>9} | {'PITrms20':>9} {'PITrms60':>9} "
+          f"{'growth':>7} {'PITmean':>8} {'0leak':>7}")
+    for h in HORIZONS:
+        if f"needle_mass_median_export_{h}" not in summary:
+            continue
+        g = lambda k: summary.get(f"{k}_{h}", float("nan"))
+        print(f"{h:>3} {g('needle_mass_median_export'):>11.4f} "
+              f"{g('needle_mass_p90_export'):>11.4f} {g('max_density_p99_export'):>12.1f} "
+              f"{g('over_f_max_frac_export'):>8.3f} | {g('needle_mass_median_ref'):>9.4f} "
+              f"{g('max_density_p99_ref'):>9.1f} | {g('pit_rms_se_20'):>9.2f} "
+              f"{g('pit_rms_se_60'):>9.2f} {g('pit_growth_vs_noise'):>7.3f} "
+              f"{g('pit_mean'):>8.4f} {g('zero_leak_neg_ratio'):>7.2f}")
+    print("targets: needle ~0, maxdens <= 578, >f_max ~0, PITrms ~1, PITmean 0.50, 0leak 1.00")
+
     print(f"\nexceedance mean|log10(pred/obs)| over distance bands: "
           f"{summary['exceedance_abs_log10']:.4f}")
     print(f"qf vs published triple, max |diff|: {summary['qf_vs_triple_max']:.2e} "

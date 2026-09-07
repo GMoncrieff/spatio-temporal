@@ -24,11 +24,13 @@ HM_LABELS = ["[0,0.01)", "[0.01,0.1)", "[0.1,0.3)", "[0.3,0.6)", "[0.6,1]"]
 DIST_BINS = [0.0, 1.0, 3.0, 10.0, 30.0, 100.0, np.inf]
 DIST_LABELS = ["0-1", "1-3", "3-10", "10-30", "30-100", ">100"]
 
-# Observed |change| magnitude. The core stratum matters more in this phase than it ever did
-# before: 68% of land moves by less than 0.01 and that is where the density defect lives, so
-# a scorecard that only reports pooled numbers cannot see the thing being fixed.
-OBS_MAG_BINS = [0.0, 0.0001, 0.001, 0.01, 0.05, np.inf]
-OBS_MAG_LABELS = ["<1e-4", "[1e-4,1e-3)", "[1e-3,0.01)", "[0.01,0.05)", ">=0.05"]
+# Observed SIGNED change. Signed rather than absolute because the negative bin is a finding
+# in its own right: 18.1% of land shows a small decrease and HM does not meaningfully
+# decrease, so that bin is measurement noise and a forecast leaking probability into it is
+# the zero-crossing defect. The core stratum matters more in this phase than it ever has:
+# 68% of land moves by less than 0.01, and that is where the density defect lives.
+OBS_MAG_BINS = [-np.inf, -0.01, 0.001, 0.01, 0.05, np.inf]
+OBS_MAG_LABELS = ["<-0.01", "[-0.01,0.001)", "[0.001,0.01)", "[0.01,0.05)", ">=0.05"]
 
 
 def distance_band(dist):
@@ -55,6 +57,6 @@ def hm_bin(hm0):
 
 
 def obs_mag_bin(change):
-    """Bin index of the observed change magnitude."""
-    return np.clip(np.digitize(np.abs(np.asarray(change)), OBS_MAG_BINS[1:-1]),
+    """Bin index of the observed signed change."""
+    return np.clip(np.digitize(np.asarray(change), OBS_MAG_BINS[1:-1]),
                    0, len(OBS_MAG_LABELS) - 1)
