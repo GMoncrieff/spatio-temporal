@@ -56,10 +56,12 @@ def plan_row_bands(r0, r1, stride, tile, row_chunk):
 def _wants_context(args):
     """True when any head is configured to read the past-change context rasters.
 
-    The quantile heads were the first consumer, but the central heads can take the same
-    tensor, so the dataset must load it whenever either asks for it.
+    The quantile heads were the first consumer; the central heads and now the trunk take the
+    same tensor, so the dataset must load it whenever any of the three asks for it.
     """
-    return bool(getattr(args, "quantile_context", False) or getattr(args, "central_context", False))
+    return bool(getattr(args, "quantile_context", False)
+                or getattr(args, "central_context", False)
+                or getattr(args, "trunk_context", False))
 
 
 def _csv_floats(spec):
@@ -97,7 +99,7 @@ def _spline_head_banner(args):
     function so the check that greps this line and the code that prints it can be tested
     against each other, rather than a check being written against text nobody emits.
     """
-    if getattr(args, "head_family", "triple") != "spline":
+    if getattr(args, "head_family", "triple") not in ("spline", "pwl", "isqf"):
         return None
     from src.models.quantile_spline import knot_preset, n_spline_params
     k = knot_preset(args.spline_knots)
@@ -140,6 +142,9 @@ def _experiment_kwargs(args):
         spline_checkpoint=args.spline_checkpoint,
         chip_weight_correct=args.chip_sampling_correct,
         spline_knots=args.spline_knots,
+        crps_z_weight=args.crps_z_weight,
+        crps_z_scale=args.crps_z_scale,
+        spline_gap_floor=args.spline_gap_floor,
         crps_tail_lam_lo=args.crps_tail_weight_lo,
         crps_tail_u0_lo=args.crps_tail_u0_lo,
         shape_head_hidden_layers=args.shape_head_hidden_layers,
@@ -373,6 +378,15 @@ if __name__ == "__main__":
         help="Balance the distance-to-past-change bands in the pinball loss (default: none)",
     )
     parser.add_argument(
+        "--trunk_context",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=False,
+        help="Feed the same past-change context into the ConvLSTM, repeated across "
+             "timesteps alongside elevation and climate, instead of only to the heads. The "
+             "trunk can then combine 'can change happen here at all' with its own spatial "
+             "and temporal features rather than having the answer applied to its output.",
+    )
+    parser.add_argument(
         "--central_context",
         type=lambda x: (str(x).lower() == 'true'),
         nargs='?', const=True, default=False,
@@ -491,7 +505,8 @@ if __name__ == "__main__":
     )
     # --- The distributional head. 'triple' (the default) is the frozen product exactly. ---
     parser.add_argument(
-        "--head_family", type=str, default="triple", choices=["triple", "spline"],
+        "--head_family", type=str, default="triple",
+        choices=["triple", "spline", "pwl", "isqf"],
         help="'spline' replaces the (lower, central, upper) triple with a full per-pixel "
              "quantile function trained end to end, so the post-hoc width calibration and "
              "empirical marginal reshaping have nothing left to do. The triple is still "
@@ -571,13 +586,44 @@ if __name__ == "__main__":
     # ---- round 2: knot grid, two-sided tail weight, shape-head capacity, HM context ----
     parser.add_argument(
         "--spline_knots", type=str, default="default14",
-        choices=["default14", "body_dense", "deep_lower", "lean9"],
+        choices=["default14", "body_dense", "deep_lower", "lean9", "skew14", "skew11"],
         help="Named knot grid. 'body_dense' adds 0.35/0.45/0.55/0.65: the default grid has "
              "three knots between u=0.10 and u=0.90 while 53%% of pixels move by less than "
              "0.001 over twenty years, and cov50 is the worst-calibrated coverage level. "
              "'deep_lower' adds 0.0001/0.9999, for P(u<0.001) reading 7x nominal at h=20. "
              "'lean9' is a strict subset instead: 8 bins, no 0.001/0.999, asking whether the "
-             "tail resolution is information or only capacity.",
+             "tail resolution is information or only capacity. 'skew14'/'skew11' re-place the "
+             "knots for the measured right skew: the target spends 0.13%% of its value range "
+             "on u in [0.1, 0.6] and 60%% on the top decile, so the symmetric default spends "
+             "bins where nothing varies. skew14 is the same 14 bins re-placed; skew11 is 11.",
+    )
+    parser.add_argument(
+        "--crps_z_weight", type=float, default=0.0,
+        help="Weight on a second CRPS term scored in z = asinh(change / --crps_z_scale), "
+             "summed with the raw-HM term. Raw CRPS is dominated by the tail -- the "
+             "persistence core spans ~0.0036 HM against a range above 1.2 -- so placing the "
+             "core badly costs almost nothing, and 68%% of land is in that core. Measured: "
+             "at s=0.001 this compresses the tail-vs-core weighting from 166x to 17.5x.",
+    )
+    parser.add_argument(
+        "--crps_z_scale", type=float, default=0.001,
+        help="The s in asinh(change / s). Smaller compresses harder. 0.001 is ~1.4 robust "
+             "sigmas of the observed core (sigma = 0.00069).",
+    )
+    parser.add_argument(
+        "--spline_gap_floor",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=False,
+        help="Floor every quantile gap at dp_k / f_max, f_max = 578 -- the largest density "
+             "the observation noise can support. Makes a picket fence structurally "
+             "impossible rather than merely discouraged. Applies to --head_family pwl.",
+    )
+    parser.add_argument(
+        "--u_grid_spacing", type=str, default="normal", choices=["normal", "skew"],
+        help="How the exported 64 quantile levels are spread over u. 'normal' is symmetric "
+             "about the median and spends 22%% of its levels on 0.3%% of the value range; "
+             "'skew' moves eight of them out of u 0.1-0.6 and into 0.6-0.9. Export-only: "
+             "the same trained model, evaluated at different u.",
     )
     parser.add_argument(
         "--crps_tail_weight_lo", type=float, default=0.0,
@@ -682,7 +728,7 @@ if __name__ == "__main__":
              "pixels it keeps, not an approximation of them. Measured on southern Africa: 24 "
              "of 59 blocks reproduces the full-raster ranking at r=0.99 on tail_reach20. On "
              "Africa a 200-block screen is 3.3M px, ~5x the pixels of southern Africa's ENTIRE "
-             "scored area, at ~1.3% of the prediction cost.")
+             "scored area, at ~1.3%% of the prediction cost.")
     parser.add_argument("--predict_subsample_seed", type=int, default=0)
     parser.add_argument(
         "--spline_cumulative_width",
@@ -984,11 +1030,12 @@ if __name__ == "__main__":
             quantile_class_weighting=args.quantile_class_weighting,
             freeze_trunk=args.freeze_trunk,
             central_context_channels=(_n_context_channels(args) if args.central_context else 0),
+            trunk_context_channels=(_n_context_channels(args) if args.trunk_context else 0),
             central_residual=args.central_residual,
             monotone_quantile_width=args.monotone_quantile_width,
             **_experiment_kwargs(args),
         )
-        if args.quantile_context or args.central_context:
+        if args.quantile_context or args.central_context or args.trunk_context:
             # The quantile heads gain input channels, so their first conv no longer matches
             # the checkpoint. Warm-start it: the trained weights are copied into the
             # original channels and the new context channels start at zero, so the model
@@ -1042,6 +1089,7 @@ if __name__ == "__main__":
             quantile_class_weighting=args.quantile_class_weighting,
             freeze_trunk=args.freeze_trunk,
             central_context_channels=(_n_context_channels(args) if args.central_context else 0),
+            trunk_context_channels=(_n_context_channels(args) if args.trunk_context else 0),
             central_residual=args.central_residual,
             monotone_quantile_width=args.monotone_quantile_width,
             **_experiment_kwargs(args),
@@ -2228,9 +2276,10 @@ if __name__ == "__main__":
             qf_u = None
             qf_names = []
             if getattr(args, 'predict_qf_levels', 0) and \
-                    getattr(infer_model.model, 'head_family', 'triple') == 'spline':
+                    getattr(infer_model.model, 'head_family', 'triple') in ('spline', 'pwl', 'isqf'):
                 from src.models.quantile_spline import output_u_grid, splines_from_output
-                qf_u = output_u_grid(int(args.predict_qf_levels))
+                qf_u = output_u_grid(int(args.predict_qf_levels),
+                                     spacing=getattr(args, 'u_grid_spacing', 'normal'))
                 qf_names = [f"qf{i:03d}" for i in range(len(qf_u))]
                 print(f"  Quantile function: {len(qf_u)} levels, "
                       f"u in [{qf_u[0]:.5f}, {qf_u[-1]:.5f}], "

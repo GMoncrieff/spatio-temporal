@@ -132,3 +132,61 @@ def crps_reference(spline, y, n_grid: int = 200001):
                        device=spline.v_knots.device)
     q = spline.ppf(u)
     return 2.0 * torch.trapz(_pinball(u, y.unsqueeze(-1) - q), u, dim=-1)
+
+
+# ---------------------------------------------------------------------------- E3: z-space
+
+def asinh_z(x, s: float):
+    """``z = asinh(x / s)`` -- linear near zero, logarithmic far from it."""
+    return torch.asinh(x / s)
+
+
+def crps_zspace(spline, y, hm_t0, s: float, mask=None, n_nodes: int = 6, reduce: bool = True,
+                **kw):
+    """CRPS of the *transformed* forecast, ``z = asinh((Q - hm_t0) / s)`` against ``z(y)``.
+
+    The incentive problem this fixes, stated plainly. CRPS in raw HM units is dominated by
+    the tail: the persistence core spans ~0.0036 HM against a range above 1.2, so placing
+    the core badly costs almost nothing in the loss. 68% of land sits in that core, and the
+    head is very likely picket-fencing there precisely because nothing ever penalised it.
+
+    In ``z`` space an error of 0.0005 near the core weighs about the same as an error of
+    0.05 in the tail, which is the relative importance actually wanted. Summed with the raw
+    term (``--crps_z_weight``) rather than replacing it, so the tail is not abandoned to fix
+    the body.
+
+    CRPS is **not** invariant to a monotone transform, which is the whole point -- but it
+    stays proper in the transformed space, because ``asinh`` is strictly increasing and
+    therefore the ``z``-quantiles of the pushed-forward forecast are the transforms of the
+    original quantiles. Minimising it still means "get the whole distribution right", scored
+    on a different ruler.
+
+    Implemented by evaluating ``Q`` at the same split nodes and transforming *there*, so the
+    transform costs one ``asinh`` per node and no second quadrature apparatus.
+    """
+    u_a, u_b = spline.support_crossings()
+    y_z = asinh_z(y - hm_t0, s)
+
+    def q_z(u):
+        return asinh_z(spline.ppf(u, clamp=True) - hm_t0.unsqueeze(-1), s)
+
+    # The crossing in z-space is the crossing in raw space -- asinh is monotone -- so the
+    # kink is still at u* = Q^-1(y) and the same split applies unchanged.
+    u_star = spline.cdf(y).maximum(u_a).minimum(u_b)
+    u_lo, w_lo = segment_nodes(spline.u_knots, n_nodes, u_a, u_star)
+    u_hi, w_hi = segment_nodes(spline.u_knots, n_nodes, u_star, u_b)
+    u = torch.cat([u_lo, u_hi], dim=-1)
+    w = torch.cat([w_lo, w_hi], dim=-1)
+    total = (_pinball(u, y_z.unsqueeze(-1) - q_z(u)) * w).sum(dim=-1)
+
+    if spline.clamp is not None:
+        lo, hi = spline.clamp
+        lo_z = asinh_z(lo - hm_t0, s)
+        hi_z = asinh_z(hi - hm_t0, s)
+        uf, wf = flat_piece_nodes(torch.zeros_like(u_a), u_a)
+        total = total + ((y_z - lo_z).unsqueeze(-1) * uf * wf).sum(dim=-1)
+        uf, wf = flat_piece_nodes(u_b, torch.ones_like(u_b))
+        total = total + ((hi_z - y_z).unsqueeze(-1) * (1.0 - uf) * wf).sum(dim=-1)
+
+    per_pixel = 2.0 * total
+    return _masked_mean(per_pixel, mask) if reduce else per_pixel

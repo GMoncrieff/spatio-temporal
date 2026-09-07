@@ -42,7 +42,7 @@ def test_quantile_output_profile_declares_bigtiff():
 def test_stitcher_still_declares_bigtiff():
     # The stitcher always had it, which is why the stitched path never failed. If it is ever
     # dropped, the global stitched quantile raster (~15 GB) breaks the same way.
-    src = (REPO / "src" / "ensemble" / "residuals.py").read_text()
+    src = (REPO / "src" / "stitch.py").read_text()
     assert 'BIGTIFF="YES"' in src
 
 

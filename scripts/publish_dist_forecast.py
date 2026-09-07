@@ -27,7 +27,7 @@ import rasterio
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.ensemble.residuals import stitch_fold_predictions  # noqa: E402
+from src.stitch import stitch_fold_predictions  # noqa: E402
 
 QUANTILES = ("lower", "central", "upper")
 

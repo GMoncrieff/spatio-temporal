@@ -41,10 +41,13 @@ import rasterio
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.ensemble.copula import Z975  # noqa: E402
-from src.ensemble.validate import (  # noqa: E402
+from src.strata import (  # noqa: E402
     DHAT_BINS, DHAT_LABELS, DIST_LABELS, HM_BINS, HM_LABELS, distance_band,
 )
+
+# The published bounds are the 2.5/97.5 percentiles, so half-width / Z975 is the scale of the
+# normal that would place them there. One definition, here, since the copula module is gone.
+Z975 = 1.959963985
 from diagnose_central_field import (  # noqa: E402
     HORIZONS, MAX_OBSERVED_YEAR, WINDOWS, HM_DIR, _read, _read_like,
 )

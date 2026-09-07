@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from ..locationencoder import LocationEncoder
 from .convlstm import ConvLSTM
 from torch.utils.checkpoint import checkpoint
+from .quantile_pwl import ISQFQuantile, PWLQuantile, n_pwl_params
 from .quantile_spline import (
     U_KNOTS_DEFAULT,
     n_spline_params,
@@ -49,6 +50,7 @@ class SpatioTemporalPredictor(nn.Module):
                  locenc_out_channels: int = 8,
                  quantile_context_channels: int = 0,
                  central_context_channels: int = 0,
+                 trunk_context_channels: int = 0,
                  central_residual: bool = False,
                  monotone_quantile_width: bool = False,
                  quantile_dhat_context: bool = False,
@@ -66,7 +68,8 @@ class SpatioTemporalPredictor(nn.Module):
                  spline_mean_nodes: int = 8,
                  spline_checkpoint: bool = True,
                  shape_head_hidden_layers: int = 1,
-                 shape_head_width: int = 0):
+                 shape_head_width: int = 0,
+                 spline_gap_floor: bool = False):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_static_channels = int(num_static_channels)
@@ -97,8 +100,18 @@ class SpatioTemporalPredictor(nn.Module):
                 raise ValueError(
                     f"convlstm_dilations has {len(self.convlstm_dilations)} entries for "
                     f"{num_layers} layers")
+        # Neighbourhood context handed to the *trunk*, repeated across timesteps exactly like
+        # elevation and climate. Until this phase the context reached the heads only, so the
+        # ConvLSTM never saw "can change happen here at all" and could not combine it with its
+        # own spatial features -- it could only have the answer applied to its output. Nothing
+        # ever forced that choice; the precompute-on-the-full-raster requirement (radii >= 30 px
+        # saturate inside a 128 px chip) is about where the covariate is *derived*, not where it
+        # is *consumed*.
+        self.trunk_context_channels = int(trunk_context_channels)
         self.convlstm = ConvLSTM(
-            input_dim=self.num_dynamic_channels + self.num_static_channels + (self.locenc_out_channels if (self.use_location_encoder and self.locenc_out_channels > 0) else 0),  # C_d dynamic + C_s static + C_loc
+            input_dim=(self.num_dynamic_channels + self.num_static_channels
+                       + self.trunk_context_channels
+                       + (self.locenc_out_channels if (self.use_location_encoder and self.locenc_out_channels > 0) else 0)),  # C_d dynamic + C_s static + C_ctx + C_loc
             hidden_dim=hidden_dim,
             kernel_size=(kernel_size, kernel_size),
             num_layers=num_layers,
@@ -186,13 +199,20 @@ class SpatioTemporalPredictor(nn.Module):
         # 'spline' additionally emits a full per-pixel quantile function, and derives the
         # triple *from* it, so every existing consumer of the first 12 channels keeps working
         # while the post-hoc width calibration and marginal reshaping become unnecessary.
-        if head_family not in ('triple', 'spline'):
+        # 'triple' emits the frozen product's (lower, central, upper); 'spline' the C1
+        # rational-quadratic quantile function; 'pwl' the same construction with linear pieces
+        # and a closed-form CRPS (E2); 'isqf' Park et al. (2022) bounded (E1).
+        if head_family not in ('triple', 'spline', 'pwl', 'isqf'):
             raise ValueError(f"unknown head_family {head_family!r}")
         self.head_family = str(head_family)
         self.spline_learn_slopes = bool(spline_learn_slopes)
         self.spline_cumulative_width = bool(spline_cumulative_width)
         self.spline_mean_nodes = int(spline_mean_nodes)
         self.spline_checkpoint = bool(spline_checkpoint)
+        # E4: floor every quantile gap so no segment can imply a density above the
+        # one the observation noise supports. Makes a picket fence structurally
+        # impossible rather than merely discouraged.
+        self.spline_gap_floor = bool(spline_gap_floor)
         knots = U_KNOTS_DEFAULT if spline_u_knots is None else tuple(spline_u_knots)
         self.register_buffer('spline_u_knots', torch.tensor(knots, dtype=torch.float32),
                              persistent=True)
@@ -241,10 +261,15 @@ class SpatioTemporalPredictor(nn.Module):
         self.lower_heads = nn.ModuleList([_head(q_in, q_mid, n_out) for _ in range(n_modules)])
         self.upper_heads = nn.ModuleList([_head(q_in, q_mid, n_out) for _ in range(n_modules)])
 
-        if self.head_family == 'spline':
+        if self.head_family in ('spline', 'pwl', 'isqf'):
             n_knots = self.spline_u_knots.numel()
             n_bins = n_knots - 1
-            self.n_spline_params = n_spline_params(n_knots, self.spline_learn_slopes)
+            if self.head_family == 'spline':
+                self.n_spline_params = n_spline_params(n_knots, self.spline_learn_slopes)
+            else:
+                self.n_spline_params = n_pwl_params(n_knots)
+            # Every family emits [location, scale, shape...], so this subtraction means the
+            # same thing for all three.
             n_shape = self.n_spline_params - 2
             # One width head and one shape head per horizon, at the same half-trunk width as
             # the quantile heads they replace.
@@ -345,6 +370,19 @@ class SpatioTemporalPredictor(nn.Module):
             feats = self.location_encoder(ll_flat)  # [B*H*W, C_loc]
             loc_feats = feats.view(B, H, W, self.locenc_out_channels).permute(0, 3, 1, 2).contiguous()  # [B, C_loc, H, W]
             input_static = torch.cat([input_static, loc_feats], dim=1)
+        if self.trunk_context_channels > 0:
+            if quantile_context is None:
+                raise RuntimeError(
+                    f"this model expects {self.trunk_context_channels} trunk context channels "
+                    f"but none was supplied. Pass change_context (and hm_context, if "
+                    f"configured) through the batch; a zeroed covariate is not a safe default.")
+            if quantile_context.shape[1] != self.trunk_context_channels:
+                raise RuntimeError(
+                    f"context has {quantile_context.shape[1]} channels, this model expects "
+                    f"{self.trunk_context_channels} in the trunk. Check --context_radii / "
+                    f"--hm_context_stats against the checkpoint they were trained with.")
+            input_static = torch.cat(
+                [input_static, quantile_context.to(input_static.dtype)], dim=1)
         # Repeat all static channels for each timestep and concat
         static_rep = input_static.unsqueeze(1).repeat(1, T, 1, 1, 1)  # [B, T, C_s, H, W]
         x = torch.cat([input_dynamic, static_rep], dim=2)  # [B, T, C_d+C_s, H, W]
@@ -410,7 +448,7 @@ class SpatioTemporalPredictor(nn.Module):
             dhat = (central.detach() - hm_t0) * self.dhat_context_scale
             return torch.cat([q_input, dhat, dhat.abs()], dim=1)
 
-        if self.head_family == 'spline':
+        if self.head_family in ('spline', 'pwl', 'isqf'):
             return self._forward_spline(centrals, _q_input_for)
 
         # Half-widths per horizon, non-decreasing in lead time by construction.
@@ -509,9 +547,7 @@ class SpatioTemporalPredictor(nn.Module):
             blocks.append(torch.cat([centrals[h_idx], cum, self.shape_heads[h_idx](qi)], dim=1))
         block = torch.cat(blocks, dim=1)
 
-        splines = splines_from_output(block, self.num_horizons, self.spline_u_knots,
-                                      learn_slopes=self.spline_learn_slopes,
-                                      clamp=clamp, n_triple=0)
+        splines = self._decode(block, clamp)
         n_nodes = self.spline_mean_nodes
         u_knots = self.spline_u_knots
 
@@ -521,10 +557,37 @@ class SpatioTemporalPredictor(nn.Module):
         preds = []
         for sp in splines:
             lower, _, upper = sp.triple()
-            if self.spline_checkpoint and torch.is_grad_enabled():
+            if self.head_family != 'spline':
+                # Q is linear per segment, so E[Q] is the trapezoid sum -- exact, cheap, and
+                # with no quadrature graph to checkpoint.
+                central = sp.mean()
+            elif self.spline_checkpoint and torch.is_grad_enabled():
                 central = checkpoint(_mean, sp.anchor, sp.scale, sp.v_knots, sp.derivs,
                                      use_reentrant=False)
             else:
                 central = sp.mean(n_nodes=n_nodes)
             preds.extend([lower.unsqueeze(1), central.unsqueeze(1), upper.unsqueeze(1)])
         return torch.cat(preds + [block], dim=1)
+
+    def _decode(self, block, clamp, n_triple=0):
+        """``[B, n_h * P, H, W]`` -> one quantile function per horizon, whichever family.
+
+        One decoder for the loss, the prediction writer and the scorer alike; this project
+        has been bitten repeatedly by the same quantity being defined in several places.
+        """
+        if self.head_family == 'spline':
+            return splines_from_output(block, self.num_horizons, self.spline_u_knots,
+                                       learn_slopes=self.spline_learn_slopes,
+                                       clamp=clamp, n_triple=n_triple)
+        cls = ISQFQuantile if self.head_family == 'isqf' else PWLQuantile
+        p = self.n_spline_params
+        blk = block[:, n_triple:].movedim(1, -1)
+        if blk.shape[-1] != self.num_horizons * p:
+            raise ValueError(f"expected {self.num_horizons * p} head channels after "
+                             f"{n_triple}, got {blk.shape[-1]}")
+        kw = {}
+        if self.head_family == 'pwl':
+            kw = dict(gap_floor=self.spline_gap_floor, hm_std=float(self.hm_norm[1]))
+        return [cls.from_channels(blk[..., h * p:(h + 1) * p], self.spline_u_knots,
+                                  scale_pre=blk[..., h * p + 1], clamp=clamp, **kw)
+                for h in range(self.num_horizons)]

@@ -53,7 +53,7 @@ def region_window(geojson: Path, reference: Path) -> Window:
         # 8112; southern Africa happened to round the same way, which is why this survived.
         # The cost is not a warning: it surfaced as an IndexError deep inside the coverage
         # audit (943 against 944), and would have mis-indexed the distance band in
-        # generate_ensemble.py without any error at all.
+        # the prediction writer without any error at all.
         col_off = max(0, int(np.floor(win.col_off)))
         row_off = max(0, int(np.floor(win.row_off)))
         width = min(int(np.ceil(win.col_off + win.width)), src.width) - col_off

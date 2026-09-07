@@ -52,7 +52,7 @@ from rasterio.windows import Window
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from src.ensemble.validate import (  # noqa: E402
+from src.strata import (  # noqa: E402
     DHAT_BINS, DHAT_LABELS, DIST_LABELS, HM_BINS, HM_LABELS, distance_band,
 )
 from diagnose_central_field import (  # noqa: E402

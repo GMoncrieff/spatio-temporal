@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Phase 0d — fold-CV hindcast orchestration.
+"""Fold-CV hindcast orchestration.
 
 For each spatial fold, retrain the model with that fold held out entirely, predict every
 hindcast input window, then stitch the per-fold rasters into genuinely out-of-sample
-global rasters and derive residuals plus the class covariates Phase 1.5 needs.
+rasters for the scorecard to read.
 
 Training is driven by shelling out to ``scripts/train_lightning.py`` rather than
 reimplementing it, so fold-CV models are trained with exactly the same hyperparameters,
@@ -11,7 +11,7 @@ loss weights and schedule as the production checkpoint.
 
 Both GPUs are used: folds run concurrently, one process pinned per GPU.
 
-Stages (``--stage``): ``train`` | ``stitch`` | ``residuals`` | ``all``.
+Stages (``--stage``): ``train`` | ``stitch`` | ``all``.
 
 Example (global, k=5):
     python scripts/run_hindcast_folds.py --stage all \
@@ -37,17 +37,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.ensemble.residuals import (  # noqa: E402
-    HORIZONS,
-    QUANTILES,
-    RankGaussianTransform,
-    append_manifest,
-    compute_residuals,
-    fit_rank_gaussian_transform,
-    horizon_autocorrelation,
-    sample_hm_values,
-    read_manifest,
-)
+from src.stitch import HORIZONS, QUANTILES, stitch_fold_predictions  # noqa: E402
 
 REPO = Path(__file__).parent.parent
 HM_DIR = REPO / "data" / "raw" / "hm_global"
@@ -73,7 +63,7 @@ PRODUCTION_HPARAMS = dict(
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--stage", default="all", choices=["all", "train", "stitch", "residuals"])
+    p.add_argument("--stage", default="all", choices=["all", "train", "stitch"])
     p.add_argument("--stitch_mode", default="holdout", choices=["holdout", "mean"],
                    help="holdout keeps each pixel's held-out fold — honest, and a hard "
                         "mosaic on the 128 px fold checkerboard, which shows as a visible "
@@ -88,11 +78,9 @@ def parse_args(argv=None):
     p.add_argument("--region", default="config/region_to_predict_large.geojson")
     p.add_argument("--windows", default="all",
                    help="'all' or comma-separated base years, e.g. '2000,2005'")
-    p.add_argument("--output_root", default="data/ensemble/hindcast")
-    p.add_argument("--residual_dir", default="data/ensemble/residuals")
-    p.add_argument("--transform_json", default="data/ensemble/rank_gaussian.json")
-    p.add_argument("--norm_stats_json", default="data/ensemble/norm_stats.json")
-    p.add_argument("--log_dir", default="data/ensemble/logs")
+    p.add_argument("--output_root", default="data/conv_spline/hindcast")
+    p.add_argument("--norm_stats_json", default="data/conv_spline/norm_stats.json")
+    p.add_argument("--log_dir", default="data/conv_spline/logs")
     # Training passthrough
     p.add_argument("--max_epochs", type=int, default=150)
     p.add_argument("--train_chips", type=int, default=100)
@@ -212,7 +200,7 @@ def build_fold_command(args, fold, windows):
         cmd += [
             "--wandb_group", args.wandb_group,
             "--wandb_run_name", f"hindcast-fold{fold}{args.tag}",
-            "--wandb_tags", f"ensemble,hindcast,fold{fold}",
+            "--wandb_tags", f"conv-spline,hindcast,fold{fold}",
         ]
     return cmd
 
@@ -269,7 +257,6 @@ def run_folds(args, folds, windows):
 # Stage 2 — stitch
 # --------------------------------------------------------------------------------------
 def stitch_all(args, folds, windows):
-    from src.ensemble.residuals import stitch_fold_predictions
 
     pred_dir = Path(args.output_root) / "preds"
     suffix = "" if args.stitch_mode == "holdout" else f"_{args.stitch_mode}"
@@ -312,85 +299,6 @@ def stitch_all(args, folds, windows):
     return written
 
 
-# --------------------------------------------------------------------------------------
-# Stage 3 — residuals
-# --------------------------------------------------------------------------------------
-def ensure_transform(args):
-    path = Path(args.transform_json)
-    if path.exists():
-        print(f"Using existing rank-Gaussian transform: {path}")
-        return RankGaussianTransform.from_json(path)
-    print("Fitting rank-Gaussian transform from observed HM ...")
-    samples = []
-    for year in (2005, 2010, 2015, 2020):
-        f = HM_DIR / f"HM_{year}_AA_1000.tiff"
-        if f.exists():
-            samples.append(sample_hm_values(f, n_windows=100, window_size=256, random_seed=42 + year))
-    sample = np.concatenate(samples)
-    tr = fit_rank_gaussian_transform(sample)
-    tr.to_json(path)
-    print(f"  p0 (exact-zero mass) = {tr.p0:.4f}, {len(tr.knot_values)} knots -> {path}")
-    return tr
-
-
-def residuals_all(args, windows):
-    tr = ensure_transform(args)
-    stitched = Path(args.output_root) / "stitched"
-    res_dir = Path(args.residual_dir)
-    manifest = res_dir / "manifest.csv"
-    if manifest.exists():
-        manifest.unlink()
-
-    rows = []
-    for window in windows:
-        base = window[-1]
-        for h in HORIZONS:
-            target_year = base + h
-            if target_year > MAX_OBSERVED_YEAR:
-                continue
-            paths = {q: stitched / f"w{base}_prediction_{target_year}_{q}.tif" for q in QUANTILES}
-            if not all(p.exists() for p in paths.values()):
-                print(f"  ⚠ missing stitched rasters for w{base} h{h}; skipping")
-                continue
-            observed = HM_DIR / f"HM_{target_year}_AA_1000.tiff"
-            baseline = HM_DIR / f"HM_{base}_AA_1000.tiff"
-            tag = f"w{base}_h{h}"
-            info = compute_residuals(
-                observed_path=str(observed),
-                central_path=str(paths["central"]),
-                lower_path=str(paths["lower"]),
-                upper_path=str(paths["upper"]),
-                baseline_hm_path=str(baseline),
-                out_dir=str(res_dir),
-                tag=tag,
-                transform=tr,
-            )
-            row = {
-                "window": f"{window[0]}-{window[1]}-{window[2]}",
-                "base_year": base,
-                "target_year": target_year,
-                "horizon": h,
-                "path_central": str(paths["central"]),
-                "path_lower": str(paths["lower"]),
-                "path_upper": str(paths["upper"]),
-                "path_observed": str(observed),
-                **info,
-            }
-            append_manifest(manifest, row)
-            rows.append(row)
-            print(f"  ✓ {tag}: {info['n_valid_px']:,} valid residual px")
-
-    if rows:
-        rho = horizon_autocorrelation(manifest)
-        rho_path = res_dir / "horizon_autocorrelation.json"
-        with open(rho_path, "w") as f:
-            json.dump(rho, f, indent=2)
-        print(f"  ✓ horizon autocorrelation rho = "
-              f"{ {k: round(v, 4) for k, v in rho.items()} } -> {rho_path}")
-    return rows
-
-
-# --------------------------------------------------------------------------------------
 def main(argv=None):
     args = parse_args(argv)
     folds = [int(f) for f in args.folds.split(",")]
@@ -406,7 +314,7 @@ def main(argv=None):
         args.wandb_group = f"hindcast-{time.strftime('%Y%m%d-%H%M%S')}"
 
     print("=" * 78)
-    print("PHASE 0 — FOLD-CV HINDCAST HARNESS")
+    print("FOLD-CV HINDCAST HARNESS")
     print("=" * 78)
     print(f"Folds:        {folds}")
     print(f"Windows:      {[w[-1] for w in windows]} (base years)")
@@ -435,7 +343,7 @@ def main(argv=None):
                 group=args.wandb_group,
                 job_type="hindcast-orchestration",
                 name=f"{args.wandb_group}-orchestrator",
-                tags=["ensemble", "hindcast", "phase0"],
+                tags=["conv-spline", "hindcast"],
                 config={**vars(args), "windows": [w[-1] for w in windows], "folds": folds},
             )
         except Exception as e:
@@ -457,19 +365,10 @@ def main(argv=None):
         print("\n--- Stitching fold predictions ---")
         stitch_all(args, folds, windows)
 
-    if args.stage in ("all", "residuals"):
-        print("\n--- Computing residuals ---")
-        rows = residuals_all(args, windows)
-        if run is not None and rows:
-            import wandb
-
-            df = read_manifest(Path(args.residual_dir) / "manifest.csv")
-            run.log({"residual_manifest": wandb.Table(dataframe=df)})
-
     elapsed = (time.time() - t0) / 60
-    print(f"\n✓ Phase 0 stage '{args.stage}' complete in {elapsed:.1f} min")
+    print(f"\n✓ hindcast stage '{args.stage}' complete in {elapsed:.1f} min")
     if run is not None:
-        run.log({"phase0_minutes": elapsed})
+        run.log({"hindcast_minutes": elapsed})
         run.finish()
     return 0
 

@@ -5,7 +5,7 @@ import pytorch_lightning as pl
 from torchmetrics.functional import structural_similarity_index_measure as ssim
 from .spatiotemporal_predictor import SpatioTemporalPredictor
 from .losses import LaplacianPyramidLoss
-from .crps_loss import crps_spline, nll_spline
+from .crps_loss import _masked_mean, crps_spline, crps_zspace, nll_spline
 from .histogram_loss import HistogramLoss
 from .quantile_spline import knot_preset, rebuild, splines_from_output
 from .pinball_loss import PinballLoss
@@ -46,6 +46,7 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         quantile_weight_change_bins: bool = True,
         freeze_trunk: bool = False,
         central_context_channels: int = 0,
+        trunk_context_channels: int = 0,
         central_residual: bool = False,
         monotone_quantile_width: bool = False,
         quantile_dhat_context: bool = False,
@@ -80,6 +81,9 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         chip_weight_correct: bool = True,
         isolate_shape_grad: bool = False,
         spline_knots: str = 'default14',
+        crps_z_weight: float = 0.0,
+        crps_z_scale: float = 0.001,
+        spline_gap_floor: bool = False,
         crps_tail_lam_lo: float = 0.0,
         crps_tail_u0_lo: float = 0.05,
         shape_head_hidden_layers: int = 1,
@@ -116,6 +120,7 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             locenc_out_channels=locenc_out_channels,
             quantile_context_channels=quantile_context_channels,
             central_context_channels=central_context_channels,
+            trunk_context_channels=trunk_context_channels,
             central_residual=central_residual,
             monotone_quantile_width=monotone_quantile_width,
             quantile_dhat_context=quantile_dhat_context,
@@ -129,6 +134,7 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             spline_cumulative_width=spline_cumulative_width,
             spline_mean_nodes=spline_mean_nodes,
             spline_checkpoint=spline_checkpoint,
+            spline_gap_floor=spline_gap_floor,
             spline_u_knots=knot_preset(spline_knots),
             shape_head_hidden_layers=shape_head_hidden_layers,
             shape_head_width=shape_head_width,
@@ -150,6 +156,14 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         self.crps_tail_u0 = float(crps_tail_u0)
         self.crps_tail_p = float(crps_tail_p)
         self.crps_tail_lam_lo = float(crps_tail_lam_lo)
+        # E3. CRPS in raw HM units is dominated by the tail: the persistence core
+        # spans ~0.0036 HM against a range above 1.2, so placing the core badly
+        # costs almost nothing -- and 68% of land is in that core. Adding a term
+        # scored in z = asinh(change / s) makes a 0.0005 error near zero weigh
+        # about what a 0.05 error in the tail does. Summed, not substituted, so
+        # the tail is not abandoned to fix the body.
+        self.crps_z_weight = float(crps_z_weight)
+        self.crps_z_scale = float(crps_z_scale)
         self.crps_tail_u0_lo = float(crps_tail_u0_lo)
         # Weight on MSE(E[Q], y). CRPS shapes the whole distribution but presses on its mean
         # only indirectly, and the published central forecast *is* that mean, so this term is
@@ -175,6 +189,11 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         self._quantile_weights = None
         self.quantile_context_channels = int(quantile_context_channels)
         self.central_context_channels = int(central_context_channels)
+        self.trunk_context_channels = int(trunk_context_channels)
+        # Every distributional head family. Defined once: three separate
+        # `head_family == 'spline'` comparisons is exactly how 'pwl' silently took
+        # the triple-head two-pass path and arrived at backward with no graph.
+        self.is_distributional = head_family in ('spline', 'pwl', 'isqf')
         self.central_residual = bool(central_residual)
         self.monotone_quantile_width = bool(monotone_quantile_width)
         self.quantile_dhat_context = bool(quantile_dhat_context)
@@ -350,22 +369,35 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             # which is already the importance-corrected estimator when m carries the weight.
             m = (mask_h if sample_weight is None
                  else mask_h.to(target_h.dtype) * sample_weight).squeeze(1)
-            def _dist(anchor, scale, v_knots, derivs, yy):
-                sp = rebuild(anchor, scale, v_knots, derivs, spline.u_knots, spline.clamp)
-                if self.dist_objective == 'nll':
-                    return nll_spline(sp, yy, mask=m)
-                return crps_spline(sp, yy, mask=m, n_nodes=self.crps_nodes,
-                                   tail_lam=self.crps_tail_lam,
-                                   tail_u0=self.crps_tail_u0, tail_p=self.crps_tail_p,
-                                   tail_lam_lo=self.crps_tail_lam_lo,
-                                   tail_u0_lo=self.crps_tail_u0_lo)
-
-            args_ = (spline.anchor, spline.scale, spline.v_knots, spline.derivs, y)
-            if self.spline_checkpoint and torch.is_grad_enabled():
-                dist_loss = torch.utils.checkpoint.checkpoint(_dist, *args_,
-                                                              use_reentrant=False)
+            hm0 = last_input.squeeze(1)
+            if self.head_family in ('pwl', 'isqf'):
+                # Closed form: no quadrature, no nodes, nothing to checkpoint. This is the
+                # whole point of the C0 families -- see src/models/quantile_pwl.py.
+                dist_loss = _masked_mean(spline.crps(y), m)
+                if self.crps_z_weight > 0:
+                    dist_loss = dist_loss + self.crps_z_weight * _masked_mean(
+                        spline.crps_z(y, hm0, self.crps_z_scale), m)
             else:
-                dist_loss = _dist(*args_)
+                def _dist(anchor, scale, v_knots, derivs, yy):
+                    sp = rebuild(anchor, scale, v_knots, derivs, spline.u_knots, spline.clamp)
+                    if self.dist_objective == 'nll':
+                        return nll_spline(sp, yy, mask=m)
+                    out = crps_spline(sp, yy, mask=m, n_nodes=self.crps_nodes,
+                                      tail_lam=self.crps_tail_lam,
+                                      tail_u0=self.crps_tail_u0, tail_p=self.crps_tail_p,
+                                      tail_lam_lo=self.crps_tail_lam_lo,
+                                      tail_u0_lo=self.crps_tail_u0_lo)
+                    if self.crps_z_weight > 0:
+                        out = out + self.crps_z_weight * crps_zspace(
+                            sp, yy, hm0, self.crps_z_scale, mask=m, n_nodes=self.crps_nodes)
+                    return out
+
+                args_ = (spline.anchor, spline.scale, spline.v_knots, spline.derivs, y)
+                if self.spline_checkpoint and torch.is_grad_enabled():
+                    dist_loss = torch.utils.checkpoint.checkpoint(_dist, *args_,
+                                                                  use_reentrant=False)
+                else:
+                    dist_loss = _dist(*args_)
             pinball_lower = pinball_upper = torch.tensor(0.0, device=pred_central.device)
         elif self.quantile_loss == 'nll':
             pinball_lower, pinball_upper = self._two_piece_nll(
@@ -511,7 +543,8 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         features answer the same question ("can change happen here at all"), so there is no
         reason to compute two of them.
         """
-        if self.quantile_context_channels <= 0 and self.central_context_channels <= 0:
+        if (self.quantile_context_channels <= 0 and self.central_context_channels <= 0
+                and self.trunk_context_channels <= 0):
             return None
         hm_now = input_dynamic[:, -1, 0:1]
         if change_context is not None:
@@ -531,12 +564,9 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         Returns ``None`` for the triple head, so every call site is a plain ``spline=...``
         keyword and there is no second code path to keep in step.
         """
-        if self.head_family != 'spline':
+        if not self.is_distributional:
             return [None] * 4
-        return splines_from_output(preds_all, self.model.num_horizons,
-                                   self.model.spline_u_knots,
-                                   learn_slopes=self.model.spline_learn_slopes,
-                                   clamp=self.model.spline_clamp())
+        return self.model._decode(preds_all, self.model.spline_clamp(), n_triple=12)
 
     def forward(self, input_dynamic, input_static, lonlat=None, change_context=None,
                 hm_context=None):
@@ -641,7 +671,7 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         # Compute total losses separately for central vs quantile heads
         # Central loss: MSE + SSIM + Laplacian + Histogram (affects backbone + central heads)
         central_loss = avg_mse + self.ssim_weight * avg_ssim + self.laplacian_weight * avg_lap
-        if self.head_family == 'spline':
+        if self.is_distributional:
             central_loss = (self.mu_mse_weight * avg_mse
                             + self.ssim_weight * avg_ssim
                             + self.laplacian_weight * avg_lap)
@@ -652,8 +682,8 @@ class SpatioTemporalLightningModule(pl.LightningModule):
 
         # Pinball loss: Only affects quantile heads (lower_heads + upper_heads)
         pinball_loss = avg_pinball_lower + avg_pinball_upper
-        
-        if self.head_family == 'spline':
+
+        if self.is_distributional:
             # One model, one objective. The two-pass gradient isolation exists because the
             # pinball loss was a *side* constraint on a product the central head owned; here
             # CRPS is the objective and the trunk is supposed to hear it. `isolate_shape_grad`
@@ -903,7 +933,7 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         # both — so a quantile-only change selects a different epoch and therefore a
         # different central field, and a central-only A/B carries a confound without this.
         self.log('val_central_loss', avg_central, on_step=False, on_epoch=True)
-        if self.head_family == 'spline':
+        if self.is_distributional:
             # The objective itself, isolated from the auxiliary MSE and the spatial terms.
             # This is what --checkpoint_monitor val_crps selects on, and it is the only
             # metric that scores the *whole* predictive distribution rather than three

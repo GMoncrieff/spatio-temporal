@@ -42,12 +42,12 @@ import rasterio
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.ensemble.validate import DIST_BINS as DIST_EDGES  # noqa: E402
+from src.strata import DIST_BINS as DIST_EDGES  # noqa: E402
 
 REGION_ROOT = Path("data/ensemble/region/southern_africa")
 
 # Bands from the T8 table in the plan, so the numbers line up with the ones already
-# measured for the quantile heads. The edges come from src.ensemble.validate so there is
+# measured for the quantile heads. The edges come from src.strata so there is
 # one definition; _bin below already uses right=True, which is that module's convention.
 DIST_LABELS = ["0-1px", "1-3px", "3-10px", "10-30px", "30-100px", ">100px"]
 

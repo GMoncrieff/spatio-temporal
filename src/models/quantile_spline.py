@@ -73,13 +73,54 @@ KNOT_PRESETS = {
     "lean9": (0.0, 0.005, 0.025, 0.10, 0.5, 0.90, 0.975, 0.99, 1.0),
     "body_dense": tuple(sorted(set(U_KNOTS_DEFAULT) | {0.35, 0.45, 0.55, 0.65})),
     "deep_lower": tuple(sorted(set(U_KNOTS_DEFAULT) | {0.0001, 0.9999})),
+    # E5. The default grid is symmetric -- dense at BOTH ends -- and the target is not. On
+    # 10.3M land pixels the observed change spends 0.13% of its value range on u in
+    # [0.1, 0.6] and 60% on the top decile alone, so the default spends five bins where
+    # nothing varies and the picket fence is what a strictly-positive-derivative constraint
+    # does when asked for a flat segment. This grid is the observed decile structure:
+    # the lower tail keeps its knots (u 0-0.1 genuinely spans 35% of the range, with real
+    # decreases to -0.43), the flat middle drops to three, and the upper region above 0.85
+    # -- which carries the +0.017 substantive-change mode near u = 0.78 and the whole upper
+    # tail -- gets the rest. Same 14 bins, so it is a pure re-placement at equal capacity
+    # and an A/B against `default14` reads as "were the knots in the wrong places".
+    # 0.25 is what goes; the three gate levels below cannot, so the flat middle keeps one
+    # knot (0.5) rather than none.
+    "skew14": (0.0, 0.001, 0.005, 0.025, 0.05, 0.10, 0.50,
+               0.75, 0.85, 0.92, 0.96, 0.975, 0.99, 0.999, 1.0),
+    # The same idea with the body collapsed as far as it will go and the capacity moved into
+    # u > 0.75. Fewer bins than default14 (11), so it also tests whether the body needed any
+    # resolution at all -- the strong form of the claim.
+    "skew11": (0.0, 0.001, 0.01, 0.025, 0.10, 0.50, 0.85, 0.95, 0.975, 0.99, 0.999, 1.0),
 }
+
+
+def validate_knots(u, name="<grid>"):
+    """Refuse a grid that cannot support the published contract, at definition time.
+
+    ``U_LO``, ``U_MID`` and ``U_HI`` must be *exact* knots: the triple is a lookup and the
+    normalisation that pins it is a gather, so a grid missing one raises deep inside
+    ``QuantileSpline.__init__`` at the first forward pass instead of here. The first draft of
+    the ``skew14`` preset dropped 0.5 and 0.975 while re-placing the middle, which is exactly
+    the mistake this catches -- put the check where the cause is one line away.
+    """
+    arr = list(u)
+    if arr != sorted(set(arr)):
+        raise ValueError(f"knot grid {name} is not strictly increasing: {arr}")
+    if arr[0] != 0.0 or arr[-1] != 1.0:
+        raise ValueError(f"knot grid {name} must span [0, 1]: {arr}")
+    for gate in (U_LO, U_MID, U_HI):
+        if not any(abs(k - gate) < 1e-9 for k in arr):
+            raise ValueError(
+                f"knot grid {name} has no exact knot at u={gate}; the published triple is a "
+                f"lookup at 0.025 / 0.5 / 0.975 and interpolating near a gate leaves a bias "
+                f"that does not shrink with more data")
+    return tuple(arr)
 
 
 def knot_preset(name):
     """Look up a named knot grid, refusing an unknown name rather than falling back."""
     try:
-        return KNOT_PRESETS[name]
+        return validate_knots(KNOT_PRESETS[name], name)
     except KeyError:
         raise ValueError(
             f"unknown spline knot preset {name!r}; have {sorted(KNOT_PRESETS)}") from None
@@ -400,28 +441,67 @@ def flat_piece_nodes(a, b, n_nodes=8):
     return a + width * t, width * wt
 
 
-def output_u_grid(n=64, trunc=1e-4, tol=1e-9):
+# E0. How the published u-grid spends its 64 levels. ``normal`` is the incumbent's, uniform
+# in the normal score and therefore SYMMETRIC about the median; the target is not. Measured on
+# 10.3M land pixels, that grid spends 22% of its levels on 0.3% of the value range, packing
+# consecutive levels within a few int16 quantisation steps of each other -- which is what
+# renders as a picket fence -- while the segment carrying the +0.017 substantive-change mode
+# near u = 0.78 gets nine.
+#
+# ``skew`` is an explicit budget per u-segment instead of a formula, so what it spends where is
+# readable at a glance and arguable on its own terms. It moves eight levels out of the flat
+# middle and into u 0.6-0.9, which the decile table says is under-resolved by ~2x relative to
+# its share of the variation. This is export-only: the same trained spline, evaluated at
+# different u. Nothing about any model changes and it is reversible by re-running the export.
+U_GRID_SEGMENTS = (0.0, 0.1, 0.6, 0.9, 1.0)
+U_GRID_BUDGETS = {
+    #             [0,0.1)  [0.1,0.6)  [0.6,0.9)  [0.9,1]      share of value range:
+    "normal": None,                             # 35.3%   0.3%   4.5%   59.9%
+    "skew": (20, 6, 20, 18),
+}
+
+
+def output_u_grid(n=64, trunc=1e-4, tol=1e-9, spacing="normal", budget=None):
     """The fixed u-grid the quantile-function raster is written on.
 
-    Spaced uniformly in the normal score rather than in ``u``, so resolution concentrates in
-    the tails where the product's open question lives, and the three gate quantiles are pinned
-    so ``qf[0.025]`` and ``qf[0.975]`` reproduce the published bounds *exactly* -- including
-    after the prediction writer's overlap blending, which is a weighted average and therefore
-    commutes with reading a level off the grid.
+    ``normal`` spaces uniformly in the normal score, so resolution concentrates at both ends
+    equally. ``skew`` instead spends an explicit per-segment budget (:data:`U_GRID_BUDGETS`),
+    spacing uniformly in the normal score *within* each segment.
+
+    Either way the three gate quantiles are pinned so ``qf[0.025]`` and ``qf[0.975]``
+    reproduce the published bounds *exactly* -- including after the prediction writer's
+    overlap blending, which is a weighted average and therefore commutes with reading a level
+    off the grid.
 
     The levels are guaranteed **strictly increasing by more than ``tol``**, and there are
     exactly ``n`` of them. Both matter: the normal-spaced set already contains a point
     indistinguishable from 0.5, and merging the gate in beside it produced a zero-width
-    segment whose slope is 0/0. Downstream that came back as a NaN CRPS for every pixel --
-    a metric failure that looks exactly like a model failure.
+    segment whose slope is 0/0. Downstream that came back as a NaN CRPS for every pixel -- a
+    metric failure that looks exactly like a model failure.
 
-    Defined here and nowhere else. ``Z975`` is currently spelled out in four different files
-    in this repository and that has cost real time; one definition of this grid is the point.
+    Defined here and nowhere else.
     """
     from scipy.stats import norm as _norm
 
     gates = np.array([U_LO, U_MID, U_HI])
-    cand = _norm.cdf(np.linspace(_norm.ppf(trunc), _norm.ppf(1.0 - trunc), n))
+    if spacing == "normal":
+        cand = _norm.cdf(np.linspace(_norm.ppf(trunc), _norm.ppf(1.0 - trunc), n))
+    elif spacing == "skew":
+        b = tuple(budget if budget is not None else U_GRID_BUDGETS["skew"])
+        if len(b) != len(U_GRID_SEGMENTS) - 1:
+            raise ValueError(f"budget needs {len(U_GRID_SEGMENTS) - 1} entries, got {len(b)}")
+        if sum(b) != n:
+            raise ValueError(f"budget sums to {sum(b)}, not n={n}")
+        parts = []
+        for (lo, hi), k in zip(zip(U_GRID_SEGMENTS, U_GRID_SEGMENTS[1:]), b):
+            z0 = _norm.ppf(max(lo, trunc))
+            z1 = _norm.ppf(min(hi, 1.0 - trunc))
+            parts.append(_norm.cdf(np.linspace(z0, z1, k)))
+        cand = np.concatenate(parts)
+    else:
+        raise ValueError(f"unknown u-grid spacing {spacing!r}; have 'normal', 'skew'")
+
+    cand = np.unique(cand)
     cand = cand[np.min(np.abs(cand[:, None] - gates[None, :]), axis=1) > tol]
     u = np.unique(np.concatenate([cand, gates]))
     # Trim by dropping the tightest non-gate gaps first, so the grid stays well conditioned.
