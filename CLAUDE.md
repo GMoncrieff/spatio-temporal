@@ -29,7 +29,7 @@ menu, and why each experiment exists.
 
 1. **Step 1, not yet run** — establish `b1`: `e1` plus one accepted modification, the
    neighbourhood context injected into the **trunk** alongside elevation and climate rather
-   than only into the heads. Three seeds, on Africa. `./scripts/run_conv_spline_baseline.sh`
+   than into the heads. Three seeds, on Africa. `./scripts/run_conv_spline_baseline.sh`
 2. **Then** the E0–E5 slate. `./scripts/run_conv_spline_slate.sh`
 3. **E6–E8 are chosen from what E0–E5 measure**, not written in advance.
 
@@ -69,8 +69,7 @@ The previous CLAUDE.md closed these. They are open again, and several are experi
   costs 168 evaluations per horizon; a piecewise-linear head has one. Never tested (E2).
 - **Are the knots in the right places?** The grid is symmetric and the target is not (E5).
 - **Are 14 bins the right number?** `lean9` and `skew11` ask the strong form.
-- **Should the trunk see the neighbourhood context?** Now settled as yes — `b1` — but *whether
-  the heads still need their copy* is open.
+- **Should the trunk see the neighbourhood context?** Now settled as yes — `b1`
 - **Should the objective be scored in raw HM at all?** (E3.)
 - **Is the anchor/scale factorisation right**, or the free-first-knot arrangement ISQF uses (E1)?
 - **Does the far field need a learned tail rate** rather than more knots? Open, an E6–E8
@@ -96,6 +95,7 @@ The previous CLAUDE.md closed these. They are open again, and several are experi
   (`/mnt/hdd1/spatio-temporal/data`) behind symlinks — but pass the HDD path directly as an
   output, never a symlink, since output directories get cleared with `shutil.rmtree` and that
   refuses on a symbolic link.
+- Monitor free space on the HDD and SSD. 
 
 ## The loops
 
