@@ -97,16 +97,13 @@ this — they give the head more room to do the same thing.
 `b1` is `e1` plus exactly one change, accepted without question:
 
 > **the neighbourhood context is injected into the trunk**, alongside elevation and climate,
-> repeated across timesteps — not only into the heads.
+> repeated across timesteps — not into the heads.
 
 Until now the context reached `last_hidden` only, so the ConvLSTM never saw "can change happen
 here at all" and could not combine it with its own spatial and temporal features; it could only
 have the answer applied to its output. Nothing ever justified that. The precompute-on-the-full-
 raster requirement (radii ≥ 30 px saturate inside a 128 px chip) is about where the covariate
 is *derived*, not where it is *consumed*.
-
-b1 keeps the head's copy of the context as well. Whether the heads still need it once the trunk
-has it is a clean A/B and a natural E6–E8 candidate, not something to bundle in here.
 
 ```bash
 ./scripts/run_conv_spline_baseline.sh          # three seeds, Africa
@@ -188,13 +185,14 @@ screened against a blind spot. Candidates already visible:
 
 - **a learned tail rate**, ISQF's actual contribution, adapted for bounded support (in a logit
   or `1−HM` space). Aimed at the far field rather than at the fence.
-- **head context ablation** — does the head still need the context now the trunk has it?
 - **`--crps_z_scale` sweep** — measured, at s = 0.001 the transform moves tail-vs-core
   weighting from 166× to 17.5×. The issue note claims it makes them "comparable"; it does not,
   it makes them closer. A smaller `s` compresses harder, and that is a one-parameter knob.
 - **E2 × E5 together**, if both clear alone.
 - **more knots (28–32)** — only if E4's floor visibly *binds* on a large share of pixels, which
   would mean the head genuinely lacks resolution for three modes.
+
+Before locking in E6-E8, propose candidates, indicating the most promosing, and allow the eselection of 3.
 
 ## 5. Rules this phase inherits and must not relearn
 
