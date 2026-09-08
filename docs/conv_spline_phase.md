@@ -160,6 +160,12 @@ comparable at all. Raw RMS grows as √B and says nothing across resolutions.
 grows exactly like noise even though it is real.** Read growth only after `rms_se` has
 established there is structure at all.
 
+### Save and show plot
+
+For each experiment, save a plot of:
+1) estimated distribution for 9 (3x3 grid) selected pixels.
+2) The pit distribution for 0-1 with 20 bins
+Embed these plots in the scorecard
 ---
 
 ## 4. The experiment menu
