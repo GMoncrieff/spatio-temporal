@@ -178,7 +178,9 @@ either way that is worth knowing before E1c combines E1a with a freed scale.
 
 `width_narrows_frac_{h,h'}` is the **fraction of pixels** where `width95(h) < width95(h′)` for
 `h > h′`, reported for each of the six horizon pairs and **per row, never as a pass count**
-(rule 3). A pooled mean width cannot express it: two horizons have to be compared *at the same
+(rule 3). **Compute it from `triple()`, not from a channel** — under `--free_scale` there is no
+`scale` channel to read, so a channel-based implementation would work on b1 and E0a and silently
+break on exactly the arms the row exists for. A pooled mean width cannot express it: two horizons have to be compared *at the same
 pixel*, and `score_distributional_model.py` currently pools each horizon independently, so this
 row is a join the scorer does not yet do. Under the accumulating constraint it is 0.000 by
 construction, which is also the control that proves the row discriminates (rule 5) — if it does
@@ -212,30 +214,41 @@ Every entry is one stated delta from b1, additive, defaulting to today's behavio
 | **E4** | `--head_family pwl --spline_gap_floor True` | No segment may imply a density above 578. Makes a fence structurally impossible rather than discouraged. | +0 params |
 | **E5** | `--spline_knots skew14` | The same 14 bins, re-placed for the measured right skew. `skew11` is the strong form: 11 bins, testing whether the body needed resolution at all. | −0 / −6 params |
 | **E0a** | `--spline_cumulative_width False` | The incumbent head, otherwise untouched, with the horizon accumulation removed so each horizon's 95% width comes from its own channel. **Already implemented and tested**; no new code. | 29 params/h |
-| **E1a** | `--head_family isqf --isqf_tails True --isqf_space logit\|neglog` | Learned exponential tail rates β_L, β_R beyond u = 0.001/0.999, fitted on unbounded transformed support. ISQF's actual contribution, which E1 drops. CRPS still evaluated in HM. | +2 params/h |
-| **E1b** | `--head_family isqf --free_scale True` | E1 minus the cumulative-in-horizon scale: increments carry the width directly, no renormalisation to unit 95% span. Park et al.'s own arrangement. | 16 params/h |
-| **E1c** | E1a + E1b together | Park et al. (2022) as published, adapted only where the ConvLSTM forces it. **Conditional** — runs only if E1a or E1b moves. | +2 params/h |
-| **E2a** | `--head_family pwl --free_scale True` | E2 with the anchor/scale factorisation removed: softmax heights replaced by unnormalised positive increments, so the 95% width is emergent rather than injected. | 16 params/h |
+| **E1a** | `--head_family isqf --isqf_tails True --isqf_space logit\|neglog` | Learned exponential tail rates β_L, β_R on unbounded transformed support. ISQF's actual contribution, which E1 drops. CRPS still evaluated in HM. **The tails' domain is unsettled** — see §4.1. | 18 params/h |
+| **E1b** | `--head_family isqf --free_scale True` | E1 minus the cumulative-in-horizon scale: increments carry the width directly, no renormalisation to unit 95% span. Park et al.'s own arrangement. | 15 params/h |
+| **E1c** | E1a + E1b together | Park et al. (2022) as published, adapted only where the ConvLSTM forces it. **Conditional** — runs only if E1a or E1b moves. | 17 params/h |
+| **E2a** | `--head_family pwl --free_scale True` | E2 with the anchor/scale factorisation removed: softmax heights replaced by unnormalised positive increments, so the 95% width is emergent rather than injected. | 15 params/h |
 
 E0 and E2–E5 are the issue note's staged plan, ordered by how much has to be touched. E1 and E2
 are the two literature-derived heads. The last five rows are a group rather than a continuation
 of that ordering — they are §4.1 below, and they are listed after E5 because each is a delta
 from an arm above it rather than from b1 directly.
 
-**Flag status, so nothing runs inert.** `--spline_cumulative_width` (E0a) exists today. `--free_scale`,
-`--isqf_tails` and `--isqf_space` (E1a, E1b, E1c, E2a) **do not exist yet** and are the names
-proposed here, not names to pass at a shell before the code lands. Each needs a test that it
-changed something against a seeded control before its arm is run, per the convention in
-`tests/test_conv_spline_flags.py`.
+**Param counts assume `default14` (15 knots, 14 bins).** `--free_scale` drops the `scale`
+channel, so `pwl`/`isqf` go 16 → 15 and the incumbent would go 29 → 28; E1a's two tail rates
+are `+2`. Simplicity is a scoring criterion (`CLAUDE.md`), and these are the numbers reported
+beside the metrics — E1b and E2a are the *cheapest* heads on the slate, not merely different
+ones.
+
+**Flag status, so nothing runs inert.** `--spline_cumulative_width` (E0a) exists today.
+`--free_scale`, `--isqf_tails` and `--isqf_space` (E1a, E1b, E1c, E2a) **do not exist yet** and
+are the names proposed here, not names to pass at a shell before the code lands. `--free_scale`
+is one flag across all three head families with a per-family implementation — specified below,
+and specified in one place for the reason rule 2 exists. Each flag needs a test that it changed
+something against a seeded control before its arm is run, per the convention in
+`tests/test_conv_spline_flags.py`; for `--free_scale` on the incumbent that test must cover
+**all five** methods `scale` is read from, since two of them are the gates themselves.
 
 ### 4.1 The scale arms — one constraint, five ways of removing it
 
-E0a, E1a, E1b, E1c and E2a share a target that E0–E5 never touch: **the two places this model
-constrains its own quantile function from the outside.** The horizon-cumulative scale (the 95%
-width cannot shrink with lead time) and the bounded clamp to [0, 1] are both imposed rather
-than learned, and neither has ever been ablated. They are grouped here because they interact —
-both decide where the outer knots may sit — and because the ordering below is what keeps a null
-readable.
+E0a, E1a, E1b, E1c and E2a share a target that E0–E5 never touch: **the three things this model
+imposes on its own quantile function from the outside rather than learning.** The
+horizon-cumulative scale (the 95% width cannot shrink with lead time), the anchor/scale
+factorisation that makes width an injected channel at all, and the bounded clamp to [0, 1].
+None has been ablated. They are grouped here because they are entangled — dropping the scale
+channel drops the accumulation with it, and the clamp and the injected scale both constrain
+where the outer knots may sit — and the ordering below is what keeps a null readable in spite
+of that.
 
 **E0a — the constraint alone, on the incumbent.** The cheapest possible read, and the one that
 makes everything below separable. b1's rational-quadratic head, unchanged in every other
@@ -247,22 +260,80 @@ re-establishing it against a different spline class at the same time.
 
 > **This flag already exists.** `--spline_cumulative_width False` does exactly this, is
 > documented in `train_lightning.py`, and is pinned by `tests/test_spline_cumulative_width.py`
-> on both halves (the ablation ablates; `Q(u)` increasing in `u` is untouched). **Do not add a
-> `--free_scale` alias for the spline family** — that is rule 2's predicate written twice, and
-> the two spellings will disagree. `--free_scale` below names the *new* code the piecewise-linear
-> families need; for the incumbent the flag is already there and E0a is a no-code run.
+> on both halves (the ablation ablates; `Q(u)` increasing in `u` is untouched). E0a is a no-code
+> run.
 >
-> One precision: for the incumbent, `scale_pre` is always read from the width head's channel and
+> **`--free_scale` is not an alias for it, and E0a must not be respelled as one.** `--free_scale`
+> (defined below) also removes the accumulation, but only as a consequence of removing the
+> anchor/scale factorisation entirely — it is a strict superset. That is exactly why E0a exists
+> as its own arm on the narrow flag: an arm carrying `--free_scale` answers *"was the
+> anchor/scale machinery earning its keep"*, and the two questions are no longer separately
+> attributable inside it. E0a is what makes the free-scale arms readable, and it is the only
+> arm in §4.1 that changes one thing.
+>
+> One precision on the incumbent: `scale_pre` is always read from the width head's channel and
 > `QuantileSpline.from_channels`' `scale_pre=None` branch is unreachable from `forward`. The two
-> paths read the same channel and differ only by an extra softplus, so the *meaningful* ablation
-> for b1 is the accumulation, not the injection. E1b and E2a are where `scale_pre=None` becomes
-> a real difference.
+> paths read the same channel and differ only by an extra softplus, so `--spline_cumulative_width`
+> is the whole of the narrow ablation; there is no separate "injection" knob to turn.
+
+#### `--free_scale`: one semantic change, three implementations
+
+**The 95% width becomes emergent rather than injected** — whatever the fitted increments imply,
+per horizon, with no cross-horizon accumulation. One meaning, implemented per family:
+
+| family | what changes |
+|---|---|
+| `spline` (incumbent), `pwl` | unnormalised positive increments (`\|·\| + tol`) in place of the softmax heights; **no `scale` channel**; `Q(u) = anchor + (v(u) − v_mid)`, with the `/ v_span` division dropped |
+| `isqf` | removing the `scale_pre` renormalisation, and nothing else — that head has no factorisation natively |
+
+**What does not change.** The anchor stays at `Q(0.5)` and still receives `hm_t0` through the
+zero-init persistence skip: adding persistence to the median is a defensible prior, and adding
+it to the bottom of a ladder is not. The u-knots stay fixed. 0.025 / 0.5 / 0.975 stay exact
+knots, so `triple()` stays a gather rather than an interpolation.
+
+**Three things need porting rather than deleting**, and the third is not obvious from the
+forward pass.
+
+1. **`MIN_SCALE` loses its referent.** Re-express it as a floor on the span `v_hi − v_lo` in the
+   same units, enforced at construction. Without it CRPS can drive the width to zero on the
+   quiet majority of pixels and `anchor + (v − v_mid)` silently returns a constant — which reads
+   downstream as a perfectly confident forecast rather than a degenerate one, and DEGEN only
+   catches that after the fact. The failure mode is already written out at
+   `quantile_spline.py:130`; move the comment with the constant. **Resolve the number while
+   porting**: that comment justifies 3e-5 (members are int16 × 1/32767, so 3e-5 is the smallest
+   width the product can represent at all) while `MIN_SCALE` is 1e-6. Inheriting the mismatch
+   silently is how a floor stops binding.
+2. **The horizon-narrowing row must be computed from `triple()`**, since width is no longer a
+   readable channel. §3 says the same thing from the scorer's side.
+3. **On the incumbent, `scale` and `_v_span` are read in five methods, not one** —
+   `_g` (290), `ppf` (298), `triple` (303–305), `cdf` (319–320) and `log_dq_du` (362–364). The
+   first three are the ones anyone would look for. The last two are the ones that matter most:
+   `cdf` **is the PIT** and `log_dq_du` is the implied density, so they are gate 2 and gate 1
+   respectively. Port all five or the arm's own gates read garbage and the run looks like a
+   model failure rather than a porting bug — rule 2 in its exact form, and rule 1's "a metric
+   failure and a model failure are indistinguishable from the outside". Under `--free_scale`
+   they collapse cleanly (`_g` → `v − v_mid`, `cdf` → `v = (y − anchor) + v_mid`, `log_dq_du`
+   → `log(dv)`), which is an argument for the change rather than against it — but only if all
+   five move together.
+
+   `pwl` and `isqf` do not have this problem: `_PWLBase` applies the factorisation once in
+   `PWLQuantile.__init__` and every method downstream reads `q_knots`, so E2a and E1b are
+   one-site changes. **The incumbent is the expensive implementation of this flag, and no arm
+   on the slate currently needs it** — implement `spline` + `--free_scale` only if an E6–E8
+   candidate asks for it.
+
+**Scope this implies, stated so it is not re-derived later.** Dropping the scale channel entails
+dropping the horizon-cumulative constraint. An arm carrying this flag therefore answers *"was
+the anchor/scale machinery earning its keep"* and **not** the narrower *"was horizon
+monotonicity binding"*. The two are not separately attributable inside such an arm — which is
+the whole reason E0a runs first, alone, on `--spline_cumulative_width False`.
 
 **E1a — a learned tail rate on unbounded support.** ISQF's actual contribution, which E1 drops.
 The head fits in a transformed space where unbounded tails are admissible — `logit(HM)` for the
 symmetric version, `−log(1−HM)` for the one-directional version that matches the product's tail
-question — and beyond the outermost knots at u = 0.001/0.999 it extrapolates through exponential
-tails whose rates β_L, β_R are **trainable** rather than pinned to the two outer knots. Mapping
+question — and on the outer tails, below u = 0.001 and above u = 0.999, it extrapolates through
+exponential tails whose rates β_L, β_R are **trainable** rather than pinned to the two outer
+knots. (Where exactly those tails attach is not settled; see the note below.) Mapping
 back through the inverse transform respects [0, 1] structurally, so the clamp becomes redundant
 rather than load-bearing. Observed HM runs 0.00029 to 0.950, so the transform needs no epsilon
 fudge.
@@ -272,6 +343,20 @@ fudge.
 > u = 0.999 than weight per unit HM, and the point of E1a is to isolate the tail *mechanism*.
 > z-space training is E3's question, and it is a follow-up here if and only if E1a moves the
 > far-field statistics. Two knobs on one axis read as two findings (rule 10 in `CLAUDE.md`).
+>
+> **Settle the tail's domain before coding E1a, or the flag is inert.** As written, the tails
+> attach "beyond the outermost knots at u = 0.001 / 0.999" — repeating a claim in
+> `ISQFQuantile`'s docstring that **is not true of any grid this repo has**. `validate_knots`
+> hard-requires `arr[0] == 0.0` and `arr[-1] == 1.0` (line 109), and `default14` runs
+> `0.0, 0.001, …, 0.999, 1.0`. There is no u outside the outermost knots, so tails attached
+> there would cover an empty set: accepted, logged, and inert — a null that never ran.
+>
+> Prefer having the tails **replace** the outermost bins `[0, 0.001]` and `[0.999, 1]`, anchored
+> at the 0.001 / 0.999 knots, rather than relaxing `validate_knots`. That keeps one definition
+> of the grid contract, gives each tail a real domain, and matches the paper's shape (their
+> spline covers `[α, 1−α]` and the tails cover the rest; here α = 0.001). Relaxing the validator
+> for one head family breaks the `[0, 1]` span invariant everywhere else for a grid property
+> that is not the experiment.
 
 **E1b — E1 with the paper's own scale arrangement.** A pure subtraction, and the cheapest of the
 head arms. `ISQFQuantile`'s docstring names the cumulative-in-horizon scale as the one departure
@@ -296,22 +381,54 @@ sit. **Run it last, and only if at least one of E1a or E1b shows movement**; if 
 E1c has nothing left to explain.
 
 **E2a — the linear head with an emergent width.** E2 with the anchor/scale factorisation
-removed, which requires more than deleting a channel. Softmax heights guarantee the ladder spans
-exactly 0 → 1 (`_cumulative_v`), so stripping `scale` naively hands every pixel a span of 1.0 —
-a broken model, not a free one. E2a therefore replaces the softmax with **unnormalised positive
-increments** (`|·| + tol`, ISQF's construction), making the 95% width emergent from the
-increments rather than injected.
+removed, which requires more than deleting a channel. `_cumulative_v` softmaxes the heights and
+then divides by `v[..., -1:]`, so the ladder spans exactly 0 → 1 twice over; stripping `scale`
+naively hands every pixel a span of 1.0 — a broken model, not a free one. E2a is therefore the
+`pwl` row of the `--free_scale` table above: unnormalised positive increments, no `scale`
+channel, and `Q(u) = anchor + (v − v_mid)` with the `/ v_span` division dropped, making the 95%
+width emergent from the increments rather than injected.
 
-> That convergence is worth stating plainly: **E2a and E1b end up as nearly the same head**,
-> differing only in whether location arrives as a free first knot (`q0`) or as a location
-> channel (`anchor`). If that holds in the code, **E1b is the primary arm and E2a is
-> confirmation** — not two independent results. Check it before reading them as two.
+> **E2a and E4 do not compose as written.** `gap_floor_heights` computes its floor in *normalised
+> v units* as `dp_k / (f_max * scale)`, deriving it from `w_k = scale * h_k / v_span` — the
+> factorisation is load-bearing in that expression, and `--free_scale` deletes both terms. So
+> `--spline_gap_floor True --free_scale True` is not a combination, it is a re-derivation: the
+> floor has to be restated directly on the increments in absolute HM (`inc_k ≥ dp_k / f_max`),
+> which is in fact the simpler statement of the same physical claim. Worth knowing before
+> anyone reads E4 × E2a as a free crossing of the slate.
 
-**Order.** E0a first and alone, because it is the only arm that changes one thing. E1a and E1b
-next, in either order, since they are independent subtractions from E1. E2a after E1b, as its
-confirmation. E1c last and conditional. Each still needs a test that it changed something against
-a seeded control (`tests/test_conv_spline_flags.py`) — a flag that is accepted, logged and inert
-reads downstream as a null rather than as an experiment that never ran.
+> **The convergence is exact, and one decision away from being total.** Written out, E2a is
+> `anchor + cumsum(inc) − cumsum(inc)[mid]` and E1b is `q0 + cumsum(inc)`: the same ladder, up
+> to which knot the free location parameter attaches to. So they differ in exactly one thing —
+> **where persistence enters**. E2a's `anchor` is `Q(0.5)`; E1b's `q0` is `Q(u_knots[0])`, and
+> `U_KNOTS_DEFAULT[0]` is **0.0**, so `hm_t0` is currently added to the 0th percentile, not the
+> median.
+>
+> That is not cosmetic. The median 20-year change is 0.0001 against a core spanning ~0.0036, so
+> the two placements put the persistence prior in materially different places. It is also the
+> case the `--free_scale` "what does not change" clause rules out — and ISQF is the head that
+> already does it.
+>
+> **Decide before coding, and prefer keeping E1b paper-faithful** (`q0 + hm_t0` at `Q(0.0)`).
+> E1b's entire purpose is to test Park et al.'s arrangement; moving its skip to the median makes
+> it E2a with a rename and leaves the paper's arrangement untested. Keeping it means **E2a and
+> E1b are one comparison apart rather than the same head**, so both are needed and neither is
+> mere confirmation — which supersedes the "E1b primary, E2a confirmation" reading this doc
+> carried before the `--free_scale` semantics were fixed. What E2a-vs-E1b then measures is
+> precisely the persistence-anchor placement, with everything else held identical: a cleaner
+> question than either arm was originally scoped to ask.
+
+**Order.** E0a first and alone, because it is the only arm that changes one thing, and because
+every arm below it conflates the constraint with the factorisation. E1a and E1b next, in either
+order — independent subtractions from E1. E2a paired with E1b rather than following it: with the
+`--free_scale` semantics fixed, the pair is a controlled comparison of where persistence enters
+the ladder, so reading either alone wastes the control. E1c last and conditional on movement
+from E1a or E1b.
+
+Each arm still needs a test that it changed something against a seeded control
+(`tests/test_conv_spline_flags.py`) — a flag that is accepted, logged and inert reads downstream
+as a null rather than as an experiment that never ran. Two arms here have a specific way of
+failing that test silently: E1a, if its tails are given no domain, and `--free_scale` on the
+incumbent, if fewer than all five `scale` sites are ported.
 
 **E6–E8 are deliberately absent.** They are chosen from what E0–E5 and §4.1 measure. Writing them now
 would be guessing, and a slate whose last third is guesswork is how twenty-two experiments got

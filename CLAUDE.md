@@ -76,7 +76,10 @@ The previous CLAUDE.md closed these. They are open again, and several are experi
 - **Is the horizon-cumulative scale load-bearing, or merely tidy?** The 95% width cannot shrink
   with lead time by construction, so the question has never been measurable. E0a is the
   one-thing-changed read, on the incumbent, using the `--spline_cumulative_width False` flag that
-  already exists and is already tested — do not add a second spelling of it.
+  already exists and is already tested. `--free_scale` is **not** a second spelling of it: it is
+  a strict superset that drops the anchor/scale factorisation too, so an arm carrying it cannot
+  separate "was the factorisation earning its keep" from "was horizon monotonicity binding".
+  That is why E0a runs first and alone.
 - **Does the far field need a learned tail rate** rather than more knots? Now E1a: trainable
   β_L, β_R on unbounded transformed support, with CRPS still scored in HM. E1c is E1a + E1b, the
   paper as published, and runs only if one of them moves.
