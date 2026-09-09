@@ -224,6 +224,14 @@ are the two literature-derived heads. The last five rows are a group rather than
 of that ordering — they are §4.1 below, and they are listed after E5 because each is a delta
 from an arm above it rather than from b1 directly.
 
+**E0's "no retrain" is not what the slate does.** `--u_grid_spacing` is read only at
+prediction time (`train_lightning.py:2289`, inside the `predict_qf_levels` export path) and has
+no effect on training, so with the seed fixed E0's retrain reproduces `b1_s42`'s checkpoint
+exactly. `run_conv_spline_slate.sh` says as much in its own comment — "export-only and needs no
+retraining" — but still routes E0 through the full train path, ~50 min for a checkpoint that
+already exists. Running it predict-only from b1's checkpoints (`--max_epochs 0`) makes E0 ~5 min.
+The result is the same either way; only the cost differs.
+
 **Param counts assume `default14` (15 knots, 14 bins).** `--free_scale` drops the `scale`
 channel, so `pwl`/`isqf` go 16 → 15 and the incumbent would go 29 → 28; E1a's two tail rates
 are `+2`. Simplicity is a scoring criterion (`CLAUDE.md`), and these are the numbers reported

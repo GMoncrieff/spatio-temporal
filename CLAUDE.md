@@ -142,7 +142,12 @@ Kept only where they still apply. Numbering is fresh; the old file's numbers are
    time, the qf reader refuses a non-increasing u-grid rather than passing NaN downstream.
 5. **Prove a check fires on a control, or it checks nothing.** Before `conv_spline_base.sh` was
    allowed to grep for the trunk-context fingerprint, that fingerprint was verified to
-   discriminate ON from off.
+   discriminate ON from off. **A check can also fail *open*, which is silent.**
+   `verify_loss_weights` passed on a log file that did not exist: every expected weight in this
+   phase is 0.0, `grep` on a missing file returns nothing, and awk coerces `""` to 0, so all
+   three comparisons read 0==0 and the check reported success having read nothing. When a
+   check's expected value is a default (0, empty, absent), test it against *no input* as well
+   as against a wrong one — `tests/test_conv_spline_paths.py`.
 6. **Score against persistence, not zero.** The median 20-year HM change is 0.0001.
 7. **Judge sweeps on per-row values, never a total pass count.**
 8. **A metric pinned and insensitive to its own knob is under-powered, not mis-tuned** — and

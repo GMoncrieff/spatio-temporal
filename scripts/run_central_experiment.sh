@@ -29,7 +29,11 @@ VAL_STRIDE="${VAL_STRIDE:-2048}"
 # default of 4 workers each put the box into swap.
 NUM_WORKERS="${NUM_WORKERS:-3}"
 BASE_ARGS="${BASE_ARGS:-}"
-ROOT="data/ensemble/exp/${NAME}"
+# Output root. Defaults to the legacy ensemble path so every existing caller
+# (run_dist_*.sh, run_model_slate.sh, promote_model_experiment.sh) is unchanged; the
+# conv-spline runners export EXP_ROOT=data/conv_spline/exp and score ${EXP_ROOT}/<name>/
+# stitched, so a hardcoded ROOT here writes where nothing reads.
+ROOT="${EXP_ROOT:-data/ensemble/exp}/${NAME}"
 # Southern Africa by default (CLAUDE.md: all iteration is regional). REGION= overrides it —
 # used for the Africa-wide run, whose point is that southern Africa is an unrepresentative
 # sample of HM level: the [0,0.01) stratum is 6% of it and 40% of Africa, and that stratum
@@ -67,7 +71,7 @@ $PY -u scripts/run_hindcast_folds.py \
     --stage train --folds "$FOLDS" --gpus "$GPU" \
     --region "$REGION" --windows all --fold_mask "$FOLD_MASK" \
     --output_root "$ROOT" \
-    --log_dir data/ensemble/logs \
+    --log_dir "${LOG_DIR:-data/ensemble/logs}" \
     --tag "_${NAME}" \
     --max_epochs "$MAX_EPOCHS" --train_chips "$TRAIN_CHIPS" \
     --val_stride "$VAL_STRIDE" --num_workers "$NUM_WORKERS" \

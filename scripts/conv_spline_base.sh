@@ -20,6 +20,10 @@ export MAX_EPOCHS="${MAX_EPOCHS:-150}"
 export FOLDS="${FOLDS:-1,2}"
 export GPUS="${GPUS:-0,1}"
 export EXP_ROOT="${EXP_ROOT:-data/conv_spline/exp}"
+# Named here, not spelled out in each runner: the verifiers read the log that
+# run_central_experiment.sh writes, and two spellings of one path is how the check
+# ended up pointed at a file that never existed.
+export LOG_DIR="${LOG_DIR:-data/conv_spline/logs}"
 export SCORE_DIR="${SCORE_DIR:-data/conv_spline/scores}"
 export PY="${PY:-/home/glenn/miniforge3/envs/spatio-temporal-dl/bin/python}"
 
@@ -39,6 +43,20 @@ export BASE_ARGS="--head_family spline --central_residual True --central_context
 verify_loss_weights() {
   local log="$1" name="$2" expect_extra="${3:-}"
   local got_ssim got_lap got_hist
+  # Fail CLOSED on a log that is missing or carries no banner. Every expected weight in this
+  # phase is 0.0 and awk coerces an empty string to 0, so a missing log made all three
+  # comparisons read 0==0 and the check PASSED having read nothing -- the exact failure this
+  # function exists to prevent, in the one direction that is silent. Rule: prove a check
+  # fires on a control, or it checks nothing.
+  if [ ! -r "$log" ]; then
+    echo "FATAL: ${name}: no readable fold log at ${log}; loss weights unverified." >&2
+    echo "       The run cannot be trusted -- an inherited weight set reads as a finding." >&2
+    return 1
+  fi
+  if ! grep -q "LOSS WEIGHTS" "$log"; then
+    echo "FATAL: ${name}: ${log} has no LOSS WEIGHTS banner; loss weights unverified." >&2
+    return 1
+  fi
   got_ssim=$(grep -A5 "LOSS WEIGHTS" "$log" | awk '/SSIM weight:/ {print $3; exit}')
   got_lap=$(grep -A5 "LOSS WEIGHTS" "$log" | awk '/Laplacian weight:/ {print $3; exit}')
   got_hist=$(grep -A5 "LOSS WEIGHTS" "$log" | awk '/Histogram weight:/ {print $3; exit}')
@@ -49,6 +67,11 @@ verify_loss_weights() {
   case "$expect_extra" in
     *--laplacian_weight*) want_lap=$(sed -E 's/.*--laplacian_weight ([0-9.]+).*/\1/' <<<"$expect_extra") ;;
   esac
+  if [ -z "$got_ssim" ] || [ -z "$got_lap" ] || [ -z "$got_hist" ]; then
+    echo "FATAL: ${name}: could not parse all three weights out of ${log}" >&2
+    echo "  got  ssim='${got_ssim}' lap='${got_lap}' hist='${got_hist}'" >&2
+    return 1
+  fi
   if ! awk -v a="$got_ssim" -v b="$want_ssim" 'BEGIN{exit !(a+0==b+0)}' \
      || ! awk -v a="$got_lap" -v b="$want_lap" 'BEGIN{exit !(a+0==b+0)}' \
      || ! awk -v a="$got_hist" 'BEGIN{exit !(a+0==0)}'; then

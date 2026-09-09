@@ -55,7 +55,7 @@ for ENTRY in "${SLATE[@]}"; do
     EXP_ROOT="$EXP_ROOT" REGION="$REGION" FOLD_MASK="$FOLD_MASK" \
       ./scripts/run_central_experiment.sh "$NAME" "$GPUS" "$FOLDS" "${FLAGS} --seed ${SEED}"
 
-    LOG="data/conv_spline/logs/hindcast_fold${FIRST_FOLD}_${NAME}.log"
+    LOG="${LOG_DIR}/hindcast_fold${FIRST_FOLD}_${NAME}.log"
     verify_loss_weights "$LOG" "$NAME" "$FLAGS"
     verify_trunk_context "$LOG" "$NAME"
 
