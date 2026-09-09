@@ -216,7 +216,7 @@ Every entry is one stated delta from b1, additive, defaulting to today's behavio
 | **E0a** | `--spline_cumulative_width False` | The incumbent head, otherwise untouched, with the horizon accumulation removed so each horizon's 95% width comes from its own channel. **Already implemented and tested**; no new code. | 29 params/h |
 | **E1a** | `--head_family isqf --isqf_tails True --isqf_space logit\|neglog` | Learned exponential tail rates β_L, β_R on unbounded transformed support. ISQF's actual contribution, which E1 drops. CRPS still evaluated in HM. **The tails' domain is unsettled** — see §4.1. | 18 params/h |
 | **E1b** | `--head_family isqf --free_scale True` | E1 minus the cumulative-in-horizon scale: increments carry the width directly, no renormalisation to unit 95% span. Park et al.'s own arrangement. | 15 params/h |
-| **E1c** | E1a + E1b together | Park et al. (2022) as published, adapted only where the ConvLSTM forces it. **Conditional** — runs only if E1a or E1b moves. | 17 params/h |
+| **E1c** | E1a + E1b together | Park et al. (2022) as published, adapted only where the ConvLSTM forces it. **Runs unconditionally** — it is the fourth cell of a 2x2 and completes it. | 17 params/h |
 | **E2a** | `--head_family pwl --free_scale True` | E2 with the anchor/scale factorisation removed: softmax heights replaced by unnormalised positive increments, so the 95% width is emergent rather than injected. | 15 params/h |
 
 E0 and E2–E5 are the issue note's staged plan, ordered by how much has to be touched. E1 and E2
@@ -374,11 +374,22 @@ gather — what goes is the reparameterisation and the constraint, not the looku
 **E1c — Park et al. (2022) transplanted.** E1a and E1b together: learned exponential tails on
 unbounded support, free per-horizon scale, fixed outer quantile levels with values from
 cumulative positive increments and linear interpolation between. This is the paper as published,
-adapted only where the ConvLSTM architecture forces it. It exists so that a null on E1a or E1b
-can be checked against the possibility that the two departures were load-bearing *jointly* — the
-bounded clamp and the injected scale interact, since both constrain where the outer knots can
-sit. **Run it last, and only if at least one of E1a or E1b shows movement**; if both are null,
-E1c has nothing left to explain.
+adapted only where the ConvLSTM architecture forces it.
+
+**E1c runs unconditionally.** E1, E1a, E1b and E1c are a complete 2×2 over {learned tails, free
+scale} — neither, tails only, scale only, both — and three cells of a 2×2 cannot separate an
+interaction from two main-effect nulls. The bounded clamp and the injected scale interact by
+construction, since both constrain where the outer knots can sit, so a joint effect is a live
+hypothesis rather than a remote one.
+
+Gating E1c on movement in E1a or E1b would drop the fourth cell in **exactly the case that makes
+it diagnostic**: if both are null, an interaction is the only remaining explanation, and the run
+that would test it is the one the gate skips. Such a gate is an unstated assumption — that the
+two departures are additive — wearing the clothes of a cost saving, and it fails silently: a
+run that never happened reads downstream as a result, the same family of error as a flag that is
+accepted, logged and inert. Two nulls and a skipped cell would get written up as "the paper's
+mechanism does not transfer", which is a claim the design would not have earned. Run it last for
+ordering, not for permission.
 
 **E2a — the linear head with an emergent width.** E2 with the anchor/scale factorisation
 removed, which requires more than deleting a channel. `_cumulative_v` softmaxes the heights and
@@ -421,8 +432,13 @@ width emergent from the increments rather than injected.
 every arm below it conflates the constraint with the factorisation. E1a and E1b next, in either
 order — independent subtractions from E1. E2a paired with E1b rather than following it: with the
 `--free_scale` semantics fixed, the pair is a controlled comparison of where persistence enters
-the ladder, so reading either alone wastes the control. E1c last and conditional on movement
-from E1a or E1b.
+the ladder, so reading either alone wastes the control. E1c last — last in sequence, not
+contingent on what precedes it; it is the cell that closes the 2×2.
+
+**Cost, since none of these is optional.** Five arms at ~50 min each (two folds in parallel, per
+the loops table in `CLAUDE.md`) is ~4 h for the group, on top of the six-arm E0–E5 slate and b1's
+three seeds. `run_conv_spline_slate.sh` currently knows E0–E5 only; §4.1 needs adding to it, and
+it should refuse to start without b1's floor for the same reason the existing slate does.
 
 Each arm still needs a test that it changed something against a seeded control
 (`tests/test_conv_spline_flags.py`) — a flag that is accepted, logged and inert reads downstream

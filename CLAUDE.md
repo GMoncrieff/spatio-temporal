@@ -82,7 +82,9 @@ The previous CLAUDE.md closed these. They are open again, and several are experi
   That is why E0a runs first and alone.
 - **Does the far field need a learned tail rate** rather than more knots? Now E1a: trainable
   β_L, β_R on unbounded transformed support, with CRPS still scored in HM. E1c is E1a + E1b, the
-  paper as published, and runs only if one of them moves.
+  paper as published, and **runs unconditionally**: E1/E1a/E1b/E1c are a complete 2×2 over
+  {tails, free scale}, and gating the fourth cell on movement in the other two drops it exactly
+  when a joint effect is the only remaining explanation.
 - **`--crps_nodes 6` may be thin under extreme shapes.** Measured 2026-09-07: at `shape_mag=3`
   the split quadrature's gradient error rises to 4.2e-2, *worse* than a naive uniform rule at
   the same budget. Cheap to check, never checked.
