@@ -435,10 +435,13 @@ order — independent subtractions from E1. E2a paired with E1b rather than foll
 the ladder, so reading either alone wastes the control. E1c last — last in sequence, not
 contingent on what precedes it; it is the cell that closes the 2×2.
 
-**Cost, since none of these is optional.** Five arms at ~50 min each (two folds in parallel, per
-the loops table in `CLAUDE.md`) is ~4 h for the group, on top of the six-arm E0–E5 slate and b1's
-three seeds. `run_conv_spline_slate.sh` currently knows E0–E5 only; §4.1 needs adding to it, and
-it should refuse to start without b1's floor for the same reason the existing slate does.
+**Cost, since none of these is optional.** ~55 min per arm — ~50 min to train two folds in
+parallel and stitch, plus the ~5 min scoring step the driver scripts run separately — so ~4.6 h
+for the five, on top of the six-arm E0–E5 slate (5.5 h) and b1's three seeds (2.75 h). Arms
+cannot overlap: `GPUS=0,1` with `FOLDS=1,2` means one arm already occupies both cards, so the
+total is a sum rather than a max. `run_conv_spline_slate.sh` currently knows E0–E5 only; §4.1
+needs adding to it, and it should refuse to start without b1's floor for the same reason the
+existing slate does.
 
 Each arm still needs a test that it changed something against a seeded control
 (`tests/test_conv_spline_flags.py`) — a flag that is accepted, logged and inert reads downstream
