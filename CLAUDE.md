@@ -72,8 +72,14 @@ The previous CLAUDE.md closed these. They are open again, and several are experi
 - **Should the trunk see the neighbourhood context?** Now settled as yes — `b1`
 - **Should the objective be scored in raw HM at all?** (E3.)
 - **Is the anchor/scale factorisation right**, or the free-first-knot arrangement ISQF uses (E1)?
-- **Does the far field need a learned tail rate** rather than more knots? Open, an E6–E8
-  candidate, and the one idea from Park et al. (2022) not yet tried.
+  E1b and E2a ask the strong form, and are expected to converge on nearly the same head.
+- **Is the horizon-cumulative scale load-bearing, or merely tidy?** The 95% width cannot shrink
+  with lead time by construction, so the question has never been measurable. E0a is the
+  one-thing-changed read, on the incumbent, using the `--spline_cumulative_width False` flag that
+  already exists and is already tested — do not add a second spelling of it.
+- **Does the far field need a learned tail rate** rather than more knots? Now E1a: trainable
+  β_L, β_R on unbounded transformed support, with CRPS still scored in HM. E1c is E1a + E1b, the
+  paper as published, and runs only if one of them moves.
 - **`--crps_nodes 6` may be thin under extreme shapes.** Measured 2026-09-07: at `shape_mag=3`
   the split quadrature's gradient error rises to 4.2e-2, *worse* than a naive uniform rule at
   the same budget. Cheap to check, never checked.

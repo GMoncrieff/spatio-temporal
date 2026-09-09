@@ -131,6 +131,7 @@ a side script — a diagnostic that has to be remembered is one that stops being
 | **gate 1: the fence** | `needle_mass_median/p90`, `max_density_p99`, `over_f_max_frac` |
 | **gate 2: PIT structure** | `pit_rms_se_{20,40,60}`, `pit_growth_vs_noise`, `zero_leak_*` |
 | placement | `exceedance_abs_log10`, `tail_reach` |
+| **width vs lead time** | `width95_{h}`, `width_narrows_frac_{h,h'}` |
 
 ### Every fence statistic is reported twice, and this is load-bearing
 
@@ -160,6 +161,35 @@ comparable at all. Raw RMS grows as √B and says nothing across resolutions.
 grows exactly like noise even though it is real.** Read growth only after `rms_se` has
 established there is structure at all.
 
+### The width-vs-lead-time row, added for the scale arms
+
+`width95` narrowing with lead time is currently **unmeasurable, not absent**. The spline head
+accumulates non-negative width increments across horizons (`cum = cum + softplus(step)` in
+`SpatioTemporalPredictor.forward`), so `width95(20) ≥ width95(15) ≥ …` holds by construction and
+no statistic could ever read otherwise. The free-scale arms in §4.1 — E0a, E1b, E1c, E2a —
+remove that accumulation, which makes the quantity real for the first time, so it needs a row
+before those arms run, not after.
+
+**E1a is the control on this row, not a fourth free-scale arm.** Its learned tails act beyond
+u = 0.001/0.999 while `width95` is interior (u = 0.025 to 0.975), so E1a on its own leaves the
+accumulation intact and should read exactly 0.000 here. If it does not, either the tail
+mechanism is reaching further in than intended or the row is measuring something else — and
+either way that is worth knowing before E1c combines E1a with a freed scale.
+
+`width_narrows_frac_{h,h'}` is the **fraction of pixels** where `width95(h) < width95(h′)` for
+`h > h′`, reported for each of the six horizon pairs and **per row, never as a pass count**
+(rule 3). A pooled mean width cannot express it: two horizons have to be compared *at the same
+pixel*, and `score_distributional_model.py` currently pools each horizon independently, so this
+row is a join the scorer does not yet do. Under the accumulating constraint it is 0.000 by
+construction, which is also the control that proves the row discriminates (rule 5) — if it does
+not read exactly zero on b1, the statistic is wrong before any arm is judged.
+
+**The DEGEN rule binds harder here than anywhere else.** A freed scale can collapse toward
+`MIN_SCALE` (1e-6) across the quiet majority of pixels — 68% of land is in the persistence core
+— and a floor band of width ~0 clears every margin test it is given. Read this row beside
+`width95_{h}` in absolute HM and beside `cov95`: a narrowing fraction that rises while `cov95`
+falls is a collapse, not a finding.
+
 ### Save and show plot
 
 For each experiment, save a plot of:
@@ -181,16 +211,112 @@ Every entry is one stated delta from b1, additive, defaulting to today's behavio
 | **E3** | `--crps_z_weight 1.0` | A second CRPS term in `z = asinh(change/s)`, summed with the raw term. Attacks the incentive problem directly. | same head |
 | **E4** | `--head_family pwl --spline_gap_floor True` | No segment may imply a density above 578. Makes a fence structurally impossible rather than discouraged. | +0 params |
 | **E5** | `--spline_knots skew14` | The same 14 bins, re-placed for the measured right skew. `skew11` is the strong form: 11 bins, testing whether the body needed resolution at all. | −0 / −6 params |
+| **E0a** | `--spline_cumulative_width False` | The incumbent head, otherwise untouched, with the horizon accumulation removed so each horizon's 95% width comes from its own channel. **Already implemented and tested**; no new code. | 29 params/h |
+| **E1a** | `--head_family isqf --isqf_tails True --isqf_space logit\|neglog` | Learned exponential tail rates β_L, β_R beyond u = 0.001/0.999, fitted on unbounded transformed support. ISQF's actual contribution, which E1 drops. CRPS still evaluated in HM. | +2 params/h |
+| **E1b** | `--head_family isqf --free_scale True` | E1 minus the cumulative-in-horizon scale: increments carry the width directly, no renormalisation to unit 95% span. Park et al.'s own arrangement. | 16 params/h |
+| **E1c** | E1a + E1b together | Park et al. (2022) as published, adapted only where the ConvLSTM forces it. **Conditional** — runs only if E1a or E1b moves. | +2 params/h |
+| **E2a** | `--head_family pwl --free_scale True` | E2 with the anchor/scale factorisation removed: softmax heights replaced by unnormalised positive increments, so the 95% width is emergent rather than injected. | 16 params/h |
 
 E0 and E2–E5 are the issue note's staged plan, ordered by how much has to be touched. E1 and E2
-are the two literature-derived heads.
+are the two literature-derived heads. The last five rows are a group rather than a continuation
+of that ordering — they are §4.1 below, and they are listed after E5 because each is a delta
+from an arm above it rather than from b1 directly.
 
-**E6–E8 are deliberately absent.** They are chosen from what E0–E5 measure. Writing them now
+**Flag status, so nothing runs inert.** `--spline_cumulative_width` (E0a) exists today. `--free_scale`,
+`--isqf_tails` and `--isqf_space` (E1a, E1b, E1c, E2a) **do not exist yet** and are the names
+proposed here, not names to pass at a shell before the code lands. Each needs a test that it
+changed something against a seeded control before its arm is run, per the convention in
+`tests/test_conv_spline_flags.py`.
+
+### 4.1 The scale arms — one constraint, five ways of removing it
+
+E0a, E1a, E1b, E1c and E2a share a target that E0–E5 never touch: **the two places this model
+constrains its own quantile function from the outside.** The horizon-cumulative scale (the 95%
+width cannot shrink with lead time) and the bounded clamp to [0, 1] are both imposed rather
+than learned, and neither has ever been ablated. They are grouped here because they interact —
+both decide where the outer knots may sit — and because the ordering below is what keeps a null
+readable.
+
+**E0a — the constraint alone, on the incumbent.** The cheapest possible read, and the one that
+makes everything below separable. b1's rational-quadratic head, unchanged in every other
+respect, with the horizon accumulation removed so each horizon's 95% width is set by its own
+channel rather than accumulated across lead times. Running this on the incumbent rather than on
+a new head is the whole point: if E0a's bands widen with lead time *unprompted*, the constraint
+is free insurance, and every downstream free-scale arm inherits that finding instead of
+re-establishing it against a different spline class at the same time.
+
+> **This flag already exists.** `--spline_cumulative_width False` does exactly this, is
+> documented in `train_lightning.py`, and is pinned by `tests/test_spline_cumulative_width.py`
+> on both halves (the ablation ablates; `Q(u)` increasing in `u` is untouched). **Do not add a
+> `--free_scale` alias for the spline family** — that is rule 2's predicate written twice, and
+> the two spellings will disagree. `--free_scale` below names the *new* code the piecewise-linear
+> families need; for the incumbent the flag is already there and E0a is a no-code run.
+>
+> One precision: for the incumbent, `scale_pre` is always read from the width head's channel and
+> `QuantileSpline.from_channels`' `scale_pre=None` branch is unreachable from `forward`. The two
+> paths read the same channel and differ only by an extra softplus, so the *meaningful* ablation
+> for b1 is the accumulation, not the injection. E1b and E2a are where `scale_pre=None` becomes
+> a real difference.
+
+**E1a — a learned tail rate on unbounded support.** ISQF's actual contribution, which E1 drops.
+The head fits in a transformed space where unbounded tails are admissible — `logit(HM)` for the
+symmetric version, `−log(1−HM)` for the one-directional version that matches the product's tail
+question — and beyond the outermost knots at u = 0.001/0.999 it extrapolates through exponential
+tails whose rates β_L, β_R are **trainable** rather than pinned to the two outer knots. Mapping
+back through the inverse transform respects [0, 1] structurally, so the clamp becomes redundant
+rather than load-bearing. Observed HM runs 0.00029 to 0.950, so the transform needs no epsilon
+fudge.
+
+> **Evaluate CRPS in HM space, not in the transformed space.** The closed form in z is tempting
+> and it silently changes the objective: weight per unit log-odds allocates very differently near
+> u = 0.999 than weight per unit HM, and the point of E1a is to isolate the tail *mechanism*.
+> z-space training is E3's question, and it is a follow-up here if and only if E1a moves the
+> far-field statistics. Two knobs on one axis read as two findings (rule 10 in `CLAUDE.md`).
+
+**E1b — E1 with the paper's own scale arrangement.** A pure subtraction, and the cheapest of the
+head arms. `ISQFQuantile`'s docstring names the cumulative-in-horizon scale as the one departure
+from Park et al. it deliberately keeps; E1b removes it. The increments carry the width directly,
+the ladder is no longer renormalised to unit 95% span, and horizons carry independent parameters
+exactly as the Seq2Seq setting does. Location still comes from the free first knot `q0` through
+the same zero-init persistence skip. The gate levels stay exact knots and `triple()` stays a
+gather — what goes is the reparameterisation and the constraint, not the lookup contract.
+
+> `ISQFQuantile.from_channels` **already handles `scale_pre=None`** correctly (it skips the
+> renormalisation block and uses `|·| + tol` directly). The missing piece is only that
+> `SpatioTemporalPredictor._decode` passes `scale_pre=blk[..., h * p + 1]` unconditionally. E1b
+> is a decode-site change, not a head rewrite.
+
+**E1c — Park et al. (2022) transplanted.** E1a and E1b together: learned exponential tails on
+unbounded support, free per-horizon scale, fixed outer quantile levels with values from
+cumulative positive increments and linear interpolation between. This is the paper as published,
+adapted only where the ConvLSTM architecture forces it. It exists so that a null on E1a or E1b
+can be checked against the possibility that the two departures were load-bearing *jointly* — the
+bounded clamp and the injected scale interact, since both constrain where the outer knots can
+sit. **Run it last, and only if at least one of E1a or E1b shows movement**; if both are null,
+E1c has nothing left to explain.
+
+**E2a — the linear head with an emergent width.** E2 with the anchor/scale factorisation
+removed, which requires more than deleting a channel. Softmax heights guarantee the ladder spans
+exactly 0 → 1 (`_cumulative_v`), so stripping `scale` naively hands every pixel a span of 1.0 —
+a broken model, not a free one. E2a therefore replaces the softmax with **unnormalised positive
+increments** (`|·| + tol`, ISQF's construction), making the 95% width emergent from the
+increments rather than injected.
+
+> That convergence is worth stating plainly: **E2a and E1b end up as nearly the same head**,
+> differing only in whether location arrives as a free first knot (`q0`) or as a location
+> channel (`anchor`). If that holds in the code, **E1b is the primary arm and E2a is
+> confirmation** — not two independent results. Check it before reading them as two.
+
+**Order.** E0a first and alone, because it is the only arm that changes one thing. E1a and E1b
+next, in either order, since they are independent subtractions from E1. E2a after E1b, as its
+confirmation. E1c last and conditional. Each still needs a test that it changed something against
+a seeded control (`tests/test_conv_spline_flags.py`) — a flag that is accepted, logged and inert
+reads downstream as a null rather than as an experiment that never ran.
+
+**E6–E8 are deliberately absent.** They are chosen from what E0–E5 and §4.1 measure. Writing them now
 would be guessing, and a slate whose last third is guesswork is how twenty-two experiments got
 screened against a blind spot. Candidates already visible:
 
-- **a learned tail rate**, ISQF's actual contribution, adapted for bounded support (in a logit
-  or `1−HM` space). Aimed at the far field rather than at the fence.
 - **`--crps_z_scale` sweep** — measured, at s = 0.001 the transform moves tail-vs-core
   weighting from 166× to 17.5×. The issue note claims it makes them "comparable"; it does not,
   it makes them closer. A smaller `s` compresses harder, and that is a one-parameter knob.
