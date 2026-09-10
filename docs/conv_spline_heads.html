@@ -1,0 +1,1301 @@
+<title>Five Quantile Heads</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chivo:wght@600;700;900&family=JetBrains+Mono:wght@400;500;700&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&display=swap">
+
+<style>
+  :root {
+    --ground:     #eef1f5;
+    --surface:    #ffffff;
+    --surface-2:  #e2e8ee;
+    --ink:        #131f2a;
+    --ink-2:      #44576a;
+    --ink-3:      #7a8b9d;
+    --rule:       #c2ccd7;
+    --rule-soft:  #d8e0e8;
+    --accent:     #0c6f66;
+    --accent-2:   #cfe6e2;
+    --warn:       #9d3f29;
+    --warn-2:     #f0dcd4;
+
+    --spine: 67ch;
+    --wide: 1080px;
+
+    --f-display: "Chivo", "Helvetica Neue", Arial, sans-serif;
+    --f-body: "Newsreader", Georgia, "Times New Roman", serif;
+    --f-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Consolas, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:    #0c131a;
+      --surface:   #141e28;
+      --surface-2: #1b2833;
+      --ink:       #dee7ef;
+      --ink-2:     #a2b3c3;
+      --ink-3:     #74899d;
+      --rule:      #2c3c4a;
+      --rule-soft: #21303c;
+      --accent:    #4cbaaa;
+      --accent-2:  #10362f;
+      --warn:      #df8365;
+      --warn-2:    #3a2118;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground:    #0c131a;
+    --surface:   #141e28;
+    --surface-2: #1b2833;
+    --ink:       #dee7ef;
+    --ink-2:     #a2b3c3;
+    --ink-3:     #74899d;
+    --rule:      #2c3c4a;
+    --rule-soft: #21303c;
+    --accent:    #4cbaaa;
+    --accent-2:  #10362f;
+    --warn:      #df8365;
+    --warn-2:    #3a2118;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--f-body);
+    font-size: 17px;
+    line-height: 1.62;
+    margin: 0;
+    padding-block: 0 4rem;
+    padding-inline: 20px;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  main, header.page {
+    display: grid;
+    grid-template-columns: 1fr min(var(--spine), 100%) 1fr;
+    column-gap: 0;
+  }
+  main > *, header.page > * { grid-column: 2; }
+  .bleed { grid-column: 1 / -1; width: min(var(--wide), 100%); margin-inline: auto; }
+
+  /* ---------- header ---------- */
+
+  header.page { padding-block: 3.5rem 2.25rem; }
+
+  .eyebrow {
+    font-family: var(--f-mono);
+    font-size: 12px;
+    font-weight: 500;
+    letter-spacing: 0.13em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 1rem;
+  }
+
+  h1 {
+    font-family: var(--f-display);
+    font-weight: 900;
+    font-size: clamp(2.3rem, 6.5vw, 3.5rem);
+    line-height: 1.02;
+    letter-spacing: -0.025em;
+    text-wrap: balance;
+    margin: 0 0 1.1rem;
+  }
+
+  .standfirst {
+    font-size: 1.2rem;
+    line-height: 1.5;
+    color: var(--ink-2);
+    margin: 0 0 1.75rem;
+    max-width: 58ch;
+  }
+
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem 1.6rem;
+    font-family: var(--f-mono);
+    font-size: 12.5px;
+    color: var(--ink-3);
+    border-top: 1px solid var(--rule);
+    border-bottom: 1px solid var(--rule);
+    padding-block: 0.7rem;
+  }
+  .meta b { color: var(--ink-2); font-weight: 500; }
+
+  /* ---------- prose ---------- */
+
+  h2 {
+    font-family: var(--f-display);
+    font-weight: 700;
+    font-size: clamp(1.5rem, 3.4vw, 1.95rem);
+    letter-spacing: -0.015em;
+    line-height: 1.15;
+    text-wrap: balance;
+    margin: 3.75rem 0 0.35rem;
+  }
+
+  h3 {
+    font-family: var(--f-display);
+    font-weight: 600;
+    font-size: 1.12rem;
+    letter-spacing: -0.005em;
+    margin: 2.25rem 0 0.5rem;
+  }
+
+  .kicker {
+    font-family: var(--f-mono);
+    font-size: 11.5px;
+    font-weight: 500;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    margin: 0 0 1.4rem;
+  }
+
+  p { margin: 0 0 1.05rem; }
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+
+  code, .mono { font-family: var(--f-mono); font-size: 0.855em; }
+  p code, li code, td code, figcaption code {
+    background: var(--surface-2);
+    padding: 0.1em 0.36em;
+    border-radius: 3px;
+  }
+
+  ul { margin: 0 0 1.05rem; padding-left: 1.15rem; }
+  li { margin-bottom: 0.35rem; }
+
+  strong { font-weight: 500; color: var(--ink); }
+  em { font-style: italic; }
+
+  /* ---------- note strip ---------- */
+
+  .note {
+    border-left: 3px solid var(--accent);
+    background: var(--surface);
+    padding: 1rem 1.15rem;
+    margin: 1.6rem 0;
+    font-size: 0.94rem;
+    line-height: 1.55;
+  }
+  .note.caution { border-left-color: var(--warn); }
+  .note p:last-child { margin-bottom: 0; }
+  .note .tag {
+    display: block;
+    font-family: var(--f-mono);
+    font-size: 11px;
+    letter-spacing: 0.11em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 0.4rem;
+  }
+  .note.caution .tag { color: var(--warn); }
+
+  /* ---------- spec card ---------- */
+
+  .spec {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: 1.15rem 1.25rem 1.25rem;
+    margin: 1.5rem 0 1.75rem;
+  }
+
+  .spec-head {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 0.55rem 0.8rem;
+    padding-bottom: 0.8rem;
+    border-bottom: 1px solid var(--rule-soft);
+    margin-bottom: 0.9rem;
+  }
+
+  .spec-id {
+    font-family: var(--f-mono);
+    font-weight: 700;
+    font-size: 1.05rem;
+    color: var(--accent);
+  }
+  .spec-name { font-family: var(--f-display); font-weight: 600; font-size: 1.02rem; }
+
+  .chip {
+    font-family: var(--f-mono);
+    font-size: 10.5px;
+    font-weight: 500;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    padding: 0.18em 0.5em;
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    color: var(--ink-3);
+    margin-left: auto;
+    white-space: nowrap;
+  }
+  .chip.live { color: var(--accent); border-color: var(--accent); }
+  .chip.draft { color: var(--warn); border-color: var(--warn); }
+
+  .spec dl {
+    display: grid;
+    grid-template-columns: minmax(9rem, auto) 1fr;
+    gap: 0.45rem 1.1rem;
+    margin: 0;
+    font-size: 0.9rem;
+  }
+  .spec dt {
+    font-family: var(--f-mono);
+    font-size: 11.5px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    padding-top: 0.22em;
+  }
+  .spec dd { margin: 0; color: var(--ink-2); }
+  .spec dd .mono { color: var(--ink); }
+
+  /* ---------- figures ---------- */
+
+  figure {
+    margin: 2rem 0 2.25rem;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: 1.1rem 1.1rem 0.9rem;
+  }
+  .fig-scroll { overflow-x: auto; }
+  figure svg { display: block; width: 100%; max-width: 100%; height: auto; min-width: 460px; }
+  figcaption {
+    font-size: 0.87rem;
+    line-height: 1.5;
+    color: var(--ink-2);
+    margin-top: 0.95rem;
+    padding-top: 0.7rem;
+    border-top: 1px solid var(--rule-soft);
+  }
+  figcaption b {
+    font-family: var(--f-mono);
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    font-weight: 500;
+    display: block;
+    margin-bottom: 0.3rem;
+  }
+
+  /* svg primitives */
+  .s-box   { fill: var(--surface-2); stroke: var(--rule); stroke-width: 1; }
+  .s-plain { fill: none; stroke: var(--rule); stroke-width: 1; }
+  .s-line  { fill: none; stroke: var(--ink-3); stroke-width: 1.4; }
+  .s-curve { fill: none; stroke: var(--ink); stroke-width: 2; }
+  .s-acc   { fill: none; stroke: var(--accent); stroke-width: 2; }
+  .s-accf  { fill: var(--accent); }
+  .s-accbox{ fill: var(--accent-2); stroke: var(--accent); stroke-width: 1.2; }
+  .s-wrn   { fill: none; stroke: var(--warn); stroke-width: 2; }
+  .s-wrnf  { fill: var(--warn); }
+  .s-wrnbox{ fill: var(--warn-2); stroke: var(--warn); stroke-width: 1.2; }
+  .s-axis  { fill: none; stroke: var(--ink-3); stroke-width: 1; }
+  .s-dash  { fill: none; stroke: var(--ink-3); stroke-width: 1; stroke-dasharray: 3 3; }
+  .s-dashacc { fill: none; stroke: var(--accent); stroke-width: 1.6; stroke-dasharray: 5 4; }
+  .s-dot   { fill: var(--ink); }
+  .s-tick  { fill: none; stroke: var(--ink-3); stroke-width: 1; }
+
+  text { font-family: var(--f-mono); fill: var(--ink-2); font-size: 12px; }
+  .t-lab  { font-size: 12px; fill: var(--ink); font-weight: 500; }
+  .t-sm   { font-size: 10.5px; fill: var(--ink-3); }
+  .t-acc  { font-size: 11.5px; fill: var(--accent); font-weight: 500; }
+  .t-wrn  { font-size: 11.5px; fill: var(--warn); font-weight: 500; }
+  .t-hd   { font-family: "Chivo", sans-serif; font-size: 13px; font-weight: 700; fill: var(--ink); letter-spacing: 0.02em; }
+
+  /* ---------- channel strip ---------- */
+
+  .strip {
+    display: flex;
+    align-items: stretch;
+    gap: 2px;
+    font-family: var(--f-mono);
+    font-size: 11px;
+    margin: 1rem 0 0.35rem;
+    flex-wrap: wrap;
+  }
+  .cell {
+    padding: 0.4em 0.6em;
+    background: var(--surface-2);
+    border: 1px solid var(--rule);
+    color: var(--ink-2);
+    white-space: nowrap;
+  }
+  .cell.loc { background: var(--surface); border-color: var(--ink-3); color: var(--ink); }
+  .cell.scl { background: var(--surface); border-color: var(--ink-3); color: var(--ink); }
+  .cell.shape { flex: 1 1 6rem; text-align: center; white-space: normal; }
+  .cell.add { background: var(--accent-2); border-color: var(--accent); color: var(--accent); }
+  .strip-cap { font-family: var(--f-mono); font-size: 11px; color: var(--ink-3); }
+
+  /* ---------- table ---------- */
+
+  .table-wrap { overflow-x: auto; margin: 1.75rem 0 1rem; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    min-width: 720px;
+    font-size: 0.87rem;
+    background: var(--surface);
+  }
+  th, td {
+    text-align: left;
+    padding: 0.62rem 0.7rem;
+    border-bottom: 1px solid var(--rule-soft);
+    vertical-align: top;
+  }
+  thead th {
+    font-family: var(--f-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    font-weight: 500;
+    border-bottom: 1px solid var(--rule);
+    white-space: nowrap;
+  }
+  tbody th {
+    font-family: var(--f-mono);
+    font-weight: 700;
+    color: var(--accent);
+    white-space: nowrap;
+  }
+  td { color: var(--ink-2); }
+  td.num { font-family: var(--f-mono); font-variant-numeric: tabular-nums; color: var(--ink); white-space: nowrap; }
+  tbody tr:last-child th, tbody tr:last-child td { border-bottom: none; }
+  tr.proposed th, tr.proposed td { color: var(--ink-3); }
+  tr.proposed th { color: var(--warn); }
+
+  footer.page {
+    margin-top: 3.5rem;
+    padding-top: 1.2rem;
+    border-top: 1px solid var(--rule);
+    font-family: var(--f-mono);
+    font-size: 11.5px;
+    color: var(--ink-3);
+    line-height: 1.7;
+  }
+
+  @media (max-width: 640px) {
+    body { font-size: 16px; }
+    .spec dl { grid-template-columns: 1fr; gap: 0.15rem; }
+    .spec dt { padding-top: 0.5em; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+</style>
+
+<header class="page">
+  <p class="eyebrow">conv-spline &middot; head architecture</p>
+  <h1>Five Quantile Heads</h1>
+  <p class="standfirst">
+    Everything downstream of the trunk is one object: a per-pixel quantile function
+    <span class="mono">Q<sub>h</sub>(u|x)</span>. These five heads build it five different ways,
+    and the differences are small enough to draw.
+  </p>
+  <div class="meta">
+    <span><b>branch</b> conv-spline</span>
+    <span><b>region</b> Africa, 63.1 Mpx</span>
+    <span><b>horizons</b> +5 / +10 / +15 / +20 yr</span>
+    <span><b>grid</b> default14 &mdash; 15 knots, 14 bins</span>
+  </div>
+</header>
+
+<main>
+
+  <div class="note caution">
+    <span class="tag">state of play</span>
+    <p>
+      Nothing on this branch has been run. Every figure below is a property of the <em>code</em>
+      or of the <em>data</em> &mdash; never a result. Where a number appears (677, 578, 168, 0.00069)
+      it is a measurement recorded in <code>docs/conv_spline_phase.md</code> or a constant in
+      <code>src/models/</code>, cited so it can be checked.
+    </p>
+  </div>
+
+  <p>
+    Two of these heads exist and are one flag away. One is the baseline. One is the slate's E4
+    under a different name. One is a proposal with no code behind it, drawn here as a design
+    and marked as such throughout.
+  </p>
+
+  <div class="note">
+    <span class="tag">a naming collision worth one line</span>
+    <p>
+      This branch uses <code>e1</code> (lower case) for the <em>previous</em> phase's neighbourhood-covariate
+      configuration &mdash; the thing <code>b1</code> is defined as "<code>e1</code> plus trunk context". It also uses
+      <code>E1</code> for the ISQF head in this phase's slate. This document means the <em>slate's</em>
+      E1 and E2 throughout: <code>--head_family isqf</code> and <code>--head_family pwl</code>.
+    </p>
+  </div>
+
+  <h2>Where the head sits</h2>
+  <p class="kicker">the plumbing all five share</p>
+
+  <p>
+    The trunk is a ConvLSTM over the HM stack plus static layers. Its final hidden state feeds
+    three heads per horizon: a <strong>central head</strong>, a <strong>width head</strong>, and a
+    <strong>shape head</strong>. Those three write one contiguous block of channels,
+    <span class="mono">[location, scale, shape&hellip;]</span>, and a single decoder turns the block
+    into one quantile function per horizon. That decoder is where the head families diverge; everything
+    to its left is identical across all five.
+  </p>
+
+  <figure class="bleed">
+    <div class="fig-scroll">
+      <svg viewBox="0 0 980 372" role="img" aria-label="Flow from inputs through the ConvLSTM trunk to three per-horizon heads, whose channels are decoded into one quantile function per horizon. The neighbourhood context enters both the trunk and the heads.">
+        <defs>
+          <marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,1 L9,5 L0,9 z" class="s-dot"></path>
+          </marker>
+          <marker id="a1acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,1 L9,5 L0,9 z" class="s-accf"></path>
+          </marker>
+        </defs>
+
+        <!-- inputs -->
+        <text x="14" y="26" class="t-hd">inputs</text>
+        <rect x="14" y="40" width="150" height="34" rx="2" class="s-box"></rect>
+        <text x="24" y="61">HM stack, 1990&ndash;2020</text>
+        <rect x="14" y="82" width="150" height="34" rx="2" class="s-box"></rect>
+        <text x="24" y="103">elevation, climate</text>
+        <rect x="14" y="124" width="150" height="34" rx="2" class="s-accbox"></rect>
+        <text x="24" y="140" class="t-acc">neighbourhood</text>
+        <text x="24" y="152" class="t-acc">HM context</text>
+        <text x="14" y="176" class="t-sm">precomputed on the full raster</text>
+
+        <!-- trunk -->
+        <rect x="196" y="56" width="116" height="86" rx="2" class="s-box"></rect>
+        <text x="208" y="95" class="t-lab">ConvLSTM</text>
+        <text x="208" y="113" class="t-lab">trunk</text>
+        <line x1="166" y1="57" x2="194" y2="82" class="s-line" marker-end="url(#a1)"></line>
+        <line x1="166" y1="99" x2="194" y2="99" class="s-line" marker-end="url(#a1)"></line>
+        <line x1="166" y1="141" x2="194" y2="118" class="s-acc" marker-end="url(#a1acc)"></line>
+        <text x="176" y="196" class="t-acc">b1&rsquo;s one change</text>
+        <text x="176" y="210" class="t-sm">context repeated across timesteps,</text>
+        <text x="176" y="223" class="t-sm">beside elevation and climate</text>
+
+        <!-- last hidden -->
+        <line x1="314" y1="99" x2="392" y2="99" class="s-line" marker-end="url(#a1)"></line>
+        <text x="318" y="92" class="t-sm">last_hidden</text>
+
+        <!-- context re-entering the heads -->
+        <path d="M89,158 L89,258 L404,258 L404,214" class="s-dashacc"></path>
+        <text x="150" y="273" class="t-acc">the same tensor also concatenated onto every head input</text>
+
+        <!-- heads -->
+        <rect x="394" y="30" width="152" height="42" rx="2" class="s-box"></rect>
+        <text x="406" y="49" class="t-lab">central head</text>
+        <text x="406" y="64" class="t-sm">residual on HM(t0)</text>
+
+        <rect x="394" y="82" width="152" height="42" rx="2" class="s-box"></rect>
+        <text x="406" y="101" class="t-lab">width head</text>
+        <text x="406" y="116" class="t-sm">softplus, cumulative</text>
+
+        <rect x="394" y="134" width="152" height="42" rx="2" class="s-box"></rect>
+        <text x="406" y="153" class="t-lab">shape head</text>
+        <text x="406" y="168" class="t-sm">14 or 27 channels</text>
+
+        <line x1="392" y1="99" x2="392" y2="51" class="s-plain"></line>
+        <line x1="392" y1="99" x2="392" y2="155" class="s-plain"></line>
+
+        <!-- channel block -->
+        <line x1="548" y1="51" x2="606" y2="88" class="s-line" marker-end="url(#a1)"></line>
+        <line x1="548" y1="103" x2="606" y2="103" class="s-line" marker-end="url(#a1)"></line>
+        <line x1="548" y1="155" x2="606" y2="118" class="s-line" marker-end="url(#a1)"></line>
+
+        <rect x="608" y="72" width="52" height="62" rx="2" class="s-box"></rect>
+        <text x="618" y="108" class="t-lab">loc</text>
+        <rect x="660" y="72" width="52" height="62" rx="2" class="s-box"></rect>
+        <text x="668" y="108" class="t-lab">scale</text>
+        <rect x="712" y="72" width="86" height="62" rx="2" class="s-box"></rect>
+        <text x="722" y="108" class="t-lab">shape&hellip;</text>
+        <text x="608" y="62" class="t-sm">one contiguous block per horizon</text>
+        <text x="608" y="152" class="t-sm">P = 29 (spline) or 16 (pwl / isqf)</text>
+
+        <!-- decode -->
+        <line x1="800" y1="103" x2="838" y2="103" class="s-line" marker-end="url(#a1)"></line>
+        <rect x="840" y="62" width="126" height="82" rx="2" class="s-accbox"></rect>
+        <text x="852" y="96" class="t-acc">_decode</text>
+        <text x="852" y="114" class="t-acc">Q(u)</text>
+        <text x="840" y="164" class="t-sm">the one place the</text>
+        <text x="840" y="177" class="t-sm">families differ</text>
+
+        <!-- outputs -->
+        <line x1="903" y1="146" x2="903" y2="296" class="s-line" marker-end="url(#a1)"></line>
+        <rect x="700" y="298" width="266" height="56" rx="2" class="s-box"></rect>
+        <text x="712" y="320" class="t-lab">lower &middot; central &middot; upper &times; 4</text>
+        <text x="712" y="340" class="t-sm">central = E[Q], not the median</text>
+
+        <text x="24" y="318" class="t-sm">both are read off the same Q &mdash; the triple is a lookup at</text>
+        <text x="24" y="334" class="t-sm">u = 0.025 / 0.5 / 0.975, the mean an integral of it</text>
+      </svg>
+    </div>
+    <figcaption>
+      <b>Figure 1 &mdash; the shared path</b>
+      Three heads, one channel block, one decoder. <code>b1</code> is the previous phase's <code>e1</code> plus
+      exactly one edge: the accent arrow, where the neighbourhood context joins the trunk's static inputs
+      instead of reaching the heads alone. The context is still concatenated onto the head inputs as well
+      (dashed) &mdash; b1 adds a consumer, it does not move one. Every experiment below carries that change,
+      so none of them is comparable to a <code>dist-convlstm</code> number.
+    </figcaption>
+  </figure>
+
+  <h2>b1 &mdash; the rational-quadratic spline</h2>
+  <p class="kicker">the incumbent, and the thing being measured against</p>
+
+  <div class="spec">
+    <div class="spec-head">
+      <span class="spec-id">b1</span>
+      <span class="spec-name">Monotone rational-quadratic spline</span>
+      <span class="chip live">runnable</span>
+    </div>
+    <dl>
+      <dt>flag</dt><dd><span class="mono">--head_family spline</span> (default), with <span class="mono">--trunk_context True</span></dd>
+      <dt>params / horizon</dt><dd><span class="mono">29</span> = anchor + scale + 14 bin heights + 13 internal slopes</dd>
+      <dt>continuity</dt><dd>C1 &mdash; pieces meet with matching derivative</dd>
+      <dt>location pinned at</dt><dd><span class="mono">Q(0.5) = anchor</span></dd>
+      <dt>scale means</dt><dd><span class="mono">Q(0.975) &minus; Q(0.025)</span>, non-decreasing in lead time</dd>
+      <dt>CRPS</dt><dd>split quadrature, 6 nodes per piece &mdash; <span class="mono">168</span> spline evaluations per horizon</dd>
+      <dt>source</dt><dd><code>src/models/quantile_spline.py</code></dd>
+    </dl>
+    <div class="strip">
+      <span class="cell loc">0 &middot; anchor</span>
+      <span class="cell scl">1 &middot; scale</span>
+      <span class="cell shape">2&ndash;15 &middot; 14 bin heights &rarr; softmax</span>
+      <span class="cell shape">16&ndash;28 &middot; 13 internal slopes &rarr; softplus</span>
+    </div>
+    <p class="strip-cap">channel layout, one horizon</p>
+  </div>
+
+  <p>
+    The construction is a factorisation, and that is its whole character. Bin heights go through a
+    softmax and accumulate into a ladder <span class="mono">v</span> running exactly 0&nbsp;&rarr;&nbsp;1;
+    the ladder is then re-centred and re-scaled so that <span class="mono">u = 0.5</span> lands on the
+    anchor and the span from 0.025 to 0.975 is exactly <span class="mono">scale</span>. Shape, location
+    and width are therefore three separate things the network can move independently &mdash; and the
+    published triple is a gather, never an interpolation.
+  </p>
+
+  <p>
+    Monotonicity is structural: positive bin heights and positive knot derivatives make the
+    rational-quadratic piece monotone for free, so <span class="mono">lower &le; central &le; upper</span>
+    cannot be violated and nothing needs sorting afterwards. That guarantee is also the suspect. A
+    strictly positive derivative cannot produce a flat segment, so when the target <em>is</em> flat &mdash;
+    and between u&nbsp;=&nbsp;0.1 and 0.6 the observed change spends 0.13% of its value range &mdash; the
+    levels collapse toward each other without collapsing onto each other. That is the picket fence:
+    4.5% of gaps within three quantisation steps against 0.7% exactly zero.
+  </p>
+
+  <figure class="bleed">
+    <div class="fig-scroll">
+      <svg viewBox="0 0 980 300" role="img" aria-label="The b1 spline construction: softmax bin heights accumulate into a monotone ladder from zero to one, which is then normalised so the median sits at the anchor and the 95 percent span equals the scale.">
+        <defs>
+          <marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,1 L9,5 L0,9 z" class="s-dot"></path>
+          </marker>
+        </defs>
+
+        <!-- stage 1: heights -->
+        <text x="14" y="24" class="t-hd">1 &middot; bin heights</text>
+        <text x="14" y="42" class="t-sm">14 raw channels &rarr; softmax</text>
+        <line x1="14" y1="200" x2="200" y2="200" class="s-axis"></line>
+        <rect x="20" y="180" width="11" height="20" class="s-box"></rect>
+        <rect x="33" y="168" width="11" height="32" class="s-box"></rect>
+        <rect x="46" y="150" width="11" height="50" class="s-box"></rect>
+        <rect x="59" y="124" width="11" height="76" class="s-box"></rect>
+        <rect x="72" y="86"  width="11" height="114" class="s-box"></rect>
+        <rect x="85" y="62"  width="11" height="138" class="s-box"></rect>
+        <rect x="98" y="70"  width="11" height="130" class="s-box"></rect>
+        <rect x="111" y="96" width="11" height="104" class="s-box"></rect>
+        <rect x="124" y="128" width="11" height="72" class="s-box"></rect>
+        <rect x="137" y="152" width="11" height="48" class="s-box"></rect>
+        <rect x="150" y="166" width="11" height="34" class="s-box"></rect>
+        <rect x="163" y="176" width="11" height="24" class="s-box"></rect>
+        <rect x="176" y="186" width="11" height="14" class="s-box"></rect>
+        <rect x="189" y="192" width="9" height="8" class="s-box"></rect>
+        <text x="14" y="220" class="t-sm">h<tspan baseline-shift="sub" font-size="8">k</tspan> &ge; 1e-4, &Sigma;h = 1</text>
+        <text x="14" y="238" class="t-sm">init: log h from the</text>
+        <text x="14" y="252" class="t-sm">standard normal</text>
+
+        <line x1="212" y1="140" x2="248" y2="140" class="s-line" marker-end="url(#a2)"></line>
+        <text x="212" y="132" class="t-sm">cumsum</text>
+
+        <!-- stage 2: ladder -->
+        <text x="258" y="24" class="t-hd">2 &middot; the ladder v(u)</text>
+        <text x="258" y="42" class="t-sm">monotone, exactly 0 &rarr; 1</text>
+        <line x1="262" y1="200" x2="262" y2="60" class="s-axis"></line>
+        <line x1="262" y1="200" x2="430" y2="200" class="s-axis"></line>
+        <path d="M262,200 L272,197 L282,192 L294,183 L308,166 L324,140 L344,112 L364,88 L384,74 L400,67 L412,63 L420,61 L426,60 L430,60" class="s-curve"></path>
+        <circle cx="282" cy="192" r="3" class="s-dot"></circle>
+        <circle cx="344" cy="112" r="3" class="s-dot"></circle>
+        <circle cx="400" cy="67" r="3" class="s-dot"></circle>
+        <text x="270" y="216" class="t-sm">0.025</text>
+        <text x="330" y="216" class="t-sm">0.5</text>
+        <text x="386" y="216" class="t-sm">0.975</text>
+        <text x="258" y="238" class="t-sm">the three gate levels are</text>
+        <text x="258" y="252" class="t-sm">exact knots, by validation</text>
+
+        <line x1="444" y1="140" x2="480" y2="140" class="s-line" marker-end="url(#a2)"></line>
+        <text x="440" y="132" class="t-sm">normalise</text>
+
+        <!-- stage 3: Q -->
+        <text x="494" y="24" class="t-hd">3 &middot; Q = anchor + scale &middot; g(v)</text>
+        <text x="494" y="42" class="t-sm">g(v) = (v &minus; v<tspan baseline-shift="sub" font-size="8">mid</tspan>) / (v<tspan baseline-shift="sub" font-size="8">hi</tspan> &minus; v<tspan baseline-shift="sub" font-size="8">lo</tspan>)</text>
+        <line x1="500" y1="200" x2="500" y2="60" class="s-axis"></line>
+        <line x1="500" y1="200" x2="700" y2="200" class="s-axis"></line>
+        <path d="M500,196 L512,193 L524,188 L540,178 L558,160 L578,132 L600,106 L622,86 L644,72 L664,64 L680,60 L692,57 L700,56" class="s-curve"></path>
+        <line x1="500" y1="130" x2="700" y2="130" class="s-dash"></line>
+        <circle cx="578" cy="132" r="4" class="s-accf"></circle>
+        <text x="590" y="152" class="t-acc">anchor = Q(0.5)</text>
+        <line x1="524" y1="188" x2="524" y2="240" class="s-dash"></line>
+        <line x1="644" y1="72" x2="644" y2="240" class="s-dash"></line>
+        <line x1="524" y1="234" x2="644" y2="234" class="s-acc" marker-end="url(#a2)"></line>
+        <text x="524" y="256" class="t-acc">scale = the 95% width</text>
+
+        <!-- C1 inset -->
+        <text x="734" y="24" class="t-hd">the C1 corner</text>
+        <rect x="734" y="36" width="232" height="164" rx="2" class="s-plain"></rect>
+        <line x1="800" y1="46" x2="800" y2="190" class="s-dash"></line>
+        <line x1="890" y1="46" x2="890" y2="190" class="s-dash"></line>
+        <path d="M744,172 C768,168 786,150 800,128 C814,106 836,80 890,66 L960,58" class="s-curve"></path>
+        <circle cx="800" cy="128" r="3" class="s-dot"></circle>
+        <circle cx="890" cy="66" r="3" class="s-dot"></circle>
+        <text x="744" y="60" class="t-sm">derivative matches</text>
+        <text x="744" y="74" class="t-sm">across every knot</text>
+        <text x="734" y="220" class="t-sm">13 of 15 slopes are learned; the</text>
+        <text x="734" y="234" class="t-sm">two boundary slopes are pinned to</text>
+        <text x="734" y="248" class="t-sm">their own bin&rsquo;s secant, so tail</text>
+        <text x="734" y="262" class="t-sm">reach is carried by the outermost</text>
+        <text x="734" y="276" class="t-sm">bin&rsquo;s mass, not by its slope</text>
+      </svg>
+    </div>
+    <figcaption>
+      <b>Figure 2 &mdash; b1&rsquo;s three stages</b>
+      Heights &rarr; ladder &rarr; normalised quantile function. The normalisation in stage 3 is what makes
+      <span class="mono">anchor</span> and <span class="mono">scale</span> mean something exact rather than
+      approximately: <code>triple()</code> never touches the spline at all, it reads the three pinned knots.
+      Cost: 29 channels per horizon, of which 13 buy nothing but smoothness.
+    </figcaption>
+  </figure>
+
+  <h2>E1 and E2 &mdash; the two C0 heads</h2>
+  <p class="kicker">what changes when the pieces go straight</p>
+
+  <p>
+    E1 and E2 share a base class and differ from each other in one thing only: where the ladder is
+    nailed down. Both give up C1 continuity, and both get the same thing back for it &mdash; CRPS in
+    closed form. Both cost 16 channels per horizon instead of 29.
+  </p>
+
+  <div class="spec">
+    <div class="spec-head">
+      <span class="spec-id">E2</span>
+      <span class="spec-name">Piecewise linear, the incumbent's factorisation</span>
+      <span class="chip live">runnable</span>
+    </div>
+    <dl>
+      <dt>flag</dt><dd><span class="mono">--head_family pwl</span></dd>
+      <dt>delta from b1</dt><dd>linear pieces in place of rational-quadratic; the 13 slope channels disappear</dd>
+      <dt>params / horizon</dt><dd><span class="mono">16</span> = anchor + scale + 14 bin heights</dd>
+      <dt>location pinned at</dt><dd><span class="mono">Q(0.5) = anchor</span> &mdash; identical to b1</dd>
+      <dt>what it isolates</dt><dd>the interpolation class, and nothing else</dd>
+      <dt>source</dt><dd><code>src/models/quantile_pwl.py</code> &middot; <code>PWLQuantile</code></dd>
+    </dl>
+    <div class="strip">
+      <span class="cell loc">0 &middot; anchor</span>
+      <span class="cell scl">1 &middot; scale</span>
+      <span class="cell shape">2&ndash;15 &middot; 14 bin heights &rarr; softmax</span>
+    </div>
+    <p class="strip-cap">channel layout, one horizon</p>
+  </div>
+
+  <div class="spec">
+    <div class="spec-head">
+      <span class="spec-id">E1</span>
+      <span class="spec-name">ISQF, bounded &mdash; Park et al. (2022)</span>
+      <span class="chip live">runnable</span>
+    </div>
+    <dl>
+      <dt>flag</dt><dd><span class="mono">--head_family isqf</span></dd>
+      <dt>delta from b1</dt><dd>the whole parameterisation: a free first knot plus positive increments, not anchor and scale around a median</dd>
+      <dt>params / horizon</dt><dd><span class="mono">16</span> = q<sub>0</sub> + scale + 14 increments</dd>
+      <dt>location pinned at</dt><dd><span class="mono">Q(0) = q<sub>0</sub></span> &mdash; the bottom of the ladder</dd>
+      <dt>kept from the paper</dt><dd>cumulative-in-horizon scale, so the 95% width cannot shrink with lead time</dd>
+      <dt>dropped from the paper</dt><dd>the exponential tails &mdash; unbounded, and HM lives on [0, 1]</dd>
+      <dt>source</dt><dd><code>src/models/quantile_pwl.py</code> &middot; <code>ISQFQuantile</code></dd>
+    </dl>
+    <div class="strip">
+      <span class="cell loc">0 &middot; q<sub>0</sub></span>
+      <span class="cell scl">1 &middot; scale</span>
+      <span class="cell shape">2&ndash;15 &middot; 14 increments &rarr; |&middot;| + 1e-4</span>
+    </div>
+    <p class="strip-cap">one layout for all three families, deliberately &mdash; a per-family layout buys an off-by-one that only shows up as a wrong-shaped distribution</p>
+  </div>
+
+  <figure class="bleed">
+    <div class="fig-scroll">
+      <svg viewBox="0 0 980 334" role="img" aria-label="Three panels comparing where each head pins its location: b1 and E2 pin the median at the anchor, while E1 pins the first knot at u equals zero, so the location parameter is the distribution's floor rather than its middle.">
+        <defs>
+          <marker id="a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,1 L9,5 L0,9 z" class="s-dot"></path>
+          </marker>
+          <marker id="a3acc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,1 L9,5 L0,9 z" class="s-accf"></path>
+          </marker>
+        </defs>
+
+        <!-- panel b1 -->
+        <text x="14" y="24" class="t-hd">b1 &middot; spline</text>
+        <text x="14" y="42" class="t-sm">C1 curve through the ladder</text>
+        <line x1="34" y1="230" x2="34" y2="60" class="s-axis"></line>
+        <line x1="34" y1="230" x2="286" y2="230" class="s-axis"></line>
+        <text x="8" y="66" class="t-sm">q</text>
+        <text x="294" y="234" class="t-sm">u</text>
+        <path d="M34,226 L52,222 L72,215 L96,202 L124,180 L150,152 L176,124 L204,100 L232,82 L254,71 L268,66 L280,63" class="s-curve"></path>
+        <line x1="34" y1="152" x2="286" y2="152" class="s-dash"></line>
+        <circle cx="150" cy="152" r="4.5" class="s-accf"></circle>
+        <text x="118" y="142" class="t-acc">anchor</text>
+        <line x1="72" y1="215" x2="72" y2="276" class="s-dash"></line>
+        <line x1="232" y1="82" x2="232" y2="276" class="s-dash"></line>
+        <line x1="72" y1="270" x2="232" y2="270" class="s-acc" marker-start="url(#a3acc)" marker-end="url(#a3acc)"></line>
+        <text x="92" y="290" class="t-acc">scale</text>
+        <text x="60" y="248" class="t-sm">.025</text>
+        <text x="140" y="248" class="t-sm">.5</text>
+        <text x="212" y="248" class="t-sm">.975</text>
+        <text x="14" y="308" class="t-sm">29 params &middot; heights + slopes</text>
+
+        <!-- panel E2 -->
+        <text x="354" y="24" class="t-hd">E2 &middot; pwl</text>
+        <text x="354" y="42" class="t-sm">same ladder, straight pieces</text>
+        <line x1="374" y1="230" x2="374" y2="60" class="s-axis"></line>
+        <line x1="374" y1="230" x2="626" y2="230" class="s-axis"></line>
+        <text x="634" y="234" class="t-sm">u</text>
+        <polyline points="374,226 392,223 412,216 436,203 464,181 490,153 516,125 544,101 572,83 594,72 608,67 620,63" class="s-curve"></polyline>
+        <circle cx="392" cy="223" r="2.5" class="s-dot"></circle>
+        <circle cx="436" cy="203" r="2.5" class="s-dot"></circle>
+        <circle cx="490" cy="153" r="2.5" class="s-dot"></circle>
+        <circle cx="544" cy="101" r="2.5" class="s-dot"></circle>
+        <circle cx="594" cy="72" r="2.5" class="s-dot"></circle>
+        <line x1="374" y1="153" x2="626" y2="153" class="s-dash"></line>
+        <circle cx="490" cy="153" r="4.5" class="s-accf"></circle>
+        <text x="458" y="143" class="t-acc">anchor</text>
+        <line x1="412" y1="216" x2="412" y2="276" class="s-dash"></line>
+        <line x1="572" y1="83" x2="572" y2="276" class="s-dash"></line>
+        <line x1="412" y1="270" x2="572" y2="270" class="s-acc" marker-start="url(#a3acc)" marker-end="url(#a3acc)"></line>
+        <text x="432" y="290" class="t-acc">scale</text>
+        <text x="400" y="248" class="t-sm">.025</text>
+        <text x="480" y="248" class="t-sm">.5</text>
+        <text x="552" y="248" class="t-sm">.975</text>
+        <text x="354" y="308" class="t-sm">16 params &middot; the 13 slopes are gone</text>
+
+        <!-- panel E1 -->
+        <text x="694" y="24" class="t-hd">E1 &middot; isqf</text>
+        <text x="694" y="42" class="t-sm">a ladder climbing from q<tspan baseline-shift="sub" font-size="8">0</tspan></text>
+        <line x1="714" y1="230" x2="714" y2="60" class="s-axis"></line>
+        <line x1="714" y1="230" x2="960" y2="230" class="s-axis"></line>
+        <text x="966" y="234" class="t-sm">u</text>
+        <polyline points="714,226 732,223 752,216 776,203 804,181 830,153 856,125 884,101 912,83 934,72 948,67 958,63" class="s-curve"></polyline>
+        <circle cx="714" cy="226" r="5" class="s-accf"></circle>
+        <text x="724" y="208" class="t-acc">q<tspan baseline-shift="sub" font-size="8">0</tspan> = Q(0)</text>
+        <!-- increments -->
+        <line x1="752" y1="216" x2="752" y2="226" class="s-acc"></line>
+        <line x1="776" y1="203" x2="776" y2="216" class="s-acc"></line>
+        <line x1="804" y1="181" x2="804" y2="203" class="s-acc"></line>
+        <line x1="830" y1="153" x2="830" y2="181" class="s-acc"></line>
+        <text x="768" y="266" class="t-acc">+ |&middot;| + tol, cumulative</text>
+        <line x1="752" y1="216" x2="752" y2="276" class="s-dash"></line>
+        <line x1="912" y1="83" x2="912" y2="276" class="s-dash"></line>
+        <line x1="752" y1="282" x2="912" y2="282" class="s-acc" marker-start="url(#a3acc)" marker-end="url(#a3acc)"></line>
+        <text x="752" y="300" class="t-acc">rescaled: this span = scale</text>
+        <text x="740" y="248" class="t-sm">.025</text>
+        <text x="892" y="248" class="t-sm">.975</text>
+        <text x="694" y="322" class="t-sm">16 params &middot; no pinned median</text>
+      </svg>
+    </div>
+    <figcaption>
+      <b>Figure 3 &mdash; the difference is where the ladder is nailed</b>
+      b1 and E2 pin the <em>middle</em>: the anchor is the median by construction, and the ladder is
+      re-centred around it. E1 pins the <em>bottom</em>: <span class="mono">q<sub>0</sub></span> is the value at
+      the first knot and every other knot is reached by adding a positive increment. Both then rescale so the
+      0.025&ndash;0.975 span equals <span class="mono">scale</span>, which is what keeps the two comparable at all.
+      Between E1 and E2 the interpolation is <em>identical</em> &mdash; they share <code>_PWLBase</code> &mdash; so an
+      E1-vs-E2 A/B is purely about the parameterisation, and an E2-vs-b1 A/B is purely about C1.
+    </figcaption>
+  </figure>
+
+  <div class="note caution">
+    <span class="tag">worth checking on the first E1 run</span>
+    <p>
+      On <code>default14</code> the u-grid spans <span class="mono">[0, 1]</span> &mdash; the closed form
+      refuses a grid that stops short &mdash; so E1's free first knot lands at <span class="mono">u = 0</span>,
+      and the central head's zero-initialised residual therefore starts the run with persistence as the
+      distribution's <em>floor</em> rather than its median. Under b1 and E2 the same initialisation puts
+      persistence at the middle. The phase's second measured defect is 15% of cells displaced one bin left,
+      <em>across zero</em>; E1 begins from the opposite prior. That is the paper's arrangement working as
+      designed, not a bug &mdash; but it is the first thing to look at in E1's PIT panel, and it is why the
+      docstring calls E1 a test of the whole parameterisation rather than of one piece of it.
+    </p>
+  </div>
+
+  <h3>What C0 costs, and what it buys</h3>
+
+  <p>
+    The density is <span class="mono">1 / (dQ/du)</span>. Under b1 that is a smooth function; under E1
+    and E2 it is piecewise <em>constant</em>, jumping at every knot. CRPS does not care &mdash; it integrates
+    <span class="mono">Q</span>, not its derivative &mdash; but the NLL option and any density render do.
+    What C0 buys is the reason the module exists: with <span class="mono">Q</span> linear on a segment,
+    the pinball integrand is a quadratic in <span class="mono">u</span> with one kink, both pieces
+    integrate exactly, and the crossing is the root of a linear function.
+  </p>
+
+  <figure class="bleed">
+    <div class="fig-scroll">
+      <svg viewBox="0 0 980 300" role="img" aria-label="Left: b1 evaluates CRPS by splitting the integral at the support crossings and the pinball kink, then applying six quadrature nodes per piece, 168 spline evaluations per horizon. Right: the piecewise-linear heads solve the crossing analytically and integrate a quadratic exactly.">
+        <defs>
+          <marker id="a4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,1 L9,5 L0,9 z" class="s-dot"></path>
+          </marker>
+        </defs>
+
+        <!-- left: quadrature -->
+        <text x="14" y="24" class="t-hd">b1 &middot; split quadrature</text>
+        <text x="14" y="42" class="t-sm">no closed form exists for a rational-quadratic Q</text>
+        <line x1="24" y1="150" x2="456" y2="150" class="s-axis"></line>
+        <text x="18" y="172" class="t-sm">0</text>
+        <text x="448" y="172" class="t-sm">1</text>
+        <text x="230" y="172" class="t-sm">u</text>
+
+        <line x1="96" y1="132" x2="96" y2="168" class="s-tick"></line>
+        <text x="76" y="126" class="t-sm">u<tspan baseline-shift="sub" font-size="8">a</tspan></text>
+        <line x1="252" y1="120" x2="252" y2="180" class="s-wrn"></line>
+        <text x="234" y="112" class="t-wrn">u* = Q<tspan baseline-shift="super" font-size="8">&minus;1</tspan>(y)</text>
+        <text x="222" y="196" class="t-wrn">the pinball kink</text>
+        <line x1="392" y1="132" x2="392" y2="168" class="s-tick"></line>
+        <text x="384" y="126" class="t-sm">u<tspan baseline-shift="sub" font-size="8">b</tspan></text>
+
+        <rect x="24" y="140" width="72" height="20" class="s-box"></rect>
+        <text x="28" y="216" class="t-sm">flat: clamp</text>
+        <text x="28" y="230" class="t-sm">holds, no eval</text>
+        <rect x="392" y="140" width="64" height="20" class="s-box"></rect>
+
+        <!-- nodes -->
+        <circle cx="112" cy="150" r="2.6" class="s-accf"></circle>
+        <circle cx="136" cy="150" r="2.6" class="s-accf"></circle>
+        <circle cx="162" cy="150" r="2.6" class="s-accf"></circle>
+        <circle cx="190" cy="150" r="2.6" class="s-accf"></circle>
+        <circle cx="216" cy="150" r="2.6" class="s-accf"></circle>
+        <circle cx="240" cy="150" r="2.6" class="s-accf"></circle>
+        <circle cx="266" cy="150" r="2.6" class="s-accf"></circle>
+        <circle cx="290" cy="150" r="2.6" class="s-accf"></circle>
+        <circle cx="316" cy="150" r="2.6" class="s-accf"></circle>
+        <circle cx="342" cy="150" r="2.6" class="s-accf"></circle>
+        <circle cx="366" cy="150" r="2.6" class="s-accf"></circle>
+        <circle cx="384" cy="150" r="2.6" class="s-accf"></circle>
+        <text x="104" y="76" class="t-acc">6 Gauss nodes per bin, per side of u*</text>
+        <line x1="150" y1="82" x2="150" y2="142" class="s-dashacc"></line>
+        <line x1="330" y1="82" x2="330" y2="142" class="s-dashacc"></line>
+
+        <text x="14" y="252" class="t-lab">6 &times; 14 bins &times; 2 pieces = 168 evaluations / horizon</text>
+        <text x="14" y="270" class="t-sm">22.4 GB of a 24.6 GB card before gradient checkpointing</text>
+        <text x="14" y="286" class="t-sm">at shape_mag = 3 the split rule&rsquo;s gradient error reaches 4.2e-2</text>
+
+        <line x1="486" y1="40" x2="486" y2="286" class="s-plain"></line>
+
+        <!-- right: closed form -->
+        <text x="516" y="24" class="t-hd">E1 &middot; E2 &middot; closed form</text>
+        <text x="516" y="42" class="t-sm">one segment [a, b], Q linear, e(u) = y &minus; Q(u)</text>
+
+        <line x1="546" y1="200" x2="546" y2="70" class="s-axis"></line>
+        <line x1="546" y1="200" x2="946" y2="200" class="s-axis"></line>
+        <line x1="546" y1="196" x2="946" y2="86" class="s-curve"></line>
+        <text x="900" y="78" class="t-sm">Q</text>
+        <line x1="546" y1="140" x2="946" y2="140" class="s-dash"></line>
+        <text x="950" y="144" class="t-sm">y</text>
+        <line x1="750" y1="140" x2="750" y2="200" class="s-wrn"></line>
+        <circle cx="750" cy="140" r="4" class="s-wrnf"></circle>
+        <text x="700" y="132" class="t-wrn">t*</text>
+        <text x="542" y="218" class="t-sm">a</text>
+        <text x="938" y="218" class="t-sm">b</text>
+
+        <rect x="546" y="228" width="204" height="20" class="s-accbox"></rect>
+        <text x="556" y="243" class="t-acc">e &gt; 0</text>
+        <rect x="750" y="228" width="196" height="20" class="s-box"></rect>
+        <text x="760" y="243" class="t-sm">e &lt; 0</text>
+
+        <text x="516" y="272" class="t-lab">t* = e<tspan baseline-shift="sub" font-size="8">a</tspan> / (e<tspan baseline-shift="sub" font-size="8">a</tspan> &minus; e<tspan baseline-shift="sub" font-size="8">b</tspan>), clamped to [0, 1]</text>
+        <text x="516" y="290" class="t-sm">e decreases in t, so the sign order cannot flip &mdash; no branch to get wrong</text>
+      </svg>
+    </div>
+    <figcaption>
+      <b>Figure 4 &mdash; the objective, priced</b>
+      Left: because <span class="mono">Q</span> has no closed-form CRPS, b1 splits the integral at the two
+      support crossings and the kink, then spends six nodes per piece. Right: with straight pieces the kink
+      location is the root of a linear function, the integrand is a quadratic, and a three-point Simpson
+      evaluation is <em>exact</em> rather than approximate. No nodes, no <code>--crps_nodes</code>, nothing to
+      checkpoint. Both implementations were checked against a dense numerical reference sharing no
+      quadrature code &mdash; the rational-quadratic closed form was once wrong by a relative error of ~1, and
+      the linear one once returned negatives.
+    </figcaption>
+  </figure>
+
+  <h2>E1 vs E1c &mdash; giving the tail a rate</h2>
+  <p class="kicker">a proposal, not a flag</p>
+
+  <div class="spec">
+    <div class="spec-head">
+      <span class="spec-id">E1c</span>
+      <span class="spec-name">ISQF with a learned bounded tail</span>
+      <span class="chip draft">not implemented</span>
+    </div>
+    <dl>
+      <dt>status</dt><dd>an E6&ndash;E8 candidate. No code exists; the construction below is a design</dd>
+      <dt>delta from E1</dt><dd>the two outermost segments stop being straight lines and become learned tails</dd>
+      <dt>params / horizon</dt><dd><span class="mono">18</span> = 16 + two tail rates, &beta;<sub>lo</sub> and &beta;<sub>hi</sub></dd>
+      <dt>aimed at</dt><dd>the far field &mdash; <span class="mono">tail_reach</span>, not the picket fence</dd>
+      <dt>why it is worth trying</dt><dd>the learned tail rate is ISQF's actual contribution, and it is the one idea from the paper this branch has not tried</dd>
+    </dl>
+    <div class="strip">
+      <span class="cell loc">0 &middot; q<sub>0</sub></span>
+      <span class="cell scl">1 &middot; scale</span>
+      <span class="cell shape">2&ndash;15 &middot; 14 increments</span>
+      <span class="cell add">16 &middot; &beta;<sub>lo</sub></span>
+      <span class="cell add">17 &middot; &beta;<sub>hi</sub></span>
+    </div>
+    <p class="strip-cap">two channels added; softplus keeps both positive</p>
+  </div>
+
+  <p>
+    E1 drops the paper's exponential tails on physical grounds, and the reasoning is correct:
+    <span class="mono">q(&alpha;) = a log &alpha; + b</span> is unbounded on both sides and HM is an index on
+    [0,&nbsp;1]. But dropping the mechanism also drops the thing the mechanism was for. In E1 the far
+    field is whatever the outermost bin's mass happens to buy, and beyond the last knot the clamp
+    simply holds &mdash; a hard stop, with no learned rate of approach.
+  </p>
+
+  <p>
+    E1c restores the tail in a coordinate where the bound sits at infinity. Take
+    <span class="mono">w = &minus;log(1 &minus; HM)</span>; the physical ceiling HM = 1 maps to
+    <span class="mono">w = &infin;</span>, so Park's exponential tail can be written there unchanged and
+    mapped back. The upper tail becomes
+  </p>
+
+  <p style="font-family: var(--f-mono); font-size: 0.9rem; background: var(--surface); border: 1px solid var(--rule); padding: 0.85rem 1rem; overflow-x: auto;">
+    Q(u) = 1 &minus; (1 &minus; q<sub>hi</sub>) &middot; [ (1&minus;u) / (1&minus;u<sub>hi</sub>) ]<sup>1/&beta;<sub>hi</sub></sup>
+  </p>
+
+  <p>
+    which meets the last knot exactly at <span class="mono">u<sub>hi</sub></span>, is strictly increasing
+    for any <span class="mono">&beta;<sub>hi</sub> &gt; 0</span>, and approaches 1 without ever
+    crossing it. The lower tail mirrors it toward 0 with
+    <span class="mono">Q(u) = q<sub>lo</sub> (u / u<sub>lo</sub>)<sup>1/&beta;<sub>lo</sub></sup></span>.
+    Small <span class="mono">&beta;</span> hugs the last knot; large <span class="mono">&beta;</span> reaches
+    for the bound.
+  </p>
+
+  <figure class="bleed">
+    <div class="fig-scroll">
+      <svg viewBox="0 0 980 330" role="img" aria-label="Left: in the upper tail E1 runs straight to its last knot and then stops at the clamp, while E1c curves asymptotically toward the physical bound at HM equals one with a learned rate. Right: in the transformed coordinate minus log of one minus HM, the same E1c tail is a straight line whose slope is one over beta, which is Park's exponential tail.">
+        <defs>
+          <marker id="a5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,1 L9,5 L0,9 z" class="s-dot"></path>
+          </marker>
+        </defs>
+
+        <!-- left: raw HM space -->
+        <text x="14" y="24" class="t-hd">in HM, the far field</text>
+        <text x="14" y="42" class="t-sm">u from 0.99 to 1 &mdash; the last two bins</text>
+
+        <line x1="60" y1="250" x2="60" y2="70" class="s-axis"></line>
+        <line x1="60" y1="250" x2="470" y2="250" class="s-axis"></line>
+        <text x="30" y="76" class="t-sm">HM</text>
+        <text x="462" y="270" class="t-sm">u</text>
+        <text x="52" y="270" class="t-sm">.99</text>
+        <text x="440" y="270" class="t-sm">1.0</text>
+
+        <!-- the physical bound -->
+        <line x1="60" y1="82" x2="470" y2="82" class="s-dash"></line>
+        <text x="64" y="76" class="t-sm">HM = 1, the bound</text>
+
+        <!-- shared body up to the last knot -->
+        <polyline points="60,222 130,206 200,184" class="s-curve"></polyline>
+        <circle cx="200" cy="184" r="4" class="s-dot"></circle>
+        <text x="64" y="176" class="t-sm">last knot, u = 0.999</text>
+        <line x1="150" y1="181" x2="194" y2="183" class="s-dash"></line>
+
+        <!-- E1: straight then clamp -->
+        <polyline points="200,184 300,150 300,150" class="s-line"></polyline>
+        <line x1="300" y1="150" x2="470" y2="150" class="s-line"></line>
+        <circle cx="300" cy="150" r="3" class="s-dot"></circle>
+        <text x="400" y="142" class="t-lab">E1</text>
+        <text x="248" y="174" class="t-sm">straight to u = 1, then clamped</text>
+
+        <!-- E1c: curved asymptote -->
+        <path d="M200,184 C250,160 300,132 350,114 C400,98 430,90 470,86" class="s-acc"></path>
+        <text x="64" y="108" class="t-acc">E1c</text>
+        <text x="64" y="124" class="t-acc">learned tail rate &beta;<tspan baseline-shift="sub" font-size="8">hi</tspan></text>
+        <path d="M196,118 L292,134" class="s-dashacc"></path>
+
+        <text x="14" y="300" class="t-sm">&beta; small &rarr; hugs the knot &nbsp;&middot;&nbsp; &beta; large &rarr; reaches for the bound</text>
+        <text x="14" y="318" class="t-sm">either way Q &lt; 1 for every u &lt; 1, so the clamp never has to act</text>
+
+        <line x1="506" y1="40" x2="506" y2="318" class="s-plain"></line>
+
+        <!-- right: transformed space -->
+        <text x="536" y="24" class="t-hd">in w = &minus;log(1 &minus; HM)</text>
+        <text x="536" y="42" class="t-sm">where the bound sits at infinity</text>
+
+        <line x1="580" y1="250" x2="580" y2="70" class="s-axis"></line>
+        <line x1="580" y1="250" x2="946" y2="250" class="s-axis"></line>
+        <text x="548" y="76" class="t-sm">w</text>
+        <text x="880" y="270" class="t-sm">&minus;log(1 &minus; u)</text>
+
+        <polyline points="580,222 640,206 700,190" class="s-curve"></polyline>
+        <circle cx="700" cy="190" r="4" class="s-dot"></circle>
+
+        <line x1="700" y1="190" x2="930" y2="98" class="s-acc"></line>
+        <text x="784" y="104" class="t-acc">slope = 1 / &beta;<tspan baseline-shift="sub" font-size="8">hi</tspan></text>
+        <text x="700" y="212" class="t-acc">Park&rsquo;s exponential tail, written</text>
+        <text x="700" y="228" class="t-acc">in a bounded coordinate</text>
+
+        <line x1="700" y1="190" x2="930" y2="152" class="s-line"></line>
+        <text x="898" y="140" class="t-sm">E1</text>
+
+        <text x="536" y="300" class="t-sm">the crossing u* stays analytic: u* = 1 &minus; (1&minus;u<tspan baseline-shift="sub" font-size="8">hi</tspan>)[(1&minus;y)/(1&minus;q<tspan baseline-shift="sub" font-size="8">hi</tspan>)]<tspan baseline-shift="super" font-size="8">&beta;</tspan></text>
+        <text x="536" y="318" class="t-sm">and &int;(1&minus;u)<tspan baseline-shift="super" font-size="8">1/&beta;</tspan> du is elementary, so the closed form survives</text>
+      </svg>
+    </div>
+    <figcaption>
+      <b>Figure 5 &mdash; E1 vs E1c, the outer two segments only</b>
+      Everything below <span class="mono">u = 0.999</span> is unchanged; the proposal touches the two
+      outermost segments and adds two channels. The right panel is the point: this is not a new mechanism,
+      it is Park's own exponential tail expressed in <span class="mono">&minus;log(1 &minus; HM)</span>, which
+      is exactly the adaptation the phase notes call for. The closed-form CRPS survives &mdash; the crossing and
+      both tail integrals are elementary &mdash; but they are two new expressions that must be checked against
+      the dense numerical reference before anything is believed, because this project has shipped a wrong
+      closed form twice.
+    </figcaption>
+  </figure>
+
+  <div class="note caution">
+    <span class="tag">what E1c does not do</span>
+    <p>
+      It does not touch the picket fence, which lives in the body. It also costs the property that makes
+      the current module cheap to reason about: one base class, one <code>crps</code>, one code path. Simplicity
+      is a scoring criterion on this branch, and <span class="mono">tail_reach20</span> correlates with
+      <span class="mono">pit_ks5</span> at r&nbsp;=&nbsp;0.691 across 13 runs &mdash; so a tail win and a PIT win
+      may be one axis, not two findings.
+    </p>
+  </div>
+
+  <h2>E2 vs E2a &mdash; making the fence impossible</h2>
+  <p class="kicker">the same head, with a floor under every gap</p>
+
+  <div class="spec">
+    <div class="spec-head">
+      <span class="spec-id">E2a</span>
+      <span class="spec-name">Piecewise linear with a density gap floor</span>
+      <span class="chip live">runnable</span>
+    </div>
+    <dl>
+      <dt>also known as</dt><dd>the slate's <strong>E4</strong> &mdash; same flags, same code path</dd>
+      <dt>flag</dt><dd><span class="mono">--head_family pwl --spline_gap_floor True</span></dd>
+      <dt>delta from E2</dt><dd>every bin reserves a minimum height before the softmax distributes what is left</dd>
+      <dt>params / horizon</dt><dd><span class="mono">16</span> &mdash; unchanged. The floor is a constraint, not a parameter</dd>
+      <dt>the physical statement</dt><dd>no segment may imply a density above <span class="mono">f_max = 578</span></dd>
+      <dt>where 578 comes from</dt><dd>the core's robust &sigma; is 0.00069, and a kernel that narrow supports at most ~578</dd>
+      <dt>source</dt><dd><code>gap_floor_heights</code> and <code>_cumulative_v</code> in <code>quantile_pwl.py</code></dd>
+    </dl>
+  </div>
+
+  <p>
+    E2 discourages a fence; E2a makes one unrepresentable. The mechanism is a reservation. A bin holding
+    probability <span class="mono">dp<sub>k</sub></span> over value width <span class="mono">w<sub>k</sub></span>
+    implies density <span class="mono">dp<sub>k</sub> / w<sub>k</sub></span>, and
+    <span class="mono">w<sub>k</sub></span> is <span class="mono">scale &middot; h<sub>k</sub></span> up to
+    normalisation &mdash; so bounding the density is bounding <span class="mono">h<sub>k</sub></span> from below.
+    Each bin takes its floor off the top; the softmax then shares out the remaining room, and the ladder
+    still sums to exactly 1.
+  </p>
+
+  <figure class="bleed">
+    <div class="fig-scroll">
+      <svg viewBox="0 0 980 340" role="img" aria-label="Left: under E2 the softmax can drive a bin's height to its minimum, collapsing a quantile gap and producing a needle in the density. Right: under E2a each bin first reserves a floor proportional to its probability divided by the scale, so the implied density cannot exceed the ceiling the observation noise supports.">
+        <defs>
+          <marker id="a6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,1 L9,5 L0,9 z" class="s-dot"></path>
+          </marker>
+          <marker id="a6w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,1 L9,5 L0,9 z" class="s-wrnf"></path>
+          </marker>
+        </defs>
+
+        <!-- E2 ladder -->
+        <text x="14" y="24" class="t-hd">E2 &middot; softmax alone</text>
+        <text x="14" y="42" class="t-sm">bin heights in v, stacked 0 &rarr; 1</text>
+        <rect x="24" y="62" width="54" height="200" class="s-plain"></rect>
+        <line x1="24" y1="92" x2="78" y2="92" class="s-plain"></line>
+        <line x1="24" y1="122" x2="78" y2="122" class="s-plain"></line>
+        <line x1="24" y1="148" x2="78" y2="148" class="s-plain"></line>
+        <line x1="24" y1="151" x2="78" y2="151" class="s-wrn"></line>
+        <line x1="24" y1="154" x2="78" y2="154" class="s-wrn"></line>
+        <line x1="24" y1="157" x2="78" y2="157" class="s-wrn"></line>
+        <line x1="24" y1="186" x2="78" y2="186" class="s-plain"></line>
+        <line x1="24" y1="220" x2="78" y2="220" class="s-plain"></line>
+        <text x="90" y="156" class="t-wrn">three bins at the</text>
+        <text x="90" y="170" class="t-wrn">1e-4 minimum</text>
+        <text x="14" y="284" class="t-sm">nothing stops the optimiser</text>
+        <text x="14" y="300" class="t-sm">collapsing a gap: raw CRPS is</text>
+        <text x="14" y="316" class="t-sm">dominated by the tail, and the</text>
+        <text x="14" y="332" class="t-sm">core spans 0.0036 of a range &gt; 1.2</text>
+
+        <!-- E2 density -->
+        <text x="250" y="24" class="t-hd">the density it implies</text>
+        <text x="250" y="42" class="t-sm">and what crosses the ceiling</text>
+        <line x1="260" y1="262" x2="450" y2="262" class="s-axis"></line>
+        <line x1="260" y1="262" x2="260" y2="70" class="s-axis"></line>
+        <line x1="260" y1="112" x2="450" y2="112" class="s-wrn" stroke-dasharray="4 4"></line>
+        <text x="266" y="106" class="t-wrn">578</text>
+        <path d="M260,258 L280,252 L300,240 L316,222 L326,206" class="s-curve"></path>
+        <path d="M330,206 L330,86 L334,86 L334,206" class="s-wrnf"></path>
+        <path d="M342,206 L342,96 L346,96 L346,206" class="s-wrnf"></path>
+        <path d="M354,206 L354,120 L358,120 L358,206" class="s-wrnf"></path>
+        <path d="M362,206 L374,224 L392,242 L414,254 L440,260" class="s-curve"></path>
+        <text x="352" y="80" class="t-wrn">677</text>
+        <text x="250" y="284" class="t-sm">needle mass: 4.5% at the median pixel,</text>
+        <text x="250" y="300" class="t-sm">21% at the 90th percentile</text>
+
+        <line x1="500" y1="40" x2="500" y2="332" class="s-plain"></line>
+
+        <!-- E2a ladder -->
+        <text x="530" y="24" class="t-hd">E2a &middot; floor first, then softmax</text>
+        <text x="530" y="42" class="t-sm">floor<tspan baseline-shift="sub" font-size="8">k</tspan> = dp<tspan baseline-shift="sub" font-size="8">k</tspan> / (f_max &middot; scale)</text>
+        <rect x="540" y="62" width="54" height="200" class="s-plain"></rect>
+        <rect x="540" y="62" width="54" height="12" class="s-accbox"></rect>
+        <rect x="540" y="92" width="54" height="12" class="s-accbox"></rect>
+        <rect x="540" y="128" width="54" height="12" class="s-accbox"></rect>
+        <rect x="540" y="164" width="54" height="12" class="s-accbox"></rect>
+        <rect x="540" y="200" width="54" height="12" class="s-accbox"></rect>
+        <rect x="540" y="236" width="54" height="12" class="s-accbox"></rect>
+        <line x1="540" y1="104" x2="594" y2="104" class="s-plain"></line>
+        <line x1="540" y1="140" x2="594" y2="140" class="s-plain"></line>
+        <line x1="540" y1="176" x2="594" y2="176" class="s-plain"></line>
+        <line x1="540" y1="212" x2="594" y2="212" class="s-plain"></line>
+        <text x="606" y="106" class="t-acc">reserved</text>
+        <text x="606" y="122" class="t-sm">then room = 1 &minus; &Sigma;floor</text>
+        <text x="606" y="138" class="t-sm">shared out by softmax</text>
+        <text x="530" y="284" class="t-sm">no bin can be thinner than its</text>
+        <text x="530" y="300" class="t-sm">floor, so no gap can collapse &mdash;</text>
+        <text x="530" y="316" class="t-sm">structural, not discouraged, and</text>
+        <text x="530" y="332" class="t-sm">&Sigma;h is still exactly 1</text>
+
+        <!-- E2a density -->
+        <text x="760" y="24" class="t-hd">the ceiling, enforced</text>
+        <line x1="770" y1="262" x2="946" y2="262" class="s-axis"></line>
+        <line x1="770" y1="262" x2="770" y2="70" class="s-axis"></line>
+        <line x1="770" y1="112" x2="946" y2="112" class="s-acc" stroke-dasharray="4 4"></line>
+        <text x="852" y="106" class="t-acc">578</text>
+        <path d="M770,258 L790,250 L808,236 L824,206 L838,150 L848,118 L862,116 L876,140 L892,196 L910,236 L930,254 L946,260" class="s-acc"></path>
+        <text x="768" y="284" class="t-sm">the mode stays sharp &mdash; the</text>
+        <text x="768" y="300" class="t-sm">target is trimodal, and forcing</text>
+        <text x="768" y="316" class="t-sm">unimodality is measurably wrong.</text>
+        <text x="768" y="332" class="t-sm">It just cannot outrun the data</text>
+      </svg>
+    </div>
+    <figcaption>
+      <b>Figure 6 &mdash; E2 vs E2a, one reservation</b>
+      The floor is proportional to <span class="mono">1 / scale</span>, so it bites hardest exactly where the
+      forecast is narrow. Two properties of the implementation are worth knowing before reading a result:
+      the floor is derived approximating the ladder's span by 1 when it is ~0.53 at Gaussian
+      initialisation, so the ceiling it actually enforces is nearer 300 than 578 &mdash; conservative by about 2&times;;
+      and when the floors alone would exceed 0.9 of the ladder the constraint is infeasible and backs off
+      proportionally rather than producing something non-normalisable. A pixel whose scale is small enough
+      to trigger that backoff is not covered by the guarantee.
+    </figcaption>
+  </figure>
+
+  <h2>The five, side by side</h2>
+  <p class="kicker">parameter counts are for default14 &mdash; 15 knots, 14 bins</p>
+
+  <div class="table-wrap bleed">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">head</th>
+          <th scope="col">flag</th>
+          <th scope="col">params / h</th>
+          <th scope="col">pieces</th>
+          <th scope="col">location pinned at</th>
+          <th scope="col">CRPS</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th scope="row">b1</th>
+          <td><span class="mono">--head_family spline</span></td>
+          <td class="num">29</td>
+          <td>rational-quadratic, C1</td>
+          <td><span class="mono">Q(0.5)</span></td>
+          <td>168 evals / horizon</td>
+        </tr>
+        <tr>
+          <th scope="row">E1</th>
+          <td><span class="mono">--head_family isqf</span></td>
+          <td class="num">16</td>
+          <td>linear, C0</td>
+          <td><span class="mono">Q(0)</span></td>
+          <td>closed form</td>
+        </tr>
+        <tr>
+          <th scope="row">E2</th>
+          <td><span class="mono">--head_family pwl</span></td>
+          <td class="num">16</td>
+          <td>linear, C0</td>
+          <td><span class="mono">Q(0.5)</span></td>
+          <td>closed form</td>
+        </tr>
+        <tr class="proposed">
+          <th scope="row">E1c</th>
+          <td><span class="mono">&mdash; not implemented &mdash;</span></td>
+          <td class="num">18</td>
+          <td>linear + two power tails</td>
+          <td><span class="mono">Q(0)</span></td>
+          <td>closed form, two new terms</td>
+        </tr>
+        <tr>
+          <th scope="row">E2a</th>
+          <td><span class="mono">--head_family pwl --spline_gap_floor True</span></td>
+          <td class="num">16</td>
+          <td>linear, C0, floored</td>
+          <td><span class="mono">Q(0.5)</span></td>
+          <td>closed form</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>
+    Read the table as three separate questions rather than five options. <strong>b1 vs E2</strong> asks whether
+    C1 smoothness was ever load-bearing &mdash; it has never been tested, and it is 13 of b1's 29 channels plus
+    the whole quadrature apparatus. <strong>E2 vs E1</strong> asks whether the median is the right thing to pin.
+    <strong>E2 vs E2a</strong> asks whether the fence needs to be forbidden or merely discouraged. E1c asks a
+    fourth question, about the far field, and is the only row here with no code behind it.
+  </p>
+
+  <footer class="page">
+    sources &mdash; src/models/quantile_spline.py &middot; src/models/quantile_pwl.py &middot;
+    src/models/crps_loss.py &middot; src/models/spatiotemporal_predictor.py &middot;
+    scripts/conv_spline_base.sh &middot; docs/conv_spline_phase.md<br>
+    measurements quoted are from docs/conv_spline_phase.md &sect;1; no experiment on this branch has been run
+  </footer>
+
+</main>
