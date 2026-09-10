@@ -9,9 +9,16 @@
 # is not evaluating. That is not hypothetical -- it cost a 35-minute run in the previous phase,
 # caught only by reading the run's own LOSS WEIGHTS banner.
 #
-# b1 is e1 plus exactly one change: --trunk_context True. That modification was accepted
+# b1 is e1 plus exactly one change: the neighbourhood context is injected into the TRUNK,
+# alongside elevation and climate, and NOT into the heads. That modification was accepted
 # without question, so it is part of the baseline rather than an experiment, and every
 # experiment below carries it.
+#
+# --central_context and --quantile_context are therefore named False, explicitly. e1 fed the
+# context to both heads and never to the trunk; carrying those two forward would leave b1
+# feeding it to all three, which is not one modification but two arrangements at once, and
+# the trunk change could not then be attributed. They are named rather than omitted for the
+# reason every other weight here is named: what BASE_ARGS does not name is inherited.
 
 export REGION="${REGION:-config/region_africa.geojson}"
 export FOLD_MASK="${FOLD_MASK:-data/raw/hm_global/fold_mask_b4_1000.tif}"
@@ -33,8 +40,8 @@ EXPECT_HIST="0.0"
 
 # val_crps, not val_total_loss: an experiment that sets --mu_mse_weight 0 would otherwise be
 # selecting epochs on a different quantity from every other run in the slate.
-export BASE_ARGS="--head_family spline --central_residual True --central_context True \
---quantile_context True --trunk_context True --checkpoint_monitor val_crps \
+export BASE_ARGS="--head_family spline --central_residual True --central_context False \
+--quantile_context False --trunk_context True --checkpoint_monitor val_crps \
 --ssim_weight ${EXPECT_SSIM} --laplacian_weight ${EXPECT_LAP} --histogram_weight ${EXPECT_HIST}"
 
 # Read the effective weights back out of the fold log and refuse to continue if they are not
@@ -88,12 +95,26 @@ verify_loss_weights() {
 # cannot tell "context wired" from "context silently absent". This greps the run's own
 # fingerprint line instead. Prove the check fires on a control before trusting it.
 verify_trunk_context() {
-  local log="$1" name="$2"
-  if ! grep -q "trunk context ON" "$log"; then
+  local log="$1" name="$2" got
+  if ! grep -q "trunk context ON" "$log" 2>/dev/null; then
     echo "FATAL: ${name} printed no trunk-context fingerprint; --trunk_context did not take" >&2
     return 1
   fi
-  echo "  ✓ ${name}: $(grep -m1 'Context consumers' "$log")"
+  # ON is necessary and not sufficient. b1 feeds the trunk and *nothing else*, so read the
+  # consumer list and require it to be exactly that. A head consumer left on does not break
+  # the run -- it trains happily and scores -- it just means the baseline is e1's arrangement
+  # AND the trunk change at once, and no comparison downstream can separate them. A missing
+  # or malformed line leaves `got` empty, which is not "trunk", so this fails closed.
+  got=$(grep -m1 'Context consumers:' "$log" 2>/dev/null \
+        | sed -e 's/.*Context consumers: //' -e 's/ *\[.*//' -e 's/[[:space:]]*$//')
+  if [ "$got" != "trunk" ]; then
+    echo "FATAL: ${name} context consumers are '${got:-<nothing read>}', want exactly 'trunk'." >&2
+    echo "       b1 injects the neighbourhood context into the trunk and not into the heads." >&2
+    echo "       Check --central_context / --quantile_context in BASE_ARGS and in whatever" >&2
+    echo "       --extra_train_args appended after it." >&2
+    return 1
+  fi
+  echo "  ✓ ${name}: context consumers = trunk only"
 }
 
 # Africa, not southern Africa, and not the globe. Southern Africa's far-field band holds ZERO

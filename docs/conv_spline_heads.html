@@ -301,6 +301,7 @@
   .s-axis  { fill: none; stroke: var(--ink-3); stroke-width: 1; }
   .s-dash  { fill: none; stroke: var(--ink-3); stroke-width: 1; stroke-dasharray: 3 3; }
   .s-dashacc { fill: none; stroke: var(--accent); stroke-width: 1.6; stroke-dasharray: 5 4; }
+  .s-dashoff { fill: none; stroke: var(--ink-3); stroke-width: 1.2; stroke-dasharray: 3 5; opacity: 0.55; }
   .s-dot   { fill: var(--ink); }
   .s-tick  { fill: none; stroke: var(--ink-3); stroke-width: 1; }
 
@@ -444,7 +445,7 @@
   </div>
 
   <h2>Where the head sits</h2>
-  <p class="kicker">the plumbing all five share</p>
+  <p class="kicker">the plumbing all seven share</p>
 
   <p>
     The trunk is a ConvLSTM over the HM stack plus static layers. Its final hidden state feeds
@@ -452,12 +453,23 @@
     <strong>shape head</strong>. Those three write one contiguous block of channels,
     <span class="mono">[location, scale, shape&hellip;]</span>, and a single decoder turns the block
     into one quantile function per horizon. That decoder is where the head families diverge; everything
-    to its left is identical across all five.
+    to its left is identical across all seven.
   </p>
 
+
+  <p>
+    One thing to its left did change, and it is the whole of <code>b1</code>. Under <code>e1</code> the
+    neighbourhood context reached <span class="mono">last_hidden</span> only &mdash; concatenated onto the
+    head inputs after the recurrence had already run &mdash; so the ConvLSTM never saw "can change happen
+    here at all" and could not combine it with its own spatial and temporal features. It could only have
+    the answer applied to its output. b1 moves the covariate to the trunk and takes it off the heads: one
+    consumer, not three. The precompute-on-the-full-raster requirement (radii &ge; 30 px saturate inside a
+    128 px chip) is about where the covariate is <em>derived</em>, not where it is consumed, so the same
+    precomputed tensor feeds the trunk unchanged.
+  </p>
   <figure class="bleed">
     <div class="fig-scroll">
-      <svg viewBox="0 0 980 372" role="img" aria-label="Flow from inputs through the ConvLSTM trunk to three per-horizon heads, whose channels are decoded into one quantile function per horizon. The neighbourhood context enters both the trunk and the heads.">
+      <svg viewBox="0 0 980 372" role="img" aria-label="Flow from inputs through the ConvLSTM trunk to three per-horizon heads, whose channels are decoded into one quantile function per horizon. The neighbourhood context enters the trunk only; under e1 it reached the heads instead.">
         <defs>
           <marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
             <path d="M0,1 L9,5 L0,9 z" class="s-dot"></path>
@@ -493,9 +505,10 @@
         <line x1="314" y1="99" x2="392" y2="99" class="s-line" marker-end="url(#a1)"></line>
         <text x="318" y="92" class="t-sm">last_hidden</text>
 
-        <!-- context re-entering the heads -->
-        <path d="M89,158 L89,258 L404,258 L404,214" class="s-dashacc"></path>
-        <text x="150" y="273" class="t-acc">the same tensor also concatenated onto every head input</text>
+        <!-- e1's path, which b1 removes -->
+        <path d="M89,158 L89,258 L404,258 L404,214" class="s-dashoff"></path>
+        <line x1="240" y1="248" x2="264" y2="268" class="s-wrn"></line>
+        <text x="150" y="286" class="t-sm">e1 fed the heads and never the trunk &mdash; b1 removes this path</text>
 
         <!-- heads -->
         <rect x="394" y="30" width="152" height="42" rx="2" class="s-box"></rect>
@@ -547,11 +560,14 @@
     </div>
     <figcaption>
       <b>Figure 1 &mdash; the shared path</b>
-      Three heads, one channel block, one decoder. <code>b1</code> is the previous phase's <code>e1</code> plus
-      exactly one edge: the accent arrow, where the neighbourhood context joins the trunk's static inputs
-      instead of reaching the heads alone. The context is still concatenated onto the head inputs as well
-      (dashed) &mdash; b1 adds a consumer, it does not move one. Every experiment below carries that change,
-      so none of them is comparable to a <code>dist-convlstm</code> number.
+      Three heads, one channel block, one decoder. <code>b1</code> is the previous phase's <code>e1</code> with
+      one edge <em>moved</em>: the neighbourhood context joins the trunk's static inputs, repeated across
+      timesteps, and no longer reaches the heads at all. <span class="mono">--central_context False
+      --quantile_context False --trunk_context True</span>, all three named in
+      <code>conv_spline_base.sh</code> rather than left to defaults. Feeding all three consumers would make
+      b1 two arrangements at once and leave the trunk change unattributable, which is why the runner reads
+      the consumer list back out of the run's own log and refuses anything but <span class="mono">trunk</span>.
+      Every experiment below carries that change, so none is comparable to a <code>dist-convlstm</code> number.
     </figcaption>
   </figure>
 
@@ -565,7 +581,7 @@
       <span class="chip live">runnable</span>
     </div>
     <dl>
-      <dt>flag</dt><dd><span class="mono">--head_family spline</span> (default), with <span class="mono">--trunk_context True</span></dd>
+      <dt>flag</dt><dd><span class="mono">--head_family spline</span> (default), with <span class="mono">--trunk_context True --central_context False --quantile_context False</span></dd>
       <dt>params / horizon</dt><dd><span class="mono">29</span> = anchor + scale + 14 bin heights + 13 internal slopes</dd>
       <dt>continuity</dt><dd>C1 &mdash; pieces meet with matching derivative</dd>
       <dt>location pinned at</dt><dd><span class="mono">Q(0.5) = anchor</span></dd>

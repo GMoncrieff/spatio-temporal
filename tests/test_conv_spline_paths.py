@@ -70,6 +70,66 @@ def test_verify_loss_weights_fails_closed_without_a_banner(tmp_path):
     assert not _verify(p)
 
 
+CONSUMERS = "Context consumers: {who}   [trunk context {onoff}]\n"
+
+
+def _verify_trunk(log_path):
+    """Run verify_trunk_context out of conv_spline_base.sh; True iff it accepts the log."""
+    script = (
+        f'source "{ROOT}/scripts/conv_spline_base.sh"\n'
+        f'verify_trunk_context "{log_path}" probe\n'
+    )
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True).returncode == 0
+
+
+def _consumer_log(tmp_path, name, who, onoff="ON"):
+    p = tmp_path / name
+    p.write_text("Context: 8 channels (radii 1,2,4)\n"
+                 + CONSUMERS.format(who=who, onoff=onoff))
+    return p
+
+
+def test_verify_trunk_context_accepts_the_trunk_alone(tmp_path):
+    assert _verify_trunk(_consumer_log(tmp_path, "b1.log", "trunk"))
+
+
+def test_verify_trunk_context_rejects_a_head_consumer(tmp_path):
+    """The regression: e1's --central_context/--quantile_context carried into b1's BASE_ARGS.
+
+    'trunk context ON' was true of that log, so the old check passed it. b1 is then e1's
+    arrangement *and* the trunk change, and nothing downstream can attribute either.
+    """
+    assert not _verify_trunk(_consumer_log(tmp_path, "both.log", "trunk, central, quantile"))
+    assert not _verify_trunk(_consumer_log(tmp_path, "one.log", "trunk, quantile"))
+
+
+def test_verify_trunk_context_rejects_the_heads_alone(tmp_path):
+    """e1 itself: the control the fingerprint has to discriminate against."""
+    assert not _verify_trunk(
+        _consumer_log(tmp_path, "e1.log", "central, quantile", onoff="off"))
+
+
+def test_verify_trunk_context_fails_closed_on_a_missing_log(tmp_path):
+    assert not _verify_trunk(tmp_path / "does_not_exist.log")
+
+
+def test_verify_trunk_context_fails_closed_without_the_consumer_line(tmp_path):
+    """'trunk context ON' present, consumer list absent -- got is empty, not 'trunk'."""
+    p = tmp_path / "partial.log"
+    p.write_text("something   [trunk context ON]\nepoch 0\n")
+    assert not _verify_trunk(p)
+
+
+def test_base_args_names_every_context_consumer():
+    """Rule 16: what BASE_ARGS does not name, --extra_train_args can inherit from elsewhere."""
+    out = subprocess.run(
+        ["bash", "-c", f'source "{ROOT}/scripts/conv_spline_base.sh"\nprintf "%s" "$BASE_ARGS"'],
+        capture_output=True, text=True, check=True).stdout
+    assert "--trunk_context True" in out
+    assert "--central_context False" in out
+    assert "--quantile_context False" in out
+
+
 def _runner_args(tmp_path, env_extra):
     """Run run_central_experiment.sh with a stub interpreter; return the args it would pass."""
     stub = tmp_path / "fakepy"
