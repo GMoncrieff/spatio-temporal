@@ -109,7 +109,7 @@ def test_a_missing_context_raises_instead_of_being_zeroed():
     m = SpatioTemporalPredictor(
         hidden_dim=8, num_layers=1, num_static_channels=2, num_dynamic_channels=4,
         use_location_encoder=False, central_residual=True,
-        quantile_context_channels=8, central_context_channels=8)
+        context_channels=8)
     with pytest.raises(RuntimeError, match="context"):
         m(torch.randn(2, 3, 4, 16, 16), torch.randn(2, 2, 16, 16))
 
@@ -120,10 +120,10 @@ def test_a_wrong_width_context_raises():
     m = SpatioTemporalPredictor(
         hidden_dim=8, num_layers=1, num_static_channels=2, num_dynamic_channels=4,
         use_location_encoder=False, central_residual=True,
-        quantile_context_channels=12, central_context_channels=12)
+        context_channels=12)
     with pytest.raises(RuntimeError, match="12"):
         m(torch.randn(2, 3, 4, 16, 16), torch.randn(2, 2, 16, 16),
-          quantile_context=torch.randn(2, 8, 16, 16))
+          context=torch.randn(2, 8, 16, 16))
 
 
 def test_an_eight_channel_checkpoint_is_rejected_by_a_twelve_channel_model():
@@ -134,7 +134,7 @@ def test_an_eight_channel_checkpoint_is_rejected_by_a_twelve_channel_model():
         return SpatioTemporalPredictor(
             hidden_dim=8, num_layers=1, num_static_channels=2, num_dynamic_channels=4,
             use_location_encoder=False, central_residual=True,
-            quantile_context_channels=n, central_context_channels=n)
+            context_channels=n)
 
     old, new = build(8), build(12)
     with pytest.raises(RuntimeError):

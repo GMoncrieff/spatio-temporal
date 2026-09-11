@@ -27,14 +27,25 @@ menu, and why each experiment exists.
 
 **Nothing has been run.** The code is in place; the data is not on this machine.
 
-1. **Step 1, not yet run** — establish `b1`: `e1` plus one accepted modification, the
-   neighbourhood context injected into the **trunk** alongside elevation and climate rather
-   than into the heads. Three seeds, on Africa. `./scripts/run_conv_spline_baseline.sh`
+1. **Step 1, not yet run** — establish `b1`. Three seeds, on Africa.
+   `./scripts/run_conv_spline_baseline.sh`
 2. **Then** the E0–E5 slate. `./scripts/run_conv_spline_slate.sh`
-3. **E6–E8 are chosen from what E0–E5 measure**, not written in advance.
+3. **Then §4.1's scale arms** — E0a first and alone, then E1a and E1b in either order, E2a
+   paired with E1b, E1c last. `run_conv_spline_slate.sh` knows E0–E5 only, so none of them has
+   a runner entry yet, and three need `--free_scale` / `--isqf_tails`, which do not exist.
+4. **E6–E8 are chosen from what E0–E5 and §4.1 measure**, not written in advance.
 
 Nothing on this branch is comparable to a `dist-convlstm` number: the trunk change alone makes
 `b1` a different model, and the scorecard carries two gates `e1` never had.
+
+**The neighbourhood context is a covariate, not a setting.** Distance to past change and the
+neighbourhood HM summaries go into the **trunk**, repeated across timesteps beside elevation and
+climate, and into **no head**. There is nothing to pass: `--trunk_context`, `--central_context`
+and `--quantile_context` were removed, and the wiring is part of the model. `e1` fed the heads
+and never the trunk; everything from `b1` onward feeds the trunk and never the heads. The run's
+log reports the channel count the trunk was actually built with — read off the module, not off a
+flag — and `verify_context_wiring` refuses a run where that is zero, disagrees with what
+`--context_radii` / `--hm_context_stats` imply, or says a head received it.
 
 ## The two defects the phase exists to fix
 
@@ -141,8 +152,11 @@ Kept only where they still apply. Numbering is fresh; the old file's numbers are
    check where the cause is one line away: `validate_knots` refuses a bad grid at definition
    time, the qf reader refuses a non-increasing u-grid rather than passing NaN downstream.
 5. **Prove a check fires on a control, or it checks nothing.** Before `conv_spline_base.sh` was
-   allowed to grep for the trunk-context fingerprint, that fingerprint was verified to
-   discriminate ON from off. **A check can also fail *open*, which is silent.**
+   allowed to grep for the context fingerprint, that fingerprint was verified to discriminate.
+   **ON is not the same as ONLY**: the first version checked that the trunk context was on, and
+   passed `b1`'s own misconfiguration, because `e1`'s head consumers were on too. The check now
+   reads the trunk's channel count off the module and refuses a head consumer. **A check can
+   also fail *open*, which is silent.**
    `verify_loss_weights` passed on a log file that did not exist: every expected weight in this
    phase is 0.0, `grep` on a missing file returns nothing, and awk coerces `""` to 0, so all
    three comparisons read 0==0 and the check reported success having read nothing. When a
@@ -178,15 +192,21 @@ Kept only where they still apply. Numbering is fresh; the old file's numbers are
 16. **"No extra flags" is not the production architecture — it is argparse defaults**, and
     **"the flags I passed" is not "the flags that took effect."** `run_hindcast_folds.py`
     injects the frozen product's loss weights and `--extra_train_args` is appended last, so
-    anything `BASE_ARGS` does not name is silently inherited. `conv_spline_base.sh` names every
-    weight and reads them back out of the run's own log.
+    anything `BASE_ARGS` does not name is silently inherited. `conv_spline_base.sh` names all
+    four loss weights — including `--mu_mse_weight`, which was an argparse default on every arm
+    until 2026-09-11 — and reads them back out of the run's own log. The context needs no such
+    naming any more: it is not a flag, so nothing appended later can turn it off.
 17. **Any long-range covariate must be precomputed on the full raster**, never derived inside a
     128 px chip (radii ≥ 30 px saturate against the chip boundary). This is about where the
     covariate is *derived*, not where it is *consumed* — which is why b1 can feed the same
     precomputed tensor to the trunk.
-18. **The stitched hindcast is a quilt of five fold models, and the seam is real.** Products and
-    display rasters use `--stitch_mode mean` (seamless, in-sample); **anything scored stays on
-    `holdout`**. Never score a mean-stitched raster.
+18. **The stitched hindcast is a quilt of five fold models, and the seam is real.** Anything
+    scored stays on `--stitch_mode holdout`. **`mean` through `run_hindcast_folds.py` is not a
+    five-fold average**: `--predict_restrict_mask` is passed unconditionally, so each fold
+    predicts only tiles overlapping its own territory and a block's interior has exactly one
+    prediction to average. A real mean needs a prediction pass without the restriction. The
+    forward product is neither — it is a separate `--train_all_splits` model
+    (`run_global_dist_forecast.sh`), which is why the configuration is validated by k-fold.
 19. **The fold tile is one correlation length, so held-out skill is optimistic.** The residual
     field's practical range on Africa is 99–166 px against a 128 px fold tile. `fold_mask_b4`
     (512 px blocks) is what this phase uses.
@@ -220,7 +240,9 @@ Kept only where they still apply. Numbering is fresh; the old file's numbers are
   the boolean idiom is
   `type=lambda x: (str(x).lower()=='true'), nargs='?', const=True, default=…`.
 - Tests are flat in `tests/`, pytest, `sys.path.insert(0, parent)` + absolute imports,
-  synthetic tensors. **The suite stands at 355 passed / 15 failed.** Those 15 fail identically
+  synthetic tensors. **The suite stood at 355 passed / 15 failed** when this phase began; tests
+  have been added since (`test_conv_spline_paths.py`, 0 → 20) and the count has not been
+  re-measured. Those 15 fail identically
   on `dist-convlstm` (stale legacy tests asserting a 4-channel output from a model that emits
   12, plus fixtures needing data that is not on this machine). Any other failure is yours.
 - **A new experiment needs a test that it changed something**, against a seeded control. A flag
@@ -229,4 +251,5 @@ Kept only where they still apply. Numbering is fresh; the old file's numbers are
 - Scripts write to `data/conv_spline/exp/<name>/` so configurations never collide.
 - Simplicity is a scoring criterion, not a preference. A simpler configuration that gives back
   a little is preferred to a more complex one that does not; the parameter count per horizon is
-  reported alongside the metrics for that reason (spline 29, pwl/isqf 16, skew11 23).
+  reported alongside the metrics for that reason (spline 29, pwl/isqf 16, skew11 23,
+  free-scale 15, E1a 18, E1c 17).

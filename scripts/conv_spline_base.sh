@@ -9,16 +9,17 @@
 # is not evaluating. That is not hypothetical -- it cost a 35-minute run in the previous phase,
 # caught only by reading the run's own LOSS WEIGHTS banner.
 #
-# b1 is e1 plus exactly one change: the neighbourhood context is injected into the TRUNK,
-# alongside elevation and climate, and NOT into the heads. That modification was accepted
-# without question, so it is part of the baseline rather than an experiment, and every
-# experiment below carries it.
+# The neighbourhood context -- distance to past change and the neighbourhood HM summaries --
+# goes into the TRUNK, beside elevation and climate, and into no head. That is not a setting:
+# --trunk_context, --central_context and --quantile_context no longer exist, and the wiring is
+# part of the model. e1 fed the heads and never the trunk; b1 and everything after it feed the
+# trunk and never the heads.
 #
-# --central_context and --quantile_context are therefore named False, explicitly. e1 fed the
-# context to both heads and never to the trunk; carrying those two forward would leave b1
-# feeding it to all three, which is not one modification but two arrangements at once, and
-# the trunk change could not then be attributed. They are named rather than omitted for the
-# reason every other weight here is named: what BASE_ARGS does not name is inherited.
+# Nothing to name in BASE_ARGS, therefore, and nothing that --extra_train_args could override
+# back. What is still worth verifying is that the covariate arrived at all: the run's own log
+# reports the channel count the trunk was built with, read off the module rather than off a
+# flag, and verify_context_wiring below refuses a run where that is zero or disagrees with the
+# channel count --context_radii / --hm_context_stats imply.
 
 export REGION="${REGION:-config/region_africa.geojson}"
 export FOLD_MASK="${FOLD_MASK:-data/raw/hm_global/fold_mask_b4_1000.tif}"
@@ -47,8 +48,7 @@ EXPECT_MU_MSE="1.0"
 
 # val_crps, not val_total_loss: an experiment that sets --mu_mse_weight 0 would otherwise be
 # selecting epochs on a different quantity from every other run in the slate.
-export BASE_ARGS="--head_family spline --central_residual True --central_context False \
---quantile_context False --trunk_context True --checkpoint_monitor val_crps \
+export BASE_ARGS="--head_family spline --central_residual True --checkpoint_monitor val_crps \
 --mu_mse_weight ${EXPECT_MU_MSE} \
 --ssim_weight ${EXPECT_SSIM} --laplacian_weight ${EXPECT_LAP} --histogram_weight ${EXPECT_HIST}"
 
@@ -104,30 +104,39 @@ verify_loss_weights() {
 }
 
 # The trunk must actually receive the context, and under --central_residual the ConvLSTM's
-# gradient from the *central* loss is zero by construction -- so the startup banner alone
-# cannot tell "context wired" from "context silently absent". This greps the run's own
-# fingerprint line instead. Prove the check fires on a control before trusting it.
-verify_trunk_context() {
-  local log="$1" name="$2" got
-  if ! grep -q "trunk context ON" "$log" 2>/dev/null; then
-    echo "FATAL: ${name} printed no trunk-context fingerprint; --trunk_context did not take" >&2
+# gradient from the *central* loss is zero by construction -- so a trunk that never got the
+# covariate trains, scores, and looks exactly like a trunk that got it and ignored it. There
+# is no flag to inspect any more, so the fingerprint is the module's own channel count, and
+# this cross-checks it against the count --context_radii / --hm_context_stats imply. Prove a
+# check fires on a control before trusting it (tests/test_conv_spline_paths.py).
+verify_context_wiring() {
+  local log="$1" name="$2" n_args n_trunk
+  if [ ! -r "$log" ]; then
+    echo "FATAL: ${name}: no readable fold log at ${log}; context wiring unverified." >&2
     return 1
   fi
-  # ON is necessary and not sufficient. b1 feeds the trunk and *nothing else*, so read the
-  # consumer list and require it to be exactly that. A head consumer left on does not break
-  # the run -- it trains happily and scores -- it just means the baseline is e1's arrangement
-  # AND the trunk change at once, and no comparison downstream can separate them. A missing
-  # or malformed line leaves `got` empty, which is not "trunk", so this fails closed.
-  got=$(grep -m1 'Context consumers:' "$log" 2>/dev/null \
-        | sed -e 's/.*Context consumers: //' -e 's/ *\[.*//' -e 's/[[:space:]]*$//')
-  if [ "$got" != "trunk" ]; then
-    echo "FATAL: ${name} context consumers are '${got:-<nothing read>}', want exactly 'trunk'." >&2
-    echo "       b1 injects the neighbourhood context into the trunk and not into the heads." >&2
-    echo "       Check --central_context / --quantile_context in BASE_ARGS and in whatever" >&2
-    echo "       --extra_train_args appended after it." >&2
+  n_args=$(grep -m1 "^Context channels:" "$log" | awk '{print $3}')
+  n_trunk=$(grep -m1 "^Context into trunk:" "$log" | awk '{print $4}')
+  if [ -z "$n_trunk" ] || [ -z "$n_args" ]; then
+    echo "FATAL: ${name}: ${log} carries no context fingerprint." >&2
+    echo "  Context channels='${n_args:-<nothing read>}' into trunk='${n_trunk:-<nothing read>}'" >&2
     return 1
   fi
-  echo "  ✓ ${name}: context consumers = trunk only"
+  if ! [ "$n_trunk" -gt 0 ] 2>/dev/null; then
+    echo "FATAL: ${name}: the trunk was built with ${n_trunk} context channels." >&2
+    echo "       The covariate never reached the model; the run is not this configuration." >&2
+    return 1
+  fi
+  if [ "$n_trunk" != "$n_args" ]; then
+    echo "FATAL: ${name}: trunk has ${n_trunk} context channels, the flags imply ${n_args}." >&2
+    echo "       Check --context_radii / --hm_context_stats against the checkpoint, if any." >&2
+    return 1
+  fi
+  if ! grep -q "^Context into trunk:.*heads: none" "$log"; then
+    echo "FATAL: ${name}: the log does not say the heads are excluded." >&2
+    return 1
+  fi
+  echo "  ✓ ${name}: context wiring verified (${n_trunk} channels -> trunk, heads none)"
 }
 
 # Africa, not southern Africa, and not the globe. Southern Africa's far-field band holds ZERO

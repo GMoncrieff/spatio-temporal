@@ -42,11 +42,9 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         histogram_lambda_w2: float = 0.1,
         histogram_warmup_epochs: int = 20,
         quantile_class_weighting: str = 'none',
-        quantile_context_channels: int = 0,
+        context_channels: int = 0,
         quantile_weight_change_bins: bool = True,
         freeze_trunk: bool = False,
-        central_context_channels: int = 0,
-        trunk_context_channels: int = 0,
         central_residual: bool = False,
         monotone_quantile_width: bool = False,
         quantile_dhat_context: bool = False,
@@ -118,9 +116,7 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             locenc_backbone=locenc_backbone,
             locenc_hparams=locenc_hparams,
             locenc_out_channels=locenc_out_channels,
-            quantile_context_channels=quantile_context_channels,
-            central_context_channels=central_context_channels,
-            trunk_context_channels=trunk_context_channels,
+            context_channels=context_channels,
             central_residual=central_residual,
             monotone_quantile_width=monotone_quantile_width,
             quantile_dhat_context=quantile_dhat_context,
@@ -187,9 +183,7 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         self.quantile_weight_change_bins = bool(quantile_weight_change_bins)
         self.freeze_trunk = bool(freeze_trunk)
         self._quantile_weights = None
-        self.quantile_context_channels = int(quantile_context_channels)
-        self.central_context_channels = int(central_context_channels)
-        self.trunk_context_channels = int(trunk_context_channels)
+        self.context_channels = int(context_channels)
         # Every distributional head family. Defined once: three separate
         # `head_family == 'spline'` comparisons is exactly how 'pwl' silently took
         # the triple-head two-pass path and arrived at backward with no graph.
@@ -532,19 +526,18 @@ class SpatioTemporalLightningModule(pl.LightningModule):
             change = (target_h - last) * float(getattr(self, 'hm_std', 1.0))
         return class_balanced_weights(past, mask, target_change=change)
 
-    def _build_quantile_context(self, input_dynamic, change_context=None, hm_context=None):
-        """Past-change occupancy for the quantile heads (see change_weights).
+    def _build_context(self, input_dynamic, change_context=None, hm_context=None):
+        """The neighbourhood covariate the trunk consumes: past-change occupancy and
+        distance to past change, plus the neighbourhood HM summaries.
 
         Prefers the precomputed full-raster context (band 1 past change, band 2 distance);
         falls back to the chip-local dilation only when none is supplied, which is correct
         just for chips much larger than the biggest radius.
 
-        The same tensor feeds the central heads when they are configured to take it — the
-        features answer the same question ("can change happen here at all"), so there is no
-        reason to compute two of them.
+        There is one consumer and one tensor. It goes into the trunk beside elevation and
+        climate; no head receives it.
         """
-        if (self.quantile_context_channels <= 0 and self.central_context_channels <= 0
-                and self.trunk_context_channels <= 0):
+        if self.context_channels <= 0:
             return None
         hm_now = input_dynamic[:, -1, 0:1]
         if change_context is not None:
@@ -573,8 +566,8 @@ class SpatioTemporalLightningModule(pl.LightningModule):
         # Ensure input_dynamic is [B, T, 1, H, W]
         if input_dynamic.dim() == 4:
             input_dynamic = input_dynamic.unsqueeze(2)
-        ctx = self._build_quantile_context(input_dynamic, change_context, hm_context)
-        return self.model(input_dynamic, input_static, lonlat=lonlat, quantile_context=ctx)
+        ctx = self._build_context(input_dynamic, change_context, hm_context)
+        return self.model(input_dynamic, input_static, lonlat=lonlat, context=ctx)
 
     def training_step(self, batch, batch_idx):
         # Get optimizer (manual optimization)

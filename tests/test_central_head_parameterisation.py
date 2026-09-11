@@ -79,10 +79,10 @@ def test_absolute_parameterisation_is_unchanged_by_default():
 
 
 def test_monotone_width_is_non_decreasing_and_brackets_central():
-    model = build(quantile_context_channels=N_CTX, monotone_quantile_width=True)
+    model = build(context_channels=N_CTX, monotone_quantile_width=True)
     dyn, stat, ctx = inputs()
     with torch.no_grad():
-        pred = model(dyn, stat, quantile_context=ctx)
+        pred = model(dyn, stat, context=ctx)
     lo = pred[:, 0::3]
     ce = pred[:, 1::3]
     up = pred[:, 2::3]
@@ -96,11 +96,11 @@ def test_monotone_width_is_non_decreasing_and_brackets_central():
 
 def test_monotone_width_initial_scale_is_sane():
     """softplus(0) would start intervals ~0.11 HM wide; the bias must fix that."""
-    model = build(quantile_context_channels=N_CTX, monotone_quantile_width=True,
+    model = build(context_channels=N_CTX, monotone_quantile_width=True,
                   initial_width_normalized=0.065)
     dyn, stat, ctx = inputs()
     with torch.no_grad():
-        pred = model(dyn, stat, quantile_context=ctx)
+        pred = model(dyn, stat, context=ctx)
     first_half_width = (pred[:, 2:3] - pred[:, 1:2]).mean().item()
     assert 0.01 < first_half_width < 0.25, first_half_width
 
@@ -113,9 +113,9 @@ def test_anchoring_adds_no_gradient_path_into_the_central_heads():
     in ``training_step`` by saving and restoring the central-loss gradients. What is new is
     ``upper = central.detach() + w``, and the detach is what this asserts.
     """
-    model = build(quantile_context_channels=N_CTX, monotone_quantile_width=True)
+    model = build(context_channels=N_CTX, monotone_quantile_width=True)
     dyn, stat, ctx = inputs()
-    pred = model(dyn, stat, quantile_context=ctx)
+    pred = model(dyn, stat, context=ctx)
     (pred[:, 0::3].sum() + pred[:, 2::3].sum()).backward()
     for h_idx, head in enumerate(model.central_heads):
         for name, p in head.named_parameters():
@@ -125,10 +125,10 @@ def test_anchoring_adds_no_gradient_path_into_the_central_heads():
 
 def test_central_loss_does_not_reach_the_quantile_heads():
     """The reverse direction: the central objective must leave the interval heads alone."""
-    model = build(quantile_context_channels=N_CTX, monotone_quantile_width=True,
+    model = build(context_channels=N_CTX, monotone_quantile_width=True,
                   central_residual=True)
     dyn, stat, ctx = inputs()
-    pred = model(dyn, stat, quantile_context=ctx)
+    pred = model(dyn, stat, context=ctx)
     central_channels(pred).sum().backward()
     for heads, tag in ((model.lower_heads, "lower"), (model.upper_heads, "upper")):
         for h_idx, head in enumerate(heads):
@@ -137,13 +137,19 @@ def test_central_loss_does_not_reach_the_quantile_heads():
                     f"{tag} head {h_idx}.{name} got central grad")
 
 
-def test_central_context_changes_the_central_prediction():
-    model = build(central_context_channels=N_CTX)
+def test_context_changes_the_central_prediction():
+    """The covariate reaches the central forecast through the trunk, not through the head.
+
+    The head no longer takes the context directly, so this is now an end-to-end check that
+    the trunk carried it: if the ConvLSTM ignored its context channels, the central output
+    would be identical for two different contexts.
+    """
+    model = build(context_channels=N_CTX)
     dyn, stat, ctx = inputs()
     with torch.no_grad():
-        a = central_channels(model(dyn, stat, quantile_context=ctx))
-        b = central_channels(model(dyn, stat, quantile_context=torch.zeros_like(ctx)))
-    assert not torch.allclose(a, b), "central heads ignore the context they were given"
+        a = central_channels(model(dyn, stat, context=ctx))
+        b = central_channels(model(dyn, stat, context=torch.zeros_like(ctx)))
+    assert not torch.allclose(a, b), "the trunk ignored the context the central head depends on"
 
 
 def test_missing_context_is_refused():
@@ -156,23 +162,23 @@ def test_missing_context_is_refused():
     hypothetical one. The behaviour was changed deliberately; see
     docs/superpowers/specs/2026-08-25-distributional-round-2-design.md §5.2.
     """
-    model = build(central_context_channels=N_CTX, quantile_context_channels=N_CTX)
+    model = build(context_channels=N_CTX)
     dyn, stat, ctx = inputs()
     with pytest.raises(RuntimeError, match="context"):
         with torch.no_grad():
-            model(dyn, stat, quantile_context=None)
+            model(dyn, stat, context=None)
     # ...and the supplied case still works, or this would pass for the wrong reason.
     with torch.no_grad():
-        pred = model(dyn, stat, quantile_context=ctx)
+        pred = model(dyn, stat, context=ctx)
     assert pred.shape == (B, 12, H, W)
     assert torch.isfinite(pred).all()
 
 
 @pytest.mark.parametrize("residual", [False, True])
 def test_output_contract_is_12_channels(residual):
-    model = build(central_residual=residual, quantile_context_channels=N_CTX,
+    model = build(central_residual=residual, context_channels=N_CTX,
                   monotone_quantile_width=True)
     dyn, stat, ctx = inputs()
     with torch.no_grad():
-        pred = model(dyn, stat, quantile_context=ctx)
+        pred = model(dyn, stat, context=ctx)
     assert pred.shape == (B, 12, H, W)

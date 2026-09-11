@@ -26,7 +26,7 @@ B, T, H, W, C_CTX = 2, 3, 32, 32, 8
 BASE = dict(hidden_dim=8, num_static_channels=2, num_dynamic_channels=1,
             use_location_encoder=False, central_residual=True,
             ssim_weight=0.0, laplacian_weight=0.0, histogram_weight=0.0,
-            quantile_context_channels=C_CTX, central_context_channels=C_CTX)
+            context_channels=C_CTX)
 
 
 def module(seed=0, **kw):

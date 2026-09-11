@@ -29,7 +29,7 @@ GPUS="${GPUS:-0,1}"
 ROOT="data/ensemble/exp/${NAME}"
 REGION_ROOT="data/ensemble/region/southern_africa"
 SCORE_DIR="${SCORE_DIR:-data/ensemble/exp/scores}"
-PHASE_REF="${PHASE_REF:---central_residual True --central_context True --monotone_quantile_width True --quantile_context True --histogram_weight 0 --checkpoint_monitor val_central_loss}"
+PHASE_REF="${PHASE_REF:---central_residual True --monotone_quantile_width True --histogram_weight 0 --checkpoint_monitor val_central_loss}"
 
 echo "############ promoting ${NAME} to k=5 (${EPOCHS} epochs, M=${MEMBERS}) ############"
 

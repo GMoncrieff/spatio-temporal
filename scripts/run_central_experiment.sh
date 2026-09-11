@@ -59,8 +59,7 @@ if [ -z "${BASE_ARGS}${EXTRA}" ]; then
   echo "WARNING: no BASE_ARGS and no extra flags — training with argparse DEFAULTS," >&2
   echo "         which is NOT the shipped configuration (--central_residual defaults False)." >&2
   echo "         The shipped set is:" >&2
-  echo "           --central_residual True --central_context True \\" >&2
-  echo "           --monotone_quantile_width True --quantile_context True" >&2
+  echo "           --central_residual True --monotone_quantile_width True" >&2
   echo "         Set BASE_ARGS to it, or export ALLOW_DEFAULT_ARCH=1 to proceed anyway." >&2
   [ -n "${ALLOW_DEFAULT_ARCH:-}" ] || exit 3
 fi

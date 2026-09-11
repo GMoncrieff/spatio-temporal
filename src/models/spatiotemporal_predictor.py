@@ -48,9 +48,7 @@ class SpatioTemporalPredictor(nn.Module):
                  locenc_backbone=("sphericalharmonics", "siren"),
                  locenc_hparams=None,
                  locenc_out_channels: int = 8,
-                 quantile_context_channels: int = 0,
-                 central_context_channels: int = 0,
-                 trunk_context_channels: int = 0,
+                 context_channels: int = 0,
                  central_residual: bool = False,
                  monotone_quantile_width: bool = False,
                  quantile_dhat_context: bool = False,
@@ -100,17 +98,20 @@ class SpatioTemporalPredictor(nn.Module):
                 raise ValueError(
                     f"convlstm_dilations has {len(self.convlstm_dilations)} entries for "
                     f"{num_layers} layers")
-        # Neighbourhood context handed to the *trunk*, repeated across timesteps exactly like
-        # elevation and climate. Until this phase the context reached the heads only, so the
-        # ConvLSTM never saw "can change happen here at all" and could not combine it with its
-        # own spatial features -- it could only have the answer applied to its output. Nothing
-        # ever forced that choice; the precompute-on-the-full-raster requirement (radii >= 30 px
-        # saturate inside a 128 px chip) is about where the covariate is *derived*, not where it
-        # is *consumed*.
-        self.trunk_context_channels = int(trunk_context_channels)
+        # The neighbourhood context -- distance to past change and the neighbourhood HM
+        # summaries -- is an ordinary covariate. It enters the trunk, repeated across
+        # timesteps exactly like elevation and climate, and it enters nowhere else. This is
+        # not a mode and there is no flag: a model that did not see it would be a different
+        # model, and the heads receiving it a second time was e1's arrangement, not this
+        # one's.
+        #
+        # The precompute-on-the-full-raster requirement (radii >= 30 px saturate inside a
+        # 128 px chip) is about where the covariate is *derived*, not where it is consumed,
+        # which is what lets the same precomputed tensor feed the trunk.
+        self.context_channels = int(context_channels)
         self.convlstm = ConvLSTM(
             input_dim=(self.num_dynamic_channels + self.num_static_channels
-                       + self.trunk_context_channels
+                       + self.context_channels
                        + (self.locenc_out_channels if (self.use_location_encoder and self.locenc_out_channels > 0) else 0)),  # C_d dynamic + C_s static + C_ctx + C_loc
             hidden_dim=hidden_dim,
             kernel_size=(kernel_size, kernel_size),
@@ -124,17 +125,6 @@ class SpatioTemporalPredictor(nn.Module):
         # Central heads: Optimized for accuracy + spatial patterns (MSE, SSIM, Laplacian, Histogram)
         # Quantile heads: Optimized purely for uncertainty estimation (Pinball loss only)
         self.num_horizons = 4
-        # Extra channels handed to the *quantile* heads only. The trunk's receptive field
-        # is ~10 px, so it cannot see whether past change exists 30-100 px away — which is
-        # exactly the covariate that decides whether change is possible at all. Feeding it
-        # to the quantile heads supplies information no amount of retraining could recover
-        # from the trunk features, and leaves the central head's input untouched.
-        self.quantile_context_channels = int(quantile_context_channels)
-        # The central head can be handed the same context. The trunk's ~10 px radius cannot
-        # see past change 30-100 px away either, and beyond 100 px from past change not one
-        # of 493,240 measured pixels moved by more than 0.01 in twenty years — so this is
-        # the covariate that tells the central head where the answer is exactly zero.
-        self.central_context_channels = int(central_context_channels)
         # Predict change on top of HM_t0 instead of the absolute level. Measured motivation:
         # on the 53-70% of pixels whose observed 5-20yr change is below 0.001, the absolute
         # parameterisation still emits change of sd ~0.0075 HM, because reproducing HM_t0
@@ -239,7 +229,7 @@ class SpatioTemporalPredictor(nn.Module):
         # Central prediction heads (one per horizon)
         # These produce the "best estimate" optimized for multiple objectives
         self.central_heads = nn.ModuleList([
-            _head(hidden_dim + self.central_context_channels, hidden_dim, 1)
+            _head(hidden_dim, hidden_dim, 1)
             for _ in range(self.num_horizons)
         ])
         if self.central_residual:
@@ -253,7 +243,7 @@ class SpatioTemporalPredictor(nn.Module):
         # Quantile heads. 'per_horizon' keeps one module per horizon (today); 'joint' and
         # 'power' use a single module per side emitting all horizons at once, so the shape
         # of the width's growth in lead time is a learned function of shared features.
-        q_in = hidden_dim + self.quantile_context_channels + n_dhat
+        q_in = hidden_dim + n_dhat
         q_mid = hidden_dim // 2
         n_out = {'per_horizon': 1, 'joint': self.num_horizons, 'power': 2,
                  'power_plus': 2 + self.num_horizons}[self.width_head_mode]
@@ -358,7 +348,7 @@ class SpatioTemporalPredictor(nn.Module):
         mean, std = self.hm_norm[0], self.hm_norm[1]
         return float((0.0 - mean) / std), float((1.0 - mean) / std)
 
-    def forward(self, input_dynamic, input_static, lonlat=None, quantile_context=None):
+    def forward(self, input_dynamic, input_static, lonlat=None, context=None):
         # input_dynamic: [B, T, C_d, H, W]
         # input_static: [B, C_s, H, W]
         # lonlat: [B, H, W, 2]
@@ -370,19 +360,23 @@ class SpatioTemporalPredictor(nn.Module):
             feats = self.location_encoder(ll_flat)  # [B*H*W, C_loc]
             loc_feats = feats.view(B, H, W, self.locenc_out_channels).permute(0, 3, 1, 2).contiguous()  # [B, C_loc, H, W]
             input_static = torch.cat([input_static, loc_feats], dim=1)
-        if self.trunk_context_channels > 0:
-            if quantile_context is None:
+        if self.context_channels > 0:
+            # Refuse rather than substitute zeros. Training happily on a zeroed covariate
+            # reads downstream as a real result, and since the channel count varies with
+            # --context_radii / --hm_context_stats, an off-by-one band selection is a live
+            # way to get the wrong covariate rather than a hypothetical one.
+            if context is None:
                 raise RuntimeError(
-                    f"this model expects {self.trunk_context_channels} trunk context channels "
-                    f"but none was supplied. Pass change_context (and hm_context, if "
-                    f"configured) through the batch; a zeroed covariate is not a safe default.")
-            if quantile_context.shape[1] != self.trunk_context_channels:
+                    f"this model expects {self.context_channels} context channels but none "
+                    f"was supplied. Pass change_context (and hm_context, if configured) "
+                    f"through the batch; a zeroed covariate is not a safe default.")
+            if context.shape[1] != self.context_channels:
                 raise RuntimeError(
-                    f"context has {quantile_context.shape[1]} channels, this model expects "
-                    f"{self.trunk_context_channels} in the trunk. Check --context_radii / "
-                    f"--hm_context_stats against the checkpoint they were trained with.")
+                    f"context has {context.shape[1]} channels, this model expects "
+                    f"{self.context_channels}. Check --context_radii / --hm_context_stats "
+                    f"against the checkpoint they were trained with.")
             input_static = torch.cat(
-                [input_static, quantile_context.to(input_static.dtype)], dim=1)
+                [input_static, context.to(input_static.dtype)], dim=1)
         # Repeat all static channels for each timestep and concat
         static_rep = input_static.unsqueeze(1).repeat(1, T, 1, 1, 1)  # [B, T, C_s, H, W]
         x = torch.cat([input_dynamic, static_rep], dim=2)  # [B, T, C_d+C_s, H, W]
@@ -395,28 +389,11 @@ class SpatioTemporalPredictor(nn.Module):
         # Each horizon has 3 separate heads: lower, central, upper
         preds = []
 
-        def _with_context(n_channels):
-            if n_channels <= 0:
-                return last_hidden
-            # Refuse rather than substitute zeros. The old behaviour trained happily on a
-            # zeroed covariate whenever the context raster was not wired through, which reads
-            # downstream as a real result; and now that the channel count varies with the
-            # flags, an off-by-one band selection is a live way to get the wrong covariate
-            # rather than a hypothetical one.
-            if quantile_context is None:
-                raise RuntimeError(
-                    f"this model expects {n_channels} context channels but none was supplied. "
-                    f"Pass change_context (and hm_context, if configured) through the batch; "
-                    f"a zeroed covariate is not a safe default.")
-            if quantile_context.shape[1] != n_channels:
-                raise RuntimeError(
-                    f"context has {quantile_context.shape[1]} channels, this model expects "
-                    f"{n_channels}. Check --context_radii / --hm_context_stats against the "
-                    f"checkpoint they were trained with.")
-            return torch.cat([last_hidden, quantile_context.to(last_hidden.dtype)], dim=1)
-
-        q_input = _with_context(self.quantile_context_channels)
-        c_input = _with_context(self.central_context_channels)
+        # The heads read trunk features and nothing else. The context reached them directly
+        # under e1; it now reaches the trunk instead, so a head input carrying it a second
+        # time would be both arrangements at once.
+        q_input = last_hidden
+        c_input = last_hidden
 
         # HM at the last input timestep, in the same normalized space as the targets, so a
         # zero head output is exactly "no change".

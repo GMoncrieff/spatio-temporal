@@ -562,11 +562,11 @@
       <b>Figure 1 &mdash; the shared path</b>
       Three heads, one channel block, one decoder. <code>b1</code> is the previous phase's <code>e1</code> with
       one edge <em>moved</em>: the neighbourhood context joins the trunk's static inputs, repeated across
-      timesteps, and no longer reaches the heads at all. <span class="mono">--central_context False
-      --quantile_context False --trunk_context True</span>, all three named in
-      <code>conv_spline_base.sh</code> rather than left to defaults. Feeding all three consumers would make
-      b1 two arrangements at once and leave the trunk change unattributable, which is why the runner reads
-      the consumer list back out of the run's own log and refuses anything but <span class="mono">trunk</span>.
+      timesteps, and no longer reaches the heads at all. This is not a setting &mdash; the three context
+      flags were removed and the wiring is part of the model, so the covariate is handled exactly like
+      elevation and climate. Feeding the heads as well would make b1 two arrangements at once and leave
+      the trunk change unattributable, which is why the runner reads the trunk's own channel count back
+      out of the log and refuses a run where it is zero or a head is named as a consumer.
       Every experiment below carries that change, so none is comparable to a <code>dist-convlstm</code> number.
     </figcaption>
   </figure>
@@ -581,7 +581,7 @@
       <span class="chip live">runnable</span>
     </div>
     <dl>
-      <dt>flag</dt><dd><span class="mono">--head_family spline</span> (default), with <span class="mono">--trunk_context True --central_context False --quantile_context False</span></dd>
+      <dt>flag</dt><dd><span class="mono">--head_family spline</span> (default). The neighbourhood context needs no flag &mdash; it is wired into the trunk by construction</dd>
       <dt>params / horizon</dt><dd><span class="mono">29</span> = anchor + scale + 14 bin heights + 13 internal slopes</dd>
       <dt>continuity</dt><dd>C1 &mdash; pieces meet with matching derivative</dd>
       <dt>location pinned at</dt><dd><span class="mono">Q(0.5) = anchor</span></dd>

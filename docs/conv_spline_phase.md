@@ -97,13 +97,24 @@ this — they give the head more room to do the same thing.
 `b1` is `e1` plus exactly one change, accepted without question:
 
 > **the neighbourhood context is injected into the trunk**, alongside elevation and climate,
-> repeated across timesteps — not into the heads.
+> repeated across timesteps — and **not into the heads**.
 
 Until now the context reached `last_hidden` only, so the ConvLSTM never saw "can change happen
 here at all" and could not combine it with its own spatial and temporal features; it could only
 have the answer applied to its output. Nothing ever justified that. The precompute-on-the-full-
 raster requirement (radii ≥ 30 px saturate inside a 128 px chip) is about where the covariate
 is *derived*, not where it is *consumed*.
+
+**This is not a flag.** `--trunk_context`, `--central_context` and `--quantile_context` were
+removed on 2026-09-11: distance to past change and the neighbourhood HM summaries are ordinary
+covariates, handled like elevation and climate, and the wiring is part of the model. There is
+nothing to pass, nothing for `--extra_train_args` to override back, and no configuration in
+which a head receives the covariate a second time. What is still verified is that it *arrived*:
+the run's log reports the channel count the trunk was built with, read off the module rather
+than off an argument, and `verify_context_wiring` refuses a run where that count is zero,
+disagrees with what `--context_radii` / `--hm_context_stats` imply, or names a head as a
+consumer. A checkpoint trained before the change has a narrower trunk conv and is warm-started:
+its trained weights are copied in and the context channels start at zero.
 
 ```bash
 ./scripts/run_conv_spline_baseline.sh          # three seeds, Africa

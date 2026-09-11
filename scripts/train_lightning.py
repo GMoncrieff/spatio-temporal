@@ -53,17 +53,6 @@ def plan_row_bands(r0, r1, stride, tile, row_chunk):
     return bands
 
 
-def _wants_context(args):
-    """True when any head is configured to read the past-change context rasters.
-
-    The quantile heads were the first consumer; the central heads and now the trunk take the
-    same tensor, so the dataset must load it whenever any of the three asks for it.
-    """
-    return bool(getattr(args, "quantile_context", False)
-                or getattr(args, "central_context", False)
-                or getattr(args, "trunk_context", False))
-
-
 def _csv_floats(spec):
     """'1,1.333,2,4' -> [1.0, 1.333, 2.0, 4.0]; None/'' -> None (today's behaviour)."""
     if spec is None or str(spec).strip() == "":
@@ -360,14 +349,6 @@ if __name__ == "__main__":
         help="Override the split mask (e.g. a region-restricted one for development)",
     )
     parser.add_argument(
-        "--quantile_context",
-        type=lambda x: (str(x).lower() == 'true'),
-        nargs='?', const=True, default=False,
-        help="Feed multi-scale past-change occupancy to the quantile heads. The trunk's "
-             "receptive field is ~10px and cannot see whether change occurred 30-100px "
-             "away, which is what decides whether change is possible at all.",
-    )
-    parser.add_argument(
         "--context_pattern", type=str,
         default="data/raw/hm_global/change_context_w{year}_1000.tif",
         help="Full-raster past-change context rasters (band 1 past change, band 2 distance)",
@@ -376,23 +357,6 @@ if __name__ == "__main__":
         "--quantile_class_weighting", type=str, default="none",
         choices=["none", "distance"],
         help="Balance the distance-to-past-change bands in the pinball loss (default: none)",
-    )
-    parser.add_argument(
-        "--trunk_context",
-        type=lambda x: (str(x).lower() == 'true'),
-        nargs='?', const=True, default=False,
-        help="Feed the same past-change context into the ConvLSTM, repeated across "
-             "timesteps alongside elevation and climate, instead of only to the heads. The "
-             "trunk can then combine 'can change happen here at all' with its own spatial "
-             "and temporal features rather than having the answer applied to its output.",
-    )
-    parser.add_argument(
-        "--central_context",
-        type=lambda x: (str(x).lower() == 'true'),
-        nargs='?', const=True, default=False,
-        help="Feed the same past-change context to the central heads. Beyond 100px from "
-             "past change, no measured pixel moved by >0.01 in 20 years, and the trunk "
-             "cannot see that far.",
     )
     parser.add_argument(
         "--central_residual",
@@ -951,8 +915,8 @@ if __name__ == "__main__":
         pin_memory=True if args.num_workers > 0 else False,
         persistent_workers=True if args.num_workers > 0 else False,
         split_mask_file=split_mask_file,
-        context_pattern=(args.context_pattern if _wants_context(args) else None),
-        hm_context_pattern=(args.hm_context_pattern if _wants_context(args) else None),
+        context_pattern=args.context_pattern,
+        hm_context_pattern=args.hm_context_pattern,
         hm_context_stats=_csv_strs(args.hm_context_stats),
         hm_context_radii=_csv_ints(args.hm_context_radii) or (3, 30, 100),
         chip_weights=args.chip_weights,
@@ -985,8 +949,8 @@ if __name__ == "__main__":
         pin_memory=True if args.num_workers > 0 else False,
         persistent_workers=True if args.num_workers > 0 else False,
         split_mask_file=split_mask_file,
-        context_pattern=(args.context_pattern if _wants_context(args) else None),
-        hm_context_pattern=(args.hm_context_pattern if _wants_context(args) else None),
+        context_pattern=args.context_pattern,
+        hm_context_pattern=args.hm_context_pattern,
         hm_context_stats=_csv_strs(args.hm_context_stats),
         hm_context_radii=_csv_ints(args.hm_context_radii) or (3, 30, 100),
         split_value=val_split_value,  # Validation split
@@ -1007,8 +971,8 @@ if __name__ == "__main__":
         pin_memory=True if args.num_workers > 0 else False,
         persistent_workers=True if args.num_workers > 0 else False,
         split_mask_file=split_mask_file,
-        context_pattern=(args.context_pattern if _wants_context(args) else None),
-        hm_context_pattern=(args.hm_context_pattern if _wants_context(args) else None),
+        context_pattern=args.context_pattern,
+        hm_context_pattern=args.hm_context_pattern,
         hm_context_stats=_csv_strs(args.hm_context_stats),
         hm_context_radii=_csv_ints(args.hm_context_radii) or (3, 30, 100),
         split_value=test_split_value,  # Test split
@@ -1026,43 +990,46 @@ if __name__ == "__main__":
         print(f"Loading model from checkpoint: {checkpoint_path}")
         print("="*70)
         overrides = dict(
-            quantile_context_channels=(_n_context_channels(args) if args.quantile_context else 0),
+            context_channels=_n_context_channels(args),
             quantile_class_weighting=args.quantile_class_weighting,
             freeze_trunk=args.freeze_trunk,
-            central_context_channels=(_n_context_channels(args) if args.central_context else 0),
-            trunk_context_channels=(_n_context_channels(args) if args.trunk_context else 0),
             central_residual=args.central_residual,
             monotone_quantile_width=args.monotone_quantile_width,
             **_experiment_kwargs(args),
         )
-        if args.quantile_context or args.central_context or args.trunk_context:
-            # The quantile heads gain input channels, so their first conv no longer matches
-            # the checkpoint. Warm-start it: the trained weights are copied into the
-            # original channels and the new context channels start at zero, so the model
-            # initially reproduces the checkpoint exactly and then learns what the context
-            # adds. Random re-initialisation would throw away a trained head for nothing.
-            ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-            hp = dict(ckpt.get('hyper_parameters', {}))
-            hp.update(overrides)
-            model = SpatioTemporalLightningModule(**hp)
-            sd = dict(ckpt['state_dict'])
-            msd = model.state_dict()
-            grown = []
-            for k, v in list(sd.items()):
-                if k in msd and msd[k].shape != v.shape and v.dim() == 4:
-                    new_w = torch.zeros_like(msd[k])
-                    new_w[:, :v.shape[1]] = v
-                    sd[k] = new_w
-                    grown.append(k)
-            missing, unexpected = model.load_state_dict(sd, strict=False)
-            print(f"✓ Checkpoint loaded with {len(grown)} warm-started quantile-head convs")
-            if missing:
-                print(f"  (randomly initialised: {len(missing)} tensors)")
-            print("  Trunk and central heads keep the checkpoint's weights exactly.")
-        else:
-            model = SpatioTemporalLightningModule.load_from_checkpoint(
-                checkpoint_path, strict=not args.freeze_trunk, **overrides)
-            print(f"✓ Checkpoint loaded successfully!")
+        # The context is part of the trunk's input, so the trunk's first conv does not match a
+        # checkpoint trained without it. Warm-start it: the trained weights are copied into the
+        # original channels and the context channels start at zero, so the model initially
+        # reproduces the checkpoint exactly and then learns what the context adds. Random
+        # re-initialisation would throw away a trained trunk for nothing.
+        #
+        # This path is unconditional because the context is unconditional. Any tensor whose
+        # shape already matches is loaded untouched, so a checkpoint that carried the context
+        # loads exactly as it used to; the counts below are how a mismatch announces itself,
+        # since load_state_dict is non-strict here and would otherwise be silent.
+        ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+        hp = dict(ckpt.get('hyper_parameters', {}))
+        hp.pop('quantile_context_channels', None)
+        hp.pop('central_context_channels', None)
+        hp.pop('trunk_context_channels', None)
+        hp.update(overrides)
+        model = SpatioTemporalLightningModule(**hp)
+        sd = dict(ckpt['state_dict'])
+        msd = model.state_dict()
+        grown = []
+        for k, v in list(sd.items()):
+            if k in msd and msd[k].shape != v.shape and v.dim() == 4:
+                new_w = torch.zeros_like(msd[k])
+                new_w[:, :v.shape[1]] = v
+                sd[k] = new_w
+                grown.append(k)
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        print(f"✓ Checkpoint loaded with {len(grown)} warm-started convs")
+        if missing:
+            print(f"  (randomly initialised: {len(missing)} tensors)")
+        if unexpected:
+            print(f"  (checkpoint tensors this model has no slot for: {len(unexpected)})")
+        print("  Every tensor whose shape already matched is unchanged.")
         print(f"\nModel configuration from checkpoint:")
         for key in ['hidden_dim', 'num_layers', 'kernel_size', 'num_static_channels', 
                     'num_dynamic_channels', 'use_location_encoder', 'locenc_out_channels']:
@@ -1085,11 +1052,9 @@ if __name__ == "__main__":
             histogram_weight=args.histogram_weight,
             histogram_lambda_w2=args.histogram_lambda_w2,
             histogram_warmup_epochs=args.histogram_warmup_epochs,
-            quantile_context_channels=(_n_context_channels(args) if args.quantile_context else 0),
+            context_channels=_n_context_channels(args),
             quantile_class_weighting=args.quantile_class_weighting,
             freeze_trunk=args.freeze_trunk,
-            central_context_channels=(_n_context_channels(args) if args.central_context else 0),
-            trunk_context_channels=(_n_context_channels(args) if args.trunk_context else 0),
             central_residual=args.central_residual,
             monotone_quantile_width=args.monotone_quantile_width,
             **_experiment_kwargs(args),
@@ -1181,24 +1146,20 @@ if __name__ == "__main__":
     print(f"SSIM weight:       {args.ssim_weight}")
     print(f"Laplacian weight:  {args.laplacian_weight}")
     print(f"Histogram weight:  {args.histogram_weight} (warmup: {args.histogram_warmup_epochs} epochs)")
-    if _wants_context(args):
-        # Printed because the round-2 covariate IS a channel count: a run that silently fell
-        # back to the eight-channel context would read as "the covariate does nothing".
-        print(f"Context channels:  {_n_context_channels(args)} "
-              f"(radii {args.context_radii}"
-              + (f", hm {args.hm_context_stats} @ {args.hm_context_radii}"
-                 if _csv_strs(args.hm_context_stats) else ", no hm context") + ")")
-        # The b1 modification's fingerprint. Which *consumers* get the context, not merely
-        # how many channels it has: under --central_residual the ConvLSTM takes no gradient
-        # from the central loss, so a trunk that never received the covariate looks exactly
-        # like a trunk that received it and ignored it. This line is the only place a log
-        # reader can tell them apart, and scripts/conv_spline_base.sh greps for it.
-        _consumers = [n for n, on in (("trunk", args.trunk_context),
-                                      ("central", args.central_context),
-                                      ("quantile", args.quantile_context)) if on]
-        print(f"Context consumers: {', '.join(_consumers) or 'NONE'}"
-              + ("   [trunk context ON]" if args.trunk_context
-                 else "   [trunk context off]"))
+    # Printed because the covariate IS a channel count: a run that silently fell back to the
+    # eight-channel context would read as "the covariate does nothing".
+    print(f"Context channels:  {_n_context_channels(args)} "
+          f"(radii {args.context_radii}"
+          + (f", hm {args.hm_context_stats} @ {args.hm_context_radii}"
+             if _csv_strs(args.hm_context_stats) else ", no hm context") + ")")
+    # Read off the constructed trunk, never off args. There is no flag to inspect any more --
+    # the context is hardwired into the trunk's input like elevation and climate -- so the
+    # only honest evidence that it was wired is the module's own channel count. Under
+    # --central_residual the ConvLSTM takes no gradient from the central loss, so a trunk
+    # that never received the covariate looks exactly like one that received it and ignored
+    # it; this line is where a log reader tells them apart, and conv_spline_base.sh greps it.
+    # A literal here would be rule 25 all over again.
+    print(f"Context into trunk: {model.model.context_channels} channels; heads: none")
     _spline_banner = _spline_head_banner(args)
     if _spline_banner:
         print(_spline_banner)
@@ -1353,10 +1314,9 @@ if __name__ == "__main__":
                     if lonlat is not None:
                         lonlat = lonlat.to(device)
                     # Get predictions from model: [B, 12, H, W] (4 horizons × 3 quantiles)
-                    # The context tensors were missing here, so under --central_context /
-                    # --quantile_context these W&B test metrics were computed with every
-                    # context channel silently zeroed. The model refuses that now, which is
-                    # how the omission surfaced.
+                    # The context tensors were missing here, so these W&B test metrics were
+                    # once computed with every context channel silently zeroed. The model
+                    # refuses that now, which is how the omission surfaced.
                     _cc = batch.get('change_context')
                     _hc = batch.get('hm_context')
                     preds_all = best_model(
@@ -2235,7 +2195,7 @@ if __name__ == "__main__":
             comp_srcs = {y: [rasterio.open(p) for p in component_files[y]] for y in years} if include_components else {y: [] for y in years}
             stat_srcs = [rasterio.open(p) for p in static_list_paths]
             hm_ctx_src, hm_ctx_bands = None, None
-            if (_wants_context(args) and args.hm_context_pattern
+            if (args.hm_context_pattern
                     and _csv_strs(args.hm_context_stats)):
                 from prepare_hm_context import band_indices
                 hm_path = args.hm_context_pattern.format(year=base_year)
@@ -2250,7 +2210,7 @@ if __name__ == "__main__":
                 print(f"HM context: {hm_path} bands {hm_ctx_bands}")
 
             ctx_src = None
-            if _wants_context(args) and args.context_pattern:
+            if args.context_pattern:
                 ctx_path = args.context_pattern.format(year=base_year)
                 if os.path.exists(ctx_path):
                     ctx_src = rasterio.open(ctx_path)

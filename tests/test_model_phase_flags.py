@@ -72,7 +72,7 @@ def test_histogram_loss_carries_no_gradient():
 # Inertness of the defaults
 # ---------------------------------------------------------------------------------------
 
-BASE = dict(quantile_context_channels=N_CTX, central_context_channels=N_CTX,
+BASE = dict(context_channels=N_CTX,
             central_residual=True, monotone_quantile_width=True)
 
 
@@ -82,7 +82,7 @@ def test_explicit_defaults_reproduce_the_original_model():
     b = build(**BASE, quantile_dhat_context=False, width_parameterisation='softplus',
               convlstm_dilations=None)
     with torch.no_grad():
-        assert torch.equal(a(d, s, quantile_context=ctx), b(d, s, quantile_context=ctx))
+        assert torch.equal(a(d, s, context=ctx), b(d, s, context=ctx))
 
 
 def test_unit_dilation_reproduces_the_original_trunk():
@@ -90,7 +90,7 @@ def test_unit_dilation_reproduces_the_original_trunk():
     a = build(**BASE)
     b = build(**BASE, convlstm_dilations=[1, 1])
     with torch.no_grad():
-        assert torch.equal(a(d, s, quantile_context=ctx), b(d, s, quantile_context=ctx))
+        assert torch.equal(a(d, s, context=ctx), b(d, s, context=ctx))
 
 
 def test_lightning_defaults_leave_the_loss_untouched():
@@ -121,9 +121,9 @@ def test_dilation_widens_the_receptive_field():
         s = torch.zeros(B, C_S, H, W)
         ctx = torch.zeros(B, N_CTX, H, W)
         with torch.no_grad():
-            base = m(d, s, quantile_context=ctx)
+            base = m(d, s, context=ctx)
             d[:, :, :, H // 2, W // 2] = 5.0
-            hit = m(d, s, quantile_context=ctx)
+            hit = m(d, s, context=ctx)
         moved = (hit - base).abs().amax(dim=(0, 1)) > 1e-7
         rows = moved.any(dim=1).nonzero()
         return int(rows.max() - rows.min()) + 1
@@ -158,8 +158,8 @@ def test_exp_width_starts_at_the_same_place_as_softplus():
     soft = build(**BASE, initial_width_normalized=w0)
     expo = build(**BASE, initial_width_normalized=w0, width_parameterisation='exp')
     with torch.no_grad():
-        po = soft(d, s, quantile_context=ctx)
-        pe = expo(d, s, quantile_context=ctx)
+        po = soft(d, s, context=ctx)
+        pe = expo(d, s, context=ctx)
     # 'exp' zero-initialises the output convolution, so the first increment is exactly w0
     # at every pixel — the same device --central_residual uses to start at persistence.
     assert float((pe[:, 2] - pe[:, 1]).mean()) == pytest.approx(w0, rel=1e-5)
@@ -174,7 +174,7 @@ def test_exp_width_stays_positive_and_monotone():
     d, s, ctx = inputs()
     m = build(**BASE, width_parameterisation='exp')
     with torch.no_grad():
-        p = m(d, s, quantile_context=ctx)
+        p = m(d, s, context=ctx)
     for h in range(4):
         lo, ce, up = p[:, 3 * h], p[:, 3 * h + 1], p[:, 3 * h + 2]
         assert bool((up >= ce).all()) and bool((ce >= lo).all())
@@ -189,8 +189,8 @@ def test_dhat_context_changes_the_prediction_but_not_the_gradient_isolation():
     plain = build(**BASE)
     with_dhat = build(**BASE, quantile_dhat_context=True)
     with torch.no_grad():
-        a = plain(d, s, quantile_context=ctx)
-        b = with_dhat(d, s, quantile_context=ctx)
+        a = plain(d, s, context=ctx)
+        b = with_dhat(d, s, context=ctx)
     # Central heads are untouched by the extra quantile-head channels.
     assert torch.allclose(a[:, 1::3], b[:, 1::3])
     # The bounds do move (an inert flag would be the bug).
@@ -201,7 +201,7 @@ def test_dhat_context_changes_the_prediction_but_not_the_gradient_isolation():
     # path exists and training_step is what severs it, by saving and restoring the central
     # pass's gradients around the pinball backward. This flag must not weaken that, which
     # is what test_pinball_gradient_isolation.py checks on the real loop.)
-    p = with_dhat(d, s, quantile_context=ctx)
+    p = with_dhat(d, s, context=ctx)
     (p[:, 0::3].sum() + p[:, 2::3].sum()).backward()
     for name, param in with_dhat.named_parameters():
         if name.startswith('central_heads'):

@@ -22,8 +22,8 @@ EXPECT_HIST="0.0"
 
 # val_crps, not val_total_loss: D6 sets --mu_mse_weight 0, so a monitor carrying the auxiliary
 # MSE would select epochs on a different quantity for that run than for every other one.
-export BASE_ARGS="--head_family spline --central_residual True --central_context True \
---quantile_context True --checkpoint_monitor val_crps \
+export BASE_ARGS="--head_family spline --central_residual True \
+--checkpoint_monitor val_crps \
 --ssim_weight ${EXPECT_SSIM} --laplacian_weight ${EXPECT_LAP} --histogram_weight ${EXPECT_HIST}"
 
 # Read the effective weights back out of the fold log and refuse to continue if they are not

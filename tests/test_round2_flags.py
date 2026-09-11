@@ -23,7 +23,7 @@ from src.models.spatiotemporal_predictor import SpatioTemporalPredictor  # noqa:
 
 B, T, C_D, C_S, H, W = 2, 3, 4, 2, 24, 24
 HID, N_CTX = 8, 8
-BASE = dict(quantile_context_channels=N_CTX, central_context_channels=N_CTX,
+BASE = dict(context_channels=N_CTX,
             central_residual=True, monotone_quantile_width=True)
 
 
@@ -51,7 +51,7 @@ def test_round2_defaults_change_nothing():
     b = build(**BASE, head_hidden_layers=1, width_head_mode='per_horizon',
               central_target_transform='none')
     with torch.no_grad():
-        assert torch.equal(a(d, s, quantile_context=ctx), b(d, s, quantile_context=ctx))
+        assert torch.equal(a(d, s, context=ctx), b(d, s, context=ctx))
 
 
 def test_lightning_round2_defaults():
@@ -104,7 +104,7 @@ def test_head_depth_adds_parameters_and_keeps_the_output_shape():
     n = lambda m: sum(p.numel() for p in m.parameters())
     assert n(deep) > n(shallow)
     with torch.no_grad():
-        assert deep(d, s, quantile_context=ctx).shape == shallow(d, s, quantile_context=ctx).shape
+        assert deep(d, s, context=ctx).shape == shallow(d, s, context=ctx).shape
 
 
 @pytest.mark.parametrize("mode", ["joint", "power", "power_plus"])
@@ -112,7 +112,7 @@ def test_alternative_width_heads_stay_positive_and_monotone(mode):
     d, s, ctx = inputs()
     m = build(**BASE, width_head_mode=mode)
     with torch.no_grad():
-        p = m(d, s, quantile_context=ctx)
+        p = m(d, s, context=ctx)
     for h in range(4):
         lo, ce, up = p[:, 3 * h], p[:, 3 * h + 1], p[:, 3 * h + 2]
         assert bool((up >= ce).all()) and bool((ce >= lo).all()), f"{mode} h={h}"
@@ -128,7 +128,7 @@ def test_power_width_starts_linear_in_lead_time():
     d, s, ctx = inputs()
     m = build(**BASE, width_head_mode='power', initial_width_normalized=0.065)
     with torch.no_grad():
-        p = m(d, s, quantile_context=ctx)
+        p = m(d, s, context=ctx)
     w = [float((p[:, 3 * h + 2] - p[:, 3 * h + 1]).mean()) for h in range(4)]
     assert w[0] == pytest.approx(0.065, rel=1e-4)
     for h in range(4):
@@ -147,7 +147,7 @@ def test_asinh_transform_still_starts_at_persistence():
     d, s, ctx = inputs()
     m = build(**BASE, central_target_transform='asinh')
     with torch.no_grad():
-        p = m(d, s, quantile_context=ctx)
+        p = m(d, s, context=ctx)
     hm_t0 = d[:, -1, 0:1]
     for h in range(4):
         assert torch.allclose(p[:, 3 * h + 1:3 * h + 2], hm_t0, atol=1e-6)

@@ -57,7 +57,7 @@ for ENTRY in "${SLATE[@]}"; do
 
     LOG="${LOG_DIR}/hindcast_fold${FIRST_FOLD}_${NAME}.log"
     verify_loss_weights "$LOG" "$NAME" "$FLAGS"
-    verify_trunk_context "$LOG" "$NAME"
+    verify_context_wiring "$LOG" "$NAME"
 
     $PY -u scripts/score_distributional_model.py \
         --stitched_dir "${EXP_ROOT}/${NAME}/stitched" \
