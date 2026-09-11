@@ -196,7 +196,9 @@ Kept only where they still apply. Numbering is fresh; the old file's numbers are
 21. **`ModelCheckpoint` monitors what you tell it**, and a quantile-only change still selects a
     different epoch through a shared monitor. This phase uses `--checkpoint_monitor val_crps`
     so a run setting `--mu_mse_weight 0` is not selecting on a different quantity from the rest
-    of the slate.
+    of the slate. E0a, E1b, E1c and E2a are those runs: the free-scale arms score on CRPS
+    alone, because an MSE term pinning `E[Q]` is not a bystander to an experiment about where
+    the width comes from.
 22. **A regional working set can hide a quadratic.** Something `(M, H, W)` and unremarkable on
     1.86 Mpx is dead on 63.1 Mpx. Check peak memory against the region you will actually run.
 23. **Never edit a shell script while it is running.** Bash reads a script incrementally by byte
@@ -206,6 +208,11 @@ Kept only where they still apply. Numbering is fresh; the old file's numbers are
 24. **A leak shows up as a gradient, not a level.** Removing a leak must make error rise *with*
     distance from the fold's own trained-on data; a flat profile that is simply worse
     everywhere is a training signature.
+25. **A banner that prints a literal is not a fingerprint.** `MSE weight: 1.0 (fixed)` was
+    hardcoded while `--mu_mse_weight` was a live flag the previous phase had already ablated,
+    so the one line a log reader checks could not distinguish the two runs — and the check that
+    greps it passed either way. Print the argument, then verify it; a check on a constant
+    string checks nothing (rule 5, and rule 2's predicate written twice).
 
 ## Conventions
 

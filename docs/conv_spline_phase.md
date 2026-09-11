@@ -213,11 +213,11 @@ Every entry is one stated delta from b1, additive, defaulting to today's behavio
 | **E3** | `--crps_z_weight 1.0` | A second CRPS term in `z = asinh(change/s)`, summed with the raw term. Attacks the incentive problem directly. | same head |
 | **E4** | `--head_family pwl --spline_gap_floor True` | No segment may imply a density above 578. Makes a fence structurally impossible rather than discouraged. | +0 params |
 | **E5** | `--spline_knots skew14` | The same 14 bins, re-placed for the measured right skew. `skew11` is the strong form: 11 bins, testing whether the body needed resolution at all. | −0 / −6 params |
-| **E0a** | `--spline_cumulative_width False` | The incumbent head, otherwise untouched, with the horizon accumulation removed so each horizon's 95% width comes from its own channel. **Already implemented and tested**; no new code. | 29 params/h |
+| **E0a** | `--spline_cumulative_width False --mu_mse_weight 0.0` | The incumbent head, otherwise untouched, with the horizon accumulation removed so each horizon's 95% width comes from its own channel. **Already implemented and tested**; no new code. | 29 params/h |
 | **E1a** | `--head_family isqf --isqf_tails True --isqf_space logit\|neglog` | Learned exponential tail rates β_L, β_R on unbounded transformed support. ISQF's actual contribution, which E1 drops. CRPS still evaluated in HM. **The tails' domain is unsettled** — see §4.1. | 18 params/h |
-| **E1b** | `--head_family isqf --free_scale True` | E1 minus the cumulative-in-horizon scale: increments carry the width directly, no renormalisation to unit 95% span. Park et al.'s own arrangement. | 15 params/h |
-| **E1c** | E1a + E1b together | Park et al. (2022) as published, adapted only where the ConvLSTM forces it. **Runs unconditionally** — it is the fourth cell of a 2x2 and completes it. | 17 params/h |
-| **E2a** | `--head_family pwl --free_scale True` | E2 with the anchor/scale factorisation removed: softmax heights replaced by unnormalised positive increments, so the 95% width is emergent rather than injected. | 15 params/h |
+| **E1b** | `--head_family isqf --free_scale True --mu_mse_weight 0.0` | E1 minus the cumulative-in-horizon scale: increments carry the width directly, no renormalisation to unit 95% span. Park et al.'s own arrangement. | 15 params/h |
+| **E1c** | E1a + E1b together, `--mu_mse_weight 0.0` | Park et al. (2022) as published, adapted only where the ConvLSTM forces it. **Runs unconditionally** — it is the fourth cell of a 2x2 and completes it. | 17 params/h |
+| **E2a** | `--head_family pwl --free_scale True --mu_mse_weight 0.0` | E2 with the anchor/scale factorisation removed: softmax heights replaced by unnormalised positive increments, so the 95% width is emergent rather than injected. | 15 params/h |
 
 E0 and E2–E5 are the issue note's staged plan, ordered by how much has to be touched. E1 and E2
 are the two literature-derived heads. The last five rows are a group rather than a continuation
@@ -283,6 +283,38 @@ re-establishing it against a different spline class at the same time.
 > `QuantileSpline.from_channels`' `scale_pre=None` branch is unreachable from `forward`. The two
 > paths read the same channel and differ only by an extra softplus, so `--spline_cumulative_width`
 > is the whole of the narrow ablation; there is no separate "injection" knob to turn.
+
+#### The four free-scale arms drop the auxiliary MSE
+
+**E0a, E1b, E1c and E2a run on CRPS alone — `--mu_mse_weight 0.0`.** E1a keeps it, because E1a
+keeps the accumulation and is the control on the width row; b1 and E0–E5 keep it too.
+
+The reason is that the term is not a neutral bystander to *this* question. The objective is
+
+```
+total = mu_mse_weight * MSE(E[Q], y) + CRPS
+```
+
+and an MSE term pins the distribution's first moment to the conditional mean. Every arm in this
+group exists to ask where the width comes from once it is no longer injected — and a freed
+scale that is simultaneously held by a squared-error term on its own mean is not free. Worse, it
+is not *separably* unfree: a null would not distinguish "the factorisation was earning its keep"
+from "the MSE term supplied what the factorisation used to". Since the arms were defined by a
+subtraction, the subtraction has to be complete.
+
+**This weight was an argparse default until now, on every arm including b1.** `BASE_ARGS` named
+`--ssim_weight`, `--laplacian_weight` and `--histogram_weight` and not this one, and
+`PRODUCTION_HPARAMS` does not carry it either, so a second objective nobody chose rode along at
+1.0 — rule 16 in its exact form. It is now named in `BASE_ARGS` and read back by
+`verify_loss_weights`.
+
+> **The banner was printing a literal.** `train_lightning.py` printed `MSE weight: 1.0 (fixed)`
+> regardless of the flag, which is the line `verify_loss_weights` greps and the only place a log
+> reader could check. An arm defined by *not* having this term would have logged as though it
+> did, and the previous phase already ran one (`d6`, `--mu_mse_weight 0.0`) against that banner.
+> Fixed to print `args.mu_mse_weight`, and pinned by
+> `tests/test_conv_spline_paths.py::test_banner_reports_the_flag_rather_than_a_literal` — without
+> the fingerprint moving with the run, every other check on this weight passes vacuously.
 
 #### `--free_scale`: one semantic change, three implementations
 

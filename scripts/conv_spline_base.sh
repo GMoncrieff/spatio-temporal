@@ -37,11 +37,19 @@ export PY="${PY:-/home/glenn/miniforge3/envs/spatio-temporal-dl/bin/python}"
 EXPECT_SSIM="0.0"
 EXPECT_LAP="0.0"
 EXPECT_HIST="0.0"
+# The auxiliary MSE on E[Q]. Named here because it was the one loss weight the phase left to
+# an argparse default, which is rule 16's exact shape: every arm carried a second objective
+# nobody chose. The free-scale arms (E0a, E1b, E1c, E2a) set it to 0.0 -- an MSE term pinning
+# the first moment is not a neutral bystander to an experiment about where the width comes
+# from -- and they pass `--mu_mse_weight 0.0` in their own flags, which BASE_ARGS being first
+# lets them override.
+EXPECT_MU_MSE="1.0"
 
 # val_crps, not val_total_loss: an experiment that sets --mu_mse_weight 0 would otherwise be
 # selecting epochs on a different quantity from every other run in the slate.
 export BASE_ARGS="--head_family spline --central_residual True --central_context False \
 --quantile_context False --trunk_context True --checkpoint_monitor val_crps \
+--mu_mse_weight ${EXPECT_MU_MSE} \
 --ssim_weight ${EXPECT_SSIM} --laplacian_weight ${EXPECT_LAP} --histogram_weight ${EXPECT_HIST}"
 
 # Read the effective weights back out of the fold log and refuse to continue if they are not
@@ -49,7 +57,7 @@ export BASE_ARGS="--head_family spline --central_residual True --central_context
 # inherited defaults reads exactly like a real finding.
 verify_loss_weights() {
   local log="$1" name="$2" expect_extra="${3:-}"
-  local got_ssim got_lap got_hist
+  local got_ssim got_lap got_hist got_mse
   # Fail CLOSED on a log that is missing or carries no banner. Every expected weight in this
   # phase is 0.0 and awk coerces an empty string to 0, so a missing log made all three
   # comparisons read 0==0 and the check PASSED having read nothing -- the exact failure this
@@ -64,30 +72,35 @@ verify_loss_weights() {
     echo "FATAL: ${name}: ${log} has no LOSS WEIGHTS banner; loss weights unverified." >&2
     return 1
   fi
+  got_mse=$(grep -A5 "LOSS WEIGHTS" "$log" | awk '/MSE weight:/ {print $3; exit}')
   got_ssim=$(grep -A5 "LOSS WEIGHTS" "$log" | awk '/SSIM weight:/ {print $3; exit}')
   got_lap=$(grep -A5 "LOSS WEIGHTS" "$log" | awk '/Laplacian weight:/ {print $3; exit}')
   got_hist=$(grep -A5 "LOSS WEIGHTS" "$log" | awk '/Histogram weight:/ {print $3; exit}')
-  local want_ssim="$EXPECT_SSIM" want_lap="$EXPECT_LAP"
+  local want_ssim="$EXPECT_SSIM" want_lap="$EXPECT_LAP" want_mse="$EXPECT_MU_MSE"
   case "$expect_extra" in
     *--ssim_weight*)      want_ssim=$(sed -E 's/.*--ssim_weight ([0-9.]+).*/\1/' <<<"$expect_extra") ;;
   esac
   case "$expect_extra" in
     *--laplacian_weight*) want_lap=$(sed -E 's/.*--laplacian_weight ([0-9.]+).*/\1/' <<<"$expect_extra") ;;
   esac
-  if [ -z "$got_ssim" ] || [ -z "$got_lap" ] || [ -z "$got_hist" ]; then
-    echo "FATAL: ${name}: could not parse all three weights out of ${log}" >&2
-    echo "  got  ssim='${got_ssim}' lap='${got_lap}' hist='${got_hist}'" >&2
+  case "$expect_extra" in
+    *--mu_mse_weight*)    want_mse=$(sed -E 's/.*--mu_mse_weight ([0-9.]+).*/\1/' <<<"$expect_extra") ;;
+  esac
+  if [ -z "$got_ssim" ] || [ -z "$got_lap" ] || [ -z "$got_hist" ] || [ -z "$got_mse" ]; then
+    echo "FATAL: ${name}: could not parse all four weights out of ${log}" >&2
+    echo "  got  mse='${got_mse}' ssim='${got_ssim}' lap='${got_lap}' hist='${got_hist}'" >&2
     return 1
   fi
-  if ! awk -v a="$got_ssim" -v b="$want_ssim" 'BEGIN{exit !(a+0==b+0)}' \
+  if ! awk -v a="$got_mse" -v b="$want_mse" 'BEGIN{exit !(a+0==b+0)}' \
+     || ! awk -v a="$got_ssim" -v b="$want_ssim" 'BEGIN{exit !(a+0==b+0)}' \
      || ! awk -v a="$got_lap" -v b="$want_lap" 'BEGIN{exit !(a+0==b+0)}' \
      || ! awk -v a="$got_hist" 'BEGIN{exit !(a+0==0)}'; then
     echo "FATAL: ${name} trained on the wrong loss weights." >&2
-    echo "  got  ssim=${got_ssim} lap=${got_lap} hist=${got_hist}" >&2
-    echo "  want ssim=${want_ssim} lap=${want_lap} hist=0" >&2
+    echo "  got  mse=${got_mse} ssim=${got_ssim} lap=${got_lap} hist=${got_hist}" >&2
+    echo "  want mse=${want_mse} ssim=${want_ssim} lap=${want_lap} hist=0" >&2
     return 1
   fi
-  echo "  ✓ ${name}: loss weights verified (ssim=${got_ssim} lap=${got_lap} hist=${got_hist})"
+  echo "  ✓ ${name}: loss weights verified (mse=${got_mse} ssim=${got_ssim} lap=${got_lap} hist=${got_hist})"
 }
 
 # The trunk must actually receive the context, and under --central_residual the ConvLSTM's

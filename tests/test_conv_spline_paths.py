@@ -28,7 +28,7 @@ BANNER = (
     "============================================================\n"
     "LOSS WEIGHTS\n"
     "============================================================\n"
-    "MSE weight:        1.0 (fixed)\n"
+    "MSE weight:        {mse}\n"
     "SSIM weight:       {ssim}\n"
     "Laplacian weight:  {lap}\n"
     "Histogram weight:  {hist} (warmup: 5 epochs)\n"
@@ -44,9 +44,9 @@ def _verify(log_path, extra=""):
     return subprocess.run(["bash", "-c", script], capture_output=True, text=True).returncode == 0
 
 
-def _write(tmp_path, name, **kw):
+def _write(tmp_path, name, mse="1.0", **kw):
     p = tmp_path / name
-    p.write_text(BANNER.format(**kw))
+    p.write_text(BANNER.format(mse=mse, **kw))
     return p
 
 
@@ -57,6 +57,44 @@ def test_verify_loss_weights_accepts_the_phase_baseline(tmp_path):
 def test_verify_loss_weights_rejects_the_inherited_product_weights(tmp_path):
     """--ssim 0.2 --laplacian 0.3 --histogram 1.0 is what run_hindcast_folds.py injects."""
     assert not _verify(_write(tmp_path, "bad.log", ssim="0.2", lap="0.3", hist="1.0"))
+
+
+def test_verify_loss_weights_accepts_the_auxiliary_mse_at_its_named_value(tmp_path):
+    """BASE_ARGS names --mu_mse_weight 1.0; a log reading 1.0 is the baseline."""
+    assert _verify(_write(tmp_path, "mse1.log", mse="1.0", ssim="0.0", lap="0.0", hist="0.0"))
+
+
+def test_verify_loss_weights_accepts_zero_mse_when_the_arm_asks_for_it(tmp_path):
+    """E0a, E1b, E1c and E2a carry --mu_mse_weight 0.0: CRPS alone, no term on E[Q]."""
+    log = _write(tmp_path, "mse0.log", mse="0.0", ssim="0.0", lap="0.0", hist="0.0")
+    assert _verify(log, extra="--mu_mse_weight 0.0")
+
+
+def test_verify_loss_weights_rejects_an_inherited_mse_on_a_free_scale_arm(tmp_path):
+    """The regression: the arm asked for 0.0 and the run trained at the 1.0 default.
+
+    Before this was checked the banner printed the literal "1.0 (fixed)" whatever the flag
+    said, so the log could not distinguish the two runs at all -- an arm defined by not
+    having an MSE term would have read as one that did, or vice versa, with nothing to see.
+    """
+    log = _write(tmp_path, "inherited.log", mse="1.0", ssim="0.0", lap="0.0", hist="0.0")
+    assert not _verify(log, extra="--mu_mse_weight 0.0")
+
+
+def test_verify_loss_weights_fails_closed_without_the_mse_line(tmp_path):
+    """An arm expecting 0.0 is exactly where an unparsed weight coerces to 0 and passes."""
+    p = tmp_path / "no_mse_line.log"
+    p.write_text("============\nLOSS WEIGHTS\n============\n"
+                 "SSIM weight:       0.0\nLaplacian weight:  0.0\n"
+                 "Histogram weight:  0.0 (warmup: 5 epochs)\n")
+    assert not _verify(p, extra="--mu_mse_weight 0.0")
+
+
+def test_banner_reports_the_flag_rather_than_a_literal():
+    """The fingerprint has to move with the run, or every check above passes vacuously."""
+    src = open(os.path.join(ROOT, "scripts", "train_lightning.py")).read()
+    line = next(l for l in src.splitlines() if "MSE weight:" in l and "print" in l)
+    assert "mu_mse_weight" in line, f"MSE banner is hardcoded: {line.strip()}"
 
 
 def test_verify_loss_weights_fails_closed_on_a_missing_log(tmp_path):
@@ -128,6 +166,7 @@ def test_base_args_names_every_context_consumer():
     assert "--trunk_context True" in out
     assert "--central_context False" in out
     assert "--quantile_context False" in out
+    assert "--mu_mse_weight 1.0" in out
 
 
 def _runner_args(tmp_path, env_extra):

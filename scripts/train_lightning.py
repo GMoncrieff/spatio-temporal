@@ -1174,7 +1174,10 @@ if __name__ == "__main__":
     print("="*60)
     print("LOSS WEIGHTS")
     print("="*60)
-    print(f"MSE weight:        1.0 (fixed)")
+    # Not "1.0 (fixed)". It is --mu_mse_weight and it has not been fixed since the previous
+    # phase ran an arm at 0.0; printing the literal made the fingerprint disagree with the
+    # run, in the one place a log reader goes to check. conv_spline_base.sh greps this line.
+    print(f"MSE weight:        {args.mu_mse_weight}")
     print(f"SSIM weight:       {args.ssim_weight}")
     print(f"Laplacian weight:  {args.laplacian_weight}")
     print(f"Histogram weight:  {args.histogram_weight} (warmup: {args.histogram_warmup_epochs} epochs)")
