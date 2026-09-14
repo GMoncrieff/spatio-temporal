@@ -117,7 +117,8 @@ The previous CLAUDE.md closed these. They are open again, and several are experi
   (`/mnt/hdd1/spatio-temporal/data`) behind symlinks — but pass the HDD path directly as an
   output, never a symlink, since output directories get cleared with `shutil.rmtree` and that
   refuses on a symbolic link.
-- Monitor free space on the HDD and SSD. 
+- Monitor free space on the HDD and SSD.
+- When long running tasks are underway e.g. training, scoring, prediction. periodically check progress and health  (every 30 mins). 
 
 ## The loops
 
