@@ -31,11 +31,13 @@ for SEED in $SEEDS; do
   LOG="${LOG_DIR}/hindcast_fold${FIRST_FOLD}_${NAME}.log"
   verify_loss_weights "$LOG" "$NAME"
   verify_context_wiring "$LOG" "$NAME"
+  verify_weight_averaging "$LOG" "$NAME"
 
   $PY -u scripts/score_distributional_model.py \
       --stitched_dir "${EXP_ROOT}/${NAME}/stitched" \
       --label "$NAME" --folds "$FOLDS" --out_dir "$SCORE_DIR" \
-      --fold_mask "$FOLD_MASK"
+      --fold_mask "$FOLD_MASK" \
+      --row_chunk "$SCORE_ROW_CHUNK"
 done
 
 echo

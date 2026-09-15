@@ -15,11 +15,15 @@
 # part of the model. e1 fed the heads and never the trunk; b1 and everything after it feed the
 # trunk and never the heads.
 #
-# Nothing to name in BASE_ARGS, therefore, and nothing that --extra_train_args could override
-# back. What is still worth verifying is that the covariate arrived at all: the run's own log
-# reports the channel count the trunk was built with, read off the module rather than off a
-# flag, and verify_context_wiring below refuses a run where that is zero or disagrees with the
-# channel count --context_radii / --hm_context_stats imply.
+# Where it goes is not a setting. WHICH covariate it is still is, and that is named here.
+# b1 is "e1 plus exactly one change", and e1 is --context_radii 3,30,100 with the
+# neighbourhood-HM summaries at mean,max over 3,30,100 -- twelve trunk channels
+# (docs/dist_model_phase2.md, and the shipped global run). Left to argparse this defaults to
+# --context_radii 1,3,10,30,100 and NO hm stats: eight channels, e1's dropped fine radii
+# back, and the HM summaries the phase doc says reach the trunk simply absent. That is rule
+# 16 in its exact shape -- "no extra flags" is not the architecture, it is argparse defaults
+# -- and verify_context_wiring could not see it, because it compared the module against the
+# same defaults and read 8 == 8. So the count is named, and checked against the run's log.
 
 export REGION="${REGION:-config/region_africa.geojson}"
 export FOLD_MASK="${FOLD_MASK:-data/raw/hm_global/fold_mask_b4_1000.tif}"
@@ -27,7 +31,15 @@ export VAL_STRIDE="${VAL_STRIDE:-1024}"
 export MAX_EPOCHS="${MAX_EPOCHS:-150}"
 export FOLDS="${FOLDS:-1,2}"
 export GPUS="${GPUS:-0,1}"
-export EXP_ROOT="${EXP_ROOT:-data/conv_spline/exp}"
+# The HDD path spelled out, not data/conv_spline/exp behind a symlink. NOTE the reason
+# CLAUDE.md used to give for this -- "shutil.rmtree refuses on a symbolic link" -- is about
+# code that no longer exists: that rmtree lived in migrate_zarr_to_icechunk.py, which commit
+# 60c6a9e deleted with the ensemble layer, and `git grep rmtree` now finds nothing.
+# The live reason is size. Measured on the 2026-09-14 smoke: one fold writes 8.0 GB of
+# per-fold rasters over ten window-years (the qf raster deflates from 8.1 GB raw to ~0.85 GB),
+# and --keep_fold_rasters retains a set per fold beside the stitched mosaic. Logs and scores
+# stay on the SSD under data/conv_spline/: they are small and every verifier greps them.
+export EXP_ROOT="${EXP_ROOT:-/mnt/hdd1/spatio-temporal/data/conv_spline/exp}"
 # Named here, not spelled out in each runner: the verifiers read the log that
 # run_central_experiment.sh writes, and two spellings of one path is how the check
 # ended up pointed at a file that never existed.
@@ -46,11 +58,63 @@ EXPECT_HIST="0.0"
 # lets them override.
 EXPECT_MU_MSE="1.0"
 
+# e1's neighbourhood covariate: 3 occupancy radii + 3 fixed bands + mean,max over 3 HM
+# radii = 12. EXPECT_CTX_CHANNELS must be recomputed with the flags if either changes --
+# src.models.change_weights.context_channel_count is the one definition.
+EXPECT_CTX="--context_radii 3,30,100 --hm_context_radii 3,30,100 --hm_context_stats mean,max"
+EXPECT_CTX_CHANNELS="12"
+
+# Africa's prediction accumulators are len(active_horizons) * (3 + 64) full-window float32
+# arrays -- 268 on the four-horizon window. MEASURED on the 2026-09-14 smoke: one fold peaks
+# at 40.7 GB resident, and b1 runs two folds concurrently on a 125 GB box, so unbanded is
+# ~81 GB before GDAL's cache. (plan_row_bands' docstring estimated ~22 GB for Africa; that
+# was low by 1.85x.) 2048 rows caps a fold near 17 GB and costs ~6% more prediction work,
+# because each band recomputes the tiles in its halo. The banded write is an identity --
+# tests/test_predict_row_bands.py.
+EXPECT_ROW_CHUNK="--predict_row_chunk 2048"
+
+# float32, not the ensemble's old int16 x 1/32767. MEASURED on b1_s42, which is why this is
+# not a preference: the int16 quantum is 3.05e-05 in ABSOLUTE HM, b1's core is narrower than
+# that, and 34% of adjacent quantile levels exported to the SAME code. max_density_p99 then
+# read 1531.8 at every horizon -- exactly dp_max / one quantum, the statistic's ceiling
+# rather than a density -- and the pixels whose gap was exactly zero were dropped from the
+# gate entirely for having infinite density. Both gates were unreadable. Doubles the qf
+# raster (~19 GB -> ~35 GB per experiment); the HDD has room and a pinned metric does not.
+EXPECT_QF_DTYPE="--predict_qf_dtype float32"
+
+# Average the last 20 epochs instead of letting ModelCheckpoint pick one. MEASURED on the
+# three-seed argmin floor (data/conv_spline/scores/floor_argmin/README.md): val_crps plateaus
+# after ~epoch 30 and then oscillates by +/- 0.001, so the argmin picked epochs 67, 124, 146,
+# 67, 127, 111 across six fold-models -- a coin toss among ~100 candidates. Accuracy did not
+# care (rmse20 reproducible to 0.1%); the GATES did, with bands of 25-115% of their own mean
+# on three replicates of one configuration. Every arm in this phase is judged on those gates,
+# so a floor that wide makes the slate unrankable.
+#
+# This flag's own help text records the same finding from a prior phase (140/85/60 across
+# three seeds) and BOTH shipped global configs pass it -- run_global_dist_hindcast.sh:47 and
+# run_global_dist_forecast.sh:40. BASE_ARGS did not, which is rule 16 for the third time in
+# this phase. Implies --checkpoint_select final, so prediction runs on the averaged weights.
+EXPECT_WA="--weight_avg_last 20"
+
 # val_crps, not val_total_loss: an experiment that sets --mu_mse_weight 0 would otherwise be
 # selecting epochs on a different quantity from every other run in the slate.
 export BASE_ARGS="--head_family spline --central_residual True --checkpoint_monitor val_crps \
---mu_mse_weight ${EXPECT_MU_MSE} \
+--mu_mse_weight ${EXPECT_MU_MSE} ${EXPECT_CTX} ${EXPECT_ROW_CHUNK} ${EXPECT_QF_DTYPE} ${EXPECT_WA} \
 --ssim_weight ${EXPECT_SSIM} --laplacian_weight ${EXPECT_LAP} --histogram_weight ${EXPECT_HIST}"
+
+# The scorer's own working set, measured the same way and worse: 59.1 GB peak on ONE fold.
+# read_qf pulls the whole 64-band raster (16.1 GB on Africa) and the ref-grid gate built
+# [256, n_px] and [255, n_px] temporaries on top of it -- the float64 density array alone was
+# 13.6 GB. That is now blocked by pixel inside qf_diagnostics.fence_per_pixel, which bounds it
+# regardless of how many pixels a stratum has: MEASURED 59.1 -> 32.1 GB on the same rasters,
+# 31 min against 33, and all 88 summary metrics bit-identical. Two folds project to ~48 GB
+# (the 16.1 GB raster read is fixed; the rest doubles), which fits with room, so no row
+# banding by default.
+#
+# --row_chunk is still there and still a proven identity (tests/test_score_dist_row_chunk.py),
+# but it is NOT free: at 512 it cost ~36% wall clock, which is 4 h across this phase's 14
+# arms. Raise it only if a measurement says the peak bites -- and measure, do not project.
+export SCORE_ROW_CHUNK="${SCORE_ROW_CHUNK:-0}"
 
 # Read the effective weights back out of the fold log and refuse to continue if they are not
 # what BASE_ARGS asked for. Verify the fingerprint before trusting a retrain: a run on
@@ -132,11 +196,48 @@ verify_context_wiring() {
     echo "       Check --context_radii / --hm_context_stats against the checkpoint, if any." >&2
     return 1
   fi
+  # ON is not the same as ONLY, and neither is the same as THE RIGHT ONE. The two counts
+  # above agree whenever the flags and the module agree -- including when both are argparse
+  # defaults nobody chose. This is the only line that can tell b1's covariate from the
+  # default one.
+  if [ -n "${EXPECT_CTX_CHANNELS:-}" ] && [ "$n_trunk" != "$EXPECT_CTX_CHANNELS" ]; then
+    echo "FATAL: ${name}: trunk has ${n_trunk} context channels; this phase's baseline is" >&2
+    echo "       ${EXPECT_CTX_CHANNELS} (${EXPECT_CTX})." >&2
+    echo "       An arm on a different covariate is not comparable to the floor." >&2
+    return 1
+  fi
   if ! grep -q "^Context into trunk:.*heads: none" "$log"; then
     echo "FATAL: ${name}: the log does not say the heads are excluded." >&2
     return 1
   fi
   echo "  ✓ ${name}: context wiring verified (${n_trunk} channels -> trunk, heads none)"
+}
+
+# The averaged weights must actually be what got predicted. Two fingerprints, both printed by
+# the run itself: the averaging writes the mean into the tensors, and prediction is repointed
+# at the end-of-training checkpoint rather than the monitored one. A run that silently fell
+# back to the argmin would carry the wide gate band and read as a null.
+verify_weight_averaging() {
+  local log="$1" name="$2" want="${3:-20}" got
+  if [ ! -r "$log" ]; then
+    echo "FATAL: ${name}: no readable fold log at ${log}; weight averaging unverified." >&2
+    return 1
+  fi
+  got=$(grep -m1 "^\[weight averaging\] wrote the mean of the last" "$log" | awk '{print $9}')
+  if [ -z "$got" ]; then
+    echo "FATAL: ${name}: no weight-averaging line in ${log}." >&2
+    echo "       The run selected a single epoch, and its gates carry the argmin band." >&2
+    return 1
+  fi
+  if [ "$got" != "$want" ]; then
+    echo "FATAL: ${name}: averaged ${got} epochs, expected ${want}." >&2
+    return 1
+  fi
+  if ! grep -q "Prediction will use the end-of-training checkpoint" "$log"; then
+    echo "FATAL: ${name}: averaging ran but prediction was not repointed at it." >&2
+    return 1
+  fi
+  echo "  ✓ ${name}: weight averaging verified (mean of the last ${got} epochs, predicted)"
 }
 
 # Africa, not southern Africa, and not the globe. Southern Africa's far-field band holds ZERO

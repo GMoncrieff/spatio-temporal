@@ -23,16 +23,29 @@ documents describe systems that no longer exist here. Read them for method, not 
 **Read `docs/conv_spline_phase.md` first.** It carries the measured defects, the experiment
 menu, and why each experiment exists.
 
+**The scorecard has pictures now.** `score_distributional_model.py` writes
+`densities_<label>.png` (nine per-pixel implied densities on a 3x3 grid, log axis, with
+`f_max`, the observed change and zero marked), `pit_<label>.png` (a 20-bin PIT histogram per
+horizon) and `scorecard_<label>.html`, which embeds both beside the two metric tables. The nine
+pixels come from a seeded walk over the **fold mask**, not over the run's own finite pixels, so
+every arm draws the same nine and the panels stack. `src/qf_plots.py`.
+
 ## Where the phase is
 
-**Nothing has been run.** The code is in place; the data is not on this machine.
+**No experiment has been run.** The data *is* on this machine now, and as of 2026-09-14 the
+code has met it: a one-epoch, one-fold smoke pass over the full Africa path. Three defects had
+to be fixed before `b1` could run at all — the prediction writer could not decode `pwl`/`isqf`,
+both gates raised `KeyError` on every real scoring run, and `b1` was scripted on the wrong
+covariate. All three are written up in `docs/conv_spline_phase.md`.
 
 1. **Step 1, not yet run** — establish `b1`. Three seeds, on Africa.
    `./scripts/run_conv_spline_baseline.sh`
 2. **Then** the E0–E5 slate. `./scripts/run_conv_spline_slate.sh`
-3. **Then §4.1's scale arms** — E0a first and alone, then E1a and E1b in either order, E2a
-   paired with E1b, E1c last. `run_conv_spline_slate.sh` knows E0–E5 only, so none of them has
-   a runner entry yet, and three need `--free_scale` / `--isqf_tails`, which do not exist.
+3. **Then §4.1's scale arms** — `./scripts/run_conv_spline_scale_arms.sh`. Written 2026-09-15:
+   `--free_scale`, `--isqf_tails` and `--isqf_space` exist and are tested, and the runner holds
+   the six arms in the doc's order (E0a first and alone, both `--isqf_space` arms, E1b paired
+   with E2a, E1c last and unconditional) with a test asserting it. **Two things §4.1 specified
+   were wrong and only running it showed that** — see the phase doc's flag-status block.
 4. **E6–E8 are chosen from what E0–E5 and §4.1 measure**, not written in advance.
 
 Nothing on this branch is comparable to a `dist-convlstm` number: the trunk change alone makes
@@ -46,6 +59,30 @@ and never the trunk; everything from `b1` onward feeds the trunk and never the h
 log reports the channel count the trunk was actually built with — read off the module, not off a
 flag — and `verify_context_wiring` refuses a run where that is zero, disagrees with what
 `--context_radii` / `--hm_context_stats` imply, or says a head received it.
+
+**Where it goes is not a setting; which covariate it is still is, and it is named.** `b1` is
+"`e1` plus exactly one change", and `e1` is `--context_radii 3,30,100 --hm_context_radii
+3,30,100 --hm_context_stats mean,max` — **twelve** trunk channels. `BASE_ARGS` named none of
+them until 2026-09-14, so `b1` was scripted on argparse defaults: `--context_radii
+1,3,10,30,100`, no HM summaries, **eight** channels — `e1`'s dropped fine radii back and the
+neighbourhood-HM covariate simply absent. `verify_context_wiring` could not see it: it compared
+the module against the same defaults and read 8 == 8. `conv_spline_base.sh` now names the flags
+and carries `EXPECT_CTX_CHANNELS=12`, which the wiring check compares the trunk against —
+`tests/test_conv_spline_paths.py` proves that line fires on the 8- and 9-channel controls.
+
+## What b1 measures — first run, 2026-09-14
+
+`b1_s42` on Africa, folds 1+2, `fold_mask_b4`, 150 epochs. `crps_skill` 0.202 / 0.261 / 0.285 /
+0.289 and central `skill` 0.120 / 0.209 / 0.247 / 0.253 at +5/10/15/20 yr, both against
+persistence. **The pooled skill is carried entirely by pixels near past change**: by distance
+band at h=20 it runs +0.395 / +0.293 / +0.223 / +0.137 / **−0.106** / **−1.510**, so beyond
+30 px the model loses to persistence and in the far field it loses badly.
+
+**The fence is real, it is in the core, and it is severe.** 73.3% of the needle mass comes from
+`u ∈ [0.1, 0.6]` and 0.3% from the clamp; 74.8% of core segments are needles; the median core
+segment is **7.93e-6 HM**, 87x narrower than the observation noise's sigma of 6.9e-4 — while
+`width95` is a healthy 0.020. `MIN_SCALE` is **not** the cause (0.0% of pixels near it). None of
+this is comparable to e1's numbers, for the reasons in `docs/conv_spline_phase.md` §1a.
 
 ## The two defects the phase exists to fix
 
@@ -114,20 +151,28 @@ The previous CLAUDE.md closed these. They are open again, and several are experi
   `ALLOW_GLOBAL=1` is required and should never be set casually. Projected from the Africa run:
   ~121 min prediction per fold, ~10 h for k=5.
 - Artifacts live under `data/conv_spline/`. Large ones belong on the HDD
-  (`/mnt/hdd1/spatio-temporal/data`) behind symlinks — but pass the HDD path directly as an
-  output, never a symlink, since output directories get cleared with `shutil.rmtree` and that
-  refuses on a symbolic link.
-- Monitor free space on the HDD and SSD.
+  (`/mnt/hdd1/spatio-temporal/data`), and output roots are passed as the HDD path spelled out
+  rather than through a symlink. **The reason this rule used to give no longer exists**: the
+  `shutil.rmtree` that refuses on a symbolic link lived in `migrate_zarr_to_icechunk.py`,
+  which commit `60c6a9e` deleted with the rest of the ensemble layer — `git grep rmtree` finds
+  nothing on this branch, and `run_hindcast_folds.py` only does `mkdir(exist_ok=True)` and
+  `Path.unlink()`. Keep the practice (there is then no resolution to reason about when a
+  path is cleared or moved), drop the dead justification. `EXP_ROOT` therefore defaults to
+  `/mnt/hdd1/spatio-temporal/data/conv_spline/exp` spelled out, while `LOG_DIR` and `SCORE_DIR`
+  stay on the SSD under `data/conv_spline/` — they are small and every verifier greps them.
+- Monitor free space on the HDD and SSD. A stitched Africa window-year is 64 int16 bands over
+  63.1 Mpx and there are **ten** of them per experiment, plus one set per fold under
+  `--keep_fold_rasters`. Deflate-compressed, so measure rather than project from the raw size.
 - When long running tasks are underway e.g. training, scoring, prediction. periodically check progress and health  (every 30 mins). 
 
 ## The loops
 
 | what | command | cost |
 |---|---|---|
-| one experiment (train held-out folds, predict Africa, stitch) | `BASE_ARGS=... ./scripts/run_central_experiment.sh <name> 0,1 1,2 "<flags>"` | ~50 min, 2 folds in parallel |
+| one experiment (train held-out folds, predict Africa, stitch) | `BASE_ARGS=... ./scripts/run_central_experiment.sh <name> 0,1 1,2 "<flags>"` | **prediction alone is ~26 min/fold** (measured 2026-09-14: 9:32 + 7:10 + 5:23 + 3:39 for the four windows), folds in parallel, + stitch ~7 min. Training is on top of that. |
 | **establish the baseline and its floor** (3 seeds) | `./scripts/run_conv_spline_baseline.sh` | 3x the above |
 | **the experiment slate** (refuses without a floor) | `./scripts/run_conv_spline_slate.sh` | 6x the above |
-| **score a model**, no ensemble, both gates included | `scripts/score_distributional_model.py --stitched_dir … --folds 1,2` | ~5 min on Africa |
+| **score a model**, no ensemble, both gates included, two figures and an HTML scorecard | `scripts/score_distributional_model.py --stitched_dir … --folds 1,2` | **~31 min on Africa**, not the ~5 min this table claimed — measured 2026-09-14 over ten window-years, one fold |
 | **rank against the measured floor** | `scripts/compare_conv_spline_runs.py --floor_prefix b1` | seconds |
 | **predict-only from frozen checkpoints** | `run_hindcast_folds.py --fold_checkpoints … --max_epochs 0` | ~121 min/fold globally |
 | build the neighbourhood-HM covariate (once) | `scripts/prepare_hm_context.py` | 2:45 per base year |
@@ -140,12 +185,18 @@ Kept only where they still apply. Numbering is fresh; the old file's numbers are
    model bugs in this project throughout. Byte-identical numbers across supposedly different
    configurations is the tell — but check the artifacts are genuinely distinct before
    concluding it, since two immaterial fixes look identical too.
-2. **Three bugs were caught setting up this phase, each of which would have read as a null
-   result.** A closed-form CRPS returning *negative* values; a knot preset silently missing the
-   0.5 and 0.975 gate levels; and `pwl`/`isqf` taking the triple-head two-pass code path
-   because `head_family == 'spline'` was spelled out in three separate places. The third is the
-   general form: **a predicate written more than once is a predicate that will disagree with
-   itself.**
+2. **Bugs caught before a single run, each of which would have read as something else.** A
+   closed-form CRPS returning *negative* values; a knot preset silently missing the 0.5 and
+   0.975 gate levels; and `pwl`/`isqf` taking the triple-head two-pass code path because
+   `head_family == 'spline'` was spelled out in three separate places. The general form:
+   **a predicate written more than once is a predicate that will disagree with itself.**
+   A fourth, found 2026-09-14 and the same shape: the prediction writer called
+   `splines_from_output` — the *rational-quadratic* decoder, 29 channels per horizon — for
+   every family, so `pwl` and `isqf` (16) raised `ValueError: expected 116 spline channels
+   after 12, got 64` at the first prediction batch. E1, E2, E4 and all four §4.1 free-scale
+   arms would each have trained for fifty minutes and written no raster. There is now one
+   decoder, `SpatioTemporalPredictor._decode`, and the loss and the writer both go through it
+   (`tests/test_conv_spline_flags.py`, with the old call pinned as the control).
 3. **The second implementation earns its keep, fourth time now.** The rational-quadratic closed
    form was wrong by a *relative* error of ~1; the piecewise-linear one returned negatives.
    Both were caught only by a dense numerical reference sharing no quadrature code. Keep one.
@@ -195,8 +246,13 @@ Kept only where they still apply. Numbering is fresh; the old file's numbers are
     injects the frozen product's loss weights and `--extra_train_args` is appended last, so
     anything `BASE_ARGS` does not name is silently inherited. `conv_spline_base.sh` names all
     four loss weights — including `--mu_mse_weight`, which was an argparse default on every arm
-    until 2026-09-11 — and reads them back out of the run's own log. The context needs no such
-    naming any more: it is not a flag, so nothing appended later can turn it off.
+    until 2026-09-11 — and reads them back out of the run's own log. **Hardwiring something
+    into the model exempts only what was hardwired.**
+    The context's *destination* is no longer a flag, so nothing appended later can turn it off —
+    but its *content* is still `--context_radii` / `--hm_context_stats`, and `BASE_ARGS` named
+    neither until 2026-09-14. `b1` was therefore scripted on eight default channels while the
+    phase doc called it `e1` (twelve) plus one change. `EXPECT_CTX_CHANNELS` now names the count
+    and `verify_context_wiring` compares the trunk against it.
 17. **Any long-range covariate must be precomputed on the full raster**, never derived inside a
     128 px chip (radii ≥ 30 px saturate against the chip boundary). This is about where the
     covariate is *derived*, not where it is *consumed* — which is why b1 can feed the same
@@ -222,6 +278,19 @@ Kept only where they still apply. Numbering is fresh; the old file's numbers are
     the width comes from.
 22. **A regional working set can hide a quadratic.** Something `(M, H, W)` and unremarkable on
     1.86 Mpx is dead on 63.1 Mpx. Check peak memory against the region you will actually run.
+    **Measured on Africa, 2026-09-14, both worse than the estimates in the code:** prediction
+    accumulators peak at **40.7 GB per fold** where `plan_row_bands` estimated ~22 GB, and the
+    scorer peaked at **59.1 GB on one fold** — `read_qf` pulls the whole 64-band raster
+    (16.1 GB) and the ref-grid gate built `[256, n_px]` and `[255, n_px]` on top of it, the
+    float64 density array alone 13.6 GB. `conv_spline_base.sh` passes
+    `--predict_row_chunk 2048` for the first; the second is fixed by blocking the gate over
+    pixels inside `qf_diagnostics.fence_per_pixel` — **59.1 → 32.1 GB, 31 min against 33, all
+    88 summary metrics bit-identical** on the same rasters. **Bound the temporary where it is
+    built, not by shrinking the caller's slice**: `--row_chunk 512` bought the same memory and
+    cost ~36% wall clock, four hours across this phase's fourteen arms, so it now defaults off
+    (`SCORE_ROW_CHUNK=0`) and stays available. **A restriction mask is not a memory saving when
+    the kept pixels are scattered** — `fold_mask_b4`'s 512 px blocks touch nearly every 4 KiB
+    page of a full-region accumulator while keeping a fifth of the pixels.
 23. **Never edit a shell script while it is running.** Bash reads a script incrementally by byte
     offset, so inserting lines mid-run makes it resume at a stale offset and execute a
     fragment. Copy to a new name and launch that. Likewise `pkill -f <pattern>` matches the
@@ -229,7 +298,38 @@ Kept only where they still apply. Numbering is fresh; the old file's numbers are
 24. **A leak shows up as a gradient, not a level.** Removing a leak must make error rise *with*
     distance from the fold's own trained-on data; a flat profile that is simply worse
     everywhere is a training signature.
-25. **A banner that prints a literal is not a fingerprint.** `MSE weight: 1.0 (fixed)` was
+25. **A metric is only a metric while its instrument can resolve the thing.** `max_density_p99`
+    read **1531.8 at all four horizons** on b1_s42 — exactly `dp_max / one int16 quantum`. An
+    identical value at four horizons is a ceiling, not a density. Three defects compounded and
+    each had to be fixed before anything could be said about the model: the int16 export pinned
+    the statistic (now `--predict_qf_dtype float32`, and the reader takes the scale off the
+    raster rather than a constant); `fence_reduce` **dropped** every pixel with infinite density
+    before computing the density gate, which on b1 was 91.5% of them; and the clamp at HM=0 — a
+    physical boundary, 40% of Africa sits in `[0, 0.01)` — was counted as a fence. **Separate
+    the boundary from the pathology and rank only the pathology**: a column that is a large
+    constant on every arm cannot discriminate between them (`px_clamp_frac`, ranked "none").
+    **The ceiling moves, it does not leave.** float32 lifted `max_density` from 1531.8 to ~1e7
+    and 47.9% of pixels still sit within two float32 ULPs of their sharpest segment, so it is
+    now reported rather than ranked. Rank the fence on what is bounded in [0, 1] and cannot
+    saturate: `needle_mass`, `px_degenerate_frac`, `over_f_max_frac`.
+26. **A parameterisation is only meaningful relative to what consumes it.** Every head feeds
+    its shape channels through a *softmax*, so their absolute magnitude has never mattered --
+    measured, `|raw|` averages 2.68 at init. `--free_scale` makes that magnitude *be* the
+    width, and the spec as written (`|.| + tol`, unnormalised) therefore started the ladder
+    **330x too wide**, saturating the clamp: pwl spanned all of [0, 1] and isqf reported a
+    width of exactly zero. Both arms would have measured optimiser escape from a hopeless
+    init. When you remove a normalisation, the quantity underneath does not keep its old
+    meaning — give it a **unit** (a constant), which is not the same thing as giving it back
+    a **normalisation** (a per-pixel rescale) and does not undo the experiment.
+27. **A unit test that builds its own input tests the function, not the path.** `gate_stats`
+    had a passing test that constructed `cell` by hand with the quantile function in it. The
+    real caller does not: `load_row` streams the raster in bands and does `del cell["qf"]`
+    before concatenating, so **every real scoring run raised `KeyError: 'qf'` on the pooled
+    stratum** and the two gates the phase exists to measure never ran once. Nothing between the
+    two was tested. Pair every unit test of a reduction with one end-to-end call on the path
+    that feeds it, and prove the pair fires by reverting the fix
+    (`tests/test_score_dist_row_chunk.py`).
+28. **A banner that prints a literal is not a fingerprint.** `MSE weight: 1.0 (fixed)` was
     hardcoded while `--mu_mse_weight` was a live flag the previous phase had already ablated,
     so the one line a log reader checks could not distinguish the two runs — and the check that
     greps it passed either way. Print the argument, then verify it; a check on a constant
@@ -241,11 +341,14 @@ Kept only where they still apply. Numbering is fresh; the old file's numbers are
   the boolean idiom is
   `type=lambda x: (str(x).lower()=='true'), nargs='?', const=True, default=…`.
 - Tests are flat in `tests/`, pytest, `sys.path.insert(0, parent)` + absolute imports,
-  synthetic tensors. **The suite stood at 355 passed / 15 failed** when this phase began; tests
-  have been added since (`test_conv_spline_paths.py`, 0 → 20) and the count has not been
-  re-measured. Those 15 fail identically
-  on `dist-convlstm` (stale legacy tests asserting a 4-channel output from a model that emits
-  12, plus fixtures needing data that is not on this machine). Any other failure is yours.
+  synthetic tensors. **Measured 2026-09-15 on this machine: 451 passed / 7 failed.** Not the 15
+  the phase began with — the fixture-needing ones pass now that the data is here. All 7 fail
+  identically on `dist-convlstm` (checked in a worktree): stale legacy tests asserting a
+  4-channel output from a model that emits 12, forwards that pass no `lonlat` to a trunk built
+  with a location encoder, and a `target` key the loader no longer emits. Any other failure is
+  yours. One flake to know about: `test_dataloader_targets_different` samples chips with
+  `mode="random"` and no seed, so it fails perhaps one run in three — it passes 3/3 in
+  isolation, and it is not a regression.
 - **A new experiment needs a test that it changed something**, against a seeded control. A flag
   that is accepted, logged and inert reads downstream as "the experiment was a null" rather
   than "the experiment never ran" — see `tests/test_conv_spline_flags.py`.

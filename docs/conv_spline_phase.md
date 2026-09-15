@@ -3,6 +3,131 @@
 Branch `conv-spline`. Started 2026-09-07. **No experiment has been run.** Everything below is
 code that exists and a plan that has not been executed.
 
+> **2026-09-14 — the code met real data for the first time, and three things had to change
+> before `b1` could run.** Recorded here because each would have been read as a result.
+>
+> 1. **The prediction writer could not decode two of the three head families.** It called
+>    `splines_from_output` — the rational-quadratic decoder, 29 channels per horizon — for
+>    every family, so `pwl` and `isqf` (16) raised `ValueError: expected 116 spline channels
+>    after 12, got 64` at the first prediction batch. **E1, E2, E4 and all four of §4.1's
+>    free-scale arms** would each have trained for fifty minutes and written no raster. It now
+>    goes through `SpatioTemporalPredictor._decode`, which is the call the loss already makes.
+> 2. **Both gates crashed every real scoring run.** `load_row` streams the quantile-function
+>    raster in horizontal bands and does `del cell["qf"]` before concatenating them;
+>    `gate_stats` read `cell["qf"]` back out, so the pooled stratum raised `KeyError: 'qf'`.
+>    The unit test passed because it built `cell` itself with the quantile function still in
+>    it. Both gates are now reductions over per-pixel quantities computed inside the band loop
+>    (`qf_diagnostics.gate_per_pixel` / `gate_reduce`), which also removes the `64 x n_px` copy
+>    per stratum that §22 of `CLAUDE.md` warns about. Pinned by an exact identity against the
+>    whole-raster statistic and by an end-to-end control proved to fire on the reverted fix.
+> 3. **`b1` was not `e1` plus one change.** `BASE_ARGS` named no context flags, so it trained
+>    on argparse defaults — `--context_radii 1,3,10,30,100`, no HM summaries, **eight** trunk
+>    channels — where `e1` is `--context_radii 3,30,100 --hm_context_radii 3,30,100
+>    --hm_context_stats mean,max`, **twelve**. `verify_context_wiring` could not see it: it
+>    compared the module against the same defaults and read 8 == 8. The flags are named now and
+>    the count is pinned as `EXPECT_CTX_CHANNELS=12`.
+>
+> The suite stands at **425 passed / 7 failed**; all 7 fail identically on `dist-convlstm`.
+
+## 1a. What b1_s42 actually measured, and what had to be fixed to measure it
+
+Run 2026-09-14: Africa, folds 1+2, `fold_mask_b4`, 150 epochs, one seed. **The first scorecard
+was unreadable, and three separate things were wrong with the instrument before anything could
+be said about the model.**
+
+**The fence gate was pinned at its own ceiling.** `max_density_p99` read **1531.8 at every
+horizon** — which is exactly `dp_max / one int16 quantum` (0.046747 / 3.0518509e-05). An
+identical value at four horizons is not a density, it is a statistic reporting that the widest
+u-bin has collapsed onto a single stored code. The qf raster is now written **float32**
+(`--predict_qf_dtype float32`, named in `BASE_ARGS`) and the reader takes the scale off the
+raster's own tag instead of a hardcoded constant — that quantity used to be spelled in three
+places. With the floor removed the same weights report a max density of **1.2e7**, and the
+statistic varies by horizon again.
+
+**The gate was discarding its own worst evidence.** `fence_reduce` filtered non-finite values
+(`px_max[np.isfinite(px_max)]`) before every density statistic, so a pixel with a zero-width
+segment — infinite implied density, the strongest possible needle — left no trace. On b1_s42
+that was **91.5%** of pixels. They now count, and `px_degenerate_frac` sits beside
+`max_density` so the latter is never read alone.
+
+**The support boundary was being counted as a fence.** HM cannot leave [0, 1] and 40% of Africa
+sits in `[0, 0.01)`, so the lower tail clamps flat at zero — correct behaviour. Measured: of
+pixels whose two lowest levels were identical, **100%** had `Q = 0.0` exactly there, and the
+clamp contributed **0.3%** of the needle mass. It is now excluded from the fence and reported
+as `px_clamp_frac` / `gap_frac_clamp`, ranked "none": a column that is a large constant on
+every arm cannot discriminate between them.
+
+### The fence is real, it is in the core, and it is severe
+
+With the instrument fixed, the same weights re-exported at float32 give needle mass p50 0.334
+against int16's 0.344 and **p90 identical to four decimals**. Nothing about it was storage.
+Attributing the needle mass by u-region:
+
+| u region | share of needle mass | probability it holds |
+|---|---|---|
+| clamp, u < 0.01 | 0.3% | 0.010 |
+| lower tail 0.01–0.1 | 0.3% | 0.097 |
+| **core 0.1–0.6** | **73.3%** | 0.509 |
+| upper body 0.6–0.9 | 24.3% | 0.297 |
+| upper tail u ≥ 0.9 | 1.9% | 0.087 |
+
+With the clamp separated out, the genuine degeneracy is confined to short lead times:
+`px_degenerate_frac` reads 0.613 / 0.174 / **0.000** / 0.000 at h=5/10/15/20 while
+`px_clamp_frac` sits at 0.49-0.59 throughout. **Beyond h=10 there is no zero-width segment
+anywhere that is not HM resting on its floor.** The same split shows in coverage from a wholly
+independent instrument -- `cov50` is 0.383 / 0.374 at h=5/10 against 0.525 / 0.504 at h=15/20 --
+so the short-horizon core collapse is two measurements agreeing, not one metric's artefact.
+
+**74.8% of core segments are needles**, and the median core segment is **7.93e-6 HM** wide —
+87x narrower than the needle threshold and 87x narrower than the observation noise's own sigma
+of 6.9e-4. Meanwhile `width95` is healthy (median 0.020, p1 4.6e-3). Half the probability mass
+is packed into a few microunits of HM inside a wide interval. That is the phase's own sentence,
+measured: *the head is being asked to spend five bins on a region where nothing varies.*
+
+> **`MIN_SCALE` is not the cause, though the mismatch section 4.1 flags is real.** The comment
+> at `quantile_spline.py:130` justifies 3e-5 while the constant is 1e-6 — which is 1.53e-7 in
+> HM, 4,500x below the noise. Measured on b1_s42: **0.0%** of pixels are at that floor, below
+> 3e-5, or even below the noise sigma. Resolve it before the `--free_scale` port as section 4.1
+> says; it explains nothing here.
+
+> **`max_density` is a lower bound, not a value, and is reported rather than ranked.** The
+> int16 export pinned it at 1531.8; float32 moved the ceiling to ~1e7 without removing it.
+> Measured on b1_s42's float32 raster: **47.9% of pixels have their sharpest segment within
+> two float32 ULPs**, median 3.0 ULP. A `max_density_p99` that is byte-identical across four
+> window-years (1.25e+07 at h=5 in every one) is the tell. The fence is therefore ranked on
+> the statistics that are **bounded in [0, 1] and cannot saturate** -- `needle_mass_median` /
+> `_p90`, `px_degenerate_frac`, `over_f_max_frac` -- with `max_density` printed beside them
+> for scale. `max_density_p50` is the better-behaved of the two percentiles (8.1e3-1.9e4
+> across window-years at h=5, against a p99 that does not move at all).
+
+> **Do not compare any of this to e1's 4.5% / 677.** Different model, different fold mask
+> (`fold_mask_b4`'s 512 px blocks against a 128 px checkerboard), and e1's number came from a
+> side script whose density statistic had the same drop-the-degenerate-pixels defect. b1's
+> fence IS the floor; there is no regression to explain.
+
+**Costs, measured rather than projected.** Train 150 epochs + predict, two folds in parallel:
+63.0 min. Stitch: 11.7 min. Score: ~57 min. **~2.2 h per experiment**, so the fourteen-arm
+programme is ~31 h, not the ~10.75 h section 4.1 projects. float32 storage is 2.4x int16
+(2.58 GB against 1.06 GB per stitched window-year; 66 GB per experiment).
+>
+> **And two costs the code's own estimates understated, both found by running it.** Prediction
+> accumulators peak at **40.7 GB for one Africa fold** where `plan_row_bands` estimated ~22 GB
+> — the restriction mask saves less than it looks like it saves, because `fold_mask_b4`'s
+> 512 px blocks touch nearly every page of a full-region accumulator while keeping a fifth of
+> the pixels. The scorer peaks at **59.1 GB on one fold**: `read_qf` pulls the whole 64-band
+> raster (16.1 GB on Africa) and the ref-grid gate builds `[256, n_px]` and `[255, n_px]` on
+> top of it — the float64 density array alone 13.6 GB. b1 runs *two* folds on a 125 GB box.
+> `conv_spline_base.sh` passes `--predict_row_chunk 2048` for the accumulators; the gate is
+> fixed instead by blocking it over pixels where the temporary is built
+> (`qf_diagnostics.fence_per_pixel`), measured **59.1 → 32.1 GB with all 88 summary metrics
+> bit-identical and no time cost**. `--row_chunk` would have bought the same memory for ~36%
+> more wall clock, so it defaults off and stays available.
+>
+> Timings, measured rather than inherited: prediction is **~26 min per fold** (9:32 / 7:10 /
+> 5:23 / 3:39 for the four windows, which shrink with the horizon count), stitching ~7 min, and
+> **scoring ~33 min** — not the ~5 min the loop table in `CLAUDE.md` carried from an earlier
+> phase. Training is on top of all of that.
+
 The phase evaluates the distributional ConvLSTM **alone**. There is no ensemble, no post-hoc
 chain, no copula, no width calibration and no empirical marginal — those were deleted rather
 than left dormant, because a dormant path is one nothing runs and nothing checks. The model's
@@ -203,12 +328,31 @@ not read exactly zero on b1, the statistic is wrong before any arm is judged.
 `width95_{h}` in absolute HM and beside `cov95`: a narrowing fraction that rises while `cov95`
 falls is a collapse, not a finding.
 
-### Save and show plot
+### The figures — built 2026-09-14, `src/qf_plots.py`
 
-For each experiment, save a plot of:
-1) estimated distribution for 9 (3x3 grid) selected pixels.
-2) The pit distribution for 0-1 with 20 bins
-Embed these plots in the scorecard
+Every experiment writes both, beside its numbers, without being asked:
+
+1. **`densities_<label>.png`** — the implied density of nine per-pixel forecasts on a 3x3
+   grid. The x axis is *change* (`Q(u) - HM_t0`), because against absolute HM the whole
+   persistence core collapses into one pixel of the plot; the y axis is logarithmic, because
+   the core sits at several hundred and the tails well under one. Drawn as a **step** function,
+   which is what the distribution is — the raster is a piecewise-linear quantile function, so
+   its density is piecewise constant, and smoothing it would hide exactly the discontinuities
+   the gate counts. `f_max = 578`, the observed change and zero are marked on every panel.
+2. **`pit_<label>.png`** — the PIT histogram in twenty bins, one panel per horizon, plotted as
+   a density so the calibrated reference is the line at 1.0 at every horizon whatever the pixel
+   count. Same reason `pit_rms_se` is reported rather than raw RMS.
+
+Both are embedded, base64, into **`scorecard_<label>.html`** beside the pooled-by-horizon and
+gate tables.
+
+**The nine pixels are drawn by a seeded walk over the fold mask**, not over the run's own
+finite pixels, so two arms scored on the same folds draw the same nine and their panels stack.
+A pixel an arm failed to predict is skipped and the walk continues — the only way the choice
+can differ between arms, and worth seeing when it does. Both figures are read off the exported
+raster, the same object the gates are computed from: a figure drawn from a different object
+than the metric would be the fourth way this project has found to make a measurement disagree
+with itself.
 ---
 
 ## 4. The experiment menu
@@ -249,9 +393,52 @@ are `+2`. Simplicity is a scoring criterion (`CLAUDE.md`), and these are the num
 beside the metrics — E1b and E2a are the *cheapest* heads on the slate, not merely different
 ones.
 
-**Flag status, so nothing runs inert.** `--spline_cumulative_width` (E0a) exists today.
-`--free_scale`, `--isqf_tails` and `--isqf_space` (E1a, E1b, E1c, E2a) **do not exist yet** and
-are the names proposed here, not names to pass at a shell before the code lands. `--free_scale`
+**Flag status.** `--spline_cumulative_width` (E0a) exists. `--free_scale`, `--isqf_tails` and
+`--isqf_space` were **implemented 2026-09-15** and are pinned by twelve tests in
+`tests/test_conv_spline_flags.py`; `scripts/run_conv_spline_scale_arms.sh` runs the six arms in
+the order below, with a test asserting that order. **Two things this section specified turned
+out to be wrong, and neither was visible without running it:**
+
+> **1. `--free_scale` as specified starts the ladder 330x too wide.** The spec is "unnormalised
+> positive increments (`|.| + tol`) in place of the softmax heights". But every head feeds the
+> shape channels *through a softmax*, so only their relative values have ever mattered and
+> their absolute magnitude is arbitrary -- measured at init, `|raw|` averages **2.68**.
+> `--free_scale` makes that magnitude *be* the 95% width: 8 bins x 2.68 = 3.3 HM against an
+> intended 0.010. Every knot then saturates the [0, 1] clamp, and the two arms fail in
+> opposite directions -- `pwl` spans the entire range, `isqf` piles its whole ladder onto the
+> upper bound and reports a width of **exactly zero**. Both would have measured whether the
+> optimiser can escape a hopeless initialisation. The fix gives one increment a defined size
+> (`initial_width_normalized / n_95_bins`, `quantile_pwl.free_increments`): a **unit**, not a
+> normalisation -- no pixel's width is tied to another's and nothing is rescaled to a target
+> span, so the width stays emergent. Measured after: every arm starts at 0.020-0.028 HM
+> against b1's own 0.0184.
+>
+> **2. The tails would have been a straight line to a distant point.** Writing the learned
+> tail into the endpoint knot alone leaves everything between u = 0.999 and u = 1 -- which is
+> exactly where the 64-level raster samples the far tail -- to linear interpolation.
+> `ISQFQuantile.ppf` now evaluates the exponential wherever it owns the domain. Verified
+> curved: `Q(0.9995)` = 0.0799 against a straight-line 0.1576. The numbers move either way,
+> so this omission would have been invisible and E1a would have been judged on a mechanism it
+> was not running.
+
+**Decisions taken before coding, as this section demands.** The tails **replace** the outer
+bins and anchor at the 0.001 / 0.999 knots (verified: the spline interior is bit-identical to
+E1, so E1a remains the control on the width row). E1b stays paper-faithful with `q0` at
+`Q(0.0)` while E2a anchors at `Q(0.5)` -- verified to produce identical widths, confirming they
+are one ladder differing only in where persistence enters. `MIN_SCALE` is ported to a span
+floor at the **3e-5** this doc resolved, not the mismatched 1e-6, and shared between both
+families so E1b and E2a cannot drift onto different scales.
+
+**`--isqf_space` is an experiment, not a setting.** b1's far-tail miss is two-sided and
+near-symmetric -- `pit_lt_0001 / pit_gt_0999` = 1.017 / 1.254 / 0.971 across the three floor
+seeds -- which `logit` can address and `neglog`, unbounded above only, structurally cannot. Both
+get an arm.
+
+**E1a would have been unreadable.** Its mechanism acts only beyond u = 0.001 / 0.999, and no
+ranked metric measured that: the arm could have worked perfectly and scored as a null, which is
+the inert-flag failure one level up. `pit_gt_0999`, `pit_lt_0001` and a pooled
+`far_tail_excess` are now ranked. Their floor band is **44%** and they print `WEAK`, so E1a
+must roughly halve the excess (2.5x -> ~1.3x) to be readable -- reported rather than hidden. `--free_scale`
 is one flag across all three head families with a per-family implementation — specified below,
 and specified in one place for the reason rule 2 exists. Each flag needs a test that it changed
 something against a seeded control before its arm is run, per the convention in

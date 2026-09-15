@@ -57,13 +57,21 @@ from src.strata import (  # noqa: E402
 )
 from src.strata import OBS_MAG_BINS as _OBS_MAG_BINS  # noqa: E402
 from src.strata import OBS_MAG_LABELS  # noqa: E402
-from src.qf_diagnostics import fence_gate, pit_structure, zero_leak  # noqa: E402
+from src.qf_diagnostics import (  # noqa: E402
+    GATE_PX_PREFIXES, gate_per_pixel, gate_reduce,
+)
+from src.qf_plots import (  # noqa: E402
+    PIT_BINS, fitted_densities_figure, pit_histogram_figure, write_scorecard,
+)
 from diagnose_central_field import (  # noqa: E402
     HORIZONS, MAX_OBSERVED_YEAR, WINDOWS, HM_DIR, _read, _read_like,
 )
 from score_model_experiment import central_stats  # noqa: E402
 
 REGION_ROOT = Path("data/ensemble/region/southern_africa")
+#: Fallback only, for a raster written before the writer tagged its own scale. The scale is a
+#: property of the raster and ``qf_levels`` reads it off the file -- it was hardcoded here
+#: while the writer tagged the literal "3.0518509e-05", the same quantity in two places.
 INT16_SCALE = 1.0 / 32767.0
 # The three exceedance questions the product is actually asked, in HM units.
 THRESHOLDS = ((0.01, "hi"), (0.05, "hi"), (-0.01, "lo"))
@@ -83,6 +91,16 @@ def qf_levels(path: str):
             raise SystemExit(f"{path} carries no u_levels tag; not a quantile-function raster")
         u = np.array([float(v) for v in tags["u_levels"].split(",")], dtype=np.float64)
         n_bands, nod = src.count, src.nodata
+        # Read the scale the writer actually used. A float32 raster carries 1.0; an int16 one
+        # carries 1/32767. Assuming the int16 scale against a float32 raster would divide
+        # every quantile by 32767 and read as a catastrophically narrow forecast -- which is
+        # the failure this phase is in the middle of diagnosing, so it must not be possible
+        # to cause it by accident.
+        scale = float(tags.get("scale_factor", INT16_SCALE))
+        if np.issubdtype(np.dtype(src.dtypes[0]), np.floating) and scale != 1.0:
+            raise SystemExit(
+                f"{path}: float raster tagged scale_factor={scale!r}; a float quantile "
+                f"raster carries its values directly and must be tagged 1.0.")
     if n_bands != u.size:
         raise SystemExit(f"{path}: {n_bands} bands against {u.size} u levels")
     # A zero-width segment makes the piecewise-linear slope 0/0, and CRPS comes back NaN for
@@ -94,7 +112,7 @@ def qf_levels(path: str):
             f"{path}: u levels are not strictly increasing (min gap {gaps.min():.3e} at "
             f"index {int(gaps.argmin())}, u={u[int(gaps.argmin())]!r}). Check the writer's "
             f"tag precision and output_u_grid's dedupe tolerance.")
-    return u, nod
+    return u, nod, scale
 
 
 def read_qf(path: str, row_off: int = 0, n_rows: int | None = None):
@@ -106,13 +124,14 @@ def read_qf(path: str, row_off: int = 0, n_rows: int | None = None):
     invisible -- a working set regional scale never exercised. The scale is applied in place
     for the same reason.
     """
-    u, nod = qf_levels(path)
+    u, nod, scale = qf_levels(path)
     with rasterio.open(path) as src:
         win = None if n_rows is None else Window(0, row_off, src.width, n_rows)
         q = src.read(window=win).astype(np.float32)
-    if nod is not None:
+    if nod is not None and np.isfinite(nod):
         q[q == nod] = np.nan
-    q *= np.float32(INT16_SCALE)
+    if scale != 1.0:
+        q *= np.float32(scale)
     return u, q
 
 
@@ -236,6 +255,47 @@ def _read_like_band(path, ref, row_off, n_rows, band: int = 1):
     return np.where(arr < -1e6, np.nan, arr)
 
 
+def sample_pixels(row, fold_sel, n=9, seed=0, n_candidates=2000):
+    """Nine scorable pixels and their exported quantile functions, for the 3x3 figure.
+
+    The walk is seeded over the **fold mask**, not over this run's finite pixels, so two
+    experiments scored on the same folds draw the same nine and their panels are comparable
+    side by side. A pixel this run failed to predict is skipped and the walk continues --
+    the only way the choice can differ between runs, and worth seeing when it does.
+
+    Read straight from the published rasters rather than carried out of ``load_row``: nine
+    one-row windows cost nothing beside a full scoring pass, and the sampler then has no way
+    to disagree with what a consumer of the product would read.
+    """
+    with rasterio.open(row["path_central"]) as src:
+        H, W = src.height, src.width
+        ref = {"transform": src.transform, "width": W, "height": H}
+    base = fold_sel if fold_sel is not None else np.ones((H, W), dtype=bool)
+    rc = np.argwhere(base)
+    if rc.size == 0:
+        return None
+    u = qf_levels(row["path_qf"])[0]
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(len(rc))[:n_candidates]
+    qs, hm0s, obss, labels = [], [], [], []
+    for i in order:
+        r, c = int(rc[i][0]), int(rc[i][1])
+        cen = _read_band(row["path_central"], r, 1)[0, c]
+        obs = _read_like_band(row["path_observed"], ref, r, 1)[0, c]
+        hm0 = _read_like_band(row["path_baseline"], ref, r, 1)[0, c]
+        if not (np.isfinite(cen) and np.isfinite(obs) and np.isfinite(hm0)):
+            continue
+        q = read_qf(row["path_qf"], r, 1)[1][:, 0, c]
+        if not np.isfinite(q).all():
+            continue
+        qs.append(q); hm0s.append(hm0); obss.append(obs); labels.append(f"r{r} c{c}")
+        if len(qs) == n:
+            break
+    if not qs:
+        return None
+    return (u, np.stack(qs, axis=1), np.array(hm0s), np.array(obss), labels)
+
+
 def _cat(parts, key):
     return np.concatenate([p[key] for p in parts]) if len(parts) > 1 else parts[0][key]
 
@@ -340,6 +400,13 @@ def per_pixel(u, cell):
         "mae_persistence": np.abs(y - hm0),
         "pit": pit(u, qf, y),
     }
+    # The two gates are per-pixel quantities reduced over a stratum, and they are computed
+    # HERE because this is the only place the quantile function exists: load_row streams the
+    # raster in bands and drops ``cell["qf"]`` before concatenating. gate_stats used to read
+    # it back out of the concatenated cell, which raised KeyError on the pooled stratum --
+    # i.e. the two gates the phase exists to measure never ran. Reducing per pixel also
+    # removes the 64 x n_px copy per stratum that rule 22 warns about.
+    out.update(gate_per_pixel(u, qf, y, hm0))
     for lev in COVERAGE_LEVELS:
         lo = quantile_at(u, qf, (1.0 - lev) / 2.0)
         hi = quantile_at(u, qf, (1.0 + lev) / 2.0)
@@ -363,19 +430,23 @@ def per_pixel(u, cell):
     return out
 
 
-def gate_stats(u, cell, sel):
+def gate_stats(pp, sel):
     """The two conv-spline gates over one stratum: the picket fence and PIT structure.
 
     These are why the phase exists, so they sit beside CRPS rather than in a side script --
-    a diagnostic that has to be remembered is one that stops being run.
+    a diagnostic that has to be remembered is one that stops being run. It takes the
+    per-pixel dict rather than the cell because the quantile function does not survive the
+    band it was read in; every quantity here was computed in ``per_pixel``.
     """
     if sel.sum() < 100:
         return {}
-    q = cell["qf"][:, sel]
-    out = fence_gate(u, q)
-    out.update(pit_structure(pit(u, q, cell["observed"][sel])))
-    out.update(zero_leak(u, q, cell["observed"][sel], cell["hm_t0"][sel]))
-    return out
+    px = {k: v[sel] for k, v in pp.items() if k.startswith(GATE_PX_PREFIXES)}
+    if not px:
+        raise KeyError(
+            "no gate quantities in the per-pixel dict -- per_pixel() must call "
+            "gate_per_pixel(). Without this the two gates silently vanish from the "
+            "scorecard, which is the one thing the phase is judged on.")
+    return gate_reduce(px, pp["pit"][sel])
 
 
 def dist_stats(pp, sel):
@@ -499,6 +570,18 @@ def main(argv=None):
                          "against 16 GB on Africa. Every per-pixel quantity is pixel-"
                          "independent and every stratum is a mean over a boolean mask, so "
                          "this changes the peak and nothing else.")
+    ap.add_argument("--plots", type=lambda x: (str(x).lower() == 'true'), nargs='?',
+                    const=True, default=True,
+                    help="Write the two scorecard figures and the HTML page that embeds "
+                         "them (docs/conv_spline_phase.md section 3). On by default: a "
+                         "diagnostic that has to be asked for is one that stops being run.")
+    ap.add_argument("--plot_horizon", type=int, default=20,
+                    help="Horizon the 3x3 fitted-density panel is drawn at. The PIT figure "
+                         "carries every horizon regardless.")
+    ap.add_argument("--plot_pixel_seed", type=int, default=0,
+                    help="Seeds the walk over the fold mask that picks the nine pixels. The "
+                         "same seed and the same folds draw the same nine in every "
+                         "experiment, which is what makes the panels comparable.")
     ap.add_argument("--min_count", type=int, default=2000,
                     help="Strata thinner than this are written out but kept out of the "
                          "headline summary, where a 40-pixel cell would otherwise swing it.")
@@ -554,12 +637,17 @@ def main(argv=None):
               f"{int(fold_sel.sum()):,} px scored")
 
     dist_recs, central_recs, consist_recs = [], [], []
+    # The PIT figure pools windows within a horizon, and the PIT array does not survive the
+    # row it was computed in -- so the histogram is accumulated as counts, which is exact.
+    pit_counts = {}
     for row in rows:
         u, cell, pp, cons = load_row(row, fold_sel, args.row_chunk)
         n = cell["observed"].size
         print(f"  w{row['base_year']} h={row['horizon']:2d}  {n:,} px")
         if n == 0:
             continue
+        c_h = np.histogram(pp["pit"], bins=PIT_BINS, range=(0.0, 1.0))[0]
+        pit_counts[row["horizon"]] = pit_counts.get(row["horizon"], 0) + c_h
         consist_recs.append({"label": args.label, "window": row["window"],
                              "horizon": row["horizon"], "n": n, **cons})
         resid = cell["observed"] - cell["central"]
@@ -569,10 +657,10 @@ def main(argv=None):
         for stratum, label, sel in strata(cell):
             base = {"label": args.label, "window": row["window"],
                     "horizon": row["horizon"], "stratum": stratum, "bin": label}
-            # The gates are per-stratum but expensive (they re-read the qf), so they are
-            # computed for the pooled row and the distance bands only -- the axes the phase
-            # is judged on. Everything else stays on the cheap per-pixel path.
-            gates = (gate_stats(u, cell, sel)
+            # The gates are per-stratum reductions of quantities computed once per pixel,
+            # so they are cheap; they are still restricted to the pooled row and the
+            # observed-change bands, which are the axes the phase is judged on.
+            gates = (gate_stats(pp, sel)
                      if stratum in ("pooled", "obs_change") else {})
             dist_recs.append({**base, **dist_stats(pp, sel), **gates})
             central_recs.append({**base, **central_stats(
@@ -604,14 +692,26 @@ def main(argv=None):
         summary[f"crps_skill{h}"] = wmean(p, "crps_skill")
         summary[f"pit_ks{h}"] = wmean(p, "pit_ks")
         summary[f"pit_gt_0999_{h}"] = wmean(p, "pit_gt_0999")
+        # The lower far tail, and both as a pooled two-sided excess. E1a's learned tail rates
+        # act ONLY beyond u = 0.001 / 0.999, so these are the only statistics that can see it
+        # -- an arm whose whole mechanism is invisible to the scorecard reads as a null.
+        # Measured on b1's floor, the miss is two-sided and near-symmetric
+        # (pit_lt_0001 / pit_gt_0999 = 1.017 / 1.254 / 0.971 across the three seeds), so the
+        # pooled form is a fair summary rather than a convenient one.
+        summary[f"pit_lt_0001_{h}"] = wmean(p, "pit_lt_0001")
+        _lo, _hi = summary[f"pit_lt_0001_{h}"], summary[f"pit_gt_0999_{h}"]
+        summary[f"far_tail_excess_{h}"] = (_lo + _hi) / 0.002
         summary[f"cov95_{h}"] = wmean(p, "cov95")
         summary[f"tail_reach{h}"] = wmean(p, "tail_reach_median")
         # The two conv-spline gates, pooled. Both fence readings, because reporting one is
         # how an export-grid re-spacing gets recorded as a model fix.
         for k in ("needle_mass_median_export", "needle_mass_p90_export",
                   "max_density_p99_export", "over_f_max_frac_export",
+                  "px_degenerate_frac_export", "gap_frac_zero_export",
+                  "px_clamp_frac_export", "gap_frac_clamp_export",
                   "needle_mass_median_ref", "needle_mass_p90_ref",
                   "max_density_p99_ref", "over_f_max_frac_ref",
+                  "px_degenerate_frac_ref",
                   "pit_rms_se_20", "pit_rms_se_60", "pit_growth_vs_noise",
                   "pit_mean", "zero_leak_neg_ratio"):
             if k in p.columns:
@@ -645,19 +745,108 @@ def main(argv=None):
     print("conv-spline gates: the picket fence and PIT structure")
     print("-" * 78)
     print(f"{'h':>3} {'needle p50':>11} {'needle p90':>11} {'maxdens p99':>12} "
-          f"{'>f_max':>8} | {'ref p50':>9} {'ref maxd':>9} | {'PITrms20':>9} {'PITrms60':>9} "
-          f"{'growth':>7} {'PITmean':>8} {'0leak':>7}")
+          f"{'>f_max':>8} {'degen':>7} {'0-gap':>7} {'clamp':>7} | "
+          f"{'ref p50':>9} {'ref maxd':>9} | "
+          f"{'PITrms20':>9} {'PITrms60':>9} {'growth':>7} {'PITmean':>8} {'0leak':>7}")
     for h in HORIZONS:
         if f"needle_mass_median_export_{h}" not in summary:
             continue
         g = lambda k: summary.get(f"{k}_{h}", float("nan"))
         print(f"{h:>3} {g('needle_mass_median_export'):>11.4f} "
               f"{g('needle_mass_p90_export'):>11.4f} {g('max_density_p99_export'):>12.1f} "
-              f"{g('over_f_max_frac_export'):>8.3f} | {g('needle_mass_median_ref'):>9.4f} "
+              f"{g('over_f_max_frac_export'):>8.3f} {g('px_degenerate_frac_export'):>7.3f} "
+              f"{g('gap_frac_zero_export'):>7.3f} {g('px_clamp_frac_export'):>7.3f} | "
+              f"{g('needle_mass_median_ref'):>9.4f} "
               f"{g('max_density_p99_ref'):>9.1f} | {g('pit_rms_se_20'):>9.2f} "
               f"{g('pit_rms_se_60'):>9.2f} {g('pit_growth_vs_noise'):>7.3f} "
               f"{g('pit_mean'):>8.4f} {g('zero_leak_neg_ratio'):>7.2f}")
-    print("targets: needle ~0, maxdens <= 578, >f_max ~0, PITrms ~1, PITmean 0.50, 0leak 1.00")
+    print("targets: needle ~0, maxdens <= 578, >f_max ~0, degen ~0, 0-gap ~0, PITrms ~1, "
+          "PITmean 0.50, 0leak 1.00")
+    print("  degen = pixels with a zero-width segment AWAY from the support boundary; 0-gap "
+          "= share of\n  (segment, pixel) pairs at exactly zero, boundary excluded. Both "
+          "near zero is what says the\n  fence is a model property and not the export's "
+          "resolution -- read maxdens only beside them.\n  clamp = pixels flat ON HM 0 or 1, "
+          "which is correct behaviour and is NOT part of the fence.")
+
+    if args.plots:
+        # After the CSVs and the summary JSON are written, never before: a figure that fails
+        # to draw must not cost a 50-minute run its numbers. It is still allowed to raise --
+        # a scorecard silently missing its gates' pictures reads as a run that had none.
+        h_plot = args.plot_horizon
+        plot_row = next((r for r in rows if r["horizon"] == h_plot), rows[-1])
+        if plot_row["horizon"] != h_plot:
+            print(f"  ! no h={h_plot} row; drawing densities at h={plot_row['horizon']}")
+        samp = sample_pixels(plot_row, fold_sel, n=9, seed=args.plot_pixel_seed)
+        imgs = []
+        if samp is not None:
+            su, sq, shm0, sobs, slab = samp
+            f1 = out_dir / f"densities_{args.label}.png"
+            fitted_densities_figure(
+                su, sq, shm0, sobs, slab, f1,
+                title=f"{args.label}: fitted per-pixel distributions, "
+                      f"w{plot_row['base_year']} h={plot_row['horizon']} "
+                      f"(seed {args.plot_pixel_seed})")
+            imgs.append(("fitted per-pixel distributions (3x3)", f1))
+            print(f"  wrote {f1}")
+        else:
+            print("  ! no scorable pixel found for the density panel")
+        if pit_counts:
+            f2 = out_dir / f"pit_{args.label}.png"
+            pit_histogram_figure(pit_counts, f2, title=f"{args.label}: PIT, {PIT_BINS} bins")
+            imgs.append((f"PIT histogram, {PIT_BINS} bins", f2))
+            print(f"  wrote {f2}")
+
+        hdr = ["h", "n", "CRPS", "crps_skill", "PIT KS", "P(u>.999)", "cov95", "reach",
+               "RMSE", "c.skill"]
+        acc_rows = []
+        for h in HORIZONS:
+            if f"crps{h}" not in summary:
+                continue
+            pdf = pooled(dist_df, h)
+            acc_rows.append([h, f"{int(pdf['n'].sum()):,}",
+                             f"{summary[f'crps{h}']:.6f}", f"{summary[f'crps_skill{h}']:.4f}",
+                             f"{summary[f'pit_ks{h}']:.4f}",
+                             f"{summary[f'pit_gt_0999_{h}']:.5f}",
+                             f"{summary[f'cov95_{h}']:.4f}", f"{summary[f'tail_reach{h}']:.2f}",
+                             f"{summary[f'rmse{h}']:.6f}", f"{summary[f'skill{h}']:.4f}"])
+        ghdr = ["h", "needle p50 exp", "needle p90 exp", "maxdens p99 exp", ">f_max exp",
+                "degen exp", "0-gap exp", "clamp exp", "needle p50 ref",
+                "maxdens p99 ref", "PIT rms20",
+                "PIT rms60", "growth", "PIT mean", "0-leak"]
+        gate_rows = []
+        for h in HORIZONS:
+            if f"needle_mass_median_export_{h}" not in summary:
+                continue
+            g = lambda k: summary.get(f"{k}_{h}", float("nan"))
+            gate_rows.append([h, f"{g('needle_mass_median_export'):.4f}",
+                              f"{g('needle_mass_p90_export'):.4f}",
+                              f"{g('max_density_p99_export'):.1f}",
+                              f"{g('over_f_max_frac_export'):.3f}",
+                              f"{g('px_degenerate_frac_export'):.3f}",
+                              f"{g('gap_frac_zero_export'):.3f}",
+                              f"{g('px_clamp_frac_export'):.3f}",
+                              f"{g('needle_mass_median_ref'):.4f}",
+                              f"{g('max_density_p99_ref'):.1f}",
+                              f"{g('pit_rms_se_20'):.2f}", f"{g('pit_rms_se_60'):.2f}",
+                              f"{g('pit_growth_vs_noise'):.3f}", f"{g('pit_mean'):.4f}",
+                              f"{g('zero_leak_neg_ratio'):.2f}"])
+        card = write_scorecard(
+            out_dir / f"scorecard_{args.label}.html", args.label,
+            {"stitched": stitched, "folds": args.folds or "all",
+             "fold mask": Path(args.fold_mask).name,
+             "exceedance abs log10": f"{summary['exceedance_abs_log10']:.4f}",
+             "qf vs triple max": f"{summary['qf_vs_triple_max']:.2e}"},
+            [("pooled by horizon", hdr, acc_rows),
+             ("gates: the picket fence and PIT structure", ghdr, gate_rows)],
+            imgs,
+            notes=["Targets: needle mass ~0, max density &le; 578, &gt;f_max ~0, "
+                   "PIT rms_se ~1, PIT mean 0.50, zero-leak ratio 1.00.",
+                   "Every fence statistic is reported twice. <code>_export</code> is read on "
+                   "the raster's own u grid and is what a consumer of the product sees; E0 "
+                   "moves it by construction. <code>_ref</code> is read on a frozen 256-level "
+                   "grid and is a property of the distribution. An arm that moves "
+                   "<code>_export</code> alone changed the rendering, not the model."])
+        print(f"  wrote {card}")
 
     print(f"\nexceedance mean|log10(pred/obs)| over distance bands: "
           f"{summary['exceedance_abs_log10']:.4f}")

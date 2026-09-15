@@ -32,9 +32,16 @@ def plan_row_bands(r0, r1, stride, tile, row_chunk):
     float32 arrays -- 268 for a four-horizon window at 64 quantile levels. Each is 2.55 GiB
     on the 17111 x 40000 global grid. np.zeros is lazily paged, so the cost is the pages the
     tiles touch: measured at 185 GiB for one global fold, on a box with 125 GB that runs two
-    folds at once. Africa's 63.1 Mpx grid puts the same 268 accumulators at ~22 GB, and the
-    only configuration ever run globally was the 12-accumulator triple head -- a working set
-    regional scale never exercised.
+    folds at once. The only configuration ever run globally was the 12-accumulator triple
+    head -- a working set regional scale never exercised.
+
+    **Africa is not the cheap case this docstring used to claim.** It estimated ~22 GB for
+    the same 268 accumulators; measured 2026-09-14 on the four-horizon window, one fold peaks
+    at **40.7 GB** -- low by 1.85x. The restriction mask does not save what it looks like it
+    saves: fold_mask_b4's 512 px blocks are scattered across the whole region, so nearly every
+    4 KiB page gets touched even though only a fifth of the pixels are kept. Two folds run at
+    once, so unbanded Africa is ~81 GB on a 125 GB box. conv_spline_base.sh therefore passes
+    --predict_row_chunk 2048, which caps a fold near 17 GB for ~6% more prediction work.
     """
     if row_chunk and row_chunk % 256:
         raise ValueError("--predict_row_chunk must be a multiple of 256 so band boundaries "
@@ -79,7 +86,7 @@ def _n_context_channels(args):
                                  _csv_ints(args.hm_context_radii) or (3, 30, 100))
 
 
-def _spline_head_banner(args):
+def _spline_head_banner(args, model=None):
     """The one line that fingerprints the distributional head, or None for the triple head.
 
     e9 (``--spline_slopes fritsch``) and e10 (``--spline_knots lean9``) ARE the head's
@@ -87,14 +94,41 @@ def _spline_head_banner(args):
     does nothing" -- the shape this project has twice mistaken for a finding. Extracted to a
     function so the check that greps this line and the code that prints it can be tested
     against each other, rather than a check being written against text nobody emits.
+
+    **It could not distinguish the three head families until 2026-09-15.** It printed the
+    literal "Spline head" and computed the count with ``n_spline_params`` -- the
+    RATIONAL-QUADRATIC formula -- whatever ``--head_family`` said, so every pwl and isqf run
+    (E1, E2, E4 and all four scale arms) logged "Spline head ... 29 params/horizon" while
+    actually running a 16- or 18-parameter head. The one line a reader checks to see which
+    head ran could not tell them, which is rule 28 in the place it does most damage, and the
+    same one-formula-for-three-families conflation that made the prediction writer unable to
+    decode pwl or isqf at all.
+
+    The count is now read off the CONSTRUCTED MODULE when one is passed, never recomputed
+    from the flags -- the same reason the context line reads its channel count off the trunk.
     """
-    if getattr(args, "head_family", "triple") not in ("spline", "pwl", "isqf"):
+    fam = getattr(args, "head_family", "triple")
+    if fam not in ("spline", "pwl", "isqf"):
         return None
     from src.models.quantile_spline import knot_preset, n_spline_params
+    from src.models.quantile_pwl import n_pwl_params
     k = knot_preset(args.spline_knots)
-    n = n_spline_params(len(k), args.spline_slopes == "learned")
-    return (f"Spline head:       knots {args.spline_knots} (n={len(k)}, bins={len(k) - 1}), "
-            f"slopes {args.spline_slopes}, {n} params/horizon")
+    if model is not None and hasattr(model, "n_spline_params"):
+        n = int(model.n_spline_params)
+    elif fam == "spline":
+        n = n_spline_params(len(k), args.spline_slopes == "learned")
+    else:
+        n = n_pwl_params(len(k), family=fam, tails=bool(getattr(args, "isqf_tails", False)))
+    extra = ""
+    if fam == "isqf" and getattr(args, "isqf_tails", False):
+        extra += f", tails {args.isqf_space}"
+    if getattr(args, "free_scale", False):
+        extra += ", free scale"
+    if fam == "spline" and not getattr(args, "spline_cumulative_width", True):
+        extra += ", non-cumulative width"
+    return (f"Spline head:       family {fam}, knots {args.spline_knots} "
+            f"(n={len(k)}, bins={len(k) - 1}), slopes {args.spline_slopes}{extra}, "
+            f"{n} params/horizon")
 
 
 def _experiment_kwargs(args):
@@ -119,6 +153,9 @@ def _experiment_kwargs(args):
         quantile_loss=args.quantile_loss,
         histogram_soft=args.histogram_soft,
         head_family=args.head_family,
+        free_scale=args.free_scale,
+        isqf_tails=args.isqf_tails,
+        isqf_space=args.isqf_space,
         dist_loss=args.dist_loss,
         crps_nodes=args.crps_nodes,
         crps_tail_lam=args.crps_tail_weight,
@@ -503,6 +540,49 @@ if __name__ == "__main__":
              "the qf reproduces the published bounds exactly.",
     )
     parser.add_argument(
+        "--free_scale", type=lambda x: (str(x).lower() == 'true'), nargs='?', const=True,
+        default=False,
+        help="Drop the anchor/scale factorisation: the 95%% width becomes emergent from the "
+             "fitted increments rather than injected by a channel, per horizon, with no "
+             "cross-horizon accumulation. pwl/E2a: unnormalised positive increments, no "
+             "scale channel, Q(u) = anchor + (v - v_mid). isqf/E1b: drop the scale_pre "
+             "renormalisation and nothing else -- that head has no factorisation natively. "
+             "NOT a second spelling of --spline_cumulative_width False: this is a strict "
+             "superset that removes the accumulation only as a consequence of removing the "
+             "factorisation, so an arm carrying it cannot separate 'was the factorisation "
+             "earning its keep' from 'was horizon monotonicity binding'. Run E0a first for "
+             "the narrow question. Not implemented for head_family=spline.",
+    )
+    parser.add_argument(
+        "--isqf_tails", type=lambda x: (str(x).lower() == 'true'), nargs='?', const=True,
+        default=False,
+        help="E1a: learned exponential tail rates on the outer bins, ISQF's actual "
+             "contribution, which E1 drops. The tails REPLACE the outermost bins "
+             "[0, 0.001] and [0.999, 1] and anchor at those knots -- they cannot attach "
+             "'beyond the outermost knots' because validate_knots requires the grid to span "
+             "[0, 1] exactly, so a tail there would cover an empty set and be accepted, "
+             "logged and inert.",
+    )
+    parser.add_argument(
+        "--isqf_space", type=str, default="logit", choices=["logit", "neglog"],
+        help="Transformed space the E1a tails live in, where unbounded tails are "
+             "admissible. logit(HM) is symmetric; -log(1-HM) is unbounded above only. "
+             "Measured on b1's floor the far-tail miss is two-sided and near-symmetric "
+             "(pit_lt_0001 / pit_gt_0999 = 1.017 / 1.254 / 0.971 across three seeds), which "
+             "is why logit is the default. Observed HM runs 0.00029-0.950, so neither needs "
+             "an epsilon. Only read when --isqf_tails is on.",
+    )
+    parser.add_argument(
+        "--predict_qf_dtype", type=str, default="int16", choices=["int16", "float32"],
+        help="Storage for the quantile-function raster. int16 x 1/32767 (the default, and "
+             "the ensemble's old convention) quantises to 3.05e-05 in ABSOLUTE HM -- which "
+             "is coarser than the forecast core this phase is trying to measure. Measured "
+             "on b1_s42: 34%% of adjacent quantile levels exported to the SAME int16 code, "
+             "and max_density_p99 read 1531.8 at every horizon, which is exactly "
+             "dp_max / one quantum -- the statistic's ceiling, not a density. float32 "
+             "removes the floor (~3e-08 near HM 0.3) and doubles the raster.",
+    )
+    parser.add_argument(
         "--predict_row_chunk", type=int, default=0,
         help="Process large-area prediction in bands of this many rows instead of holding "
              "the whole region's accumulators at once. 0 (default) keeps today's behaviour. "
@@ -510,7 +590,9 @@ if __name__ == "__main__":
              "for a four-horizon window at 64 levels -- and each is a full-window float32 "
              "array, 2.55 GiB on the 17111x40000 global grid. Measured resident (touched 4 "
              "KiB pages, not the virtual size) is 185 GiB for one global fold, on a 125 GB "
-             "box running two folds at once. A band keeping rows [a, b) accumulates every "
+             "box running two folds at once, and 40.7 GB for one AFRICA fold at four "
+             "horizons -- regional scale is not the cheap case. A band keeping rows [a, b) "
+             "accumulates every "
              "tile that covers them, so the blend weights are complete and the written "
              "values are identical to an unchunked run.",
     )
@@ -1160,7 +1242,7 @@ if __name__ == "__main__":
     # it; this line is where a log reader tells them apart, and conv_spline_base.sh greps it.
     # A literal here would be rule 25 all over again.
     print(f"Context into trunk: {model.model.context_channels} channels; heads: none")
-    _spline_banner = _spline_head_banner(args)
+    _spline_banner = _spline_head_banner(args, getattr(model, 'model', None))
     if _spline_banner:
         print(_spline_banner)
     print("="*60 + "\n")
@@ -2251,7 +2333,7 @@ if __name__ == "__main__":
             qf_names = []
             if getattr(args, 'predict_qf_levels', 0) and \
                     getattr(infer_model.model, 'head_family', 'triple') in ('spline', 'pwl', 'isqf'):
-                from src.models.quantile_spline import output_u_grid, splines_from_output
+                from src.models.quantile_spline import output_u_grid
                 qf_u = output_u_grid(int(args.predict_qf_levels),
                                      spacing=getattr(args, 'u_grid_spacing', 'normal'))
                 qf_names = [f"qf{i:03d}" for i in range(len(qf_u))]
@@ -2409,15 +2491,23 @@ if __name__ == "__main__":
                     # is the ensemble's own storage convention: HM is bounded on [0, 1], so
                     # this is lossless to 3e-5, far below any quantity of interest.
                     qf_profile = out_profile.copy()
-                    qf_profile.update(count=len(qf_names), dtype='int16', nodata=-32768,
-                                      tiled=True, blockxsize=256, blockysize=256,
-                                      BIGTIFF='YES')
+                    _qf_f32 = getattr(args, 'predict_qf_dtype', 'int16') == 'float32'
+                    qf_profile.update(
+                        count=len(qf_names),
+                        dtype='float32' if _qf_f32 else 'int16',
+                        nodata=np.nan if _qf_f32 else -32768,
+                        tiled=True, blockxsize=256, blockysize=256, BIGTIFF='YES')
                     p = out_dir / f"{prefix}prediction_{h_year}_qf_blended.tif"
                     d = rasterio.open(p, 'w', **qf_profile)
                     for li, lname in enumerate(qf_names):
                         d.set_band_description(li + 1, f"u={qf_u[li]:.6f}")
+                    # The scale is a PROPERTY OF THE RASTER and the reader reads it here.
+                    # It used to be the literal "3.0518509e-05" beside a reader that had
+                    # 1/32767 hardcoded -- the same quantity in two places, which is how the
+                    # two get to disagree (rule 2).
                     d.update_tags(u_levels=",".join(repr(float(v)) for v in qf_u),
-                                  scale_factor="3.0518509e-05", head_family="spline")
+                                  scale_factor="1.0" if _qf_f32 else "3.0518509e-05",
+                                  head_family="spline")
                     _writers[f"{h_name}_qf"] = d
                     out_paths[f"{h_name}_qf"] = p
 
@@ -2607,12 +2697,20 @@ if __name__ == "__main__":
                                 m_ = infer_model.model
                                 u_t = torch.as_tensor(qf_u, dtype=batch_preds.dtype,
                                                       device=batch_preds.device)
+                                # model._decode, not splines_from_output: the latter is the
+                                # rational-quadratic decoder and expects 29 channels per
+                                # horizon, so pwl and isqf (16) raised ValueError here --
+                                # every E1/E2/E4 arm would have trained for 50 minutes and
+                                # then failed to write a raster. _decode is the one place
+                                # that knows which family it is (rule 2: a predicate written
+                                # twice will disagree with itself), and it is the same call
+                                # the loss makes.
                                 batch_qf = [
                                     sp.ppf(u_t).movedim(-1, 1).cpu().numpy()   # [B, n_u, H, W]
-                                    for sp in splines_from_output(
-                                        batch_preds, m_.num_horizons, m_.spline_u_knots,
-                                        learn_slopes=m_.spline_learn_slopes,
-                                        clamp=m_.spline_clamp())
+                                    for sp in m_._decode(
+                                        batch_preds, m_.spline_clamp(),
+                                        n_triple=batch_preds.shape[1]
+                                        - m_.num_horizons * m_.n_spline_params)
                                 ]
                     
                         # Process each tile in the batch
@@ -2725,10 +2823,13 @@ if __name__ == "__main__":
                         d = _writers[f"{h_name}_qf"]
                         for li, lname in enumerate(qf_names):
                             band = _blend(f"{h_name}_{lname}")
-                            q = np.where(np.isfinite(band),
-                                         np.round(band * 32767.0), -32768)
-                            d.write(np.clip(q, -32768, 32767).astype(np.int16),
-                                    li + 1, window=_win)
+                            if _qf_f32:
+                                d.write(band.astype(np.float32), li + 1, window=_win)
+                            else:
+                                q = np.where(np.isfinite(band),
+                                             np.round(band * 32767.0), -32768)
+                                d.write(np.clip(q, -32768, 32767).astype(np.int16),
+                                        li + 1, window=_win)
 
                 del accum_horizons, wsum, m
                 accum_horizons = None

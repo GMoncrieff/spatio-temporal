@@ -15,9 +15,20 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.qf_diagnostics import (  # noqa: E402
-    F_MAX_DENSITY, NEEDLE_EPS, REF_U, fence_gate, fence_stats, implied_density,
-    interp_to, needle_mass, pit_structure, zero_leak,
+    F_MAX_DENSITY, NEEDLE_EPS, REF_U, fence_gate, fence_per_pixel, fence_reduce,
+    fence_stats, implied_density, interp_to, needle_mass,
+    pit_structure, zero_leak,
 )
+from src.models.quantile_spline import output_u_grid  # noqa: E402
+
+
+def _grid(n_px=1000, n_levels=64, seed=0):
+    """A random monotone quantile function -- irregular on purpose, so a blocked reduction
+    that mishandled a column would not be hidden by every column being the same."""
+    rng = np.random.default_rng(seed)
+    u = output_u_grid(n_levels)
+    q = np.sort(rng.random((n_levels, n_px)) * rng.uniform(0.01, 0.9, n_px), axis=0)
+    return u, q.astype(np.float32)
 
 
 def clean_forecast(u, n_px=500, scale=0.05, centre=0.3):
@@ -194,3 +205,149 @@ def test_zero_leak_catches_a_forecast_shifted_across_zero():
     out = zero_leak(u, q, y, hm0)
     assert out["zero_leak_neg_obs"] > 0, "the control has no observed mass to compare against"
     assert out["zero_leak_neg_ratio"] > 1.5, out
+
+
+# --------------------------------------------------- blocking the gate must change nothing
+
+@pytest.mark.parametrize("block", [1, 7, 100, 999, 1000, 1001, 100_000])
+def test_fence_per_pixel_is_exactly_block_invariant(block):
+    """The block loop bounds ``[n_seg, n_px]``; it must not move a single bit.
+
+    Measured motivation: the reference reading is 255 segments, so one Africa fold at once
+    builds a 13.6 GB float64 density array -- the largest term in the scorer's measured
+    59.1 GB peak. Every quantity is pixel-independent, so blocking is an identity rather than
+    an approximation, and this is where that claim is checked.
+
+    The three counts and the per-pixel maximum are asserted **bit-identical** -- they are
+    order-independent reductions and nothing may move them. ``needle_mass`` is a sum, and
+    NumPy's pairwise reduction blocks differently for a 1-pixel-wide array than for a wide
+    one, so it is allowed one ULP and no more. Measured: it agrees exactly from block 7
+    upward and differs by 1.1e-16 relative at block 1, which is the only slack here.
+    """
+    u, q = _grid(n_px=1000, seed=5)
+    whole = fence_per_pixel(u, q, block=0)
+    part = fence_per_pixel(u, q, block=block)
+    assert set(whole) == set(part)
+    for k in ("n_finite", "n_needle", "n_zero", "px_max_density"):
+        assert np.array_equal(whole[k], part[k], equal_nan=True), k
+    assert whole["needle_mass"] == pytest.approx(part["needle_mass"], rel=1e-15)
+
+
+@pytest.mark.parametrize("block", [1, 333, 100_000])
+def test_the_reference_reading_is_block_invariant_too(block):
+    """``u_interp`` moves the interpolation inside the loop, which is the whole point."""
+    u, q = _grid(n_px=1000, seed=6)
+    whole = fence_per_pixel(u, q, u_interp=REF_U, block=0)
+    part = fence_per_pixel(u, q, u_interp=REF_U, block=block)
+    for k in ("n_finite", "n_needle", "n_zero", "px_max_density"):
+        assert np.array_equal(whole[k], part[k], equal_nan=True), k
+    assert whole["needle_mass"] == pytest.approx(part["needle_mass"], rel=1e-15)
+    # and it must still equal the way the caller used to spell it: interpolate the whole
+    # raster onto REF_U first, then read the fence off that grid.
+    direct = fence_per_pixel(REF_U, interp_to(u, q, REF_U), block=0)
+    for k in whole:
+        assert np.array_equal(whole[k], direct[k], equal_nan=True), f"{k} vs the old spelling"
+
+
+def test_blocking_never_materialises_the_whole_reference_grid(monkeypatch):
+    """Prove the loop is real: the biggest array interp_to returns must be bounded by the
+    block, or the identity above is passing on a code path that still allocates in full."""
+    import src.qf_diagnostics as qd
+    seen = []
+    real = qd.interp_to
+
+    def spy(u_src, q, u_dst):
+        out = real(u_src, q, u_dst)
+        seen.append(out.shape[1])
+        return out
+
+    monkeypatch.setattr(qd, "interp_to", spy)
+    u, q = _grid(n_px=5000, seed=7)
+    qd.fence_per_pixel(u, q, u_interp=qd.REF_U, block=1000)
+    assert seen, "interp_to was never called"
+    assert max(seen) <= 1000, f"a block of {max(seen)} pixels was interpolated whole"
+
+
+def test_a_degenerate_pixel_counts_against_f_max_instead_of_vanishing():
+    """A zero-width segment is infinite density: the strongest needle there is.
+
+    ``fence_reduce`` used to filter it out before every density statistic, so the pixels that
+    had fenced WORST were the ones the gate could not see. Measured consequence on b1_s42:
+    34% of adjacent quantile levels exported to the same int16 code, and the density gate was
+    reported over the remainder. This is the control for the fix.
+    """
+    u, q = _grid(n_px=200, seed=11)
+    q = q.copy()
+    q[30, :50] = q[29, :50]          # 50 pixels get one exactly-flat segment
+    px = fence_per_pixel(u, q)
+    assert (~np.isfinite(px["px_max_density"])).sum() == 50
+
+    out = fence_reduce(px, "export")
+    assert out["px_degenerate_frac_export"] == pytest.approx(50 / 200)
+    # every degenerate pixel is over any ceiling, so the fraction cannot be below their share
+    assert out["over_f_max_frac_export"] >= 50 / 200
+    # and the surviving percentiles stay finite so they still rank the rest
+    assert np.isfinite(out["max_density_p99_export"])
+
+
+def test_no_degenerate_pixels_leaves_the_old_numbers_alone():
+    """The fix must not move a reading that had nothing degenerate in it."""
+    u, q = _grid(n_px=200, seed=12)
+    px = fence_per_pixel(u, q)
+    assert np.isfinite(px["px_max_density"]).all(), "fixture has a degenerate pixel"
+    out = fence_reduce(px, "export")
+    assert out["px_degenerate_frac_export"] == 0.0
+    manual = float((px["px_max_density"] > F_MAX_DENSITY).mean())
+    assert out["over_f_max_frac_export"] == pytest.approx(manual)
+
+
+# ------------------------------------------- the support boundary is not the picket fence
+
+def _clamped_forecast(u, n_px=200, lo=0.0):
+    """A forecast whose lower tail is flat ON the clamp, as HM near zero produces."""
+    q = clean_forecast(u, n_px, scale=0.02, centre=0.03)
+    return np.maximum(q, lo)
+
+
+def test_a_clamp_atom_is_reported_as_a_clamp_and_not_as_a_needle():
+    """HM cannot go below 0, so mass at the floor is correct behaviour, not a fence.
+
+    Measured on b1_s42: 100% of pixels whose two lowest quantile levels were identical had
+    Q = 0.0 exactly there, and the clamp contributed 0.3% of the needle mass against the
+    core's 73.3%. Counting it as degeneracy put a ~0.6 constant on every arm's gate.
+    """
+    u = REF_U
+    q = _clamped_forecast(u)
+    assert (q[0] == 0.0).all(), "the fixture is not actually clamped"
+    px = fence_per_pixel(u, q, clamp=(0.0, 1.0))
+    out = fence_reduce(px, "export")
+
+    assert out["px_clamp_frac_export"] == 1.0, "the clamp was not detected"
+    assert out["gap_frac_clamp_export"] > 0
+    assert out["px_degenerate_frac_export"] == 0.0, "a clamp atom counted as degenerate"
+    assert np.isfinite(out["max_density_p99_export"]), "the clamp poisoned the density"
+    assert out["over_f_max_frac_export"] == 0.0, "the clamp counted against f_max"
+
+
+def test_a_real_collapse_away_from_the_boundary_still_counts():
+    """Prove the exclusion is narrow: only segments ON the boundary are spared."""
+    u = REF_U
+    q = _clamped_forecast(u)
+    mid = u.size // 2
+    q[mid + 1] = q[mid]                      # a genuine interior collapse, far from 0 and 1
+    out = fence_reduce(fence_per_pixel(u, q, clamp=(0.0, 1.0)), "export")
+    assert out["px_degenerate_frac_export"] == 1.0, "an interior collapse was excused"
+    assert out["over_f_max_frac_export"] == 1.0
+    assert out["px_clamp_frac_export"] == 1.0, "the clamp should still be reported too"
+
+
+def test_the_clamp_exclusion_does_nothing_to_an_unclamped_forecast():
+    """A forecast that never touches the boundary must read exactly as before."""
+    u, q = _grid(n_px=300, seed=21)
+    q = (q * 0.5 + 0.25).astype(np.float32)          # strictly inside (0, 1)
+    out = fence_reduce(fence_per_pixel(u, q, clamp=(0.0, 1.0)), "export")
+    assert out["px_clamp_frac_export"] == 0.0
+    assert out["gap_frac_clamp_export"] == 0.0
+    wide = fence_reduce(fence_per_pixel(u, q, clamp=(-1.0, 2.0)), "export")
+    for k in out:
+        assert out[k] == pytest.approx(wide[k], nan_ok=True), f"{k} moved with the clamp"

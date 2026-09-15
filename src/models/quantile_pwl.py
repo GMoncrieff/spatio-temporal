@@ -36,6 +36,38 @@ import torch.nn.functional as F
 
 MIN_BIN_HEIGHT = 1e-4
 MIN_SCALE = 1e-6
+# The --free_scale floor, and NOT a second spelling of MIN_SCALE. With the anchor/scale
+# factorisation removed there is no `scale` channel to bound, so the same physical statement
+# -- "a 95% interval narrower than this is not a forecast" -- has to be made about the SPAN
+# of the ladder instead. The number is 3e-5 rather than MIN_SCALE's 1e-6 because that is what
+# quantile_spline.py:130's own comment justifies and has always justified: the published
+# product could not represent anything narrower while it was int16 x 1/32767. Inheriting the
+# 1e-6 silently is how a floor stops binding (docs/conv_spline_phase.md section 4.1).
+#
+# Measured on b1, for the record: NO pixel is near either number -- width95's 1st percentile
+# is 4.6e-3, 150x above this floor -- so this is insurance, not a live constraint. It is
+# here because CRPS can drive the width to zero on the quiet majority of pixels once the
+# factorisation stops holding it up, and `anchor + (v - v_mid)` then silently returns a
+# constant, which reads downstream as a perfectly confident forecast rather than a degenerate
+# one. In ABSOLUTE HM; callers working in normalized units must divide by hm_std.
+MIN_FREE_SPAN = 3e-5
+
+# The unit of a free-scale increment, and the reason --free_scale needs one at all.
+#
+# Every existing head feeds the shape channels through a SOFTMAX, so only their relative
+# values matter and their absolute magnitude is arbitrary -- measured at init, |raw| averages
+# 2.68. --free_scale makes that absolute magnitude BE the 95% width, so `|raw| + tol` starts
+# the ladder 330x too wide (8 bins x 2.68 = 21.5 normalized = 3.3 HM against an intended
+# 0.065 / 0.010 HM). At that width every knot saturates the [0, 1] clamp: pwl spans the whole
+# range and isqf piles its whole ladder onto the upper bound and reports a width of ZERO.
+# Both arms would then be measuring whether the optimiser can recover from a hopeless start.
+#
+# So one increment of raw is given a defined size: INITIAL_INC = initial_width_normalized
+# divided by the number of bins spanning the 95% interval. This is a UNIT, not a
+# normalisation -- no pixel's width is tied to another's and nothing is rescaled to a target
+# span, so the width stays emergent, which is the whole point of the arm. It is the same
+# thing `initial_width_normalized` already does for the incumbent's width head.
+INITIAL_WIDTH_NORMALIZED = 0.065
 # Smallest quantile gap the observable can justify, as a *density* ceiling. The core of the
 # HM-change distribution has a robust sigma of 0.00069, so a kernel that narrow supports a
 # density of at most ~578; the incumbent emits needles reaching 677. A gap floor of
@@ -64,6 +96,42 @@ def _cumulative_v(heights_raw, min_bin_height=MIN_BIN_HEIGHT, floor=None):
     # cumsum drifts ~1e-7 in float32; the last knot must be exactly 1 or the normalisation
     # below inherits the drift at every pixel.
     return v / v[..., -1:].clamp_min(1e-12)
+
+
+def free_increments(inc_raw, u_knots, tol=1e-4, u_lo=0.025, u_hi=0.975,
+                    width0=INITIAL_WIDTH_NORMALIZED):
+    """``--free_scale``'s positive increments, in units where one of them means something.
+
+    The paper's non-crossing construction is ``|.| + tol`` and that is kept exactly; what is
+    added is the unit. See :data:`INITIAL_WIDTH_NORMALIZED` for why a unit is needed at all --
+    without it the ladder starts 330x too wide and saturates the clamp.
+
+    One definition, used by both free-scale families, because two spellings of one quantity
+    is how E1b and E2a would end up on different width scales while claiming to differ only
+    in where persistence enters.
+    """
+    from .quantile_spline import knot_index
+    arr = np.asarray(u_knots.detach().cpu().numpy(), dtype=np.float64)
+    n95 = max(knot_index(arr, u_hi) - knot_index(arr, u_lo), 1)
+    return (inc_raw.abs() + tol) * (float(width0) / n95)
+
+
+def _floor_free_span(inc, u_knots, hm_std=1.0, u_lo=0.025, u_hi=0.975):
+    """Enforce :data:`MIN_FREE_SPAN` on the 95% span of a free-scale ladder.
+
+    ``MIN_SCALE`` bounded the ``scale`` CHANNEL, and --free_scale deletes that channel, so
+    the same physical statement has to be made about the span instead -- at construction,
+    because without it CRPS can drive the width to zero on the quiet majority of pixels and
+    ``anchor + (v - v_mid)`` then silently returns a constant, which reads downstream as a
+    perfectly confident forecast rather than a degenerate one.
+    """
+    from .quantile_spline import knot_index
+    arr = np.asarray(u_knots.detach().cpu().numpy(), dtype=np.float64)
+    i_lo, i_hi = knot_index(arr, u_lo), knot_index(arr, u_hi)
+    ladder = torch.cat([torch.zeros_like(inc[..., :1]), inc], dim=-1).cumsum(-1)
+    span = (ladder[..., i_hi] - ladder[..., i_lo]).unsqueeze(-1)
+    floor = MIN_FREE_SPAN / float(hm_std)
+    return torch.where(span < floor, inc * (floor / span.clamp_min(1e-12)), inc)
 
 
 def gap_floor_heights(u_knots, scale, f_max=F_MAX_DENSITY, hm_std=1.0):
@@ -252,14 +320,63 @@ class PWLQuantile(_PWLBase):
 
     @classmethod
     def from_channels(cls, raw, u_knots, hm_t0=None, scale_pre=None, clamp=(0.0, 1.0),
-                      gap_floor=False, hm_std=1.0, **kw):
-        """Decode ``[anchor, scale, heights...]``. Slopes are not a parameter here."""
+                      gap_floor=False, hm_std=1.0, free_scale=False, tol=1e-4, **kw):
+        """Decode ``[anchor, scale, heights...]``. Slopes are not a parameter here.
+
+        ``free_scale`` (E2a) removes the anchor/scale factorisation: unnormalised positive
+        increments carry the width directly, there is no ``scale`` channel, and ``Q(u)`` is
+        ``anchor + (v - v_mid)`` with the ``/ v_span`` division dropped. Note this is NOT
+        "strip the scale channel": ``_cumulative_v`` softmaxes and then divides by
+        ``v[..., -1:]``, so the ladder spans exactly 0 -> 1 twice over and removing ``scale``
+        naively would hand every pixel a span of 1.0 -- a broken model rather than a free one.
+        """
         n_bins = u_knots.numel() - 1
         anchor = raw[..., 0] if hm_t0 is None else raw[..., 0] + hm_t0
+        if free_scale:
+            if gap_floor:
+                # gap_floor_heights derives its floor in NORMALISED v units from
+                # dp_k / (f_max * scale), and --free_scale deletes both terms. Restating it on
+                # the increments in absolute HM is the simpler form of the same physical
+                # claim, but it is a re-derivation, not a combination -- so refuse rather than
+                # silently apply a floor computed from a quantity that no longer exists.
+                raise ValueError(
+                    "--spline_gap_floor and --free_scale do not compose: the floor is "
+                    "dp_k / (f_max * scale) in normalised v units and free_scale removes "
+                    "both scale and the normalisation. Restate it as inc_k >= dp_k / f_max "
+                    "in absolute HM first (docs/conv_spline_phase.md section 4.1).")
+            return cls.from_free_increments(anchor, raw[..., 2:2 + n_bins], u_knots,
+                                            clamp=clamp, tol=tol, hm_std=hm_std, **kw)
         scale = (F.softplus(raw[..., 1]) if scale_pre is None else scale_pre).clamp_min(MIN_SCALE)
         floor = gap_floor_heights(u_knots, scale, hm_std=hm_std) if gap_floor else None
         v = _cumulative_v(raw[..., 2:2 + n_bins], floor=floor)
         return cls(anchor, scale, v, u_knots, clamp=clamp, **kw)
+
+    @classmethod
+    def from_free_increments(cls, anchor, inc_raw, u_knots, clamp=(0.0, 1.0), tol=1e-4,
+                             hm_std=1.0, u_lo=0.025, u_mid=0.5, u_hi=0.975):
+        """E2a's ladder: ``anchor + (v - v_mid)`` from unnormalised positive increments.
+
+        The 95% width is whatever the increments imply, per horizon, with no cross-horizon
+        accumulation -- emergent rather than injected. ``anchor`` stays at ``Q(0.5)`` and
+        still receives ``hm_t0`` through the zero-init persistence skip, and the u-knots stay
+        fixed, so 0.025 / 0.5 / 0.975 remain exact knots and ``triple()`` stays a gather.
+        """
+        from .quantile_spline import knot_index
+        arr = np.asarray(u_knots.detach().cpu().numpy(), dtype=np.float64)
+        i_lo, i_mid, i_hi = (knot_index(arr, u_lo), knot_index(arr, u_mid),
+                             knot_index(arr, u_hi))
+        inc = free_increments(inc_raw, u_knots, tol=tol, u_lo=u_lo, u_hi=u_hi)
+        inc = _floor_free_span(inc, u_knots, hm_std=hm_std, u_lo=u_lo, u_hi=u_hi)
+        v = torch.cat([torch.zeros_like(inc[..., :1]), inc], dim=-1).cumsum(dim=-1)
+        q = anchor.unsqueeze(-1) + (v - v[..., i_mid].unsqueeze(-1))
+        obj = _PWLBase.__new__(cls)
+        _PWLBase.__init__(obj, q, u_knots, clamp=clamp)
+        obj.anchor = anchor
+        # No scale channel exists under --free_scale. Expose the EMERGENT 95% width under a
+        # different name: anything still reading `.scale` is reading a quantity this head does
+        # not have, and should fail loudly rather than pick up a plausible number.
+        obj.free_span = (q[..., i_hi] - q[..., i_lo])
+        return obj
 
 
 class ISQFQuantile(_PWLBase):
@@ -289,7 +406,7 @@ class ISQFQuantile(_PWLBase):
 
     @classmethod
     def from_channels(cls, raw, u_knots, hm_t0=None, scale_pre=None, clamp=(0.0, 1.0),
-                      tol=1e-4, **_):
+                      tol=1e-4, tails=False, space="logit", hm_std=1.0, **_):
         """Decode ``[q0, scale, increments...]`` -- the same channel contract as every head.
 
         One layout for all three families (``[location, scale, shape...]``) rather than one
@@ -303,7 +420,15 @@ class ISQFQuantile(_PWLBase):
         """
         n_inc = u_knots.numel() - 1
         q0 = raw[..., 0] if hm_t0 is None else raw[..., 0] + hm_t0
-        inc = raw[..., 2:2 + n_inc].abs() + tol
+        if scale_pre is None:
+            # --free_scale (E1b). The renormalisation below is what this arm removes, so the
+            # increments carry the width directly -- in the same unit E2a uses, or the two
+            # arms would sit on different width scales while claiming to differ only in
+            # where persistence enters the ladder.
+            inc = free_increments(raw[..., 2:2 + n_inc], u_knots, tol=tol)
+            inc = _floor_free_span(inc, u_knots, hm_std=hm_std)
+        else:
+            inc = raw[..., 2:2 + n_inc].abs() + tol
         if scale_pre is not None:
             # Normalise the ladder to unit 95% span first, so `scale_pre` means the same
             # quantity here as it does for the incumbent head and the two are comparable.
@@ -314,14 +439,133 @@ class ISQFQuantile(_PWLBase):
             ladder = torch.cat([torch.zeros_like(inc[..., :1]), inc], dim=-1).cumsum(-1)
             span = (ladder[..., i_hi] - ladder[..., i_lo]).clamp_min(1e-9)
             inc = inc * (scale_pre / span).unsqueeze(-1)
-        return cls(q0, inc, u_knots, clamp=clamp)
+        obj = cls(q0, inc, u_knots, clamp=clamp)
+        obj._has_tails = bool(tails)
+        if tails:
+            obj._attach_tails(u_knots, raw, space, clamp)
+        return obj
+
+    def _attach_tails(self, u_knots, raw, space, clamp):
+        """E1a: learned exponential tail rates REPLACING the outermost bins.
+
+        They cannot attach *beyond* the outer knots. ``validate_knots`` requires the grid to
+        span [0, 1] exactly, so there is no u out there and a tail placed at one would cover
+        an empty set -- accepted, logged, and inert. Instead the tails own
+        ``[u[0], u[1]]`` and ``[u[-2], u[-1]]`` (0.001 of probability each on every preset
+        this repo has), anchored at the 0.001 / 0.999 knots, which is also the paper's shape:
+        their spline covers [alpha, 1-alpha] and the tails cover the rest.
+
+        The rates are trainable and live in a transformed space where an unbounded tail is
+        admissible -- ``logit(HM)`` (symmetric) or ``-log(1-HM)`` (unbounded above only).
+        Mapping back through the inverse respects [0, 1] structurally, which is what makes
+        the clamp redundant here rather than load-bearing.
+        """
+        arr = np.asarray(u_knots.detach().cpu().numpy(), dtype=np.float64)
+        lo, hi = float(clamp[0]), float(clamp[1])
+        eps = 1e-6
+        def fwd(x):
+            z = ((x - lo) / max(hi - lo, 1e-12)).clamp(eps, 1.0 - eps)
+            return torch.log(z / (1.0 - z)) if space == "logit" else -torch.log1p(-z)
+        def inv(z):
+            y = torch.sigmoid(z) if space == "logit" else (1.0 - torch.exp(-z.clamp_min(0.0)))
+            return lo + y * (hi - lo)
+        # Two trainable rates, taken from the two channels the ladder does not use. beta > 0
+        # via softplus: a tail that can flatten or invert is not a tail.
+        self.beta_l = F.softplus(raw[..., -2]) + 1e-3
+        self.beta_r = F.softplus(raw[..., -1]) + 1e-3
+        self.tail_space, self._fwd, self._inv = space, fwd, inv
+        self.u1, self.un = float(arr[1]), float(arr[-2])
+        # Anchored at the knot the tail replaces, so Q is continuous there by construction.
+        self._z1 = fwd(self.q_knots[..., 1])
+        self._zn = fwd(self.q_knots[..., -2])
+        # The endpoint knots are still written, because the exported raster and every
+        # consumer reading q_knots directly needs a finite monotone grid. But ``ppf`` below
+        # evaluates the tail wherever it is ASKED instead of interpolating to these -- the
+        # difference between a learned exponential tail and a straight line to a distant
+        # point. u = 0 and u = 1 are exactly where the tail diverges, so the stored endpoint
+        # is taken one part in a thousand inside.
+        u0e = max(float(arr[0]), self.u1 * 1e-3)
+        uNe = min(float(arr[-1]), 1.0 - (1.0 - self.un) * 1e-3)
+        q_lo = self._tail_lo(torch.as_tensor(u0e, dtype=self.q_knots.dtype))
+        q_hi = self._tail_hi(torch.as_tensor(uNe, dtype=self.q_knots.dtype))
+        new_q = torch.cat([q_lo.unsqueeze(-1), self.q_knots[..., 1:-1],
+                           q_hi.unsqueeze(-1)], dim=-1)
+        # cummax, not an assert: the two seams are the only places monotonicity is not
+        # structural, and a tail that crossed its own anchor would read downstream as a
+        # collapsed segment -- i.e. as a fence, the very thing E1a is judged on.
+        self.q_knots = torch.cummax(new_q, dim=-1).values
+
+    def _align(self, u, z, beta):
+        """Broadcast the per-pixel anchor and rate against a trailing u axis.
+
+        ``ppf`` asks for ``(..., n_u)`` while the anchors are ``(...)`` per pixel; the
+        endpoint call in ``_attach_tails`` passes a scalar. One helper so the two call sites
+        cannot disagree about which one needs the extra axis.
+        """
+        while z.dim() < u.dim():
+            z, beta = z.unsqueeze(-1), beta.unsqueeze(-1)
+        return z, beta
+
+    def _tail_lo(self, u):
+        """``inv(z(u1) - beta_l * log(u1 / u))`` -- the lower tail, for ``u <= u1``."""
+        z, beta = self._align(u, self._z1, self.beta_l)
+        lg = torch.log(torch.as_tensor(self.u1, dtype=u.dtype, device=u.device)
+                       / u.clamp_min(1e-12))
+        return self._inv(z - beta * lg)
+
+    def _tail_hi(self, u):
+        """``inv(z(un) + beta_r * log((1-un) / (1-u)))`` -- the upper tail, for ``u >= un``."""
+        z, beta = self._align(u, self._zn, self.beta_r)
+        lg = torch.log(torch.as_tensor(1.0 - self.un, dtype=u.dtype, device=u.device)
+                       / (1.0 - u).clamp_min(1e-12))
+        return self._inv(z + beta * lg)
+
+    def ppf(self, u):
+        """``Q(u)``, using the exponential tails wherever they own the domain.
+
+        Without this the tails would exist only as two relocated endpoint knots, and every u
+        between 0.999 and 1 -- which is precisely where the exported raster samples the far
+        tail -- would come from a straight line to a distant point. The numbers move either
+        way, so the omission would have been invisible: E1a would have been judged on a
+        mechanism it was not running.
+        """
+        if not getattr(self, "_has_tails", False):
+            return super().ppf(u)
+        u = torch.as_tensor(u, dtype=self.q_knots.dtype, device=self.q_knots.device)
+        if u.dim() == 1:
+            u = u.expand(self.q_knots.shape[:-1] + u.shape)
+        out = super().ppf(u)
+        # The tail is anchored so that it MEETS its knot exactly -- but `inv(fwd(q))` does not
+        # round-trip to the last bit when q sits on the transform's own clamp, which showed up
+        # as a -3e-06 backward step right at the seam. Tiny (4.6e-07 HM, below the int16
+        # quantum) and entirely cosmetic in value, but Q must be non-decreasing: the scorer's
+        # qf reader refuses a non-increasing grid rather than passing NaN downstream, so a
+        # seam like this would fail a real run rather than shade a number. Bounding each tail
+        # by its own anchor is exact and costs one min/max.
+        if bool((u < self.u1).any()):
+            anchor = self.q_knots[..., 1].unsqueeze(-1) if u.dim() > self.q_knots.dim() - 1 \
+                else self.q_knots[..., 1]
+            out = torch.where(u < self.u1,
+                              torch.minimum(self._tail_lo(u.clamp_max(self.u1)), anchor), out)
+        if bool((u > self.un).any()):
+            anchor = self.q_knots[..., -2].unsqueeze(-1) if u.dim() > self.q_knots.dim() - 1 \
+                else self.q_knots[..., -2]
+            out = torch.where(u > self.un,
+                              torch.maximum(self._tail_hi(u.clamp_min(self.un)), anchor), out)
+        return out if self.clamp is None else out.clamp(*self.clamp)
 
 
-def n_pwl_params(n_knots: int, family: str = "pwl") -> int:
+def n_pwl_params(n_knots: int, family: str = "pwl", tails: bool = False) -> int:
     """Channels one horizon needs: ``[location, scale, shape...]``, shape being one per bin.
 
     Identical for both families by construction -- see ``ISQFQuantile.from_channels``.
+    ``tails`` (E1a) appends two more for the trainable rates beta_L and beta_R, which is why
+    the phase doc counts E1a at 18 params/horizon against E1's 16. They are appended rather
+    than carved out of the ladder so that E1 and E1a differ by the tails and nothing else.
     """
     if family not in ("pwl", "isqf"):
         raise ValueError(f"unknown piecewise-linear family {family!r}")
-    return 2 + (n_knots - 1)
+    if tails and family != "isqf":
+        raise ValueError("learned tails are an isqf feature; --isqf_tails with "
+                         f"head_family={family!r} would allocate two channels nothing reads")
+    return 2 + (n_knots - 1) + (2 if tails else 0)

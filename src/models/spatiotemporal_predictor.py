@@ -60,6 +60,9 @@ class SpatioTemporalPredictor(nn.Module):
                  central_transform_scale: float = 0.01,
                  initial_width_normalized: float = 0.065,
                  head_family: str = 'triple',
+                 free_scale: bool = False,
+                 isqf_tails: bool = False,
+                 isqf_space: str = 'logit',
                  spline_u_knots=None,
                  spline_learn_slopes: bool = True,
                  spline_cumulative_width: bool = True,
@@ -108,6 +111,9 @@ class SpatioTemporalPredictor(nn.Module):
         # The precompute-on-the-full-raster requirement (radii >= 30 px saturate inside a
         # 128 px chip) is about where the covariate is *derived*, not where it is consumed,
         # which is what lets the same precomputed tensor feed the trunk.
+        self.free_scale = bool(free_scale)
+        self.isqf_tails = bool(isqf_tails)
+        self.isqf_space = str(isqf_space)
         self.context_channels = int(context_channels)
         self.convlstm = ConvLSTM(
             input_dim=(self.num_dynamic_channels + self.num_static_channels
@@ -257,7 +263,8 @@ class SpatioTemporalPredictor(nn.Module):
             if self.head_family == 'spline':
                 self.n_spline_params = n_spline_params(n_knots, self.spline_learn_slopes)
             else:
-                self.n_spline_params = n_pwl_params(n_knots)
+                self.n_spline_params = n_pwl_params(
+                    n_knots, family=self.head_family, tails=self.isqf_tails)
             # Every family emits [location, scale, shape...], so this subtraction means the
             # same thing for all three.
             n_shape = self.n_spline_params - 2
@@ -343,8 +350,9 @@ class SpatioTemporalPredictor(nn.Module):
         """
         if not bool(self.hm_norm_set):
             raise RuntimeError(
-                "head_family='spline' needs the HM normalisation: call "
-                "model.set_norm_stats(hm_mean, hm_std) before the first forward pass.")
+                f"head_family={self.head_family!r} needs the HM normalisation: call "
+                f"model.set_norm_stats(hm_mean, hm_std) before the first forward pass. "
+                f"(pwl reads hm_std here too, for --spline_gap_floor's density ceiling.)")
         mean, std = self.hm_norm[0], self.hm_norm[1]
         return float((0.0 - mean) / std), float((1.0 - mean) / std)
 
@@ -564,7 +572,18 @@ class SpatioTemporalPredictor(nn.Module):
                              f"{n_triple}, got {blk.shape[-1]}")
         kw = {}
         if self.head_family == 'pwl':
-            kw = dict(gap_floor=self.spline_gap_floor, hm_std=float(self.hm_norm[1]))
-        return [cls.from_channels(blk[..., h * p:(h + 1) * p], self.spline_u_knots,
-                                  scale_pre=blk[..., h * p + 1], clamp=clamp, **kw)
+            kw = dict(gap_floor=self.spline_gap_floor, hm_std=float(self.hm_norm[1]),
+                      free_scale=self.free_scale)
+        else:
+            kw = dict(tails=self.isqf_tails, space=self.isqf_space,
+                      hm_std=float(self.hm_norm[1]))
+        # --free_scale: the width comes from the increments, so the scale channel is not
+        # passed at all. For isqf that IS the whole change (ISQFQuantile.from_channels
+        # already skips the renormalisation when scale_pre is None); for pwl the work is in
+        # from_free_increments, because stripping the channel alone would leave
+        # _cumulative_v's 0->1 normalisation and hand every pixel a span of exactly 1.
+        return [cls.from_channels(
+                    blk[..., h * p:(h + 1) * p], self.spline_u_knots,
+                    scale_pre=(None if self.free_scale else blk[..., h * p + 1]),
+                    clamp=clamp, **kw)
                 for h in range(self.num_horizons)]

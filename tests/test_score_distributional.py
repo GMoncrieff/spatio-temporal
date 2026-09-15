@@ -163,13 +163,13 @@ def test_gate_stats_are_produced_and_named_for_both_readings():
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
-    from score_distributional_model import gate_stats
+    from score_distributional_model import gate_stats, per_pixel
 
     u, q = grid_and_q(n_px=2000)
     rng = np.random.default_rng(7)
     y = np.array([np.interp(v, u, q[:, i]) for i, v in enumerate(rng.random(q.shape[1]))])
     cell = {"qf": q, "observed": y, "hm_t0": np.full(y.size, 0.2)}
-    out = gate_stats(u, cell, np.ones(y.size, dtype=bool))
+    out = gate_stats(per_pixel(u, cell), np.ones(y.size, dtype=bool))
 
     for stat in ("needle_mass_median", "needle_mass_p90", "max_density_p99", "over_f_max_frac"):
         for reading in ("export", "ref"):
@@ -184,11 +184,49 @@ def test_gate_stats_declines_a_stratum_too_small_to_measure():
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
-    from score_distributional_model import gate_stats
+    from score_distributional_model import gate_stats, per_pixel
 
     u, q = grid_and_q(n_px=2000)
     y = q[32]
     cell = {"qf": q, "observed": y, "hm_t0": np.full(y.size, 0.2)}
     sel = np.zeros(y.size, dtype=bool)
     sel[:40] = True
-    assert gate_stats(u, cell, sel) == {}
+    assert gate_stats(per_pixel(u, cell), sel) == {}
+
+
+def test_the_gate_reduction_equals_reading_the_whole_quantile_function():
+    """The streamed reduction and the whole-raster statistic must be the same number.
+
+    ``fence_gate``/``pit_structure``/``zero_leak`` read ``[n_levels, n_px]`` directly; the
+    scorer cannot, because a stratum spans bands the quantile function did not survive. The
+    split is only legitimate if it is an identity, and rule 3's second implementation is
+    what makes that checkable at all -- so both are computed here and compared.
+
+    Tolerance 1e-12 relative, not exact: the two paths sum ``dp`` over the same segments in
+    the same order but over arrays of different width, and NumPy's pairwise reduction blocks
+    differently, which moves the last bit. That is the only difference permitted -- anything
+    the reduction actually got wrong is orders of magnitude larger.
+    """
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+    from score_distributional_model import gate_stats, per_pixel, pit as sd_pit
+    from src.qf_diagnostics import fence_gate, pit_structure, zero_leak
+
+    u, q = grid_and_q(n_px=3000, seed=3)
+    rng = np.random.default_rng(19)
+    y = np.array([np.interp(v, u, q[:, i]) for i, v in enumerate(rng.random(q.shape[1]))])
+    hm0 = np.full(y.size, 0.2)
+    cell = {"qf": q, "observed": y, "hm_t0": hm0}
+
+    sel = np.zeros(y.size, dtype=bool)
+    sel[::3] = True                       # a stratum, not the whole thing
+    got = gate_stats(per_pixel(u, cell), sel)
+
+    want = fence_gate(u, q[:, sel])
+    want.update(pit_structure(sd_pit(u, q[:, sel], y[sel])))
+    want.update(zero_leak(u, q[:, sel], y[sel], hm0[sel]))
+
+    assert set(got) == set(want)
+    for k in want:
+        assert got[k] == pytest.approx(want[k], rel=1e-12, nan_ok=True), k

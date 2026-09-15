@@ -151,3 +151,71 @@ def test_fritsch_removes_the_slope_parameters_from_the_head():
     learned = _built("default14", "learned")[0]
     fritsch = _built("default14", "fritsch")[0]
     assert learned.n_spline_params - fritsch.n_spline_params == 13
+
+
+# --------------------------------------------- the banner must tell the families apart
+
+def _banner(**kw):
+    """Call _spline_head_banner without importing train_lightning's __main__ block."""
+    import types
+    src = open(os.path.join(REPO, "scripts", "train_lightning.py")).read()
+    ns = {}
+    exec("import sys\nsys.path.insert(0, %r)\n" % REPO
+         + src[src.index("def _spline_head_banner"):src.index("def _experiment_kwargs")], ns)
+    a = types.SimpleNamespace(**{**dict(head_family="spline", spline_knots="default14",
+                                        spline_slopes="learned", isqf_tails=False,
+                                        isqf_space="logit", free_scale=False,
+                                        spline_cumulative_width=True), **kw})
+    return ns["_spline_head_banner"](a)
+
+
+def test_the_head_banner_distinguishes_every_family_on_the_slate():
+    """Until 2026-09-15 it printed "Spline head ... 29 params/horizon" for EVERY family.
+
+    It hardcoded the word and computed the count with `n_spline_params`, the
+    rational-quadratic formula, whatever --head_family said -- so E1, E2, E4 and all four
+    scale arms logged a 29-parameter spline while running a 16- or 18-parameter head. The one
+    line a log reader checks to see which head ran could not tell them. Same
+    one-formula-for-three-families conflation that left the prediction writer unable to
+    decode pwl or isqf at all.
+    """
+    lines = {
+        "spline": _banner(),
+        "isqf": _banner(head_family="isqf"),
+        "pwl": _banner(head_family="pwl"),
+    }
+    assert len(set(lines.values())) == 3, f"the banner cannot tell the families apart: {lines}"
+    for fam, line in lines.items():
+        assert f"family {fam}" in line, f"{fam}: {line}"
+    assert "29 params/horizon" in lines["spline"]
+    assert "16 params/horizon" in lines["isqf"]
+    assert "16 params/horizon" in lines["pwl"]
+
+
+def test_the_head_banner_carries_the_scale_arm_flags():
+    """An arm whose only delta is a flag must be distinguishable in the log by that flag."""
+    assert "tails neglog" in _banner(head_family="isqf", isqf_tails=True, isqf_space="neglog")
+    assert "tails logit" in _banner(head_family="isqf", isqf_tails=True)
+    assert "18 params/horizon" in _banner(head_family="isqf", isqf_tails=True)
+    assert "free scale" in _banner(head_family="isqf", free_scale=True)
+    assert "non-cumulative width" in _banner(spline_cumulative_width=False)
+    # E1c is both, and must say so
+    e1c = _banner(head_family="isqf", isqf_tails=True, free_scale=True)
+    assert "tails logit" in e1c and "free scale" in e1c
+
+
+def test_the_head_banner_prefers_the_constructed_module_over_the_flags():
+    """Read the count off the module, never recompute it from args -- the same reason the
+    context line reads its channel count off the trunk. A head built differently from what
+    the flags imply must show the head, not the flags."""
+    import types
+    src = open(os.path.join(REPO, "scripts", "train_lightning.py")).read()
+    ns = {}
+    exec("import sys\nsys.path.insert(0, %r)\n" % REPO
+         + src[src.index("def _spline_head_banner"):src.index("def _experiment_kwargs")], ns)
+    a = types.SimpleNamespace(head_family="isqf", spline_knots="default14",
+                              spline_slopes="learned", isqf_tails=False,
+                              isqf_space="logit", free_scale=False,
+                              spline_cumulative_width=True)
+    fake = types.SimpleNamespace(n_spline_params=99)
+    assert "99 params/horizon" in ns["_spline_head_banner"](a, fake)
