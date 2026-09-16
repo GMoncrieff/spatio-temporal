@@ -41,6 +41,7 @@ ARMS=(
   "E1b|--head_family isqf --free_scale True --mu_mse_weight 0.0|16|isqf"
   "E2a|--head_family pwl --free_scale True --mu_mse_weight 0.0|16|pwl"
   "E1c|--head_family isqf --isqf_tails True --isqf_space logit --free_scale True --mu_mse_weight 0.0|18|isqf"
+  "E1d|--head_family isqf --isqf_tails True --isqf_space neglog --free_scale True --mu_mse_weight 0.0|18|isqf"
 )
 
 PASS=(); FAIL=()
