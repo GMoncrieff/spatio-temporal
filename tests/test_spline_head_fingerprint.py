@@ -219,3 +219,25 @@ def test_the_head_banner_prefers_the_constructed_module_over_the_flags():
                               spline_cumulative_width=True)
     fake = types.SimpleNamespace(n_spline_params=99)
     assert "99 params/horizon" in ns["_spline_head_banner"](a, fake)
+
+
+def test_the_banner_names_the_tails_on_either_family():
+    """The banner is the fingerprint a log reader and the verifiers both grep, so it has to
+    move with the run. It was gated on ``fam == "isqf"``, so E1v -- a pwl arm WITH tails --
+    logged identically to one without. Rule 28, caught while that arm was already training.
+
+    The param count gave it away (17 = 1 + 14 + 2 under --free_scale), but a fingerprint
+    that needs arithmetic to read is not doing its job.
+    """
+    for family in ("pwl", "isqf"):
+        a_on = types.SimpleNamespace(head_family=family, spline_knots="default14",
+                                     spline_slopes="learned", isqf_tails=True,
+                                     isqf_space="neglog", free_scale=True)
+        a_off = types.SimpleNamespace(head_family=family, spline_knots="default14",
+                                      spline_slopes="learned", isqf_tails=False,
+                                      isqf_space="neglog", free_scale=True)
+        on, off = _spline_head_banner(a_on), _spline_head_banner(a_off)
+        assert "tails neglog" in on, f"{family}: the banner hid the tails"
+        assert "tails" not in off, f"{family}: the banner claimed tails that are off"
+        # and the count must agree with the words
+        assert "17 params/horizon" in on and "15 params/horizon" in off, (on, off)

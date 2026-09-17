@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from ..locationencoder import LocationEncoder
 from .convlstm import ConvLSTM
 from torch.utils.checkpoint import checkpoint
-from .quantile_pwl import ISQFQuantile, PWLQuantile, n_pwl_params
+from .quantile_pwl import ISQFQuantile, PWLQuantile, n_pwl_params, shape_offset
 from .quantile_spline import (
     U_KNOTS_DEFAULT,
     n_spline_params,
@@ -261,16 +261,32 @@ class SpatioTemporalPredictor(nn.Module):
             n_knots = self.spline_u_knots.numel()
             n_bins = n_knots - 1
             if self.head_family == 'spline':
+                if self.free_scale:
+                    # splines_from_output decodes [anchor, scale, heights, slopes] and takes
+                    # no free_scale, so removing the channel here would silently shift every
+                    # height by one. Until the rational-quadratic decoder learns the layout,
+                    # refuse: this combination was ACCEPTED AND INERT before 2026-09-16,
+                    # which reads downstream as "the experiment was a null".
+                    raise ValueError(
+                        "--free_scale is implemented for --head_family pwl and isqf only; "
+                        "with the rational-quadratic head it was silently ignored before "
+                        "2026-09-16 and would now mis-decode the shape channels")
                 self.n_spline_params = n_spline_params(n_knots, self.spline_learn_slopes)
             else:
                 self.n_spline_params = n_pwl_params(
-                    n_knots, family=self.head_family, tails=self.isqf_tails)
-            # Every family emits [location, scale, shape...], so this subtraction means the
-            # same thing for all three.
-            n_shape = self.n_spline_params - 2
+                    n_knots, family=self.head_family, tails=self.isqf_tails,
+                    free_scale=self.free_scale)
+            # Every family emits [location, scale, shape...] -- or [location, shape...] once
+            # --free_scale removes the scale channel -- so this subtraction means the same
+            # thing for all three. One spelling, shared with the decoder's slice.
+            n_shape = self.n_spline_params - shape_offset(self.free_scale)
             # One width head and one shape head per horizon, at the same half-trunk width as
-            # the quantile heads they replace.
-            self.width_heads = nn.ModuleList([_head(q_in, q_mid, 1)
+            # the quantile heads they replace. Under --free_scale the width head is not built
+            # at all: the increments carry the width, so a width head would be a module with
+            # no consumer, taking no gradient from the quantile path while still occupying
+            # parameters and a channel. Simplicity is a scoring criterion here.
+            self.width_heads = nn.ModuleList([] if self.free_scale else
+                                             [_head(q_in, q_mid, 1)
                                               for _ in range(self.num_horizons)])
             # The shape head carries the whole distribution's form: 27 outputs from q_mid
             # channels at the default. These two flags size it independently of the other
@@ -523,6 +539,12 @@ class SpatioTemporalPredictor(nn.Module):
             qi = q_input_for(centrals[h_idx])
             # Non-negative increments accumulated across horizons: the 95% width cannot
             # shrink with lead time (T4.2), by construction rather than by a later pass.
+            if self.free_scale:
+                # No scale channel exists, so there is nothing to accumulate and nothing to
+                # emit. --spline_cumulative_width is vacuous here by construction rather than
+                # by being ignored.
+                blocks.append(torch.cat([centrals[h_idx], self.shape_heads[h_idx](qi)], dim=1))
+                continue
             step = F.softplus(self.width_heads[h_idx](qi))
             # spline_cumulative_width=False makes each horizon's scale independent, so the
             # 95% width is free to SHRINK with lead time. That is the one monotonicity this
@@ -570,18 +592,14 @@ class SpatioTemporalPredictor(nn.Module):
         if blk.shape[-1] != self.num_horizons * p:
             raise ValueError(f"expected {self.num_horizons * p} head channels after "
                              f"{n_triple}, got {blk.shape[-1]}")
-        kw = {}
-        if self.head_family == 'pwl':
-            kw = dict(gap_floor=self.spline_gap_floor, hm_std=float(self.hm_norm[1]),
-                      free_scale=self.free_scale)
-        else:
-            kw = dict(tails=self.isqf_tails, space=self.isqf_space,
-                      hm_std=float(self.hm_norm[1]))
-        # --free_scale: the width comes from the increments, so the scale channel is not
-        # passed at all. For isqf that IS the whole change (ISQFQuantile.from_channels
-        # already skips the renormalisation when scale_pre is None); for pwl the work is in
-        # from_free_increments, because stripping the channel alone would leave
-        # _cumulative_v's 0->1 normalisation and hand every pixel a span of exactly 1.
+        # One kwarg set for both families: the tails live on _PWLBase, so `pwl` reads them
+        # too (E1v). Passing them only to isqf is what made --isqf_tails a family-gated flag.
+        kw = dict(hm_std=float(self.hm_norm[1]), free_scale=self.free_scale,
+                  gap_floor=self.spline_gap_floor,
+                  tails=self.isqf_tails, space=self.isqf_space)
+        # --free_scale: the width comes from the increments, so there is no scale channel to
+        # read -- the head does not emit one. Both families take the flag itself rather than
+        # inferring it from scale_pre, so the channel layout has exactly one definition.
         return [cls.from_channels(
                     blk[..., h * p:(h + 1) * p], self.spline_u_knots,
                     scale_pre=(None if self.free_scale else blk[..., h * p + 1]),

@@ -118,9 +118,20 @@ def _spline_head_banner(args, model=None):
     elif fam == "spline":
         n = n_spline_params(len(k), args.spline_slopes == "learned")
     else:
-        n = n_pwl_params(len(k), family=fam, tails=bool(getattr(args, "isqf_tails", False)))
+        # free_scale too: it drops the scale channel, so omitting it here made the fallback
+        # report 18/16 where the constructed module reports 17/15. The module path is the
+        # one a real run takes, which is exactly why this stayed wrong -- a fallback nobody
+        # reads is a fallback nobody checks.
+        n = n_pwl_params(len(k), family=fam,
+                         tails=bool(getattr(args, "isqf_tails", False)),
+                         free_scale=bool(getattr(args, "free_scale", False)))
     extra = ""
-    if fam == "isqf" and getattr(args, "isqf_tails", False):
+    # NOT gated on fam == "isqf". The tails moved to _PWLBase on 2026-09-16 and `pwl` reads
+    # them too (E1v), so gating the banner on the family printed a line that could not
+    # distinguish E1v from a tailless pwl arm -- rule 28, in a run that was already going.
+    # The param count gives it away (17 = 1 + 14 + 2) but the fingerprint must not need
+    # arithmetic to read.
+    if getattr(args, "isqf_tails", False):
         extra += f", tails {args.isqf_space}"
     if getattr(args, "free_scale", False):
         extra += ", free scale"
@@ -194,6 +205,10 @@ from scipy.ndimage import distance_transform_edt
 import yaml
 
 if __name__ == "__main__":
+    # The knot presets are defined in one place and the parser's choices are read off that
+    # dict, so adding a preset cannot be rejected here as an "invalid choice".
+    from src.models.quantile_spline import KNOT_PRESETS
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--fast_dev_run", action="store_true", help="Run 1 train/val batch for a quick smoke test")
     parser.add_argument("--max_epochs", type=int, default=100, help="Number of training epochs")
@@ -632,7 +647,11 @@ if __name__ == "__main__":
     # ---- round 2: knot grid, two-sided tail weight, shape-head capacity, HM context ----
     parser.add_argument(
         "--spline_knots", type=str, default="default14",
-        choices=["default14", "body_dense", "deep_lower", "lean9", "skew14", "skew11"],
+        # Derived from KNOT_PRESETS, never restated. This list was a second hardcoded copy
+        # until 2026-09-16 and a preset added to the dict was rejected here with
+        # "invalid choice", which is rule 2's predicate-written-twice: the two spellings
+        # disagreed the first time one of them changed.
+        choices=sorted(KNOT_PRESETS),
         help="Named knot grid. 'body_dense' adds 0.35/0.45/0.55/0.65: the default grid has "
              "three knots between u=0.10 and u=0.90 while 53%% of pixels move by less than "
              "0.001 over twenty years, and cov50 is the worst-calibrated coverage level. "
@@ -641,7 +660,9 @@ if __name__ == "__main__":
              "tail resolution is information or only capacity. 'skew14'/'skew11' re-place the "
              "knots for the measured right skew: the target spends 0.13%% of its value range "
              "on u in [0.1, 0.6] and 60%% on the top decile, so the symmetric default spends "
-             "bins where nothing varies. skew14 is the same 14 bins re-placed; skew11 is 11.",
+             "bins where nothing varies. skew14 is the same 14 bins re-placed; skew11 is 11. "
+             "'dense24' is a strict SUPERSET of default14 -- 24 bins, no knot moved -- so it "
+             "asks whether there were too few rather than whether they were misplaced.",
     )
     parser.add_argument(
         "--crps_z_weight", type=float, default=0.0,

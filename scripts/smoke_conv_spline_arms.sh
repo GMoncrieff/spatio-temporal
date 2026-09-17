@@ -38,10 +38,21 @@ ARMS=(
   "E0a|--spline_cumulative_width False --mu_mse_weight 0.0|29|spline"
   "E1a_logit|--head_family isqf --isqf_tails True --isqf_space logit|18|isqf"
   "E1a_neglog|--head_family isqf --isqf_tails True --isqf_space neglog|18|isqf"
-  "E1b|--head_family isqf --free_scale True --mu_mse_weight 0.0|16|isqf"
-  "E2a|--head_family pwl --free_scale True --mu_mse_weight 0.0|16|pwl"
-  "E1c|--head_family isqf --isqf_tails True --isqf_space logit --free_scale True --mu_mse_weight 0.0|18|isqf"
-  "E1d|--head_family isqf --isqf_tails True --isqf_space neglog --free_scale True --mu_mse_weight 0.0|18|isqf"
+  "E1b|--head_family isqf --free_scale True --mu_mse_weight 0.0|15|isqf"
+  "E2a|--head_family pwl --free_scale True --mu_mse_weight 0.0|15|pwl"
+  "E1c|--head_family isqf --isqf_tails True --isqf_space logit --free_scale True --mu_mse_weight 0.0|17|isqf"
+  "E1d|--head_family isqf --isqf_tails True --isqf_space neglog --free_scale True --mu_mse_weight 0.0|17|isqf"
+  # The six knot/floor arms. Every one carries --free_scale, which as of 2026-09-16 actually
+  # REMOVES the scale channel rather than leaving it emitted and unread, so the expected
+  # counts below are one lower than the same arms carried before that change.
+  "E2i|--head_family pwl --free_scale True --mu_mse_weight 0.0 --spline_knots skew14|15|pwl"
+  "E2ii|--head_family pwl --free_scale True --mu_mse_weight 0.0 --spline_knots skew11|12|pwl"
+  "E1i|--head_family isqf --isqf_tails True --isqf_space neglog --free_scale True --mu_mse_weight 0.0 --spline_knots skew14|17|isqf"
+  "E1ii|--head_family isqf --isqf_tails True --isqf_space neglog --free_scale True --mu_mse_weight 0.0 --spline_knots skew11|14|isqf"
+  "E2iv|--head_family pwl --free_scale True --mu_mse_weight 0.0 --spline_knots dense24|25|pwl"
+  "E1iv|--head_family isqf --isqf_tails True --isqf_space neglog --free_scale True --mu_mse_weight 0.0 --spline_knots dense24|27|isqf"
+  # E1v: E1d's tails and transform on E2a's anchor. Same 17 params as E1d, different family.
+  "E1v|--head_family pwl --isqf_tails True --isqf_space neglog --free_scale True --mu_mse_weight 0.0|17|pwl"
 )
 
 PASS=(); FAIL=()

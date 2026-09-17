@@ -91,6 +91,22 @@ KNOT_PRESETS = {
     # u > 0.75. Fewer bins than default14 (11), so it also tests whether the body needed any
     # resolution at all -- the strong form of the claim.
     "skew11": (0.0, 0.001, 0.01, 0.025, 0.10, 0.50, 0.85, 0.95, 0.975, 0.99, 0.999, 1.0),
+    # The opposite end of the same question from `skew11`: not "did the body need resolution"
+    # but "were there simply too few bins". 24 of them against default14's 14.
+    #
+    # This is the direction CLAUDE.md is sceptical of -- "more knots alone would only give the
+    # head more room to do the same thing" -- and that scepticism was correct while nothing
+    # penalised a needle. It is worth re-asking now for two reasons: the free-scale heads no
+    # longer inject a width for the extra bins to subdivide, and as of 2026-09-16 the density
+    # floor actually binds, so a finer grid can no longer buy resolution by fencing. Paired
+    # with skew11 it brackets default14 on capacity from both sides.
+    # Built as a strict SUPERSET of default14, the way body_dense and deep_lower are, so the
+    # A/B is resolution alone: no knot moves, ten are added. skew14 and skew11 answer "were
+    # the knots in the wrong places"; this answers "were there too few", and mixing the two
+    # questions into one grid would make a null unattributable. Ten of the twelve additions
+    # sit above u = 0.5 and six above u = 0.9, which is where the value range is.
+    "dense24": tuple(sorted(set(U_KNOTS_DEFAULT) | {
+        0.15, 0.35, 0.65, 0.825, 0.875, 0.925, 0.96, 0.985, 0.995, 0.9995})),
 }
 
 

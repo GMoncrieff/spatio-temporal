@@ -139,6 +139,39 @@ def test_skew_presets_move_capacity_out_of_the_flat_middle(preset):
     assert share_in(grid, 0.75, 1.0) > share_in(default, 0.75, 1.0)
 
 
+def test_every_preset_in_the_dict_is_accepted_by_the_cli():
+    """A preset the model knows and the parser refuses is rule 2's predicate written twice.
+
+    It happened: --spline_knots carried its own hardcoded choices list, so `dense24` was
+    defined, unit-tested, and then rejected at the command line with "invalid choice" --
+    caught only by the smoke run, after the slate had been written around it. The parser is
+    built under `if __name__ == "__main__"`, so the honest check is to ask the CLI itself
+    rather than to re-read the source and hope.
+    """
+    import subprocess
+    out = subprocess.run([sys.executable, "scripts/train_lightning.py", "--help"],
+                         cwd=str(Path(__file__).resolve().parent.parent),
+                         capture_output=True, text=True, timeout=300).stdout
+    line = next((l for l in out.splitlines() if "--spline_knots" in l), "")
+    assert line, "--spline_knots is not in the CLI help at all"
+    missing = [k for k in KNOT_PRESETS if k not in line]
+    assert not missing, f"defined in KNOT_PRESETS but rejected by the CLI: {missing}"
+
+
+def test_dense24_adds_resolution_without_moving_a_knot():
+    """E2iv / E1iv ask "were there too few bins", which is only separable from "were they in
+    the wrong places" if no knot moves. A strict superset is what makes that true, so assert
+    the property rather than the literal tuple -- the grid is built by a set union and a
+    hand-maintained list would drift from it."""
+    from src.models.quantile_spline import U_KNOTS_DEFAULT
+    grid = knot_preset("dense24")
+    assert set(U_KNOTS_DEFAULT) <= set(grid), "dense24 moved a knot; the A/B is no longer capacity alone"
+    assert len(grid) - 1 == 24, f"dense24 has {len(grid) - 1} bins"
+    # Deliberately NOT in test_skew_presets_move_capacity_out_of_the_flat_middle: this preset
+    # adds bins in the body too, so it would fail that property and should.
+    assert len(grid) - 1 > len(knot_preset("default14")) - 1
+
+
 def test_a_skew_preset_actually_changes_the_trained_forecast():
     a = one_step(module(head_family="spline", spline_knots="default14"), batch())
     b = one_step(module(head_family="spline", spline_knots="skew14"), batch())
@@ -357,22 +390,31 @@ def test_free_scale_gives_pwl_and_isqf_the_same_width_scale():
     assert wa == pytest.approx(wb, rel=0.5), f"pwl {wa:.4g} vs isqf {wb:.4g}"
 
 
-def test_free_scale_refuses_to_compose_with_the_gap_floor():
-    """E4 x E2a is a re-derivation, not a combination: gap_floor_heights computes its floor
-    as dp_k / (f_max * scale) in normalised v units and --free_scale deletes both terms."""
-    with pytest.raises(ValueError, match="do not compose"):
-        _decoded(module(head_family="pwl", free_scale=True, spline_gap_floor=True))
+def test_free_scale_now_composes_with_the_gap_floor():
+    """E2iii / E1iii. This combination used to raise, and the refusal was right at the time:
+    gap_floor_heights computes dp_k / (f_max * scale) in normalised v units and --free_scale
+    deletes both terms, so applying it unchanged would have floored the increments with a
+    quantity that no longer existed. The refusal asked for the restatement first; free_increments
+    are already a value width in normalised HM, so the floor is dp_k / (f_max * hm_std)
+    directly -- exact here, where the injected-scale form has to approximate v_span by 1.
+
+    Binding is asserted in tests/test_free_scale_channel.py against a fencing control; what
+    this pins is that the arm is reachable at all.
+    """
+    qf = _decoded(module(head_family="pwl", free_scale=True, spline_gap_floor=True))
+    q = qf.ppf(torch.tensor([0.025, 0.5, 0.975]))
+    assert torch.isfinite(q).all()
+    assert bool((q[..., 1:] >= q[..., :-1] - 1e-6).all())
 
 
 def test_free_scale_is_not_implemented_for_the_incumbent():
-    """The doc says implement it for spline only if an E6-E8 candidate asks. Until then it
-    must fail loudly rather than be silently ignored on the incumbent head."""
-    m = module(head_family="spline", free_scale=True).model
-    assert m.free_scale is True
-    # _decode routes 'spline' to splines_from_output, which has no free_scale path at all;
-    # the flag being accepted and ignored is exactly the inert-flag failure, so assert that
-    # the arm is not silently available rather than that it works.
-    assert m.head_family == "spline"
+    """The doc says implement it for spline only if a later candidate asks. It must fail
+    loudly rather than be silently ignored, which is what it did until 2026-09-16: _decode
+    routes 'spline' to splines_from_output, which has no free_scale path, so the flag was
+    accepted and inert -- and now that the channel is genuinely removed it would mis-decode
+    every shape channel by one. The arm is refused at construction."""
+    with pytest.raises(ValueError, match="pwl and isqf"):
+        module(head_family="spline", free_scale=True)
 
 
 @pytest.mark.parametrize("space", ["logit", "neglog"])
@@ -415,9 +457,18 @@ def test_isqf_tails_stay_monotone_and_finite_in_both_spaces():
         assert (q.diff(dim=-1) >= -1e-6).all(), f"{space}: Q(u) is not increasing"
 
 
-def test_the_tails_cost_two_channels_and_only_on_isqf():
+def test_the_tails_cost_two_channels_on_either_family():
+    """They used to be refused for pwl, and that was right while the machinery lived on
+    ISQFQuantile: the two channels would have been allocated and never read. It is on
+    _PWLBase as of 2026-09-16, so both families allocate AND read them -- which is what E1v
+    needs, being E1d's tails and transform on E2a's anchor."""
     from src.models.quantile_pwl import n_pwl_params
     assert n_pwl_params(15, "isqf") == 16
     assert n_pwl_params(15, "isqf", tails=True) == 18      # the doc's 18 params/horizon
-    with pytest.raises(ValueError, match="isqf feature"):
-        n_pwl_params(15, "pwl", tails=True)
+    assert n_pwl_params(15, "pwl") == 16
+    assert n_pwl_params(15, "pwl", tails=True) == 18
+    # free_scale drops the scale channel under either family: E1d and E1v are both 17.
+    assert n_pwl_params(15, "pwl", tails=True, free_scale=True) == 17
+    assert n_pwl_params(15, "isqf", tails=True, free_scale=True) == 17
+    with pytest.raises(ValueError, match="unknown piecewise-linear family"):
+        n_pwl_params(15, "spline", tails=True)
