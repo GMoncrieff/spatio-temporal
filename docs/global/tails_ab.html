@@ -1,0 +1,609 @@
+<title>The Learned Tails A/B</title>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Serif:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  :root{
+    --bg:#f3f5f6; --surface:#ffffff; --sunken:#eceff1;
+    --ink:#14181d; --ink-2:#3d4650; --muted:#5f6a74; --faint:#8b959e;
+    --rule:#d8dee2; --rule-soft:#e6eaed;
+    --e1v:#1565c0; --e2a:#b0680f;
+    --e1v-wash:rgba(21,101,192,.10); --e2a-wash:rgba(176,104,15,.10);
+    --critical:#a4243b; --critical-wash:rgba(164,36,59,.08);
+    --nominal:#7b858e;
+    --shadow:0 1px 2px rgba(20,24,29,.05), 0 6px 18px rgba(20,24,29,.045);
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#131619; --surface:#1b1f23; --sunken:#22272c;
+      --ink:#e7eaed; --ink-2:#c2c9cf; --muted:#98a2ab; --faint:#6f7981;
+      --rule:#2e343a; --rule-soft:#262c31;
+      --e1v:#4189d6; --e2a:#c4861f;
+      --e1v-wash:rgba(65,137,214,.15); --e2a-wash:rgba(196,134,31,.15);
+      --critical:#e2748a; --critical-wash:rgba(226,116,138,.12);
+      --nominal:#7f8a93;
+      --shadow:0 1px 2px rgba(0,0,0,.3), 0 6px 20px rgba(0,0,0,.25);
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#131619; --surface:#1b1f23; --sunken:#22272c;
+    --ink:#e7eaed; --ink-2:#c2c9cf; --muted:#98a2ab; --faint:#6f7981;
+    --rule:#2e343a; --rule-soft:#262c31;
+    --e1v:#4189d6; --e2a:#c4861f;
+    --e1v-wash:rgba(65,137,214,.15); --e2a-wash:rgba(196,134,31,.15);
+    --critical:#e2748a; --critical-wash:rgba(226,116,138,.12);
+    --nominal:#7f8a93;
+    --shadow:0 1px 2px rgba(0,0,0,.3), 0 6px 20px rgba(0,0,0,.25);
+  }
+
+  *{box-sizing:border-box}
+  body{
+    background:var(--bg); color:var(--ink);
+    font-family:"IBM Plex Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    font-size:16px; line-height:1.6;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:53rem; margin:0 auto; padding-inline:20px; padding-block:clamp(2rem,6vw,4.5rem)}
+  .prose{max-width:38rem}
+
+  h1,h2,h3{font-family:"IBM Plex Serif",Georgia,serif; text-wrap:balance; margin:0}
+  h1{font-weight:600; font-size:clamp(2rem,5.2vw,2.9rem); line-height:1.12; letter-spacing:-.018em}
+  h2{font-weight:600; font-size:1.42rem; line-height:1.25; letter-spacing:-.01em}
+  h3{font-weight:600; font-size:1.02rem; line-height:1.3}
+  p{margin:0}
+
+  .eyebrow{
+    font-family:"IBM Plex Mono",ui-monospace,monospace; font-size:.72rem;
+    text-transform:uppercase; letter-spacing:.14em; color:var(--muted);
+  }
+  .mono{font-family:"IBM Plex Mono",ui-monospace,monospace; font-variant-numeric:tabular-nums}
+  .num{font-family:"IBM Plex Mono",ui-monospace,monospace; font-variant-numeric:tabular-nums}
+  code{font-family:"IBM Plex Mono",ui-monospace,monospace; font-size:.88em; background:var(--sunken);
+       padding:.1em .34em; border-radius:3px; color:var(--ink-2)}
+  strong{font-weight:600; color:var(--ink)}
+
+  header{display:flex; flex-direction:column; gap:1.1rem; padding-bottom:2.2rem;
+         border-bottom:1px solid var(--rule)}
+  .lede{font-size:1.12rem; color:var(--ink-2); max-width:36rem}
+  .runline{display:flex; flex-wrap:wrap; gap:.45rem 1.4rem; font-size:.79rem; color:var(--muted)}
+  .runline span{white-space:nowrap}
+
+  section{padding-block:2.6rem; border-bottom:1px solid var(--rule-soft);
+          display:flex; flex-direction:column; gap:1.3rem}
+  section:last-of-type{border-bottom:0}
+
+  /* the two heads, as a legend that is also the identity key */
+  .heads{display:grid; grid-template-columns:repeat(auto-fit,minmax(15rem,1fr)); gap:1px;
+         background:var(--rule); border:1px solid var(--rule); border-radius:5px; overflow:hidden}
+  .head{background:var(--surface); padding:1.05rem 1.15rem; display:flex; flex-direction:column; gap:.4rem}
+  .head-top{display:flex; align-items:baseline; gap:.5rem}
+  .swatch{width:.72rem; height:.72rem; border-radius:2px; flex:none; transform:translateY(-1px)}
+  .head-name{font-family:"IBM Plex Mono",ui-monospace,monospace; font-weight:500; font-size:1rem}
+  .head-params{font-size:.76rem; color:var(--muted); margin-left:auto;
+               font-family:"IBM Plex Mono",ui-monospace,monospace}
+  .head-flags{font-family:"IBM Plex Mono",ui-monospace,monospace; font-size:.75rem;
+              color:var(--ink-2); line-height:1.5; word-break:break-word}
+  .head-role{font-size:.79rem; color:var(--muted)}
+
+  /* verdict */
+  .verdict{background:var(--surface); border:1px solid var(--rule); border-radius:5px;
+           box-shadow:var(--shadow); padding:1.4rem 1.5rem; display:flex; flex-direction:column; gap:.75rem}
+  .verdict p{color:var(--ink-2)}
+  .verdict .thesis{font-family:"IBM Plex Serif",Georgia,serif; font-size:1.2rem; line-height:1.35;
+                   color:var(--ink); font-weight:500}
+
+  /* charts */
+  .panels{display:grid; grid-template-columns:repeat(auto-fit,minmax(19rem,1fr)); gap:1.5rem 1.8rem}
+  .panel{display:flex; flex-direction:column; gap:.5rem; min-width:0}
+  .panel-hd{display:flex; flex-direction:column; gap:.15rem}
+  .panel-title{font-size:.94rem; font-weight:600}
+  .panel-sub{font-size:.76rem; color:var(--muted)}
+  svg{display:block; width:100%; height:auto; overflow:visible}
+  .legend{display:flex; gap:1.1rem; flex-wrap:wrap; font-size:.79rem; color:var(--ink-2)}
+  .legend span{display:inline-flex; align-items:center; gap:.4rem}
+
+  /* tables */
+  .scroll{overflow-x:auto; border:1px solid var(--rule); border-radius:5px; background:var(--surface)}
+  table{border-collapse:collapse; width:100%; font-size:.83rem}
+  th,td{text-align:right; padding:.5rem .7rem; white-space:nowrap;
+        border-bottom:1px solid var(--rule-soft)}
+  th:first-child,td:first-child{text-align:left}
+  thead th{font-size:.72rem; text-transform:uppercase; letter-spacing:.07em;
+           color:var(--muted); font-weight:500; background:var(--sunken)}
+  tbody tr:last-child td{border-bottom:0}
+  td.n{font-family:"IBM Plex Mono",ui-monospace,monospace; font-variant-numeric:tabular-nums}
+  .win{color:var(--ink); font-weight:600}
+  .bad{color:var(--critical); font-weight:600}
+  caption{caption-side:bottom; text-align:left; padding:.6rem .7rem; font-size:.75rem;
+          color:var(--muted)}
+
+  /* the far-field callout */
+  .ff{display:grid; grid-template-columns:repeat(auto-fit,minmax(11rem,1fr)); gap:1px;
+      background:var(--rule); border:1px solid var(--rule); border-radius:5px; overflow:hidden}
+  .ff-cell{background:var(--surface); padding:.95rem 1.05rem; display:flex; flex-direction:column; gap:.3rem}
+  .ff-metric{font-size:.73rem; text-transform:uppercase; letter-spacing:.07em; color:var(--muted)}
+  .ff-pair{display:flex; align-items:baseline; gap:.55rem;
+           font-family:"IBM Plex Mono",ui-monospace,monospace; font-variant-numeric:tabular-nums}
+  .ff-a{font-size:1.12rem; color:var(--e1v); font-weight:500}
+  .ff-b{font-size:1.12rem; color:var(--e2a); font-weight:500}
+  .ff-vs{font-size:.8rem; color:var(--faint)}
+  .ff-note{font-size:.75rem; color:var(--muted); line-height:1.45}
+  .ff-note.flag{color:var(--critical)}
+
+  ul{margin:0; padding-left:1.15rem; display:flex; flex-direction:column; gap:.6rem;
+     color:var(--ink-2)}
+  li::marker{color:var(--faint)}
+
+  details{background:var(--surface); border:1px solid var(--rule); border-radius:5px}
+  summary{padding:.75rem 1rem; cursor:pointer; font-size:.86rem; font-weight:500}
+  summary:focus-visible{outline:2px solid var(--e1v); outline-offset:2px}
+  details .scroll{border:0; border-top:1px solid var(--rule); border-radius:0}
+
+  footer{padding-top:2.2rem; border-top:1px solid var(--rule); font-size:.79rem;
+         color:var(--muted); display:flex; flex-direction:column; gap:.4rem}
+
+  #tip{position:fixed; pointer-events:none; opacity:0; transition:opacity .09s;
+       background:var(--ink); color:var(--bg); font-size:.76rem; line-height:1.45;
+       padding:.4rem .55rem; border-radius:4px; z-index:9; max-width:14rem;
+       font-family:"IBM Plex Mono",ui-monospace,monospace; font-variant-numeric:tabular-nums}
+  @media (prefers-reduced-motion:reduce){*{transition:none!important; animation:none!important}}
+</style>
+
+<div class="wrap">
+  <header>
+    <p class="eyebrow">Global hindcast · out of sample · 184,573,321 land px</p>
+    <h1>The learned tails, finally isolated</h1>
+    <p class="lede">Two quantile heads, identical but for two parameters per horizon. The
+      Africa screening could never separate them. Run globally on current code, they differ by
+      the learned tail rates alone — and the answer is not a ranking.</p>
+    <div class="runline">
+      <span>2026-09-22/23</span>
+      <span>branch <span class="mono">conv-spline</span></span>
+      <span>base 2000 → 2005/2010/2015/2020</span>
+      <span>k=5 holdout mosaic</span>
+    </div>
+  </header>
+
+  <section>
+    <div class="heads">
+      <div class="head">
+        <div class="head-top">
+          <span class="swatch" style="background:var(--e1v)"></span>
+          <span class="head-name">E1v</span>
+          <span class="head-params">17 params/horizon</span>
+        </div>
+        <p class="head-flags">--head_family pwl --isqf_tails True --isqf_space neglog --free_scale True</p>
+        <p class="head-role">The measured alternative. Two learned exponential tail rates on
+          <span class="mono">-log(1-HM)</span> support.</p>
+      </div>
+      <div class="head">
+        <div class="head-top">
+          <span class="swatch" style="background:var(--e2a)"></span>
+          <span class="head-name">E2a</span>
+          <span class="head-params">15 params/horizon</span>
+        </div>
+        <p class="head-flags">--head_family pwl --free_scale True</p>
+        <p class="head-role"><strong>Production model since 2026-09-25.</strong> The same head with
+          no tail channels. Scored on Africa at 16 params with a dead scale channel — that
+          scorecard is not comparable to this run.</p>
+      </div>
+    </div>
+
+    <div class="verdict">
+      <p class="eyebrow">The finding</p>
+      <p class="thesis">The learned tails cost nothing in the body of the distribution and buy
+        far-field tail calibration at the price of far-field sharpness.</p>
+      <p>Pooled <span class="mono">crps_skill</span> moves by at most 0.0042 in either
+        direction and pooled RMSE by 5×10⁻⁵ — two parameters per horizon buy nothing centrally.
+        Everything that separates the two heads lives beyond 30 px from past change, and it
+        moves in opposite directions on sharpness and on calibration. Neither head is
+        calibrated out there. They fail opposite ways.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="prose" style="display:flex;flex-direction:column;gap:.7rem">
+      <p class="eyebrow">Distance stratum · +20 yr</p>
+      <h2>Where the two heads diverge</h2>
+      <p style="color:var(--ink-2)">Six bands by distance to the nearest past HM change, in
+        pixels. The bands are ordered, and the divergence grows monotonically along them — which
+        is the mechanism, not a coincidence: without a learned tail rate the far-field
+        distribution is simply narrower.</p>
+    </div>
+
+    <div class="legend" role="note">
+      <span><span class="swatch" style="background:var(--e1v)"></span>E1v · tails</span>
+      <span><span class="swatch" style="background:var(--e2a)"></span>E2a · no tails</span>
+      <span><svg width="22" height="8" aria-hidden="true"><line x1="0" y1="4" x2="22" y2="4"
+        stroke="var(--nominal)" stroke-width="2" stroke-dasharray="4 3"></line></svg>nominal</span>
+    </div>
+
+    <div class="panels">
+      <figure class="panel" style="margin:0">
+        <figcaption class="panel-hd">
+          <span class="panel-title">CRPS skill vs persistence</span>
+          <span class="panel-sub">Higher is better. E2a ahead in every band.</span>
+        </figcaption>
+        <div id="c-crps"></div>
+      </figure>
+      <figure class="panel" style="margin:0">
+        <figcaption class="panel-hd">
+          <span class="panel-title">RMSE skill vs persistence</span>
+          <span class="panel-sub">The point forecast. E1v crosses below zero beyond 100 px.</span>
+        </figcaption>
+        <div id="c-rmse"></div>
+      </figure>
+      <figure class="panel" style="margin:0">
+        <figcaption class="panel-hd">
+          <span class="panel-title">95% interval coverage</span>
+          <span class="panel-sub">Nominal 0.95. E2a covers 0.709 beyond 100 px.</span>
+        </figcaption>
+        <div id="c-cov"></div>
+      </figure>
+      <figure class="panel" style="margin:0">
+        <figcaption class="panel-hd">
+          <span class="panel-title">P(u &gt; 0.999) — log scale</span>
+          <span class="panel-sub">Nominal 0.001. E2a reaches 0.127 — 127× — beyond 100 px.</span>
+        </figcaption>
+        <div id="c-tail"></div>
+      </figure>
+    </div>
+
+    <p class="eyebrow" style="margin-top:.4rem">The far field · &gt;100 px · 33,565,179 px · +20 yr</p>
+    <div class="ff">
+      <div class="ff-cell">
+        <span class="ff-metric">CRPS skill</span>
+        <span class="ff-pair"><span class="ff-a">0.2168</span><span class="ff-vs">vs</span><span class="ff-b">0.3003</span></span>
+        <span class="ff-note">E2a sharper, +0.0835.</span>
+      </div>
+      <div class="ff-cell">
+        <span class="ff-metric">RMSE skill</span>
+        <span class="ff-pair"><span class="ff-a">−0.0070</span><span class="ff-vs">vs</span><span class="ff-b">+0.0310</span></span>
+        <span class="ff-note">E2a's point forecast <strong>beats persistence</strong>; E1v's
+          does not. A first for this project.</span>
+      </div>
+      <div class="ff-cell">
+        <span class="ff-metric">cov95 · nominal 0.95</span>
+        <span class="ff-pair"><span class="ff-a">0.9950</span><span class="ff-vs">vs</span><span class="ff-b">0.7087</span></span>
+        <span class="ff-note flag">⚠ E2a: three observations in ten fall outside its interval.</span>
+      </div>
+      <div class="ff-cell">
+        <span class="ff-metric">P(u &gt; 0.999) · nominal 0.001</span>
+        <span class="ff-pair"><span class="ff-a">0.00155</span><span class="ff-vs">vs</span><span class="ff-b">0.12743</span></span>
+        <span class="ff-note flag">⚠ E2a at 127× nominal, against E1v's 1.6×.</span>
+      </div>
+    </div>
+
+    <details>
+      <summary>Every band, both heads, as a table</summary>
+      <div class="scroll">
+        <table id="band-table">
+          <caption>Distance stratum at +20 yr. <span class="mono">n</span> is identical between
+            heads by construction — the stratum is a property of the data.</caption>
+        </table>
+      </div>
+    </details>
+  </section>
+
+  <section>
+    <div class="prose" style="display:flex;flex-direction:column;gap:.7rem">
+      <p class="eyebrow">Pooled by horizon</p>
+      <h2>The body of the distribution is a tie</h2>
+      <p style="color:var(--ink-2)">On the central columns alone the 15-parameter head wins on
+        simplicity, which is a scoring criterion in this project. The pooled tail columns are
+        where the far-field defect shows through — diluted, but visible.</p>
+    </div>
+    <div class="scroll">
+      <table id="pooled-table">
+        <caption>All 184,573,321 land pixels per horizon. <span class="bad">Red</span> marks a
+          value more than 5× its nominal target.</caption>
+      </table>
+    </div>
+    <p class="prose" style="color:var(--ink-2)">The pooled <span class="mono">cov95</span> of
+      0.896 at +20 yr <em>is</em> the far-field 0.709 averaged against five better bands. Reading
+      only the pooled figure would describe mild narrowness rather than a band where the interval
+      misses three times in ten.</p>
+  </section>
+
+  <section>
+    <div class="prose" style="display:flex;flex-direction:column;gap:.7rem">
+      <h2>What the tails are not responsible for</h2>
+    </div>
+    <ul class="prose">
+      <li><strong>The PIT defect survives both.</strong> Mean 0.51–0.56 against 0.50 with the
+        same right shift and the same ~0.25-spaced spike family. The detailed scorecard's
+        subsampled pass over 48,911,382 px reads 0.5607 for E2a against 0.5541 for E1v. Already
+        known not to be a property of the globe; now also known not to be a property of the
+        tails.</li>
+      <li><strong>The over-populated lower far tail survives both.</strong>
+        <span class="mono">pit_lt_0001</span> runs 0.0095–0.0130 against 0.001 for E2a and
+        0.0114–0.0117 for E1v. The learned tails did not cause it and removing them did not fix
+        it.</li>
+      <li><strong>The fence gates stay unresolved at global scale.</strong>
+        <span class="mono">degen</span> is 0.000 at three horizons and 0.029 at +20 yr,
+        <span class="mono">0-gap</span> is 0.000, and <span class="mono">clamp</span> is
+        0.69–0.78 — the sharpness is dominated by the physical HM = 0 boundary most of the globe
+        sits on. Rank the pathology, not the boundary.</li>
+    </ul>
+  </section>
+
+  <section>
+    <div class="prose" style="display:flex;flex-direction:column;gap:.7rem">
+      <h2>What was produced, and what it cost</h2>
+      <p style="color:var(--ink-2)">Both deliverables built and verified against the rasters they
+        came from: passthrough bit-exact, <span class="mono">code mismatches 0</span>,
+        <span class="mono">fill/finite collisions 0</span>.</p>
+    </div>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Stage</th><th>Wall clock</th><th>Peak python RSS</th><th>E1v, same stage</th></tr></thead>
+        <tbody>
+          <tr><td>smoke</td><td class="n">62.5 min</td><td class="n">35.6 GiB</td><td class="n">~57 min</td></tr>
+          <tr><td>hindcast, 5 folds, 2 GPUs</td><td class="n">313.6 min</td><td class="n">36.1 GiB</td><td class="n">~314 min</td></tr>
+          <tr><td>stitch, 16 rasters</td><td class="n">197.9 min</td><td class="n">35.9 GiB</td><td class="n">197 min</td></tr>
+          <tr><td>forward model</td><td class="n">~3 h 54</td><td class="n">36.1 GiB</td><td class="n">~3 h 50</td></tr>
+          <tr><td>score, 4 window-years <em>(alone)</em></td><td class="n">5 h 03</td><td class="n">98.4 GiB</td><td class="n">5 h 04 · 99 GiB</td></tr>
+          <tr><td>export hindcast</td><td class="n">~2 h 20</td><td class="n">26.6 GiB</td><td class="n">~2 h</td></tr>
+          <tr><td>export forecast</td><td class="n">~2 h 25</td><td class="n">35.9 GiB</td><td class="n">~2 h</td></tr>
+        </tbody>
+        <caption>Individual folds 103.5 / 103.8 / 103.8 / 105.8 / 106.8 min. Swap never exceeded
+          2 GiB and was 0 for the scorer.</caption>
+      </table>
+    </div>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Product</th><th>COGs</th><th>icechunk</th><th>Shape</th></tr></thead>
+        <tbody>
+          <tr><td>hindcast · 2005–2020</td><td class="n">20 files · 9.7 GB</td><td class="n">69 GB</td><td class="n">[4, 64, 17111, 40000] uint16</td></tr>
+          <tr><td>forecast · 2025–2040</td><td class="n">20 files · 9.8 GB</td><td class="n">71 GB</td><td class="n">[4, 64, 17111, 40000] uint16</td></tr>
+        </tbody>
+        <caption>159 GB total. Chunks (1, 64, 256, 320); shards (1, 64, 1024, 1280); 2,650 files
+          per store including manifests.</caption>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <div class="prose" style="display:flex;flex-direction:column;gap:.7rem">
+      <h2>Which head is the product: E2a</h2>
+      <p style="color:var(--ink-2)">A measurement, not a ranking — the choice rests on what the
+        deliverable is read as. On 2026-09-25 E2a was chosen, with this trade-off on the table.</p>
+    </div>
+    <ul class="prose">
+      <li><strong>What decided it.</strong> E2a is the simpler head (15 parameters against 17),
+        centrally indistinguishable from E1v, and its point forecast beats persistence beyond
+        100 px, where this model had always been worst.</li>
+      <li><strong>What it costs, and what travels with the product.</strong> Beyond 100 px at
+        +20 yr its 95% interval covers 70.9% at nominal 95%, and it exceeds its 99.9th
+        percentile 127× as often as it should. With no tail parameters the distribution is
+        bounded by its outermost knots, so its far-field intervals must not be described as
+        calibrated.</li>
+    </ul>
+    <p class="prose"><strong>E2a is the production model.</strong> Its six checkpoints are at
+      <span class="mono">models/production/E2a_global/</span> and its products are the delivered
+      ones. E1v's six are kept at <span class="mono">models/production/E1v_global/</span> as the
+      measured alternative with calibrated far-field tails.</p>
+  </section>
+
+  <footer>
+    <p>Full write-up: <span class="mono">docs/global_production_e2a.md</span>. Scorecards, CSVs
+      and figures for both heads: <span class="mono">data/conv_spline/scores/global/</span>.</p>
+    <p>Every fold and the forward model verified on all five fingerprints — loss weights, 12
+      trunk context channels, head family and parameter count, row banding, weight averaging —
+      read back out of each run's own log.</p>
+  </footer>
+</div>
+
+<div id="tip" role="status" aria-live="polite"></div>
+
+<script>
+(function(){
+  "use strict";
+  var BANDS = ["0–1","1–3","3–10","10–30","30–100",">100"];
+  var N = [25293071,17054286,36038668,35848186,36773931,33565179];
+  var D = {
+    crps: {e1v:[.4197,.2752,.1886,.1140,.0932,.2168], e2a:[.4212,.2775,.1920,.1170,.1191,.3003]},
+    rmse: {e1v:[.3868,.1720,.0827,.0278,.0173,-.0070], e2a:[.3861,.1744,.0878,.0322,.0218,.0310]},
+    cov:  {e1v:[.9570,.9498,.9404,.9597,.9807,.9950], e2a:[.9594,.9522,.9400,.9488,.9035,.7087]},
+    tail: {e1v:[.00022,.00121,.00709,.00751,.00554,.00155], e2a:[.00268,.00450,.00956,.01282,.03422,.12743]},
+    pit:  {e1v:[.5360,.4972,.5276,.5125,.5329,.6218], e2a:[.5229,.4911,.5271,.5190,.5435,.6737]}
+  };
+  var SVGNS = "http://www.w3.org/2000/svg";
+  var tip = document.getElementById("tip");
+
+  function el(name, attrs, text){
+    var n = document.createElementNS(SVGNS, name);
+    for (var k in attrs) n.setAttribute(k, attrs[k]);
+    if (text != null) n.textContent = text;
+    return n;
+  }
+  function showTip(evt, html){
+    tip.innerHTML = html;
+    tip.style.opacity = "1";
+    var pad = 12, r = tip.getBoundingClientRect();
+    var x = Math.min(evt.clientX + pad, window.innerWidth - r.width - 8);
+    var y = Math.max(evt.clientY - r.height - pad, 8);
+    tip.style.left = x + "px";
+    tip.style.top = y + "px";
+  }
+  function hideTip(){ tip.style.opacity = "0"; }
+
+  function fmtN(v){ return v.toLocaleString("en-US"); }
+
+  // One grouped-bar panel. Linear or log10 y. Two series, fixed hue order.
+  function bars(mount, series, opts){
+    var W = 560, H = 210, m = {l:opts.padL || 50, r:14, t:12, b:34};
+    var iw = W - m.l - m.r, ih = H - m.t - m.b;
+    var log = !!opts.log;
+    var lo = opts.lo, hi = opts.hi;
+    var y = log
+      ? function(v){ var t = (Math.log10(Math.max(v, lo)) - Math.log10(lo)) / (Math.log10(hi) - Math.log10(lo)); return m.t + ih - t*ih; }
+      : function(v){ return m.t + ih - ((v - lo) / (hi - lo)) * ih; };
+
+    var svg = el("svg", {viewBox:"0 0 "+W+" "+H, role:"img",
+                         "aria-label":opts.aria, preserveAspectRatio:"xMidYMid meet"});
+
+    // grid + y labels, recessive
+    opts.ticks.forEach(function(t){
+      var yy = y(t);
+      svg.appendChild(el("line", {x1:m.l, x2:m.l+iw, y1:yy, y2:yy,
+        stroke:"var(--rule-soft)", "stroke-width":1}));
+      svg.appendChild(el("text", {x:m.l-8, y:yy+4, "text-anchor":"end",
+        "font-family":'"IBM Plex Mono", monospace', "font-size":10.5,
+        fill:"var(--faint)"}, opts.fmtTick(t)));
+    });
+
+    // zero / nominal reference
+    if (opts.zero != null){
+      svg.appendChild(el("line", {x1:m.l, x2:m.l+iw, y1:y(opts.zero), y2:y(opts.zero),
+        stroke:"var(--rule)", "stroke-width":1.5}));
+    }
+    if (opts.nominal != null){
+      var ny = y(opts.nominal);
+      svg.appendChild(el("line", {x1:m.l, x2:m.l+iw, y1:ny, y2:ny,
+        stroke:"var(--nominal)", "stroke-width":2, "stroke-dasharray":"4 3"}));
+      svg.appendChild(el("text", {x:m.l+iw, y:ny-6, "text-anchor":"end",
+        "font-family":'"IBM Plex Mono", monospace', "font-size":10,
+        fill:"var(--nominal)"}, opts.nominalLabel));
+    }
+
+    var step = iw / BANDS.length, bw = Math.min(17, (step - 12) / 2), gap = 2;
+    var base = opts.zero != null ? y(opts.zero) : m.t + ih;
+
+    BANDS.forEach(function(band, i){
+      var cx = m.l + step*i + step/2;
+      [["e1v","var(--e1v)"],["e2a","var(--e2a)"]].forEach(function(s, j){
+        var key = s[0], v = series[key][i];
+        var bx = cx - bw - gap/2 + j*(bw + gap);
+        var vy = y(v), top = Math.min(vy, base), h = Math.max(Math.abs(vy - base), 1.5);
+        var r = el("rect", {x:bx, y:top, width:bw, height:h, fill:s[1], rx:2.5,
+                            tabindex:"0", role:"graphics-symbol",
+                            "aria-label":key.toUpperCase()+" "+band+" px: "+opts.fmtVal(v)});
+        var label = "<b>"+key.toUpperCase()+"</b> · "+band+" px<br>"+opts.name+" "
+                  + opts.fmtVal(v) + "<br>n " + fmtN(N[i]);
+        r.addEventListener("pointerenter", function(e){ showTip(e, label); });
+        r.addEventListener("pointermove", function(e){ showTip(e, label); });
+        r.addEventListener("pointerleave", hideTip);
+        r.addEventListener("focus", function(){
+          tip.innerHTML = label;
+          var b = r.getBoundingClientRect();
+          showTip({clientX:b.left + b.width/2, clientY:b.top}, label);
+        });
+        r.addEventListener("blur", hideTip);
+        svg.appendChild(r);
+      });
+      svg.appendChild(el("text", {x:cx, y:H-12, "text-anchor":"middle",
+        "font-family":'"IBM Plex Mono", monospace', "font-size":10.5,
+        fill:i === 5 ? "var(--ink-2)" : "var(--muted)",
+        "font-weight":i === 5 ? 500 : 400}, band));
+    });
+
+    // Direct labels on the band that carries the finding, one per series. The two labels are
+    // wider than the gap between their bars, so they can only be told apart vertically:
+    // enforce 13px of separation rather than hoping the values differ enough.
+    var ci = 5, cx5 = m.l + step*ci + step/2;
+    var vA = series.e1v[ci], vB = series.e2a[ci];
+    var xA = cx5 - bw - gap/2 + bw/2, xB = cx5 + gap/2 + bw/2;
+    var yB = y(vB) - 7, yA = y(vA) - 7;
+    if (Math.abs(yA - yB) < 13) yA = Math.min(yA, yB) - 13;
+    svg.appendChild(el("text", {x:xB, y:yB, "text-anchor":"middle",
+      "font-family":'"IBM Plex Mono", monospace', "font-size":10.5, "font-weight":500,
+      fill:"var(--e2a)"}, opts.fmtVal(vB)));
+    svg.appendChild(el("text", {x:xA, y:yA, "text-anchor":"middle",
+      "font-family":'"IBM Plex Mono", monospace', "font-size":10.5, "font-weight":500,
+      fill:"var(--e1v)"}, opts.fmtVal(vA)));
+
+    // axis line
+    svg.appendChild(el("line", {x1:m.l, x2:m.l+iw, y1:m.t+ih, y2:m.t+ih,
+      stroke:"var(--rule)", "stroke-width":1}));
+
+    mount.appendChild(svg);
+  }
+
+  var f3 = function(v){ return (v < 0 ? "−" : "") + Math.abs(v).toFixed(3); };
+  var f4 = function(v){ return (v < 0 ? "−" : "") + Math.abs(v).toFixed(4); };
+
+  bars(document.getElementById("c-crps"), D.crps, {
+    lo:0, hi:0.45, zero:0, ticks:[0,0.15,0.30,0.45], fmtTick:f3, fmtVal:f4,
+    name:"CRPS skill", aria:"CRPS skill by distance band, E1v and E2a"
+  });
+  bars(document.getElementById("c-rmse"), D.rmse, {
+    lo:-0.05, hi:0.40, zero:0, ticks:[-0.05,0,0.15,0.30,0.40], fmtTick:f3, fmtVal:f4,
+    name:"RMSE skill", aria:"RMSE skill by distance band, E1v and E2a"
+  });
+  bars(document.getElementById("c-cov"), D.cov, {
+    lo:0.65, hi:1.0, ticks:[0.70,0.80,0.90,1.00], fmtTick:function(v){return v.toFixed(2);},
+    fmtVal:f4, nominal:0.95, nominalLabel:"0.95", name:"cov95",
+    aria:"95 percent interval coverage by distance band, E1v and E2a"
+  });
+  bars(document.getElementById("c-tail"), D.tail, {
+    log:true, lo:0.0001, hi:0.2, ticks:[0.0001,0.001,0.01,0.1],
+    fmtTick:function(v){ return v.toExponential(0).replace("e-","e−"); },
+    fmtVal:function(v){ return v.toFixed(5); },
+    nominal:0.001, nominalLabel:"0.001", padL:56, name:"P(u>0.999)",
+    aria:"Probability above the 99.9th percentile by distance band, log scale, E1v and E2a"
+  });
+
+  // band table
+  var bt = document.getElementById("band-table");
+  var rows = [
+    ["CRPS skill", D.crps, f4], ["RMSE skill", D.rmse, f4],
+    ["cov95", D.cov, f4], ["P(u>0.999)", D.tail, function(v){return v.toFixed(5);}],
+    ["PIT mean", D.pit, f4]
+  ];
+  var h = "<thead><tr><th>Metric · head</th>";
+  BANDS.forEach(function(b){ h += "<th>"+b+" px</th>"; });
+  h += "</tr></thead><tbody>";
+  rows.forEach(function(r){
+    ["e1v","e2a"].forEach(function(k){
+      h += '<tr><td><span class="swatch" style="display:inline-block;background:var(--'+k+')"></span> '
+        + r[0] + " · " + k.toUpperCase() + "</td>";
+      r[1][k].forEach(function(v, i){
+        var flag = (r[0] === "cov95" && v < 0.90) || (r[0] === "P(u>0.999)" && v > 0.005);
+        h += '<td class="n'+(flag ? " bad" : "")+'">' + r[2](v) + "</td>";
+      });
+      h += "</tr>";
+    });
+  });
+  h += '<tr><td>n</td>' + N.map(function(v){ return '<td class="n">'+fmtN(v)+"</td>"; }).join("") + "</tr>";
+  h += "</tbody>";
+  bt.insertAdjacentHTML("afterbegin", h);
+
+  // pooled table
+  var P = {
+    h:[5,10,15,20],
+    crps_skill:{e1v:[.1565,.2656,.3002,.2980], e2a:[.1542,.2655,.3018,.3021]},
+    rmse:{e1v:[.01331,.02028,.02636,.03117], e2a:[.01334,.02029,.02639,.03113]},
+    cov95:{e1v:[.95289,.95347,.92530,.96526], e2a:[.95278,.96108,.94781,.89616]},
+    pit_ks:{e1v:[.07348,.13787,.09965,.08464], e2a:[.07597,.12265,.12042,.11468]},
+    pit_gt:{e1v:[.00319,.00383,.00394,.00437], e2a:[.00357,.00420,.00514,.03513]},
+    fte:{e1v:[7.436,7.696,7.775,7.893], e2a:[8.302,8.338,8.769,22.314]}
+  };
+  var pt = document.getElementById("pooled-table");
+  var pr = [
+    ["crps_skill", P.crps_skill, function(v){return v.toFixed(4);}, null],
+    ["RMSE", P.rmse, function(v){return v.toFixed(5);}, null],
+    ["cov95", P.cov95, function(v){return v.toFixed(4);}, function(v){return v < 0.90;}],
+    ["pit_ks", P.pit_ks, function(v){return v.toFixed(4);}, null],
+    ["pit_gt_0999", P.pit_gt, function(v){return v.toFixed(5);}, function(v){return v > 0.005;}],
+    ["far_tail_excess", P.fte, function(v){return v.toFixed(3);}, function(v){return v > 15;}]
+  ];
+  var ph = "<thead><tr><th>Metric · head</th>";
+  P.h.forEach(function(x){ ph += "<th>+" + x + " yr</th>"; });
+  ph += "</tr></thead><tbody>";
+  pr.forEach(function(r){
+    ["e1v","e2a"].forEach(function(k){
+      ph += '<tr><td><span class="swatch" style="display:inline-block;background:var(--'+k+')"></span> '
+         + r[0] + " · " + k.toUpperCase() + "</td>";
+      r[1][k].forEach(function(v){
+        var flag = r[3] && r[3](v);
+        ph += '<td class="n'+(flag ? " bad" : "")+'">' + r[2](v) + "</td>";
+      });
+      ph += "</tr>";
+    });
+  });
+  ph += "</tbody>";
+  pt.insertAdjacentHTML("afterbegin", ph);
+
+  window.addEventListener("scroll", hideTip, {passive:true});
+})();
+</script>
