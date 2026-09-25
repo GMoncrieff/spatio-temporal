@@ -211,9 +211,9 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--fast_dev_run", action="store_true", help="Run 1 train/val batch for a quick smoke test")
-    parser.add_argument("--max_epochs", type=int, default=100, help="Number of training epochs")
+    parser.add_argument("--max_epochs", type=int, default=150, help="Number of training epochs")
     parser.add_argument("--disable_wandb", action="store_true", help="Disable Weights & Biases logging")
-    parser.add_argument("--train_chips", type=int, default=200, help="Chips per epoch for training")
+    parser.add_argument("--train_chips", type=int, default=100, help="Chips per epoch for training")
     parser.add_argument("--val_chips", type=int, default=40, help="Chips per epoch for validation")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for train/val")
     parser.add_argument("--train_mode", type=str, default="random", choices=["random", "grid"], help="Sampling mode for training")
@@ -222,8 +222,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--val_stride",
         type=int,
-        default=None,
-        help="Stride for grid-mode val/test sampling (default: --stride). A larger value "
+        default=1024,
+        help="Stride for grid-mode val/test sampling (default: 1024, as in production; None "
+             "falls back to --stride). A larger value "
              "subsamples the held-out geography, which keeps per-epoch validation cheap on "
              "long runs without changing what is being validated.",
     )
@@ -243,7 +244,7 @@ if __name__ == "__main__":
     )
     # Model complexity
     parser.add_argument("--hidden_dim", type=int, default=64, help="ConvLSTM hidden dimension")
-    parser.add_argument("--num_layers", type=int, default=2, help="Number of ConvLSTM layers")
+    parser.add_argument("--num_layers", type=int, default=4, help="Number of ConvLSTM layers")
     parser.add_argument("--kernel_size", type=int, default=3, help="Conv kernel size for ConvLSTM")
     # Inference flags
     parser.add_argument(
@@ -285,8 +286,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--predict_batch_size",
         type=int,
-        default=16,
-        help="Number of tiles to process in parallel on GPU during prediction (default: 16)",
+        default=32,
+        help="Number of tiles to process in parallel on GPU during prediction (default: 32)",
     )
     parser.add_argument(
         "--predict_final_year",
@@ -381,7 +382,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--norm_stats_json",
         type=str,
-        default=None,
+        default="data/conv_spline/norm_stats.json",
         help="JSON sidecar of normalization stats. Loaded if it exists, otherwise written "
              "after the first dataset build (they are not persisted in the .ckpt).",
     )
@@ -413,7 +414,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--central_residual",
         type=lambda x: (str(x).lower() == 'true'),
-        nargs='?', const=True, default=False,
+        nargs='?', const=True, default=True,
         help="Central heads predict change on top of HM_t0 rather than the absolute level, "
              "starting from exact persistence. Measured: with the absolute parameterisation "
              "the model emits change of sd ~0.0075 HM on pixels that did not change.",
@@ -435,10 +436,10 @@ if __name__ == "__main__":
     )
     # --- Model-phase experiment flags. All additive; defaults reproduce today's model. ---
     parser.add_argument(
-        "--checkpoint_monitor", type=str, default="val_total_loss",
+        "--checkpoint_monitor", type=str, default="val_crps",
         choices=["val_total_loss", "val_central_loss", "val_loss", "val_crps"],
-        help="Metric ModelCheckpoint selects on. val_total_loss (the default) includes "
-             "pinball and the histogram term, so a quantile-only change still selects a "
+        help="Metric ModelCheckpoint selects on (default: val_crps, as in production). "
+             "val_total_loss includes pinball and the histogram term, so a quantile-only change still selects a "
              "different epoch and therefore a different central field; central-only A/Bs "
              "need val_central_loss.",
     )
@@ -521,7 +522,7 @@ if __name__ == "__main__":
     )
     # --- The distributional head. 'triple' (the default) is the frozen product exactly. ---
     parser.add_argument(
-        "--head_family", type=str, default="triple",
+        "--head_family", type=str, default="pwl",
         choices=["triple", "spline", "pwl", "isqf"],
         help="'spline' replaces the (lower, central, upper) triple with a full per-pixel "
              "quantile function trained end to end, so the post-hoc width calibration and "
@@ -556,7 +557,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--free_scale", type=lambda x: (str(x).lower() == 'true'), nargs='?', const=True,
-        default=False,
+        default=True,
         help="Drop the anchor/scale factorisation: the 95%% width becomes emergent from the "
              "fitted increments rather than injected by a channel, per horizon, with no "
              "cross-horizon accumulation. pwl/E2a: unnormalised positive increments, no "
@@ -588,9 +589,9 @@ if __name__ == "__main__":
              "an epsilon. Only read when --isqf_tails is on.",
     )
     parser.add_argument(
-        "--predict_qf_dtype", type=str, default="int16", choices=["int16", "float32"],
-        help="Storage for the quantile-function raster. int16 x 1/32767 (the default, and "
-             "the ensemble's old convention) quantises to 3.05e-05 in ABSOLUTE HM -- which "
+        "--predict_qf_dtype", type=str, default="float32", choices=["int16", "float32"],
+        help="Storage for the quantile-function raster (default: float32, as in production). "
+             "int16 x 1/32767 (the old default, and the ensemble's convention) quantises to 3.05e-05 in ABSOLUTE HM -- which "
              "is coarser than the forecast core this phase is trying to measure. Measured "
              "on b1_s42: 34%% of adjacent quantile levels exported to the SAME int16 code, "
              "and max_density_p99 read 1531.8 at every horizon, which is exactly "
@@ -708,13 +709,13 @@ if __name__ == "__main__":
         help="Width of the shape head; 0 means hidden_dim // 2, today's value.",
     )
     parser.add_argument(
-        "--context_radii", type=str, default="1,3,10,30,100",
+        "--context_radii", type=str, default="3,30,100",
         help="Occupancy radii for the distance-to-past-change band.",
     )
     parser.add_argument(
-        "--hm_context_stats", type=str, default="",
-        help="Neighbourhood-HM statistics to feed the heads, e.g. 'mean,max'. Empty (the "
-             "default) reproduces the round-1 eight-channel context exactly. The model has "
+        "--hm_context_stats", type=str, default="mean,max",
+        help="Neighbourhood-HM statistics to feed the heads (default: 'mean,max', as in "
+             "production). Empty reproduces the round-1 eight-channel context exactly. The model has "
              "never had any information about the LEVEL of development around a pixel — only "
              "where past change happened — and development spreads from development.",
     )
@@ -728,7 +729,7 @@ if __name__ == "__main__":
     parser.add_argument("--crps_tail_u0", type=float, default=0.95)
     parser.add_argument("--crps_tail_p", type=float, default=2.0)
     parser.add_argument(
-        "--mu_mse_weight", type=float, default=1.0,
+        "--mu_mse_weight", type=float, default=0.0,
         help="Weight on MSE(E[Q], y). The published central forecast IS E[Q] -- the mean is "
              "the RMSE-optimal point estimate and this residual is right-skewed, so it is "
              "not the median -- and CRPS presses on it only indirectly. 0 is the pure-CRPS "
@@ -762,7 +763,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr_min_frac", type=float, default=0.01)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument(
-        "--weight_avg_last", type=int, default=0,
+        "--weight_avg_last", type=int, default=20,
         help="Average the weights of the last N epochs instead of selecting one. On fold 1 "
              "the epoch ModelCheckpoint picked was 140/85/60 across three seeds of the same "
              "configuration while the best 10%% of epochs sat within 3%% of the minimum, so "
@@ -833,8 +834,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_workers",
         type=int,
-        default=0,
-        help="Number of data loading workers (default: 0 for single-threaded)",
+        default=3,
+        help="Number of data loading workers (default: 3, as in production; 0 for single-threaded)",
     )
     parser.add_argument(
         "--accumulate_grad_batches",
@@ -846,20 +847,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ssim_weight",
         type=float,
-        default=2.0,
-        help="Weight for SSIM loss (default: 2.0)",
+        default=0.0,
+        help="Weight for SSIM loss (default: 0.0; the legacy triple head used 2.0)",
     )
     parser.add_argument(
         "--laplacian_weight",
         type=float,
-        default=1.0,
-        help="Weight for Laplacian pyramid loss (default: 1.0)",
+        default=0.0,
+        help="Weight for Laplacian pyramid loss (default: 0.0; the legacy triple head used 1.0)",
     )
     parser.add_argument(
         "--histogram_weight",
         type=float,
-        default=0.67,
-        help="Weight for histogram loss on pixel-level change distributions (default: 0.67)",
+        default=0.0,
+        help="Weight for histogram loss on pixel-level change distributions (default: 0.0; the legacy triple head used 0.67)",
     )
     parser.add_argument(
         "--histogram_lambda_w2",
@@ -870,8 +871,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--histogram_warmup_epochs",
         type=int,
-        default=20,
-        help="Number of epochs before histogram loss is applied (default: 20)",
+        default=0,
+        help="Number of epochs before histogram loss is applied (default: 0)",
     )
     parser.add_argument(
         "--checkpoint",

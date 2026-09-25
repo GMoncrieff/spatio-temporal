@@ -18,8 +18,8 @@ Twenty-three head configurations were screened on Africa, and the two finalists 
 - **Delivered products**: Cloud-Optimised GeoTIFFs and icechunk quantile-function stores for a hindcast (2005–2020) and a forecast (2025–2040)
 
 ## Documentation
-- **[Global production run](docs/global_production_e2a.md)** - The production model structure and scorecard
-- **[The conv-spline phase](docs/conv_spline_phase.md)** - The experiment design that selected the quantile head
+- **[Global production run](docs/global/global_production_e2a.md)** - The production model structure and scorecard
+- **[The conv-spline phase](docs/experiments/conv_spline_phase.md)** - The experiment design that selected the quantile head
 
 **Topics covered:**
 - **Input Data**: Dynamic variables, static covariates, neighbourhood context, location encoding
@@ -29,7 +29,7 @@ Twenty-three head configurations were screened on Africa, and the two finalists 
 - **Accuracy Assessment**: CRPS and RMSE skill against persistence, interval coverage, PIT calibration, distance-stratified scores
 - **Prediction**: Tile-based processing, the quantile-function raster, COG and icechunk products
 
-Documents in `docs/superceded/` describe earlier systems that no longer exist on this branch kept for reference 
+Documents in `docs/superseded/` describe earlier systems that no longer exist on this branch kept for reference 
 
 ## Project Structure
 
@@ -53,8 +53,7 @@ spatio_temporal/
 │   │       └── fold_mask_b4_1000.tif         # k=5 spatial folds (512 px blocks)
 │   └── conv_spline/
 │       ├── norm_stats.json         # Per-variable normalisation statistics
-│       ├── logs/                   # Run logs (every verifier reads these)
-│       └── scores/                 # Scorecards, CSVs and figures for every scored run
+│       └── logs/                   # Run logs (every verifier reads these)
 │
 ├── models/
 │   ├── checkpoints/                # Lightning's default checkpoint directory (shared)
@@ -80,7 +79,7 @@ spatio_temporal/
 ├── scripts/                        # Main scripts
 │   ├── train_lightning.py          # Training + prediction pipeline
 │   ├── torchgeo_dataloader.py      # Data loading with per-variable normalization
-│   ├── conv_spline_base.sh         # The production baseline arguments (BASE_ARGS)
+│   ├── conv_spline_base.sh         # Shared run arguments and log verifiers for the global runner
 │   ├── run_global_model.sh         # Global runner: smoke, hindcast, stitch, score, forecast, export
 │   ├── run_hindcast_folds.py       # k-fold training/prediction orchestrator
 │   ├── score_distributional_model.py  # The scorecard
@@ -95,8 +94,16 @@ spatio_temporal/
 ├── tests/                          # Unit tests (pytest)
 │
 └── docs/                           # Documentation
-    ├── global_production_e2a.md    # 📘 The production run, scorecard and A/B
-    └── global_production_e1v.md    # The runner, its verifiers, and E1v's scorecard
+    ├── experiments/                # Africa slate: design, per-arm scorecards, comparison
+    │   ├── conv_spline_phase.md    # The experiment design
+    │   ├── scores/                 # Scorecards for every screened arm
+    │   └── promotion/              # The comparison the slate was decided on
+    ├── global/                     # Global production runs
+    │   ├── global_production_e2a.md  # 📘 The production run, scorecard and A/B
+    │   ├── global_production_e1v.md  # The runner, its verifiers, and E1v's scorecard
+    │   ├── scores/                 # Global scorecards, E2a and E1v
+    │   └── tails_ab.html           # The E1v vs E2a comparison page
+    └── superseded/                 # Earlier systems, kept for reference
 ```
 
 ## Setup
@@ -137,6 +144,7 @@ pip install torchgeo einops wandb "zarr>=3" icechunk
 **Notes**:
 - Python 3.12 is recommended for best compatibility
 - `light-the-torch` (ltt)  automatically detects your hardware and installs the appropriate PyTorch version
+- There is no `requirements.txt` or `environment.yml`: the commands above are the dependency list, and `setup.py` declares no install requirements
 
 ### 2. Data Structure
 
@@ -183,47 +191,25 @@ wandb login
 
 ### Training from Scratch
 
+The argparse defaults of `train_lightning.py` are the production model, E2a: head, loss, context, training schedule and export format. A run with no model flags trains E2a.
+
 #### Basic Training Run
 
 ```bash
-source scripts/conv_spline_base.sh    # exports BASE_ARGS, the production baseline
-E2A="--head_family pwl --free_scale True --mu_mse_weight 0.0"
-
-python scripts/train_lightning.py $BASE_ARGS $E2A \
-  --max_epochs 50 \
-  --batch_size 8 \
-  --hidden_dim 64 \
-  --num_layers 4 \
-  --norm_stats_json data/conv_spline/norm_stats.json
+python scripts/train_lightning.py --max_epochs 50
 ```
 
 #### Full Training with All Options
 
-The production configuration, as the global runner issues it (add `--train_all_splits True` for the forward model, which holds no geography out):
+Every option already defaults to its production value (see [Key Training Arguments](#key-training-arguments)), so the production run needs only a region. Add `--train_all_splits True` for the forward model, which holds no geography out:
 
 ```bash
-python scripts/train_lightning.py $BASE_ARGS $E2A \
-  --max_epochs 150 \
-  --train_chips 100 \
-  --val_chips 40 \
-  --val_stride 1024 \
-  --batch_size 8 \
-  --hidden_dim 64 \
-  --num_layers 4 \
-  --kernel_size 3 \
-  --num_workers 3 \
-  --locenc_out_channels 8 \
-  --locenc_legendre_polys 10 \
-  --norm_stats_json data/conv_spline/norm_stats.json \
+python scripts/train_lightning.py \
   --run_large_area_prediction True \
-  --predict_region config/region_africa.geojson \
-  --predict_stride 64 \
-  --predict_batch_size 32 \
-  --predict_final_year 2040 \
-  --seed 42
+  --predict_region config/region_africa.geojson
 ```
 
-The run log prints the head it actually built, and that line is the check that the flags took effect:
+The run log prints the head it actually built, and that line is the check that the configuration took effect:
 
 ```
 Spline head:       family pwl, knots default14 (n=15, bins=14), slopes learned, free scale, 15 params/horizon
@@ -232,57 +218,56 @@ Spline head:       family pwl, knots default14 (n=15, bins=14), slopes learned, 
 #### Quick Development Run (Smoke Test)
 
 ```bash
-python scripts/train_lightning.py $BASE_ARGS $E2A \
+python scripts/train_lightning.py \
   --fast_dev_run \
   --batch_size 2 \
   --hidden_dim 16 \
-  --norm_stats_json data/conv_spline/norm_stats.json \
   --run_large_area_prediction False \
   --disable_wandb
 ```
 
 ### Key Training Arguments
 
-| Argument | Default | Production (E2a) | Description |
-|----------|---------|------------------|-------------|
-| `--max_epochs` | 100 | 150 | Number of training epochs |
-| `--train_chips` | 200 | 100 | Chips sampled per training epoch |
-| `--val_chips` | 40 | 40 | Chips sampled per validation epoch |
-| `--batch_size` | 8 | 8 | Batch size for training/validation |
-| `--hidden_dim` | 64 | 64 | ConvLSTM hidden dimension |
-| `--num_layers` | 2 | 4 | Number of ConvLSTM layers |
-| `--num_workers` | 0 | 3 | Data loader workers (0=single-threaded) |
-| `--head_family` | `triple` | `pwl` | Output head: `pwl` is the piecewise-linear quantile function |
-| `--spline_knots` | `default14` | `default14` | Quantile-level knot grid (15 knots, 14 bins) |
-| `--free_scale` | False | True | Learn the quantile increments directly, with no anchor/scale factorisation |
-| `--isqf_tails` / `--isqf_space` | False / `logit` | not used | Learned exponential tails on `-log(1 - HM)` support (E1v uses `True` / `neglog`) |
-| `--central_residual` | False | True | Predict change on top of HM at the base year, starting from persistence |
-| `--mu_mse_weight` | 1.0 | 0.0 | MSE on the mean; 0 means the model trains on CRPS alone |
-| `--ssim_weight` / `--laplacian_weight` / `--histogram_weight` | 2.0 / 1.0 / 0.67 | 0.0 / 0.0 / 0.0 | Legacy central-field losses, all off |
-| `--checkpoint_monitor` | `val_total_loss` | `val_crps` | Quantity used to select epochs |
-| `--weight_avg_last` | 0 | 20 | Predict with the mean of the last N epochs' weights |
-| `--context_radii` | `1,3,10,30,100` | `3,30,100` | Radii (px) for past-change occupancy context |
-| `--hm_context_radii` / `--hm_context_stats` | `3,30,100` / none | `3,30,100` / `mean,max` | Neighbourhood-HM context channels |
-| `--use_location_encoder` | true | true | Use spherical-harmonic position encoding (8 channels, 10 Legendre polynomials) |
-| `--train_all_splits` | False | True for the forecast model | Train on all data, holding no geography out |
-| `--seed` | 42 | 42 | Random seed |
+| Argument | Default (E2a) | Description |
+|----------|---------------|-------------|
+| `--max_epochs` | 150 | Number of training epochs |
+| `--train_chips` | 100 | Chips sampled per training epoch |
+| `--val_chips` | 40 | Chips sampled per validation epoch |
+| `--val_stride` | 1024 | Grid stride for validation sampling |
+| `--batch_size` | 8 | Batch size for training/validation |
+| `--hidden_dim` | 64 | ConvLSTM hidden dimension |
+| `--num_layers` | 4 | Number of ConvLSTM layers |
+| `--num_workers` | 3 | Data loader workers (0=single-threaded) |
+| `--head_family` | `pwl` | Output head: `pwl` is the piecewise-linear quantile function |
+| `--spline_knots` | `default14` | Quantile-level knot grid (15 knots, 14 bins) |
+| `--free_scale` | True | Learn the quantile increments directly, with no anchor/scale factorisation |
+| `--isqf_tails` / `--isqf_space` | False / `logit` | Learned exponential tails on `-log(1 - HM)` support (E1v uses `True` / `neglog`) |
+| `--central_residual` | True | Predict change on top of HM at the base year, starting from persistence |
+| `--mu_mse_weight` | 0.0 | MSE on the mean; 0 means the model trains on CRPS alone |
+| `--ssim_weight` / `--laplacian_weight` / `--histogram_weight` | 0.0 / 0.0 / 0.0 | Legacy central-field losses, all off |
+| `--checkpoint_monitor` | `val_crps` | Quantity used to select epochs |
+| `--weight_avg_last` | 20 | Predict with the mean of the last N epochs' weights |
+| `--context_radii` | `3,30,100` | Radii (px) for past-change occupancy context |
+| `--hm_context_radii` / `--hm_context_stats` | `3,30,100` / `mean,max` | Neighbourhood-HM context channels |
+| `--use_location_encoder` | true | Use spherical-harmonic position encoding (8 channels, 10 Legendre polynomials) |
+| `--norm_stats_json` | `data/conv_spline/norm_stats.json` | Normalisation statistics; loaded if present, otherwise computed and written |
+| `--train_all_splits` | False | Train on all data, holding no geography out (True for the forecast model) |
+| `--seed` | 42 | Random seed |
 
 ### Making Predictions with Existing Checkpoint
 
-**Pass the model's own flags when loading a checkpoint.** `--checkpoint` restores the checkpoint's hyperparameters and then overrides the head and context settings from the command line. Loading an E2a checkpoint with default flags would build a `triple` head with 8 context channels. The load is non-strict, so the only symptom is a `randomly initialised: N tensors` line in the log. A correct load prints `Checkpoint loaded with 0 warm-started convs` and no randomly initialised tensors.
+**The defaults build E2a, so an E2a checkpoint loads with no model flags.** `--checkpoint` restores the checkpoint's hyperparameters and then overrides the head and context settings from the command line, so a checkpoint of any *other* model needs that model's flags. For E1v that means `--isqf_tails True --isqf_space neglog`. The load is non-strict, so a mismatch shows only as a `randomly initialised: N tensors` line in the log. A correct load prints `Checkpoint loaded with 0 warm-started convs` and no randomly initialised tensors.
+
+**Normalisation statistics are not stored in the checkpoint.** The production checkpoints were trained with `data/conv_spline/norm_stats.json`, which is the default for `--norm_stats_json`. Like the checkpoints, that file is not in git, so copy both when moving to another machine.
 
 #### Option 1: Load from W&B Artifact
 
 ```bash
-source scripts/conv_spline_base.sh
-E2A="--head_family pwl --free_scale True --mu_mse_weight 0.0"
-
-python scripts/train_lightning.py $BASE_ARGS $E2A \
+python scripts/train_lightning.py \
   --checkpoint "model-xxxxxx:v0" \
   --max_epochs 0 \
   --run_large_area_prediction True \
-  --predict_region config/region_to_predict.geojson \
-  --norm_stats_json data/conv_spline/norm_stats.json
+  --predict_region config/region_to_predict.geojson
 ```
 
 **How to find your W&B artifact name:**
@@ -296,14 +281,13 @@ python scripts/train_lightning.py $BASE_ARGS $E2A \
 The production forward model (trained on all data, base year 2020) is `models/production/E2a_global/final_foldNone_3951459.ckpt`:
 
 ```bash
-python scripts/train_lightning.py $BASE_ARGS $E2A \
+python scripts/train_lightning.py \
   --checkpoint models/production/E2a_global/final_foldNone_3951459.ckpt \
   --max_epochs 0 \
   --run_large_area_prediction True \
   --run_full_set_evaluation False \
   --predict_region config/region_to_predict_small.geojson \
-  --predict_final_year 2040 \
-  --norm_stats_json data/conv_spline/norm_stats.json
+  --predict_final_year 2040
 ```
 
 #### Prediction Arguments
@@ -313,8 +297,8 @@ python scripts/train_lightning.py $BASE_ARGS $E2A \
 | `--predict_region` | None | Path to GeoJSON file defining prediction area |
 | `--predict_final_year` | 2040 | Last target year: 2040 predicts from base 2020, 2020 from base 2000 |
 | `--predict_stride` | 64 | Stride between tiles for overlap blending |
-| `--predict_batch_size` | 16 | Tiles processed in parallel on GPU (32 in production) |
-| `--predict_qf_dtype` | `int16` | Storage for the quantile raster; production uses `float32` (via `BASE_ARGS`) |
+| `--predict_batch_size` | 32 | Tiles processed in parallel on GPU |
+| `--predict_qf_dtype` | `float32` | Storage for the quantile raster (`int16` is coarser and quantises the forecast core) |
 | `--predict_row_chunk` | 0 | Accumulate in row bands to bound memory; 512 on the global grid |
 | `--predict_output_dir` | `data/predictions` | Where the GeoTIFFs are written |
 
@@ -416,7 +400,7 @@ Skill is measured against **persistence** (HM unchanged from the base year)
 - **The central intervals are too narrow**: 50% coverage is 0.41–0.47 and 80% coverage 0.74–0.77.
 - **The lower far tail is over-populated**: P(u < 0.001) is 0.0095–0.013 against 0.001.
 
-The full scorecard, stratified by distance to past change, is `data/conv_spline/scores/global/scorecard_detailed_g_E2a_hind.html`; see `docs/global_production_e2a.md`.
+The full scorecard, stratified by distance to past change, is `docs/global/scores/scorecard_detailed_g_E2a_hind.html`; see `docs/global/global_production_e2a.md`.
 
 ## Data: Human Modification (HM)
 

@@ -98,7 +98,10 @@ EXPECT_WA="--weight_avg_last 20"
 
 # val_crps, not val_total_loss: an experiment that sets --mu_mse_weight 0 would otherwise be
 # selecting epochs on a different quantity from every other run in the slate.
-export BASE_ARGS="--head_family spline --central_residual True --checkpoint_monitor val_crps \
+# --free_scale False is pinned because train_lightning.py's defaults are E2a's (free scale on)
+# since 2026-09-25, and the rational-quadratic spline refuses --free_scale. BASE_ARGS is the b1
+# baseline and must keep meaning b1; E1v/E2a turn it back on in their MODEL_FLAGS, which come later.
+export BASE_ARGS="--head_family spline --free_scale False --central_residual True --checkpoint_monitor val_crps \
 --mu_mse_weight ${EXPECT_MU_MSE} ${EXPECT_CTX} ${EXPECT_ROW_CHUNK} ${EXPECT_QF_DTYPE} ${EXPECT_WA} \
 --ssim_weight ${EXPECT_SSIM} --laplacian_weight ${EXPECT_LAP} --histogram_weight ${EXPECT_HIST}"
 
