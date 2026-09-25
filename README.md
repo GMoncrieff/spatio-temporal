@@ -2,28 +2,24 @@
 
 ## Overview
 
-This project implements a **distributional ConvLSTM** that forecasts the Human Modification (HM) index as a **full probability distribution per pixel**. At each of **four forecast horizons** (5, 10, 15, 20 years) the model emits a monotone quantile function `Q_h(u | x)` — the whole predictive distribution of HM at that pixel, from which any quantile, interval, mean or exceedance probability can be read. **That quantile function is the entire product**: there is no ensemble, no post-hoc calibration chain and no conformal rescaling downstream of the network.
+This project implements a **distributional ConvLSTM** that forecasts the Human Modification (HM) index as a **full probability distribution per pixel**. At each of **four forecast horizons** (5, 10, 15, 20 years) the model emits a monotone quantile function `Q_h(u | x)` — the whole predictive distribution of HM at that pixel, from which any quantile, interval, mean or exceedance probability can be read. 
 
-The production model is **E2a**, chosen on 2026-09-25. Twenty-three head configurations were screened on Africa, and the two finalists were run globally as a controlled A/B. E2a is trained with the **CRPS** (continuous ranked probability score), computed in closed form on a piecewise-linear quantile function with **15 parameters per horizon**.
+Twenty-three head configurations were screened on Africa, and the two finalists were run globally as a controlled A/B. The final model is trained with the **CRPS** (continuous ranked probability score), computed in closed form on a piecewise-linear quantile function with **15 parameters per horizon**.
 
 ### Key Features
 
-- **Full predictive distribution per pixel**: a 64-level quantile function at every horizon, not a point estimate with two bounds
+- **Full predictive distribution per pixel**: a 64-level quantile function at every horizon
 - **Multi-horizon forecasting**: 5yr, 10yr, 15yr, 20yr ahead predictions
-- **Closed-form CRPS training**: a piecewise-linear quantile head, so the proper scoring rule needs no quadrature
-- **Parsimonious head**: 15 parameters per horizon, against 29 for the rational-quadratic spline head it replaced
+- **Closed-form CRPS training**: a piecewise-linear quantile head
 - **Residual parameterisation**: the model predicts change on top of the current HM level, starting from persistence
 - **Rich covariates**: HM history plus 10 dynamic covariates (HM stressors, GDP, population), 7 static variables (elevation, climate, protected areas) and 12 channels of precomputed neighbourhood context
 - **Location encoding**: spherical-harmonic positional embeddings for spatial awareness
 - **Out-of-sample validation**: k=5 spatial-block cross-validation, scored against persistence on every land pixel of the globe
 - **Delivered products**: Cloud-Optimised GeoTIFFs and icechunk quantile-function stores for a hindcast (2005–2020) and a forecast (2025–2040)
-- **W&B integration**: Comprehensive experiment tracking and visualization
 
 ## Documentation
-- **[Global production run — E2a](docs/global_production_e2a.md)** - The production model: the global run, what was verified, the scorecard, and the A/B against E1v
-- **[Global production run — E1v](docs/global_production_e1v.md)** - The runner, its verifiers and the defects found building them; E1v's own global scorecard
-- **[The conv-spline phase](docs/conv_spline_phase.md)** - The experiment design that selected the quantile head (history; read for method)
-- **[CLAUDE.md](CLAUDE.md)** - Working notes: current configuration, measured costs, and rules learned during development
+- **[Global production run](docs/global_production_e2a.md)** - The production model structure and scorecard
+- **[The conv-spline phase](docs/conv_spline_phase.md)** - The experiment design that selected the quantile head
 
 **Topics covered:**
 - **Input Data**: Dynamic variables, static covariates, neighbourhood context, location encoding
@@ -33,7 +29,7 @@ The production model is **E2a**, chosen on 2026-09-25. Twenty-three head configu
 - **Accuracy Assessment**: CRPS and RMSE skill against persistence, interval coverage, PIT calibration, distance-stratified scores
 - **Prediction**: Tile-based processing, the quantile-function raster, COG and icechunk products
 
-Documents in `docs/background/` and `docs/dist_model_phase*.md`, `docs/global_methodology.md`, `docs/fitting_running_model.md` describe earlier systems (the triple-head model and the residual ensemble) that no longer exist on this branch. Read them for method, not for state.
+Documents in `docs/superceded/` describe earlier systems that no longer exist on this branch kept for reference 
 
 ## Project Structure
 
@@ -65,7 +61,6 @@ spatio_temporal/
 │   └── production/
 │       ├── E2a_global/             # PRODUCTION: the six global E2a checkpoints (5 folds + forward model)
 │       ├── E1v_global/             # The six global E1v checkpoints (the A/B alternative)
-│       └── E1v/                    # E1v's Africa screening checkpoints
 │
 ├── src/
 │   ├── models/                     # Model architecture
@@ -142,8 +137,6 @@ pip install torchgeo einops wandb "zarr>=3" icechunk
 **Notes**:
 - Python 3.12 is recommended for best compatibility
 - `light-the-torch` (ltt)  automatically detects your hardware and installs the appropriate PyTorch version
-- `environment.yml` and `requirements.txt` are currently **empty placeholders**; the list above is the working dependency set
-- Two 24 GB GPUs and 125 GB of RAM are what the global run was measured on. Iterating on Africa needs far less
 
 ### 2. Data Structure
 
@@ -189,8 +182,6 @@ wandb login
 ## Usage
 
 ### Training from Scratch
-
-**The argparse defaults of `train_lightning.py` are not the production model.** They still describe the legacy three-head model (`--head_family triple`, `--mu_mse_weight 1.0`, SSIM/Laplacian/histogram losses on). The production configuration is `BASE_ARGS` from `scripts/conv_spline_base.sh` plus the E2a head flags, passed in that order. argparse keeps the last occurrence of a flag, so the head flags override the baseline's.
 
 #### Basic Training Run
 
@@ -371,7 +362,7 @@ All training runs are logged to: **https://wandb.ai/glennwithtwons/spatio-tempor
 python scripts/train_lightning.py --disable_wandb
 ```
 
-## Global Production Run
+## Global Prediction
 
 The global products are built by one runner, which selects the model from a table naming its flags, head family and parameter count together:
 
@@ -389,10 +380,6 @@ MODEL=E2a ALLOW_GLOBAL=1 ./scripts/run_global_model.sh <stage>
 | `score` | The scorecard over every land pixel. **Run it alone**: it peaks at ~99 GiB | ~5 h |
 | `forecast` | The `--train_all_splits` forward model, base 2020 → 2025/2030/2035/2040 | ~3 h 50 |
 | `export_*` | Five COGs per year + one icechunk store, then verification | ~2 h each |
-
-**Every long stage refuses to start without a smoke receipt** whose code hash matches the code on disk and whose flags match the model. Editing any of the hashed files voids it, and the fix is to run `smoke` again.
-
-Each stage verifies its result from the run's own logs and rasters before it is accepted: loss weights, context wiring, head family and parameter count, row banding, weight averaging, raster completeness against the land total, and the delivered products against their sources.
 
 ### Products
 
@@ -420,19 +407,16 @@ observed/observed_hm.icechunk             # observed HM 1990-2020, (year, latitu
 | +15 yr | 0.302 | 0.233 | 0.449 | 0.948 |
 | +20 yr | 0.302 | 0.243 | 0.466 | 0.896 |
 
-Skill is measured against **persistence** (HM unchanged from the base year), not against zero, because the median 20-year HM change is 0.0001.
+Skill is measured against **persistence** (HM unchanged from the base year)
 
-**Far from past change** (beyond 100 px, 33.6 M pixels) at +20 yr, E2a's CRPS skill is 0.300 and its RMSE skill is +0.031, so its point forecast beats persistence there. At +5 yr the same band loses to persistence (CRPS skill −0.181, RMSE skill −0.0185).
 
-**Known limitations**, which a user of the distribution should know:
+**Known limitations**
 - **The far-field intervals are too narrow.** Beyond 100 px from past change at +20 yr, the 95% interval covers 70.9% of observations and 12.7% of pixels fall above the 99.9th percentile, against 0.1% nominal. Pooled over all land this shows as the +20 yr coverage of 0.896. The distribution is bounded by its outermost knots (see [Model Architecture](#model-architecture)), so it cannot reach far into the tail.
 - **The distribution is centred slightly low.** The PIT mean is 0.51–0.56 against 0.50, with recurring spikes near 0.22, 0.52, 0.77 and 0.95.
 - **The central intervals are too narrow**: 50% coverage is 0.41–0.47 and 80% coverage 0.74–0.77.
 - **The lower far tail is over-populated**: P(u < 0.001) is 0.0095–0.013 against 0.001.
 
 The full scorecard, stratified by distance to past change, is `data/conv_spline/scores/global/scorecard_detailed_g_E2a_hind.html`; see `docs/global_production_e2a.md`.
-
-**E1v**, the same model plus two learned tail rates (17 params/horizon), was run globally as a controlled A/B. Centrally the two are indistinguishable. Far from past change they fail in opposite directions. E1v's far-field intervals are calibrated to slightly conservative (95% coverage 0.995, tail exceedance 1.6× nominal), but its point forecast does not beat persistence there (RMSE skill −0.007). E2a is sharper and beats persistence, at the cost of the tail calibration above. E2a was chosen as the production model. E1v's checkpoints are kept in `models/production/E1v_global/`.
 
 ## Data: Human Modification (HM)
 
