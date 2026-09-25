@@ -275,10 +275,19 @@ def write_icechunk(out_path: Path, years, src_dir: Path, mode: str, base_year: i
         for r0 in range(0, H, row_chunk):
             nr = min(row_chunk, H - r0)
             _, q = read_qf(str(qp), r0, nr)
-            enc = np.where(np.isfinite(q),
-                           np.clip(q, 0.0, 1.0) * U16_MAX, float(U16_MAX))
-            hm[yi, :, r0:r0 + nr, :] = np.rint(enc).astype("uint16")
-            del q, enc
+            # 65535 is the FILL VALUE, so no real measurement may be allowed to land on it.
+            # `rint(clip(q,0,1) * 65535)` gives exactly 65535 for any HM >= 0.99999237, and
+            # E1v's upper tail is exponential on -log(1-HM) support, so the far upper
+            # quantiles saturate at HM = 1 over a large share of land. MEASURED on the first
+            # export: 31.7% of land at the 99.99th percentile of the 2040 forecast, and 24.5%
+            # of the 2020 hindcast, were real values written as "missing". The attributes
+            # already declared valid_range [0, 65534] and a representable maximum of
+            # 65534/65535 -- the contract was right and the code did not implement it.
+            code = np.rint(np.clip(q, 0.0, 1.0) * U16_MAX)
+            np.minimum(code, U16_MAX - 1, out=code)
+            enc = np.where(np.isfinite(q), code, float(U16_MAX))
+            hm[yi, :, r0:r0 + nr, :] = enc.astype("uint16")
+            del q, code, enc
 
     session.commit(f"{mode} quantile functions, base {base_year}, years "
                    f"{','.join(map(str, years))}")

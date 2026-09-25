@@ -163,6 +163,7 @@ th,td{padding:4px 10px;text-align:right;border-bottom:1px solid #e4e4e0}
 th{text-align:right;color:#555;font-weight:600;border-bottom:1px solid #bbb}
 td:first-child,th:first-child{text-align:left}
 img{max-width:100%;height:auto;border:1px solid #e4e4e0;background:#fff}
+.tw{overflow-x:auto;-webkit-overflow-scrolling:touch;max-width:100%}
 p.note{color:#666;font-size:12px;max-width:80ch}
 code{background:#f0f0ec;padding:1px 4px;border-radius:3px}
 """
@@ -175,14 +176,17 @@ def write_scorecard(path, label, meta, tables, images, notes=()):
     and attached to write-ups, and a scorecard whose figures are missing is worse than one
     with none -- it reads as a run where the gates were not measured.
     """
-    parts = [f"<style>{CSS}</style>",
+    parts = [f"<title>{html.escape(label)}</title>",
+             f"<style>{CSS}</style>",
              f"<h1>{html.escape(label)}</h1>",
              "<p class='sub'>" + " &middot; ".join(
                  f"{html.escape(str(k))}: <code>{html.escape(str(v))}</code>"
                  for k, v in meta.items()) + "</p>"]
     for heading, header, rows in tables:
         parts.append(f"<h2>{html.escape(heading)}</h2>")
-        parts.append(_table(rows, header))
+        # Wrapped: these tables run to twelve numeric columns and are read on phones as well
+        # as on a desktop. Only the table scrolls; the page itself must not.
+        parts.append(f"<div class='tw'>{_table(rows, header)}</div>")
     for heading, img in images:
         parts.append(f"<h2>{html.escape(heading)}</h2>")
         parts.append(f"<img alt='{html.escape(heading)}' "

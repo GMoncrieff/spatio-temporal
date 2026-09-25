@@ -13,7 +13,13 @@ Checks, in the order they would fail:
   3. its storage scale is tagged and honoured (float32 must carry 1.0)
   4. Q(u) is finite and non-decreasing on every scored pixel
   5. the head emitted the channel count the arm implies (E1a's 18 against E1's 16)
-  6. the run's own log carries the fingerprints the verifiers grep for
+  6. the raster's OWN head_family/head_params tags say which head wrote it
+  7. the run's own log carries the fingerprints the verifiers grep for
+
+Check 6 is metadata on a delivered product, not a diagnostic. It was the literal "spline"
+for every head until 2026-09-17, so E1v's Africa rasters -- the promoted model's own output
+-- carry head_family="spline" while the head is "pwl". That raster is the control this check
+was proved against before it was trusted.
 """
 from __future__ import annotations
 
@@ -39,6 +45,13 @@ def main(argv=None):
                     help="Head family the arm asked for. Checked against the "
                          "run's own banner, which until 2026-09-15 said "
                          "'Spline head' whatever family was running.")
+    ap.add_argument("--expect_tag_family", default="",
+                    help="Head family the RASTER's own head_family tag must carry. "
+                         "Distinct from --expect_family, which reads the log: a run can "
+                         "log the right head and tag the raster with the wrong one, and "
+                         "did, for every head, until 2026-09-17.")
+    ap.add_argument("--expect_tag_params", type=int, default=0,
+                    help="params/horizon the raster's head_params tag must carry.")
     ap.add_argument("--log", default="")
     ap.add_argument("--flags", default="")
     ap.add_argument("--row_chunk", type=int, default=512)
@@ -91,6 +104,19 @@ def main(argv=None):
             continue
         if n_back:
             bad.append(f"{p.name}: Q(u) decreases at {n_back} (segment, pixel) pairs")
+        if a.expect_tag_family or a.expect_tag_params:
+            with rasterio.open(str(p)) as src:
+                tags = src.tags()
+            if a.expect_tag_family:
+                got = tags.get("head_family")
+                if got != a.expect_tag_family:
+                    bad.append(f"{p.name}: head_family tag is {got!r}, expected "
+                               f"{a.expect_tag_family!r}")
+            if a.expect_tag_params:
+                got = tags.get("head_params")
+                if got is None or int(got) != a.expect_tag_params:
+                    bad.append(f"{p.name}: head_params tag is {got!r}, expected "
+                               f"{a.expect_tag_params}")
         print(f"  ✓ {p.name}: {len(u)} levels, {n:,} finite px checked, "
               f"scale={scale:g}, range [{lo_v:.5f}, {hi_v:.5f}]")
 

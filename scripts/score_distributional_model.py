@@ -665,6 +665,15 @@ def main(argv=None):
             dist_recs.append({**base, **dist_stats(pp, sel), **gates})
             central_recs.append({**base, **central_stats(
                 resid[sel], obs_change[sel], pred_change[sel], covered[sel])})
+        # Release this row's per-pixel arrays BEFORE the next load_row builds its own.
+        # `cell` and `pp` are only rebound when load_row RETURNS, so without this the loop
+        # holds two window-years at once. --row_chunk does not help: it bounds the transient
+        # band reads, not the compacted per-pixel arrays, which are the bulk.
+        # MEASURED on the global grid, 2026-09-18: one window-year of 184,573,321 px is
+        # ~85 GiB resident, so row 2 peaked past 170 GiB against 125 GB of DRAM and the run
+        # died. On Africa the same row is ~29 GiB and two fit, which is why regional scale
+        # never saw it. tests/test_score_row_release.py pins it.
+        del cell, pp, u, cons, resid, obs_change, pred_change, covered
 
     dist_df = pd.DataFrame(dist_recs)
     central_df = pd.DataFrame(central_recs)

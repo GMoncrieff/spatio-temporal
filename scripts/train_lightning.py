@@ -2472,6 +2472,16 @@ if __name__ == "__main__":
                 'transform': ref_transform * Affine.translation(c0, r0),
                 'count': 1,
                 'dtype': 'float32',
+                # NaN, not the HM reference's 3.4e38 sentinel that ref.profile carries in.
+                # The triple is filled with NaN where no tile covered a pixel, so a raster
+                # declaring 3.4e38 declares a value it never writes: a consumer masking on
+                # the tag masks nothing and reads NaN as data, and gdal_translate carries
+                # the wrong tag straight into the delivered COGs. Only the FORWARD product
+                # was exposed -- stitch_fold_predictions sets nodata=NaN explicitly, so every
+                # hindcast deliverable was already correct, and that is why no regional run
+                # ever showed it. Found 2026-09-17 by check_prediction_complete.py, which
+                # counted 370.8% of the land because NaN != 3.4e38 is true.
+                'nodata': np.nan,
                 'compress': 'deflate',
                 # GDAL's BIGTIFF default is IF_NEEDED, which cannot switch to BigTIFF for a
                 # COMPRESSED raster because it cannot predict the compressed size -- so every
@@ -2526,9 +2536,25 @@ if __name__ == "__main__":
                     # It used to be the literal "3.0518509e-05" beside a reader that had
                     # 1/32767 hardcoded -- the same quantity in two places, which is how the
                     # two get to disagree (rule 2).
+                    # head_family was the LITERAL "spline" until 2026-09-17, whatever head
+                    # ran -- so E1v's own delivered rasters say `spline` while the head is
+                    # `pwl`. Rule 28: a tag that prints a constant is not a fingerprint, and
+                    # this one ships with the product. Read it off the CONSTRUCTED MODULE,
+                    # the same place the banner reads its parameter count, never off a
+                    # literal and not off args (args says what was asked for; the module
+                    # says what was built). The param count travels with it because
+                    # 17-with-tails against 15-without is the only thing that distinguishes
+                    # E1v from a tailless pwl arm on the raster alone.
+                    _tag_mod = getattr(infer_model, 'model', None)
+                    _tag_fam = getattr(_tag_mod, 'head_family', None) or getattr(
+                        args, 'head_family', 'triple')
+                    _tag_np = getattr(_tag_mod, 'n_spline_params', None)
+                    _head_tags = {"head_family": str(_tag_fam)}
+                    if _tag_np is not None:
+                        _head_tags["head_params"] = str(int(_tag_np))
                     d.update_tags(u_levels=",".join(repr(float(v)) for v in qf_u),
                                   scale_factor="1.0" if _qf_f32 else "3.0518509e-05",
-                                  head_family="spline")
+                                  **_head_tags)
                     _writers[f"{h_name}_qf"] = d
                     out_paths[f"{h_name}_qf"] = p
 

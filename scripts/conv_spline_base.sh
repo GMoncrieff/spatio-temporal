@@ -248,9 +248,116 @@ guard_region() {
   case "${REGION}" in
     *africa.geojson) ;;
     *large*|*global*)
-      echo "FATAL: REGION looks global. This phase iterates on Africa; promote on " >&2
-      echo "       instruction only, with ALLOW_GLOBAL=1." >&2
-      [ "${ALLOW_GLOBAL:-0}" = "1" ] || return 1 ;;
+      # It printed FATAL and then continued whenever ALLOW_GLOBAL=1, so the one line a log
+      # reader greps said the run had been refused when it had been authorised. Rule 28: a
+      # banner that does not distinguish the two cases is not a fingerprint of either.
+      if [ "${ALLOW_GLOBAL:-0}" = "1" ]; then
+        echo "  ✓ GLOBAL RUN AUTHORISED: REGION=${REGION}, ALLOW_GLOBAL=1"
+      else
+        echo "FATAL: REGION looks global and ALLOW_GLOBAL is not 1." >&2
+        echo "       Screening iterates on Africa; the globe runs on instruction." >&2
+        return 1
+      fi ;;
     *) echo "  ! REGION=${REGION} is neither Africa nor global -- continuing, but check it" >&2 ;;
   esac
+}
+
+# The head itself must be the one asked for. Three distinct flags shape it and every one of
+# them has already failed silently once: --isqf_tails was gated on head_family=="isqf" so a
+# pwl arm allocated the channels and never read them; --free_scale emitted a scale channel it
+# had stopped reading, so four scored arms ran a parameter heavier than advertised; and the
+# banner printed "Spline head" with the rational-quadratic parameter count for all three
+# families. The parameter count is what distinguishes them all -- E1v is 17 (1 location + 14
+# increments + 2 tail rates) and a tailless pwl free-scale arm is 15 -- so it is the
+# fingerprint, and the family and the two modifiers are checked beside it because a count
+# alone cannot say WHICH two parameters were added.
+#
+#   verify_head_fingerprint <log> <name> <family> <params> "<flags>"
+verify_head_fingerprint() {
+  local log="$1" name="$2" want_fam="$3" want_np="$4" flags="${5:-}"
+  local line got_fam got_np
+  if [ ! -r "$log" ]; then
+    echo "FATAL: ${name}: no readable fold log at ${log}; head fingerprint unverified." >&2
+    return 1
+  fi
+  line=$(grep -m1 "^Spline head:" "$log" || true)
+  if [ -z "$line" ]; then
+    echo "FATAL: ${name}: ${log} has no head banner; the head is unverified." >&2
+    echo "       A triple-head run prints none, and that is the loudest way this fails." >&2
+    return 1
+  fi
+  got_fam=$(sed -E 's/^Spline head:[[:space:]]+family ([A-Za-z]+),.*/\1/' <<<"$line")
+  got_np=$(sed -E 's/.*[^0-9]([0-9]+) params\/horizon.*/\1/' <<<"$line")
+  if [ "$got_fam" != "$want_fam" ]; then
+    echo "FATAL: ${name}: head family is '${got_fam}', expected '${want_fam}'." >&2
+    echo "  banner: ${line}" >&2
+    return 1
+  fi
+  if [ "$got_np" != "$want_np" ]; then
+    echo "FATAL: ${name}: head emitted ${got_np} params/horizon, expected ${want_np}." >&2
+    echo "  banner: ${line}" >&2
+    return 1
+  fi
+  # The two modifiers, read off the same line. Derived from the flags rather than passed
+  # separately so a runner cannot ask for tails and forget to check for them.
+  case "$flags" in
+    *--isqf_tails\ True*)
+      local want_space
+      want_space=$(sed -E 's/.*--isqf_space ([A-Za-z]+).*/\1/' <<<"$flags")
+      case "$flags" in *--isqf_space*) ;; *) want_space="logit" ;; esac
+      if ! grep -q ", tails ${want_space}," <<<"$line"; then
+        echo "FATAL: ${name}: asked for --isqf_tails on ${want_space}; the banner does not" >&2
+        echo "       say so. The tails were allocated and never read once already." >&2
+        echo "  banner: ${line}" >&2
+        return 1
+      fi ;;
+    *)
+      if grep -q ", tails " <<<"$line"; then
+        echo "FATAL: ${name}: the banner reports learned tails nobody asked for." >&2
+        return 1
+      fi ;;
+  esac
+  case "$flags" in
+    *--free_scale\ True*)
+      if ! grep -q ", free scale," <<<"$line"; then
+        echo "FATAL: ${name}: asked for --free_scale; the banner does not say so." >&2
+        echo "  banner: ${line}" >&2
+        return 1
+      fi ;;
+    *)
+      if grep -q ", free scale," <<<"$line"; then
+        echo "FATAL: ${name}: the banner reports a free scale nobody asked for." >&2
+        return 1
+      fi ;;
+  esac
+  echo "  ✓ ${name}: head verified (${got_fam}, ${got_np} params/horizon)"
+}
+
+# Prediction accumulators are len(active_horizons) * (3 + 64) full-window float32 arrays --
+# 268 on a four-horizon window -- and each one spans the band. On the 17111 x 40000 global
+# grid a 2048-row band is 0.305 GiB per accumulator, so BASE_ARGS' Africa-sized
+# --predict_row_chunk 2048 is 81.8 GiB for ONE fold and two folds run at once, against
+# 125 GB of DRAM. 512 rows is 20.4 GiB. The value is therefore not a detail: the check reads
+# back the number the run actually banded on, not merely that it banded at all.
+#
+#   verify_row_banding <log> <name> <expected rows>
+verify_row_banding() {
+  local log="$1" name="$2" want="$3" line got
+  if [ ! -r "$log" ]; then
+    echo "FATAL: ${name}: no readable log at ${log}; row banding unverified." >&2
+    return 1
+  fi
+  line=$(grep -m1 "Row banding: " "$log" || true)
+  if [ -z "$line" ]; then
+    echo "FATAL: ${name}: the run did not band its prediction rows." >&2
+    echo "       Unbanded global accumulators are ~185 GiB resident for one fold." >&2
+    return 1
+  fi
+  got=$(sed -E 's/.*bands of ([0-9]+) rows.*/\1/' <<<"$line")
+  if [ "$got" != "$want" ]; then
+    echo "FATAL: ${name}: banded on ${got} rows, expected ${want}." >&2
+    echo "  ${line}" >&2
+    return 1
+  fi
+  echo "  ✓ ${name}: $(sed 's/^ *//' <<<"$line")"
 }

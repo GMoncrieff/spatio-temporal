@@ -4,6 +4,70 @@ Spatiotemporal Human Modification (HM) forecasting. **One system lives here now.
 
 Active branch: **`conv-spline`**. Started 2026-09-07.
 
+**The screening phase is CLOSED (2026-09-17). The E1v GLOBAL RUN IS COMPLETE (2026-09-18) and
+its 586 GB of rasters and products were CLEARED on 2026-09-22 to make room for the same run on
+E2a. What survives of E1v: `data/conv_spline/scores/global/` (every scorecard),
+`models/production/E1v/` (Africa, the 2026-09-17 promotion) and `models/production/E1v_global/` (the six
+checkpoints the global run produced). Read `docs/global_production_e2a.md` first, then
+`docs/global_production_e1v.md` for the runner and its verifiers; `docs/conv_spline_phase.md`
+is history, read for method.**
+
+**E2a IS THE PRODUCTION MODEL — decided by the user 2026-09-25**, after the global A/B below.
+Its products are the delivered ones (`/mnt/hdd1/.../products/E2a/`), its checkpoints are
+`models/production/E2a_global/`, and the README describes it. E1v is the measured alternative.
+**`run_global_model.sh` still defaults `MODEL` to E1v** (`${MODEL:=E1v}`); always pass
+`MODEL=E2a`. Changing the default edits a hashed file and voids both smoke receipts.
+
+**The E2a GLOBAL RUN IS ALSO COMPLETE (2026-09-23)** — `--head_family pwl --free_scale True
+--mu_mse_weight 0.0`, **15 params/horizon**, both products built and verified, scored on all
+184,573,321 land px. Read `docs/global_production_e2a.md`. It was scored on Africa at **16**,
+because `--free_scale` did not actually remove the scale channel until 2026-09-16, so this run
+is NOT the arm on the promotion page and its numbers are not comparable to that scorecard. It
+IS the re-run on current code, so **E1v vs E2a is now a measured A/B on the learned tails
+alone** (17 vs 15 params, same family, same free scale).
+
+**The tails cost nothing centrally and buy far-field calibration at the price of far-field
+sharpness.** Pooled `crps_skill` differs by at most 0.0042 either way and pooled RMSE by 5e-05,
+so two parameters per horizon buy nothing in the body. At **+20 yr beyond 100 px** (33.6 M px)
+E2a's CRPS skill is 0.300 against E1v's 0.217 and its **RMSE skill is +0.0310 against −0.0070 —
+E2a's far-field point forecast beats persistence where E1v's does not**, the first time anything
+here has. But E2a's far-field `cov95` is **0.709** against nominal 0.95 and its
+**P(u>0.999) is 0.127, 127x nominal**, against E1v's 1.6x. Removing the tails narrows the
+far-field distribution: narrow pays in CRPS and RMSE where change is rare, and destroys tail
+calibration. **Neither is calibrated out there; they fail in opposite directions**, E1v
+conservative and E2a overconfident. Pooled, that shows only as `cov95_20` 0.896 and
+`far_tail_excess_20` **22.31 against 7.89** — rule 14 one level down.
+**E2a was chosen as production anyway, knowingly**: it is the simpler head (15 vs 17), its
+far-field point forecast beats persistence, and its known cost is the far-field tail — a 95%
+band covering 70.9% beyond 100 px at +20 yr. That limitation is stated in the README and must
+travel with the product; do not describe E2a's intervals as calibrated in the far field.
+
+**E2a's** global hindcast, out of sample on all 184,573,321 land pixels: `crps_skill`
+0.154 / 0.266 / 0.302 / 0.302, RMSE skill 0.039 / 0.191 / 0.233 / 0.243, `cov95`
+0.953 / 0.961 / 0.948 / **0.896**, cov50 0.41–0.47, PIT mean 0.51–0.56. Beyond 100 px at +5 yr
+it loses to persistence (CRPS skill −0.181, RMSE skill −0.0185), as E1v did.
+
+**E1v's** global hindcast (kept for the record), out of sample on all 184,573,321 land pixels: `crps_skill`
+0.157 / 0.266 / 0.300 / 0.298 at +5/10/15/20 yr, `cov95` 0.953 / 0.954 / 0.925 / 0.965.
+`crps_skill` by distance band at h=20 is 0.420 / 0.275 / 0.189 / 0.114 / 0.093 / **+0.217
+beyond 100 px**, where b1 ran −0.106 and −1.510. **The far field, stated precisely.** At **+20 yr** the >100 px band's CRPS skill is
+**+0.217** — a real reversal of b1's −1.510 on Africa. But the same band's **RMSE skill is
+−0.0070**, and at **+5 yr** its CRPS skill is **−0.136**. So the far-field win is
+*distributional and long-horizon*: the predicted spread is better than persistence's at
++20 yr, while the point forecast E[Q] still is not, and at +5 yr neither is. The band's PIT
+mean is 0.622 against 0.50, the worst centring on the card. "The far field no longer loses to
+persistence" is true only of CRPS at +20 yr and must not be quoted unqualified.
+**The PIT defect is NOT fixed**: mean 0.53–0.56 against 0.50 and the same ~0.25-spaced spikes
+E1v shows on Africa, so it is a property of the head, not of the globe. **Central coverage is
+too narrow**: cov50 0.41–0.46 against 0.50 and cov80 0.75–0.80, while cov95/cov99 are close to
+nominal. **The lower far tail is 11x over-populated**: P(u<0.001) is 0.0114–0.0117 against
+0.001, against 0.0032–0.0044 on the upper side — the miss is large and asymmetric.
+
+E1v is `--head_family pwl --isqf_tails True --isqf_space neglog --free_scale True
+--mu_mse_weight 0.0` on `conv_spline_base.sh`'s BASE_ARGS: family pwl, knots default14,
+learned slopes, free scale, two learned tail rates on `-log(1-HM)` support, **17
+params/horizon** against b1's 29. Checkpoints and provenance: `models/production/E1v/`.
+
 ## What this repository is, as of this phase
 
 A distributional ConvLSTM that emits a full per-pixel quantile function `Q_h(u|x)` at
@@ -32,43 +96,49 @@ every arm draws the same nine and the panels stack. `src/qf_plots.py`.
 
 ## Where the phase is
 
-**No experiment has been run.** The data *is* on this machine now, and as of 2026-09-14 the
-code has met it: a one-epoch, one-fold smoke pass over the full Africa path. Three defects had
-to be fixed before `b1` could run at all — the prediction writer could not decode `pwl`/`isqf`,
-both gates raised `KeyError` on every real scoring run, and `b1` was scripted on the wrong
-covariate. All three are written up in `docs/conv_spline_phase.md`.
+**Screening is over.** 23 arms were scored on Africa and E1v was promoted on 2026-09-17; the
+measured comparison is in `data/conv_spline/promotion/`. **E2a replaced it as production on
+2026-09-25** after both were run globally on current code. Africa numbers for E1v: CRPS skill 0.2152 /
+0.2823 / 0.3033 / 0.3032 at +5/10/15/20 yr, `cov95_20` 0.9722, `far_tail_excess` at h=5
+**1.361** — the best far-tail calibration of any arm run.
 
-1. **Step 1, not yet run** — establish `b1`. Three seeds, on Africa.
-   `./scripts/run_conv_spline_baseline.sh`
-2. **Then** the E0–E5 slate. `./scripts/run_conv_spline_slate.sh`
-3. **Then §4.1's scale arms** — `./scripts/run_conv_spline_scale_arms.sh`. Written 2026-09-15:
-   `--free_scale`, `--isqf_tails` and `--isqf_space` exist and are tested, and the runner holds
-   the six arms in the doc's order (E0a first and alone, both `--isqf_space` arms, E1b paired
-   with E2a, E1c last and unconditional) with a test asserting it. **Two things §4.1 specified
-   were wrong and only running it showed that** — see the phase doc's flag-status block.
-4. **E6–E8 are chosen from what E0–E5 and §4.1 measure**, not written in advance.
+**The globe is the task now, not promotion-only.** `ALLOW_GLOBAL=1` is required and
+`guard_region` still enforces it, but it is no longer a reason to stop and ask.
 
-Nothing on this branch is comparable to a `dist-convlstm` number: the trunk change alone makes
-`b1` a different model, and the scorecard carries two gates `e1` never had.
+One runner covers both products:
 
-**The neighbourhood context is a covariate, not a setting.** Distance to past change and the
-neighbourhood HM summaries go into the **trunk**, repeated across timesteps beside elevation and
-climate, and into **no head**. There is nothing to pass: `--trunk_context`, `--central_context`
-and `--quantile_context` were removed, and the wiring is part of the model. `e1` fed the heads
-and never the trunk; everything from `b1` onward feeds the trunk and never the heads. The run's
-log reports the channel count the trunk was actually built with — read off the module, not off a
-flag — and `verify_context_wiring` refuses a run where that is zero, disagrees with what
-`--context_radii` / `--hm_context_stats` imply, or says a head received it.
+    MODEL=E1v|E2a ALLOW_GLOBAL=1 ./scripts/run_global_model.sh <stage>
+    args | smoke | hindcast | stitch | score | forecast
+         | export_hindcast | export_forecast | all
 
-**Where it goes is not a setting; which covariate it is still is, and it is named.** `b1` is
-"`e1` plus exactly one change", and `e1` is `--context_radii 3,30,100 --hm_context_radii
-3,30,100 --hm_context_stats mean,max` — **twelve** trunk channels. `BASE_ARGS` named none of
-them until 2026-09-14, so `b1` was scripted on argparse defaults: `--context_radii
-1,3,10,30,100`, no HM summaries, **eight** channels — `e1`'s dropped fine radii back and the
-neighbourhood-HM covariate simply absent. `verify_context_wiring` could not see it: it compared
-the module against the same defaults and read 8 == 8. `conv_spline_base.sh` now names the flags
-and carries `EXPECT_CTX_CHANNELS=12`, which the wiring check compares the trunk against —
-`tests/test_conv_spline_paths.py` proves that line fires on the 8- and 9-channel controls.
+`MODEL` selects from a table in the script that names the head's flags, family AND parameter
+count together, so the three cannot drift apart; `verify_head_fingerprint` is handed all
+three from it. Each model gets its own exp roots, product root and **its own smoke receipt** —
+a receipt earned by smoking one model does not authorise another, and the receipt pins the
+flags as well as the code hash. An unknown `MODEL` is refused rather than defaulted.
+
+It sources `conv_spline_base.sh`. **It must never be replaced by `run_global_dist_*.sh`**:
+those source `dist_base_args.sh`, which hardcodes `--head_family spline`, `--seed 46` and
+e1's context flags, so they would silently run e1 and their weaker verifiers could not tell.
+
+**Every long stage refuses to start without a smoke receipt whose code hash matches the code
+on disk.** `smoke` runs one epoch, one fold, one target year and a few hundred prediction
+blocks through *every* stage — train, predict, read the raster back, stitch, score, export,
+verify the products, and the `--train_all_splits` forward path — on the real global grid, then
+writes `data/conv_spline/logs/global/smoke_ok.stamp`. Edit any of the twelve files the hash
+covers and the receipt is void. Re-smoke; do not weaken the gate.
+
+Measured on the 2026-09-17 global smoke, and these are the numbers to plan against:
+one fold + one horizon + 400 blocks 12.7 min; stitch one target year 10.0 min; five COGs plus
+one icechunk year ~18 min; **peak python RSS 35.5 GiB, and the peak is the STITCH, not
+prediction**; writing one all-NaN 64-band global raster is 12.0 min, which is the floor on any
+full-grid write. Land is 184.5 M px of the 684.4 M grid.
+
+## Screening history — the three sections below are CLOSED
+
+They describe the b1 baseline and the defects the screening phase existed to fix. Both were
+addressed and E1v was promoted on the result. Read them for method and for what the numbers
+mean; do not read them for state. `data/conv_spline/scores/` holds all 23 scorecards.
 
 ## What b1 measures — first run, 2026-09-14
 
@@ -176,6 +246,10 @@ The previous CLAUDE.md closed these. They are open again, and several are experi
 | **rank against the measured floor** | `scripts/compare_conv_spline_runs.py --floor_prefix b1` | seconds |
 | **predict-only from frozen checkpoints** | `run_hindcast_folds.py --fold_checkpoints … --max_epochs 0` | ~121 min/fold globally |
 | build the neighbourhood-HM covariate (once) | `scripts/prepare_hm_context.py` | 2:45 per base year |
+| **the global smoke** (gates everything below it) | `ALLOW_GLOBAL=1 ./scripts/run_global_model.sh smoke` | ~1 h |
+| **global hindcast** k=5, window 2000 | `ALLOW_GLOBAL=1 ./scripts/run_global_model.sh hindcast` | ~150 min/fold, two folds per GPU round |
+| **global forward model + forecast** | `ALLOW_GLOBAL=1 ./scripts/run_global_model.sh forecast` | the longest single job — one model over the whole globe |
+| **export a product** (5 COGs/yr + icechunk) | `... run_global_model.sh export_hindcast\|export_forecast` | ~18 min per year |
 
 ## Rules learned the hard way
 
@@ -335,13 +409,70 @@ Kept only where they still apply. Numbering is fresh; the old file's numbers are
     greps it passed either way. Print the argument, then verify it; a check on a constant
     string checks nothing (rule 5, and rule 2's predicate written twice).
 
+29. **A bound you cannot calibrate will refuse a good run.** The first per-fold completeness
+    check expected "about a fifth of the land". Prediction is restricted to the tiles that
+    *overlap* a fold and keeps every pixel of each, so a fold raster covers well over its own
+    territory — **measured on both global runs, 50.6 / 54.1 / 52.2 / 53.2 / 51.7 M px** against
+    an own-land share of ~36.9 M, about 1.4x. (An earlier "67.4–71.6 M, 1.9x" survives in
+    `docs/global_production_e1v.md` and the `global-scale-defects` memory; E1v's own
+    `hindcast_run.log` contradicts it, and E2a reproduced the log's five numbers
+    byte-identically. Identical across two heads is CORRECT here, not rule 1's tell: the
+    extent is fixed by the fold mask and the prediction stride, so only the *values* may
+    differ. The calibrated bound the check carries, `[40 M, 120 M]`, is unaffected.) It would
+    have failed all five folds at the end of a nine-hour run. When the right answer is a
+    range, pass a range; and put the discriminating power in the side that catches the
+    failure — here the ceiling, because a raster truncated at the 4 GiB classic-TIFF limit
+    reads its unwritten rows back as finite zeros and reports nearly the whole grid.
+30. **Metadata on a delivered product is not a diagnostic and does not get to be wrong.**
+    The quantile raster's `head_family` tag was the literal `"spline"` for every head, so
+    E1v's own promoted rasters say `spline` while the head is `pwl`. It now comes off the
+    constructed module, with `head_params` beside it, and `check_qf_raster.py --expect_tag_*`
+    reads it back off disk. Rule 28 in the one place it ships.
+
+31. **`${VAR:-default}` does not fire on `0`.** `conv_spline_base.sh` exports
+    `SCORE_ROW_CHUNK=0` and the global runner's `${SCORE_ROW_CHUNK:-512}` kept it, so the
+    global scorer read a whole window-year in one call: `Unable to allocate 163. GiB for an
+    array with shape (64, 17111, 40000)`. `:-` substitutes only when a variable is unset or
+    EMPTY, and a meaningful `0` is neither. A default that must differ between regional and
+    global needs its own name (`GLOBAL_SCORE_ROW_CHUNK`), and the effective value belongs in
+    a dump a test can read — `run_global_model.sh args`.
+
+32. **A loop that rebinds its working set still holds the previous one.**
+    `u, cell, pp, cons = load_row(...)` rebinds only when the call RETURNS, so the scorer
+    built row 2's per-pixel arrays while row 1's were live: 92.4 GiB each on a global
+    window-year, 170+ GiB together, OOM two hours in. `--row_chunk` bounds the transient band
+    READS, not the compacted per-pixel arrays — a knob that names a memory problem is not
+    necessarily the knob for *that* memory problem. Release at the end of the loop body, and
+    test it with a weak reference rather than a memory number.
+    **The scorer needs the box to itself at global scale.**
+
+33. **A monitor that appends makes every summary a summary of the file, not of the run.**
+    `stop_monitor` reported a 99.0 GiB peak for an export that peaked at 24.6 — it was
+    quoting a scorer sampled hours earlier by an aborted run of the same stage, whose monitor
+    was still alive because killing a stage externally bypasses the cleanup. Bound a summary
+    to its own invocation (record the start time, filter on it) and trap `EXIT INT TERM` so a
+    killed stage takes its monitor with it.
+
+34. **A quantisation that can land on the fill value has no fill value.** The icechunk export
+    encoded HM as `rint(clip(q,0,1) * 65535)` with `fill_value = 65535`, so every fully
+    modified pixel — 31.7% of land at the 99.99th percentile of the 2040 forecast — was
+    written as "missing". The attributes already declared `valid_range [0, 65534]`; only the
+    code disagreed. **A round-trip check cannot catch this**: the value decodes correctly and
+    only its meaning is wrong, so assert the other half — a cell may hold the fill value only
+    where the source is not finite. Reserve a code for missing and clamp the data off it.
+35. **Do not estimate a spatial fraction from a handful of windows.** Three random-window
+    samples of the defect above read 0.14%, 46% and 0.31%; the global count was 31.7%. When a
+    quantity tracks land cover, window variance swamps it. The qf rasters are
+    band-interleaved, so one percentile level over the whole globe is a 2.7 GB read — count
+    it instead of sampling it.
+
 ## Conventions
 
 - Flat argparse, no config framework. New flags are additive and default to today's behaviour;
   the boolean idiom is
   `type=lambda x: (str(x).lower()=='true'), nargs='?', const=True, default=…`.
 - Tests are flat in `tests/`, pytest, `sys.path.insert(0, parent)` + absolute imports,
-  synthetic tensors. **Measured 2026-09-15 on this machine: 451 passed / 7 failed.** Not the 15
+  synthetic tensors. **Measured 2026-09-17 on this machine: 517 passed / 7 failed.** Not the 15
   the phase began with — the fixture-needing ones pass now that the data is here. All 7 fail
   identically on `dist-convlstm` (checked in a worktree): stale legacy tests asserting a
   4-channel output from a model that emits 12, forwards that pass no `lonlat` to a trunk built
