@@ -1,0 +1,70 @@
+Computing per-variable normalization statistics for static layers...
+Static normalization stats:
+  ele: mean=-4.199660e+03, std=1.118436e+04
+  tas: mean=1.331284e+01, std=1.304236e+01
+  tasmin: mean=2.922423e-01, std=1.976969e+00
+  pr: mean=9.521831e+00, std=8.034065e+00
+  dpi_dsi: mean=2.117226e-02, std=6.456454e-02
+  iucn_nostrict: mean=5.596099e-02, std=2.298464e-01
+  iucn_strict: mean=3.046644e-02, std=1.718669e-01
+Computing per-variable normalization statistics for components...
+Component normalization stats:
+  AG: mean=5.914771e-02, std=1.095084e-01
+  BU: mean=5.761256e-03, std=4.716104e-02
+  EX: mean=3.371559e-05, std=1.591069e-03
+  FR: mean=7.525670e-04, std=9.532811e-03
+  HI: mean=1.316297e-02, std=2.569461e-02
+  NS: mean=1.272198e-03, std=2.822036e-02
+  PO: mean=4.593512e-03, std=6.062940e-03
+  TI: mean=1.967309e-02, std=6.598077e-02
+  gdp: mean=7.596796e+06, std=5.570206e+07
+  population: mean=6.852384e+01, std=7.096302e+02
+Pre-computing valid positions for split_value=1...
+  Found 29047 valid chip positions for split 1
+Computing per-variable normalization statistics for static layers...
+Static normalization stats:
+  ele: mean=-4.199660e+03, std=1.118436e+04
+  tas: mean=1.331284e+01, std=1.304236e+01
+  tasmin: mean=2.922423e-01, std=1.976969e+00
+  pr: mean=9.521831e+00, std=8.034065e+00
+  dpi_dsi: mean=2.117226e-02, std=6.456454e-02
+  iucn_nostrict: mean=5.596099e-02, std=2.298464e-01
+  iucn_strict: mean=3.046644e-02, std=1.718669e-01
+Computing per-variable normalization statistics for components...
+Component normalization stats:
+  AG: mean=5.914771e-02, std=1.095084e-01
+  BU: mean=5.761256e-03, std=4.716104e-02
+  EX: mean=3.371559e-05, std=1.591069e-03
+  FR: mean=7.525670e-04, std=9.532811e-03
+  HI: mean=1.316297e-02, std=2.569461e-02
+  NS: mean=1.272198e-03, std=2.822036e-02
+  PO: mean=4.593512e-03, std=6.062940e-03
+  TI: mean=1.967309e-02, std=6.598077e-02
+  gdp: mean=7.596796e+06, std=5.570206e+07
+  population: mean=6.852384e+01, std=7.096302e+02
+Pre-computing valid positions for split_value=2...
+  Found 4149 valid chip positions for split 2
+Computing per-variable normalization statistics for static layers...
+Static normalization stats:
+  ele: mean=-4.199660e+03, std=1.118436e+04
+  tas: mean=1.331284e+01, std=1.304236e+01
+  tasmin: mean=2.922423e-01, std=1.976969e+00
+  pr: mean=9.521831e+00, std=8.034065e+00
+  dpi_dsi: mean=2.117226e-02, std=6.456454e-02
+  iucn_nostrict: mean=5.596099e-02, std=2.298464e-01
+  iucn_strict: mean=3.046644e-02, std=1.718669e-01
+Computing per-variable normalization statistics for components...
+Component normalization stats:
+  AG: mean=5.914771e-02, std=1.095084e-01
+  BU: mean=5.761256e-03, std=4.716104e-02
+  EX: mean=3.371559e-05, std=1.591069e-03
+  FR: mean=7.525670e-04, std=9.532811e-03
+  HI: mean=1.316297e-02, std=2.569461e-02
+  NS: mean=1.272198e-03, std=2.822036e-02
+  PO: mean=4.593512e-03, std=6.062940e-03
+  TI: mean=1.967309e-02, std=6.598077e-02
+  gdp: mean=7.596796e+06, std=5.570206e+07
+  population: mean=6.852384e+01, std=7.096302e+02
+Pre-computing valid positions for split_value=3...
+  Found 4149 valid chip positions for split 3
+Attempting to download W&B artifact: model-khrpthgy:v0

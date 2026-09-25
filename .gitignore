@@ -173,3 +173,6 @@ outputs/
 ehthumbs.db
 Thumbs.db
 data/predictions/prediction_2020_blended.tif
+
+# Ensemble artifacts (large rasters, zarr stores, logs, run outputs)
+data/ensemble/

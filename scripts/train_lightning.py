@@ -13,6 +13,184 @@ from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import WandbLogger
 from torch.utils.data import DataLoader
 from src.models.lightning_module import SpatioTemporalLightningModule
+from src.models.change_weights import N_CONTEXT_CHANNELS
+
+
+def plan_row_bands(r0, r1, stride, tile, row_chunk):
+    """Split rows [r0, r1) into bands for the large-area prediction accumulators.
+
+    Returns [(keep_a, keep_b, acc_r0, acc_r1, tile_starts), ...]. The band KEEPS rows
+    [keep_a, keep_b) -- every output row belongs to exactly one band -- and ACCUMULATES over
+    rows [acc_r0, acc_r1), which must cover every tile that touches a kept row, i.e. every
+    tile start in (keep_a - tile, keep_b). That is what makes the blend weights over the kept
+    rows complete, so a banded run writes the same values as an unbanded one.
+
+    ``row_chunk == 0`` gives a single band spanning the whole region, which is exactly the
+    behaviour before banding existed.
+
+    Why this exists: accum_horizons is len(active_horizons) * (3 + n_qf_levels) full-window
+    float32 arrays -- 268 for a four-horizon window at 64 quantile levels. Each is 2.55 GiB
+    on the 17111 x 40000 global grid. np.zeros is lazily paged, so the cost is the pages the
+    tiles touch: measured at 185 GiB for one global fold, on a box with 125 GB that runs two
+    folds at once. The only configuration ever run globally was the 12-accumulator triple
+    head -- a working set regional scale never exercised.
+
+    **Africa is not the cheap case this docstring used to claim.** It estimated ~22 GB for
+    the same 268 accumulators; measured 2026-09-14 on the four-horizon window, one fold peaks
+    at **40.7 GB** -- low by 1.85x. The restriction mask does not save what it looks like it
+    saves: fold_mask_b4's 512 px blocks are scattered across the whole region, so nearly every
+    4 KiB page gets touched even though only a fifth of the pixels are kept. Two folds run at
+    once, so unbanded Africa is ~81 GB on a 125 GB box. conv_spline_base.sh therefore passes
+    --predict_row_chunk 2048, which caps a fold near 17 GB for ~6% more prediction work.
+    """
+    if row_chunk and row_chunk % 256:
+        raise ValueError("--predict_row_chunk must be a multiple of 256 so band boundaries "
+                         "land on the output raster's block grid")
+    step = row_chunk or max(1, r1 - r0)
+    bands = []
+    for a in range(r0, r1, step):
+        b = min(a + step, r1)
+        starts = [i for i in range(r0, r1, stride) if i < b and i + tile > a]
+        if not starts:
+            continue
+        # max(b, ...) covers the kept rows even if stride > tile leaves a gap the unbanded
+        # path would have left as NaN; without it the blend slice is short and the windowed
+        # write fails on shape rather than on content.
+        bands.append((a, b, starts[0], min(r1, max(b, starts[-1] + tile)), starts))
+    return bands
+
+
+def _csv_floats(spec):
+    """'1,1.333,2,4' -> [1.0, 1.333, 2.0, 4.0]; None/'' -> None (today's behaviour)."""
+    if spec is None or str(spec).strip() == "":
+        return None
+    return [float(x) for x in str(spec).split(",")]
+
+
+def _csv_ints(spec):
+    if spec is None or str(spec).strip() == "":
+        return None
+    return [int(x) for x in str(spec).split(",")]
+
+
+def _csv_strs(v):
+    return tuple(x.strip() for x in str(v).split(",") if x.strip()) if v else ()
+
+
+def _n_context_channels(args):
+    """Head input width. Was the constant N_CONTEXT_CHANNELS; the radii and the
+    neighbourhood-HM channels are configurable now, so it is a function of the flags."""
+    from src.models.change_weights import context_channel_count
+    return context_channel_count(_csv_ints(args.context_radii) or (1, 3, 10, 30, 100),
+                                 _csv_strs(args.hm_context_stats),
+                                 _csv_ints(args.hm_context_radii) or (3, 30, 100))
+
+
+def _spline_head_banner(args, model=None):
+    """The one line that fingerprints the distributional head, or None for the triple head.
+
+    e9 (``--spline_slopes fritsch``) and e10 (``--spline_knots lean9``) ARE the head's
+    parameter count, so a run whose flag silently failed to engage would read as "the lever
+    does nothing" -- the shape this project has twice mistaken for a finding. Extracted to a
+    function so the check that greps this line and the code that prints it can be tested
+    against each other, rather than a check being written against text nobody emits.
+
+    **It could not distinguish the three head families until 2026-09-15.** It printed the
+    literal "Spline head" and computed the count with ``n_spline_params`` -- the
+    RATIONAL-QUADRATIC formula -- whatever ``--head_family`` said, so every pwl and isqf run
+    (E1, E2, E4 and all four scale arms) logged "Spline head ... 29 params/horizon" while
+    actually running a 16- or 18-parameter head. The one line a reader checks to see which
+    head ran could not tell them, which is rule 28 in the place it does most damage, and the
+    same one-formula-for-three-families conflation that made the prediction writer unable to
+    decode pwl or isqf at all.
+
+    The count is now read off the CONSTRUCTED MODULE when one is passed, never recomputed
+    from the flags -- the same reason the context line reads its channel count off the trunk.
+    """
+    fam = getattr(args, "head_family", "triple")
+    if fam not in ("spline", "pwl", "isqf"):
+        return None
+    from src.models.quantile_spline import knot_preset, n_spline_params
+    from src.models.quantile_pwl import n_pwl_params
+    k = knot_preset(args.spline_knots)
+    if model is not None and hasattr(model, "n_spline_params"):
+        n = int(model.n_spline_params)
+    elif fam == "spline":
+        n = n_spline_params(len(k), args.spline_slopes == "learned")
+    else:
+        # free_scale too: it drops the scale channel, so omitting it here made the fallback
+        # report 18/16 where the constructed module reports 17/15. The module path is the
+        # one a real run takes, which is exactly why this stayed wrong -- a fallback nobody
+        # reads is a fallback nobody checks.
+        n = n_pwl_params(len(k), family=fam,
+                         tails=bool(getattr(args, "isqf_tails", False)),
+                         free_scale=bool(getattr(args, "free_scale", False)))
+    extra = ""
+    # NOT gated on fam == "isqf". The tails moved to _PWLBase on 2026-09-16 and `pwl` reads
+    # them too (E1v), so gating the banner on the family printed a line that could not
+    # distinguish E1v from a tailless pwl arm -- rule 28, in a run that was already going.
+    # The param count gives it away (17 = 1 + 14 + 2) but the fingerprint must not need
+    # arithmetic to read.
+    if getattr(args, "isqf_tails", False):
+        extra += f", tails {args.isqf_space}"
+    if getattr(args, "free_scale", False):
+        extra += ", free scale"
+    if fam == "spline" and not getattr(args, "spline_cumulative_width", True):
+        extra += ", non-cumulative width"
+    return (f"Spline head:       family {fam}, knots {args.spline_knots} "
+            f"(n={len(k)}, bins={len(k) - 1}), slopes {args.spline_slopes}{extra}, "
+            f"{n} params/horizon")
+
+
+def _experiment_kwargs(args):
+    """Model-phase flags, as constructor kwargs. Every default is today's behaviour."""
+    return dict(
+        quantile_dhat_context=args.quantile_dhat_context,
+        width_parameterisation=args.width_parameterisation,
+        convlstm_dilations=_csv_ints(args.convlstm_dilations),
+        horizon_loss_weights=_csv_floats(args.horizon_loss_weights),
+        loss_on_change=args.loss_on_change,
+        pinball_scale_norm=args.pinball_scale_norm,
+        lr_schedule=args.lr_schedule,
+        lr_warmup_frac=args.lr_warmup_frac,
+        lr_min_frac=args.lr_min_frac,
+        weight_decay=args.weight_decay,
+        grad_clip=args.grad_clip,
+        weight_avg_last=args.weight_avg_last,
+        abort_on_nonfinite=args.abort_on_nonfinite,
+        head_hidden_layers=args.head_hidden_layers,
+        width_head_mode=args.width_head_mode,
+        central_target_transform=args.central_target_transform,
+        quantile_loss=args.quantile_loss,
+        histogram_soft=args.histogram_soft,
+        head_family=args.head_family,
+        free_scale=args.free_scale,
+        isqf_tails=args.isqf_tails,
+        isqf_space=args.isqf_space,
+        dist_loss=args.dist_loss,
+        crps_nodes=args.crps_nodes,
+        crps_tail_lam=args.crps_tail_weight,
+        crps_tail_u0=args.crps_tail_u0,
+        crps_tail_p=args.crps_tail_p,
+        mu_mse_weight=args.mu_mse_weight,
+        spline_learn_slopes=(args.spline_slopes == 'learned'),
+        spline_cumulative_width=args.spline_cumulative_width,
+        spline_mean_nodes=args.spline_mean_nodes,
+        spline_checkpoint=args.spline_checkpoint,
+        chip_weight_correct=args.chip_sampling_correct,
+        spline_knots=args.spline_knots,
+        crps_z_weight=args.crps_z_weight,
+        crps_z_scale=args.crps_z_scale,
+        spline_gap_floor=args.spline_gap_floor,
+        crps_tail_lam_lo=args.crps_tail_weight_lo,
+        crps_tail_u0_lo=args.crps_tail_u0_lo,
+        shape_head_hidden_layers=args.shape_head_hidden_layers,
+        shape_head_width=args.shape_head_width,
+        context_radii=_csv_ints(args.context_radii),
+        hm_context_stats=_csv_strs(args.hm_context_stats),
+        hm_context_radii=_csv_ints(args.hm_context_radii),
+        isolate_shape_grad=args.isolate_shape_grad,
+    )
 from torchgeo_dataloader import get_dataloader, hm_files, component_files, static_files, years
 
 # Geospatial imports for inference
@@ -27,6 +205,10 @@ from scipy.ndimage import distance_transform_edt
 import yaml
 
 if __name__ == "__main__":
+    # The knot presets are defined in one place and the parser's choices are read off that
+    # dict, so adding a preset cannot be rejected here as an "invalid choice".
+    from src.models.quantile_spline import KNOT_PRESETS
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--fast_dev_run", action="store_true", help="Run 1 train/val batch for a quick smoke test")
     parser.add_argument("--max_epochs", type=int, default=100, help="Number of training epochs")
@@ -37,6 +219,14 @@ if __name__ == "__main__":
     parser.add_argument("--train_mode", type=str, default="random", choices=["random", "grid"], help="Sampling mode for training")
     parser.add_argument("--val_mode", type=str, default="grid", choices=["random", "grid"], help="Sampling mode for validation")
     parser.add_argument("--stride", type=int, default=128, help="Stride for grid sampling (pixels)")
+    parser.add_argument(
+        "--val_stride",
+        type=int,
+        default=None,
+        help="Stride for grid-mode val/test sampling (default: --stride). A larger value "
+             "subsamples the held-out geography, which keeps per-epoch validation cheap on "
+             "long runs without changing what is being validated.",
+    )
     parser.add_argument(
         "--include_components",
         type=lambda x: (str(x).lower() == 'true'),
@@ -105,6 +295,521 @@ if __name__ == "__main__":
         choices=[2020, 2040],
         help="Final prediction year for large-area GeoTIFF output: 2040 (inputs 2010/2015/2020) or 2020 (inputs 1990/1995/2000)",
     )
+    # --- Hindcast / ensemble extensions (all additive; defaults reproduce today's behavior) ---
+    parser.add_argument(
+        "--predict_input_years",
+        type=str,
+        default=None,
+        help="Comma-separated 3 input years (e.g. '1995,2000,2005'). Overrides the legacy "
+             "--predict_final_year branch. Targets are base+5/10/15/20.",
+    )
+    parser.add_argument(
+        "--predict_all_windows",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?',
+        const=True,
+        default=False,
+        help="Loop prediction over all 4 hindcast input windows in one process/checkpoint load",
+    )
+    parser.add_argument(
+        "--predict_output_prefix",
+        type=str,
+        default=None,
+        help="Prefix prepended to output GeoTIFF filenames (default None = today's exact names)",
+    )
+    parser.add_argument(
+        "--predict_output_dir",
+        type=str,
+        default=None,
+        help="Directory for prediction GeoTIFFs (default: data/predictions)",
+    )
+    parser.add_argument(
+        "--predict_max_target_year",
+        type=int,
+        default=None,
+        help="Skip writing horizons whose target year exceeds this (e.g. 2020 for hindcasts)",
+    )
+    parser.add_argument(
+        "--predict_restrict_mask",
+        type=str,
+        default=None,
+        help="Raster mask; tiles not overlapping --predict_restrict_values are skipped. "
+             "Used to predict only a fold's held-out pixels (exact for those pixels, ~5x cheaper).",
+    )
+    parser.add_argument(
+        "--predict_restrict_values",
+        type=str,
+        default=None,
+        help="Comma-separated values of --predict_restrict_mask to keep",
+    )
+    parser.add_argument(
+        "--fold_mask",
+        type=str,
+        default=None,
+        help="Path to fold_mask_1000.tif; when set with --exclude_fold, replaces split_mask_1000.tif "
+             "for train/val chip selection",
+    )
+    parser.add_argument(
+        "--train_all_splits",
+        type=lambda x: (str(x).lower() == 'true'), nargs='?', const=True, default=False,
+        help="Train on EVERY valid chip in the split mask, ignoring the 70/10/10/10 "
+             "train/val/test/calib partition. This is the production setting: the forward "
+             "model has no held-out geography to protect, so restricting it to split 1 "
+             "throws away 30%% of the world for nothing. Validation still runs on split 2, "
+             "which is now in-sample -- that is unavoidable for a production model and is "
+             "why the configuration is validated by k-fold instead. Ignored in fold-CV mode "
+             "(--exclude_fold), where holding geography out is the whole point.",
+    )
+    parser.add_argument(
+        "--exclude_fold",
+        type=int,
+        default=None,
+        help="Fold id held out from training (its pixels never enter train or val)",
+    )
+    parser.add_argument(
+        "--val_fold",
+        type=int,
+        default=None,
+        help="Fold id used for validation during fold-CV training (default: (exclude_fold %% k) + 1)",
+    )
+    parser.add_argument(
+        "--n_folds",
+        type=int,
+        default=5,
+        help="Number of folds in --fold_mask (default: 5)",
+    )
+    parser.add_argument(
+        "--norm_stats_json",
+        type=str,
+        default=None,
+        help="JSON sidecar of normalization stats. Loaded if it exists, otherwise written "
+             "after the first dataset build (they are not persisted in the .ckpt).",
+    )
+    parser.add_argument("--wandb_project", type=str, default="spatio-temporal-convlstm")
+    parser.add_argument("--wandb_run_name", type=str, default=None)
+    parser.add_argument("--wandb_group", type=str, default=None)
+    parser.add_argument("--wandb_tags", type=str, default=None, help="Comma-separated W&B tags")
+    parser.add_argument(
+        "--devices",
+        type=str,
+        default="auto",
+        help="Lightning devices spec: 'auto', an int count, or a comma-separated device list",
+    )
+    # --- Quantile-head retraining (the T8/T6 root-cause fix) ---
+    parser.add_argument(
+        "--split_mask", type=str, default=None,
+        help="Override the split mask (e.g. a region-restricted one for development)",
+    )
+    parser.add_argument(
+        "--context_pattern", type=str,
+        default="data/raw/hm_global/change_context_w{year}_1000.tif",
+        help="Full-raster past-change context rasters (band 1 past change, band 2 distance)",
+    )
+    parser.add_argument(
+        "--quantile_class_weighting", type=str, default="none",
+        choices=["none", "distance"],
+        help="Balance the distance-to-past-change bands in the pinball loss (default: none)",
+    )
+    parser.add_argument(
+        "--central_residual",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=False,
+        help="Central heads predict change on top of HM_t0 rather than the absolute level, "
+             "starting from exact persistence. Measured: with the absolute parameterisation "
+             "the model emits change of sd ~0.0075 HM on pixels that did not change.",
+    )
+    parser.add_argument(
+        "--monotone_quantile_width",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=False,
+        help="Quantile heads emit half-widths around the (detached) central forecast that "
+             "accumulate across horizons, making spread non-decreasing in lead time and "
+             "lower<=central<=upper structural.",
+    )
+    parser.add_argument(
+        "--freeze_trunk",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=False,
+        help="Train the quantile heads only; the trunk and central heads keep the frozen "
+             "checkpoint's weights exactly, so the central forecast cannot change.",
+    )
+    # --- Model-phase experiment flags. All additive; defaults reproduce today's model. ---
+    parser.add_argument(
+        "--checkpoint_monitor", type=str, default="val_total_loss",
+        choices=["val_total_loss", "val_central_loss", "val_loss", "val_crps"],
+        help="Metric ModelCheckpoint selects on. val_total_loss (the default) includes "
+             "pinball and the histogram term, so a quantile-only change still selects a "
+             "different epoch and therefore a different central field; central-only A/Bs "
+             "need val_central_loss.",
+    )
+    parser.add_argument(
+        "--horizon_loss_weights", type=str, default=None,
+        help="Four comma-separated weights for h=5,10,15,20, renormalised to mean 1. "
+             "Training exposure is 4:3:2:1 across horizons (end_year is sampled from "
+             "2000/2005/2010/2015 and targets past 2020 are NaN), so h=20 gets a quarter "
+             "of h=5's gradient. '1,1.333,2,4' compensates exactly.",
+    )
+    parser.add_argument(
+        "--loss_on_change",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=False,
+        help="Compute SSIM and the Laplacian pyramid on the change field rather than on "
+             "absolute HM. Under --central_residual the absolute prediction is HM_t0 plus "
+             "a small change, so both terms mostly score the copy.",
+    )
+    parser.add_argument(
+        "--pinball_scale_norm",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=False,
+        help="Divide each pixel's pinball loss by its own detached half-width, making the "
+             "quantile objective relative rather than absolute. Not class weighting.",
+    )
+    parser.add_argument(
+        "--quantile_dhat_context",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=False,
+        help="Feed the detached predicted change (and its magnitude) to the quantile "
+             "heads. The needed width varies with predicted change and the heads have no "
+             "channel carrying it.",
+    )
+    parser.add_argument(
+        "--width_parameterisation", type=str, default="softplus",
+        choices=["softplus", "exp"],
+        help="How a raw quantile-head output becomes a positive half-width increment. "
+             "'exp' makes d(width)/d(raw) proportional to the width itself.",
+    )
+    parser.add_argument(
+        "--convlstm_dilations", type=str, default=None,
+        help="Comma-separated per-layer dilation for the ConvLSTM cells, e.g. '1,2,4,8'. "
+             "Widens the trunk's ~10 px receptive radius at zero parameter cost. Default "
+             "(None) is dilation 1 everywhere, i.e. today's trunk.",
+    )
+    # --- Round-2 flags: substantial architecture and objective changes ---
+    parser.add_argument(
+        "--head_hidden_layers", type=int, default=1,
+        help="Depth of every prediction head. 1 (default) is Conv3x3 -> ReLU -> Conv1x1; "
+             "each extra stage adds a 3x3+ReLU and widens the head's own radius by 1 px.",
+    )
+    parser.add_argument(
+        "--width_head_mode", type=str, default="per_horizon",
+        choices=["per_horizon", "joint", "power", "power_plus"],
+        help="How the four horizons' half-widths are produced. 'joint' emits all four from "
+             "one module so the growth profile in lead time is learned coherently; 'power' "
+             "parameterises it as w(h) = w0 * (h/5)**gamma, two per-pixel parameters, which "
+             "is exactly the quantity measured to be wrong (the far field's width grows "
+             "3.7-8.9x too fast with lead time).",
+    )
+    parser.add_argument(
+        "--central_target_transform", type=str, default="none", choices=["none", "asinh"],
+        help="'asinh' gives the central head a variance-stabilised output space: the change "
+             "is scale*sinh(raw), linear near zero and reaching large values without large "
+             "weights. Zero-init still starts at exact persistence.",
+    )
+    parser.add_argument(
+        "--quantile_loss", type=str, default="pinball", choices=["pinball", "nll"],
+        help="'nll' fits (lower, central, upper) as a two-piece normal by log score instead "
+             "of fitting two independent percentiles — a different estimand on the same "
+             "parameterisation. The Winkler interval score is deliberately not offered: it "
+             "is exactly 2/alpha times the pinball sum, so it cannot move the optimum.",
+    )
+    parser.add_argument(
+        "--histogram_soft",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=False,
+        help="Use the differentiable soft-binned histogram. The default hard binning "
+             "carries no gradient at all, so the histogram term has never trained anything.",
+    )
+    # --- The distributional head. 'triple' (the default) is the frozen product exactly. ---
+    parser.add_argument(
+        "--head_family", type=str, default="triple",
+        choices=["triple", "spline", "pwl", "isqf"],
+        help="'spline' replaces the (lower, central, upper) triple with a full per-pixel "
+             "quantile function trained end to end, so the post-hoc width calibration and "
+             "empirical marginal reshaping have nothing left to do. The triple is still "
+             "emitted, derived from the spline, so every downstream reader is unchanged.",
+    )
+    parser.add_argument(
+        "--dist_loss", type=str, default="crps", choices=["crps", "nll"],
+        help="Objective for the spline head. CRPS is an integral of pinball losses and "
+             "inherits their bounded influence per pixel, which is why it survives a "
+             "residual with kurtosis ~1e3 where Gaussian NLL inflated the fitted widths by "
+             "7x (docs/background/model_phase.md 6.3).",
+    )
+    parser.add_argument(
+        "--crps_nodes", type=int, default=6,
+        help="Gauss-Legendre nodes per u-bin. Six keeps the quadrature error below the int16 "
+             "storage quantum of 3e-5, so the objective is finer than the product it trains; "
+             "three is 1.1e-4 and coarser. Lower it only if memory demands it.",
+    )
+    parser.add_argument(
+        "--crps_tail_weight", type=float, default=0.0,
+        help="lambda in w(u) = 1 + lambda * ((u-u0)/(1-u0))_+^p. Each pinball term keeps its "
+             "own optimum whatever the weight, so a u-weighting changes where the optimiser "
+             "spends effort and never the target -- unlike stratified sampling, which does "
+             "move the target and carries an importance correction.",
+    )
+    parser.add_argument(
+        "--predict_qf_levels", type=int, default=64,
+        help="Bands in the quantile-function raster written beside the triple by the spline "
+             "head. 0 disables it. The grid is normal-spaced with 0.025/0.5/0.975 pinned, so "
+             "the qf reproduces the published bounds exactly.",
+    )
+    parser.add_argument(
+        "--free_scale", type=lambda x: (str(x).lower() == 'true'), nargs='?', const=True,
+        default=False,
+        help="Drop the anchor/scale factorisation: the 95%% width becomes emergent from the "
+             "fitted increments rather than injected by a channel, per horizon, with no "
+             "cross-horizon accumulation. pwl/E2a: unnormalised positive increments, no "
+             "scale channel, Q(u) = anchor + (v - v_mid). isqf/E1b: drop the scale_pre "
+             "renormalisation and nothing else -- that head has no factorisation natively. "
+             "NOT a second spelling of --spline_cumulative_width False: this is a strict "
+             "superset that removes the accumulation only as a consequence of removing the "
+             "factorisation, so an arm carrying it cannot separate 'was the factorisation "
+             "earning its keep' from 'was horizon monotonicity binding'. Run E0a first for "
+             "the narrow question. Not implemented for head_family=spline.",
+    )
+    parser.add_argument(
+        "--isqf_tails", type=lambda x: (str(x).lower() == 'true'), nargs='?', const=True,
+        default=False,
+        help="E1a: learned exponential tail rates on the outer bins, ISQF's actual "
+             "contribution, which E1 drops. The tails REPLACE the outermost bins "
+             "[0, 0.001] and [0.999, 1] and anchor at those knots -- they cannot attach "
+             "'beyond the outermost knots' because validate_knots requires the grid to span "
+             "[0, 1] exactly, so a tail there would cover an empty set and be accepted, "
+             "logged and inert.",
+    )
+    parser.add_argument(
+        "--isqf_space", type=str, default="logit", choices=["logit", "neglog"],
+        help="Transformed space the E1a tails live in, where unbounded tails are "
+             "admissible. logit(HM) is symmetric; -log(1-HM) is unbounded above only. "
+             "Measured on b1's floor the far-tail miss is two-sided and near-symmetric "
+             "(pit_lt_0001 / pit_gt_0999 = 1.017 / 1.254 / 0.971 across three seeds), which "
+             "is why logit is the default. Observed HM runs 0.00029-0.950, so neither needs "
+             "an epsilon. Only read when --isqf_tails is on.",
+    )
+    parser.add_argument(
+        "--predict_qf_dtype", type=str, default="int16", choices=["int16", "float32"],
+        help="Storage for the quantile-function raster. int16 x 1/32767 (the default, and "
+             "the ensemble's old convention) quantises to 3.05e-05 in ABSOLUTE HM -- which "
+             "is coarser than the forecast core this phase is trying to measure. Measured "
+             "on b1_s42: 34%% of adjacent quantile levels exported to the SAME int16 code, "
+             "and max_density_p99 read 1531.8 at every horizon, which is exactly "
+             "dp_max / one quantum -- the statistic's ceiling, not a density. float32 "
+             "removes the floor (~3e-08 near HM 0.3) and doubles the raster.",
+    )
+    parser.add_argument(
+        "--predict_row_chunk", type=int, default=0,
+        help="Process large-area prediction in bands of this many rows instead of holding "
+             "the whole region's accumulators at once. 0 (default) keeps today's behaviour. "
+             "There are len(active_horizons) * (3 + --predict_qf_levels) accumulators -- 268 "
+             "for a four-horizon window at 64 levels -- and each is a full-window float32 "
+             "array, 2.55 GiB on the 17111x40000 global grid. Measured resident (touched 4 "
+             "KiB pages, not the virtual size) is 185 GiB for one global fold, on a 125 GB "
+             "box running two folds at once, and 40.7 GB for one AFRICA fold at four "
+             "horizons -- regional scale is not the cheap case. A band keeping rows [a, b) "
+             "accumulates every "
+             "tile that covers them, so the blend weights are complete and the written "
+             "values are identical to an unchunked run.",
+    )
+    parser.add_argument(
+        "--spline_checkpoint",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=True,
+        help="Recompute the spline quadratures in the backward pass instead of storing them. "
+             "Measured: 22.4 GB of a 24.6 GB card without it at the production batch size. "
+             "Mathematically identical; off only for debugging.",
+    )
+    # ---- stratified chip sampling ------------------------------------------------
+    parser.add_argument(
+        "--chip_sampling", type=str, default="uniform",
+        choices=["uniform", "stratified"],
+        help="'stratified' draws training chips with probability rising in the chip's past "
+             "change, so rare movers are presented consistently. It samples only from "
+             "positions the fold mask already permits, so it adds no leak surface.",
+    )
+    parser.add_argument(
+        "--chip_weights", type=str, default="data/ensemble/chip_weights_128.npz",
+        help="Per-chip weight table from scripts/build_chip_weights.py.",
+    )
+    parser.add_argument(
+        "--chip_weight_alpha", type=float, default=4.0,
+        help="p(chip) proportional to 1 + alpha * w, with w normalised to mean 1.",
+    )
+    parser.add_argument(
+        "--chip_sampling_correct",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=True,
+        help="Importance-correct the stratified sampler back to the population. Reweighting "
+             "samples moves the target distribution, unlike reweighting quantile levels; "
+             "False deliberately targets a utility-weighted distribution instead, and the "
+             "run is labelled as such.",
+    )
+    # ---- round 2: knot grid, two-sided tail weight, shape-head capacity, HM context ----
+    parser.add_argument(
+        "--spline_knots", type=str, default="default14",
+        # Derived from KNOT_PRESETS, never restated. This list was a second hardcoded copy
+        # until 2026-09-16 and a preset added to the dict was rejected here with
+        # "invalid choice", which is rule 2's predicate-written-twice: the two spellings
+        # disagreed the first time one of them changed.
+        choices=sorted(KNOT_PRESETS),
+        help="Named knot grid. 'body_dense' adds 0.35/0.45/0.55/0.65: the default grid has "
+             "three knots between u=0.10 and u=0.90 while 53%% of pixels move by less than "
+             "0.001 over twenty years, and cov50 is the worst-calibrated coverage level. "
+             "'deep_lower' adds 0.0001/0.9999, for P(u<0.001) reading 7x nominal at h=20. "
+             "'lean9' is a strict subset instead: 8 bins, no 0.001/0.999, asking whether the "
+             "tail resolution is information or only capacity. 'skew14'/'skew11' re-place the "
+             "knots for the measured right skew: the target spends 0.13%% of its value range "
+             "on u in [0.1, 0.6] and 60%% on the top decile, so the symmetric default spends "
+             "bins where nothing varies. skew14 is the same 14 bins re-placed; skew11 is 11. "
+             "'dense24' is a strict SUPERSET of default14 -- 24 bins, no knot moved -- so it "
+             "asks whether there were too few rather than whether they were misplaced.",
+    )
+    parser.add_argument(
+        "--crps_z_weight", type=float, default=0.0,
+        help="Weight on a second CRPS term scored in z = asinh(change / --crps_z_scale), "
+             "summed with the raw-HM term. Raw CRPS is dominated by the tail -- the "
+             "persistence core spans ~0.0036 HM against a range above 1.2 -- so placing the "
+             "core badly costs almost nothing, and 68%% of land is in that core. Measured: "
+             "at s=0.001 this compresses the tail-vs-core weighting from 166x to 17.5x.",
+    )
+    parser.add_argument(
+        "--crps_z_scale", type=float, default=0.001,
+        help="The s in asinh(change / s). Smaller compresses harder. 0.001 is ~1.4 robust "
+             "sigmas of the observed core (sigma = 0.00069).",
+    )
+    parser.add_argument(
+        "--spline_gap_floor",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=False,
+        help="Floor every quantile gap at dp_k / f_max, f_max = 578 -- the largest density "
+             "the observation noise can support. Makes a picket fence structurally "
+             "impossible rather than merely discouraged. Applies to --head_family pwl.",
+    )
+    parser.add_argument(
+        "--u_grid_spacing", type=str, default="normal", choices=["normal", "skew"],
+        help="How the exported 64 quantile levels are spread over u. 'normal' is symmetric "
+             "about the median and spends 22%% of its levels on 0.3%% of the value range; "
+             "'skew' moves eight of them out of u 0.1-0.6 and into 0.6-0.9. Export-only: "
+             "the same trained model, evaluated at different u.",
+    )
+    parser.add_argument(
+        "--crps_tail_weight_lo", type=float, default=0.0,
+        help="Lower-side mirror of --crps_tail_weight. The model is braced for growth that "
+             "does not come and blindsided by declines; this puts optimiser effort there.",
+    )
+    parser.add_argument("--crps_tail_u0_lo", type=float, default=0.05)
+    parser.add_argument(
+        "--shape_head_hidden_layers", type=int, default=1,
+        help="Depth of the shape head only. --head_hidden_layers goes through the shared "
+             "factory and would confound this with a change to the central head.",
+    )
+    parser.add_argument(
+        "--shape_head_width", type=int, default=0,
+        help="Width of the shape head; 0 means hidden_dim // 2, today's value.",
+    )
+    parser.add_argument(
+        "--context_radii", type=str, default="1,3,10,30,100",
+        help="Occupancy radii for the distance-to-past-change band.",
+    )
+    parser.add_argument(
+        "--hm_context_stats", type=str, default="",
+        help="Neighbourhood-HM statistics to feed the heads, e.g. 'mean,max'. Empty (the "
+             "default) reproduces the round-1 eight-channel context exactly. The model has "
+             "never had any information about the LEVEL of development around a pixel — only "
+             "where past change happened — and development spreads from development.",
+    )
+    parser.add_argument("--hm_context_radii", type=str, default="3,30,100")
+    parser.add_argument(
+        "--hm_context_pattern", type=str,
+        default="data/raw/hm_global/hm_context_w{year}_1000.tif",
+        help="Built by scripts/prepare_hm_context.py, on the full raster: a 201x201 window "
+             "cannot be evaluated inside a 128 px chip.",
+    )
+    parser.add_argument("--crps_tail_u0", type=float, default=0.95)
+    parser.add_argument("--crps_tail_p", type=float, default=2.0)
+    parser.add_argument(
+        "--mu_mse_weight", type=float, default=1.0,
+        help="Weight on MSE(E[Q], y). The published central forecast IS E[Q] -- the mean is "
+             "the RMSE-optimal point estimate and this residual is right-skewed, so it is "
+             "not the median -- and CRPS presses on it only indirectly. 0 is the pure-CRPS "
+             "ablation.",
+    )
+    parser.add_argument(
+        "--spline_slopes", type=str, default="learned", choices=["learned", "fritsch"],
+        help="'fritsch' derives every knot slope from the adjacent secants "
+             "(monotonicity-preserving, zero parameters) instead of learning them.",
+    )
+    parser.add_argument(
+        "--spline_mean_nodes", type=int, default=8,
+        help="Quadrature nodes per bin for E[Q]. Eight, not four: the spline is a rational "
+             "function and a steep bin converges slowly.",
+    )
+    parser.add_argument(
+        "--isolate_shape_grad",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=False,
+        help="Keep the distributional loss out of the trunk, as the pinball loss is kept out "
+             "today. Off by default: the point of an end-to-end model is that the trunk hears "
+             "the objective. On, it is the ablation that measures what that costs.",
+    )
+    parser.add_argument("--lr", type=float, default=1e-3, help="Adam learning rate")
+    parser.add_argument(
+        "--lr_schedule", type=str, default="none", choices=["none", "cosine"],
+        help="Learning-rate schedule. 'cosine' warms up linearly then anneals; stepped by "
+             "hand because manual optimization does not drive a Lightning scheduler.",
+    )
+    parser.add_argument("--lr_warmup_frac", type=float, default=0.05)
+    parser.add_argument("--lr_min_frac", type=float, default=0.01)
+    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument(
+        "--weight_avg_last", type=int, default=0,
+        help="Average the weights of the last N epochs instead of selecting one. On fold 1 "
+             "the epoch ModelCheckpoint picked was 140/85/60 across three seeds of the same "
+             "configuration while the best 10%% of epochs sat within 3%% of the minimum, so "
+             "the argmin is close to arbitrary among the candidates. Implies "
+             "--checkpoint_select final. 0 disables it.",
+    )
+    parser.add_argument(
+        "--checkpoint_select", type=str, default="best", choices=["best", "final"],
+        help="Which checkpoint prediction uses: the monitored best (default) or the state "
+             "at the end of training. 'final' is the coherent choice with an annealed "
+             "learning rate or with weight averaging.",
+    )
+    parser.add_argument(
+        "--abort_on_nonfinite",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=True,
+        help="Stop with an error if the weights go non-finite. A diverged run is otherwise "
+             "SILENT: ModelCheckpoint never selects a NaN epoch, so the run falls back to its "
+             "last healthy checkpoint, finishes, and scores normally. Six of the "
+             "distributional round-1 runs died this way and were published anyway. False "
+             "restores the old silent behaviour.",
+    )
+    parser.add_argument(
+        "--predict_subsample_blocks", type=int, default=0,
+        help="SCREEN MODE: predict only N randomly chosen 128 px blocks of the region instead "
+             "of all of it. 0 (the default) predicts everything, today's behaviour. This is "
+             "intersected into the same restriction mask the fold hindcast already uses, so "
+             "every tile overlapping a kept block is still processed and kept pixels get "
+             "EXACTLY the blended value a full run would give -- the screen is exact on the "
+             "pixels it keeps, not an approximation of them. Measured on southern Africa: 24 "
+             "of 59 blocks reproduces the full-raster ranking at r=0.99 on tail_reach20. On "
+             "Africa a 200-block screen is 3.3M px, ~5x the pixels of southern Africa's ENTIRE "
+             "scored area, at ~1.3%% of the prediction cost.")
+    parser.add_argument("--predict_subsample_seed", type=int, default=0)
+    parser.add_argument(
+        "--spline_cumulative_width",
+        type=lambda x: (str(x).lower() == 'true'),
+        nargs='?', const=True, default=True,
+        help="True (default) accumulates non-negative width increments across horizons so the "
+             "95 percent width cannot shrink with lead time (T4.2), by construction rather "
+             "than by a later pass. False gives each horizon an independent scale, letting "
+             "spread shrink -- the ablation that asks whether that constraint is load-bearing "
+             "or merely tidy. This is the only monotonicity the model IMPOSES; Q(u) increasing "
+             "in u is structural to the spline and is unaffected.")
+    parser.add_argument("--grad_clip", type=float, default=0.0,
+                        help="Global grad-norm clip applied after the two backward passes, "
+                             "0 disables it (today's behaviour)")
     parser.add_argument(
         "--use_location_encoder",
         type=lambda x: (str(x).lower() == 'true'),
@@ -253,12 +958,50 @@ if __name__ == "__main__":
     pl.seed_everything(args.seed, workers=True)
     
     # Split mask file
-    split_mask_file = "data/raw/hm_global/split_mask_1000.tif"
+    split_mask_file = args.split_mask or "data/raw/hm_global/split_mask_1000.tif"
     if not os.path.exists(split_mask_file):
         print(f"WARNING: Split mask not found: {split_mask_file}")
         print("Training without train/val/test separation. Run scripts/create_validity_mask.py to create splits.")
         split_mask_file = None
-    
+
+    # Fold-CV mode: the fold mask replaces the 70/10/10/10 split mask. Fold `exclude_fold`
+    # is held out entirely (never seen in train or val) so its predictions are genuinely
+    # out-of-sample; one other fold serves as the validation set for checkpoint selection.
+    train_split_value, train_exclude = 1, None
+    val_split_value, test_split_value = 2, 3
+    if args.train_all_splits and args.exclude_fold is None:
+        # None/None is the dataset's "all data" case (torchgeo_dataloader: "None=all data").
+        train_split_value, train_exclude = None, None
+        print("=" * 70)
+        print("PRODUCTION MODE: training on EVERY chip in the split mask")
+        print("  no geography held out; validation on split 2 is in-sample by construction")
+        print("=" * 70)
+    if args.fold_mask is not None and args.exclude_fold is not None:
+        if not os.path.exists(args.fold_mask):
+            raise FileNotFoundError(f"--fold_mask not found: {args.fold_mask}")
+        split_mask_file = args.fold_mask
+        held_out = int(args.exclude_fold)
+        val_fold = int(args.val_fold) if args.val_fold is not None else (held_out % args.n_folds) + 1
+        if val_fold == held_out:
+            raise ValueError("--val_fold must differ from --exclude_fold")
+        train_split_value = None
+        train_exclude = [held_out, val_fold]
+        val_split_value = val_fold
+        test_split_value = val_fold
+        print("=" * 70)
+        print(f"FOLD-CV MODE: holding out fold {held_out} (out-of-sample), "
+              f"validating on fold {val_fold}")
+        print(f"  Training pool: all folds except {train_exclude}")
+        print(f"  Fold mask: {split_mask_file}")
+        print("=" * 70)
+
+    # Normalization-stat sidecar (they are plain attributes, absent from the .ckpt)
+    cached_norm_stats = None
+    if args.norm_stats_json and os.path.exists(args.norm_stats_json):
+        with open(args.norm_stats_json, 'r') as f:
+            cached_norm_stats = json.load(f)
+        print(f"Loaded normalization stats from {args.norm_stats_json}")
+
     # Data
     train_loader = get_dataloader(
         batch_size=args.batch_size,
@@ -275,8 +1018,25 @@ if __name__ == "__main__":
         pin_memory=True if args.num_workers > 0 else False,
         persistent_workers=True if args.num_workers > 0 else False,
         split_mask_file=split_mask_file,
-        split_value=1,  # Train split
+        context_pattern=args.context_pattern,
+        hm_context_pattern=args.hm_context_pattern,
+        hm_context_stats=_csv_strs(args.hm_context_stats),
+        hm_context_radii=_csv_ints(args.hm_context_radii) or (3, 30, 100),
+        chip_weights=args.chip_weights,
+        chip_sampling=args.chip_sampling,
+        chip_weight_alpha=args.chip_weight_alpha,
+        split_value=train_split_value,  # Train split (None in fold-CV mode)
+        exclude_split_values=train_exclude,
+        norm_stats=cached_norm_stats,
     )
+    # Persist the sidecar once so later inference entrypoints skip the raster-sampling cost
+    if args.norm_stats_json and cached_norm_stats is None:
+        cached_norm_stats = train_loader.dataset.norm_stats_dict()
+        Path(args.norm_stats_json).parent.mkdir(parents=True, exist_ok=True)
+        with open(args.norm_stats_json, 'w') as f:
+            json.dump(cached_norm_stats, f, indent=2)
+        print(f"✓ Wrote normalization stats sidecar: {args.norm_stats_json}")
+    val_stride = args.val_stride if args.val_stride is not None else args.stride
     # Validation uses fixed years (1990, 1995, 2000 -> 2005-2020) for consistent metrics
     val_loader = get_dataloader(
         batch_size=args.batch_size,
@@ -284,7 +1044,7 @@ if __name__ == "__main__":
         timesteps=3,
         chips_per_epoch=args.val_chips,
         mode=args.val_mode,
-        stride=args.stride,
+        stride=val_stride,
         include_components=args.include_components,
         static_channels=args.static_channels,
         use_temporal_sampling=False,  # Fixed years for validation (Option A)
@@ -292,7 +1052,12 @@ if __name__ == "__main__":
         pin_memory=True if args.num_workers > 0 else False,
         persistent_workers=True if args.num_workers > 0 else False,
         split_mask_file=split_mask_file,
-        split_value=2,  # Validation split
+        context_pattern=args.context_pattern,
+        hm_context_pattern=args.hm_context_pattern,
+        hm_context_stats=_csv_strs(args.hm_context_stats),
+        hm_context_radii=_csv_ints(args.hm_context_radii) or (3, 30, 100),
+        split_value=val_split_value,  # Validation split
+        norm_stats=cached_norm_stats,
     )
     # Test uses fixed years (1990, 1995, 2000 -> 2005-2020) for final evaluation
     test_loader = get_dataloader(
@@ -301,7 +1066,7 @@ if __name__ == "__main__":
         timesteps=3,
         chips_per_epoch=args.val_chips,
         mode=args.val_mode,
-        stride=args.stride,
+        stride=val_stride,
         include_components=args.include_components,
         static_channels=args.static_channels,
         use_temporal_sampling=False,
@@ -309,7 +1074,12 @@ if __name__ == "__main__":
         pin_memory=True if args.num_workers > 0 else False,
         persistent_workers=True if args.num_workers > 0 else False,
         split_mask_file=split_mask_file,
-        split_value=3,  # Test split
+        context_pattern=args.context_pattern,
+        hm_context_pattern=args.hm_context_pattern,
+        hm_context_stats=_csv_strs(args.hm_context_stats),
+        hm_context_radii=_csv_ints(args.hm_context_radii) or (3, 30, 100),
+        split_value=test_split_value,  # Test split
+        norm_stats=cached_norm_stats,
     )
 
     # Model
@@ -322,8 +1092,47 @@ if __name__ == "__main__":
         print("\n" + "="*70)
         print(f"Loading model from checkpoint: {checkpoint_path}")
         print("="*70)
-        model = SpatioTemporalLightningModule.load_from_checkpoint(checkpoint_path)
-        print(f"✓ Checkpoint loaded successfully!")
+        overrides = dict(
+            context_channels=_n_context_channels(args),
+            quantile_class_weighting=args.quantile_class_weighting,
+            freeze_trunk=args.freeze_trunk,
+            central_residual=args.central_residual,
+            monotone_quantile_width=args.monotone_quantile_width,
+            **_experiment_kwargs(args),
+        )
+        # The context is part of the trunk's input, so the trunk's first conv does not match a
+        # checkpoint trained without it. Warm-start it: the trained weights are copied into the
+        # original channels and the context channels start at zero, so the model initially
+        # reproduces the checkpoint exactly and then learns what the context adds. Random
+        # re-initialisation would throw away a trained trunk for nothing.
+        #
+        # This path is unconditional because the context is unconditional. Any tensor whose
+        # shape already matches is loaded untouched, so a checkpoint that carried the context
+        # loads exactly as it used to; the counts below are how a mismatch announces itself,
+        # since load_state_dict is non-strict here and would otherwise be silent.
+        ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+        hp = dict(ckpt.get('hyper_parameters', {}))
+        hp.pop('quantile_context_channels', None)
+        hp.pop('central_context_channels', None)
+        hp.pop('trunk_context_channels', None)
+        hp.update(overrides)
+        model = SpatioTemporalLightningModule(**hp)
+        sd = dict(ckpt['state_dict'])
+        msd = model.state_dict()
+        grown = []
+        for k, v in list(sd.items()):
+            if k in msd and msd[k].shape != v.shape and v.dim() == 4:
+                new_w = torch.zeros_like(msd[k])
+                new_w[:, :v.shape[1]] = v
+                sd[k] = new_w
+                grown.append(k)
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        print(f"✓ Checkpoint loaded with {len(grown)} warm-started convs")
+        if missing:
+            print(f"  (randomly initialised: {len(missing)} tensors)")
+        if unexpected:
+            print(f"  (checkpoint tensors this model has no slot for: {len(unexpected)})")
+        print("  Every tensor whose shape already matched is unchanged.")
         print(f"\nModel configuration from checkpoint:")
         for key in ['hidden_dim', 'num_layers', 'kernel_size', 'num_static_channels', 
                     'num_dynamic_channels', 'use_location_encoder', 'locenc_out_channels']:
@@ -333,7 +1142,7 @@ if __name__ == "__main__":
     else:
         model = SpatioTemporalLightningModule(
             hidden_dim=args.hidden_dim,
-            lr=1e-3,
+            lr=args.lr,
             num_static_channels=num_static_channels,
             num_dynamic_channels=num_dynamic_channels,
             num_layers=args.num_layers,
@@ -346,8 +1155,14 @@ if __name__ == "__main__":
             histogram_weight=args.histogram_weight,
             histogram_lambda_w2=args.histogram_lambda_w2,
             histogram_warmup_epochs=args.histogram_warmup_epochs,
+            context_channels=_n_context_channels(args),
+            quantile_class_weighting=args.quantile_class_weighting,
+            freeze_trunk=args.freeze_trunk,
+            central_residual=args.central_residual,
+            monotone_quantile_width=args.monotone_quantile_width,
+            **_experiment_kwargs(args),
         )
-    
+
     # Compute histogram bin weights from training data (per horizon)
     if args.histogram_weight > 0 and hasattr(model, 'histogram_loss_fn'):
         print("\nComputing histogram bin weights for each horizon from 10 training batches...")
@@ -427,10 +1242,30 @@ if __name__ == "__main__":
     print("="*60)
     print("LOSS WEIGHTS")
     print("="*60)
-    print(f"MSE weight:        1.0 (fixed)")
+    # Not "1.0 (fixed)". It is --mu_mse_weight and it has not been fixed since the previous
+    # phase ran an arm at 0.0; printing the literal made the fingerprint disagree with the
+    # run, in the one place a log reader goes to check. conv_spline_base.sh greps this line.
+    print(f"MSE weight:        {args.mu_mse_weight}")
     print(f"SSIM weight:       {args.ssim_weight}")
     print(f"Laplacian weight:  {args.laplacian_weight}")
     print(f"Histogram weight:  {args.histogram_weight} (warmup: {args.histogram_warmup_epochs} epochs)")
+    # Printed because the covariate IS a channel count: a run that silently fell back to the
+    # eight-channel context would read as "the covariate does nothing".
+    print(f"Context channels:  {_n_context_channels(args)} "
+          f"(radii {args.context_radii}"
+          + (f", hm {args.hm_context_stats} @ {args.hm_context_radii}"
+             if _csv_strs(args.hm_context_stats) else ", no hm context") + ")")
+    # Read off the constructed trunk, never off args. There is no flag to inspect any more --
+    # the context is hardwired into the trunk's input like elevation and climate -- so the
+    # only honest evidence that it was wired is the module's own channel count. Under
+    # --central_residual the ConvLSTM takes no gradient from the central loss, so a trunk
+    # that never received the covariate looks exactly like one that received it and ignored
+    # it; this line is where a log reader tells them apart, and conv_spline_base.sh greps it.
+    # A literal here would be rule 25 all over again.
+    print(f"Context into trunk: {model.model.context_channels} channels; heads: none")
+    _spline_banner = _spline_head_banner(args, getattr(model, 'model', None))
+    if _spline_banner:
+        print(_spline_banner)
     print("="*60 + "\n")
     # Set normalization stats for physical-scale MAE logging
     if hasattr(train_loader, 'dataset'):
@@ -438,20 +1273,56 @@ if __name__ == "__main__":
         if hasattr(ds, 'hm_mean') and hasattr(ds, 'hm_std'):
             model.hm_mean = ds.hm_mean
             model.hm_std = ds.hm_std
+            # The spline needs them as buffers, not plain attributes: HM's physical range
+            # [0, 1] is its support constraint, and it has to be carried in normalized units
+            # through a checkpoint round trip.
+            model.model.set_norm_stats(ds.hm_mean, ds.hm_std)
 
     # Callbacks
-    checkpoint_cb = ModelCheckpoint(monitor='val_total_loss', save_top_k=1, mode='min')
+    checkpoint_cb = ModelCheckpoint(monitor=args.checkpoint_monitor, save_top_k=1, mode='min')
+    print(f"Checkpoint selection monitors: {args.checkpoint_monitor}")
     # No early stopping
 
     # Wandb logger (optional)
     use_wandb = not args.disable_wandb
-    wandb_logger = False if not use_wandb else WandbLogger(project='spatio-temporal-convlstm', log_model=True)
+    wandb_tags = [t.strip() for t in args.wandb_tags.split(',')] if args.wandb_tags else None
+    wandb_logger = False if not use_wandb else WandbLogger(
+        project=args.wandb_project,
+        name=args.wandb_run_name,
+        group=args.wandb_group,
+        tags=wandb_tags,
+        log_model=True,
+    )
+    if use_wandb:
+        # Record the fold-CV context so hindcast runs are identifiable in the W&B UI
+        try:
+            wandb_logger.experiment.config.update(
+                {
+                    "cli_args": vars(args),
+                    "exclude_fold": args.exclude_fold,
+                    "val_fold": val_split_value if args.exclude_fold is not None else None,
+                    "fold_mask": args.fold_mask,
+                },
+                allow_val_change=True,
+            )
+        except Exception as e:
+            print(f"⚠ Could not log config to W&B: {e}")
+
+    # Devices: 'auto' keeps today's behavior; an explicit spec lets the fold orchestrator
+    # pin one process per GPU.
+    def _parse_devices(spec):
+        if spec is None or spec == "auto":
+            return "auto"
+        if ',' in spec:
+            return [int(x) for x in spec.split(',')]
+        return int(spec)
 
     # Trainer
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
         callbacks=[checkpoint_cb],
         accelerator='auto',
+        devices=_parse_devices(args.devices),
         default_root_dir=os.path.join(os.getcwd(), 'models', 'checkpoints'),
         logger=wandb_logger,
         log_every_n_steps=10,
@@ -461,6 +1332,27 @@ if __name__ == "__main__":
 
     # Train
     trainer.fit(model, train_loader, val_loader)
+
+    # Weight averaging rewrites the in-memory weights in on_train_end, so the epoch-best
+    # checkpoint on disk is not the model we mean to publish. Save the end state and point
+    # every downstream consumer at it.
+    if args.checkpoint_select == 'final' or args.weight_avg_last > 0:
+        # These two paths repoint prediction at the end-of-training weights, which bypasses the
+        # monitored checkpoint entirely -- so the fallback that (silently) protects a normal run
+        # from a diverged one is not there. Check before publishing, not after.
+        import torch as _torch
+        _bad = [n for n, p in model.named_parameters() if not _torch.isfinite(p).all()]
+        if _bad and args.abort_on_nonfinite:
+            raise RuntimeError(
+                f"refusing to publish end-of-training weights: {len(_bad)} non-finite tensors "
+                f"(e.g. {_bad[:3]}). Training diverged, and unlike the monitored checkpoint "
+                f"this path has no earlier epoch to fall back to, so prediction would run on "
+                f"NaN.")
+        _final = os.path.join(os.getcwd(), 'models', 'checkpoints',
+                              f'final_fold{args.exclude_fold}_{os.getpid()}.ckpt')
+        trainer.save_checkpoint(_final)
+        checkpoint_cb.best_model_path = _final
+        print(f"Prediction will use the end-of-training checkpoint: {_final}")
 
     # --- Log validation predictions/metrics from checkpoint to wandb (rank 0 only) ---
     import torch
@@ -525,7 +1417,15 @@ if __name__ == "__main__":
                     if lonlat is not None:
                         lonlat = lonlat.to(device)
                     # Get predictions from model: [B, 12, H, W] (4 horizons × 3 quantiles)
-                    preds_all = best_model(input_dynamic_clean, input_static_clean, lonlat=lonlat)
+                    # The context tensors were missing here, so these W&B test metrics were
+                    # once computed with every context channel silently zeroed. The model
+                    # refuses that now, which is how the omission surfaced.
+                    _cc = batch.get('change_context')
+                    _hc = batch.get('hm_context')
+                    preds_all = best_model(
+                        input_dynamic_clean, input_static_clean, lonlat=lonlat,
+                        change_context=_cc.to(device) if _cc is not None else None,
+                        hm_context=_hc.to(device) if _hc is not None else None)
                     
                     # Extract quantile predictions for each horizon
                     # Channel ordering: [lower_5yr, central_5yr, upper_5yr, lower_10yr, central_10yr, upper_10yr, ...]
@@ -1226,10 +2126,44 @@ if __name__ == "__main__":
             pass
 
     # -------------------- Large-area prediction to GeoTIFF --------------------
-    def _predict_region_and_write(best_ckpt_path: str):
+    # Snapshot everything prediction needs from the training dataset, so the loaders (and
+    # their persistent worker processes) can be released first. At the global extent the
+    # blending accumulators need tens of GB, and two folds run concurrently.
+    _ds_train = train_loader.dataset
+    PREDICT_STATS = {
+        'hm_mean': _ds_train.hm_mean,
+        'hm_std': _ds_train.hm_std,
+        'elev_mean': _ds_train.elev_mean,
+        'elev_std': _ds_train.elev_std,
+        'include_components': bool(getattr(_ds_train, 'include_components', True)),
+        'comp_means': dict(_ds_train.comp_means),
+        'comp_stds': dict(_ds_train.comp_stds),
+        'static_means': list(_ds_train.static_means),
+        'static_stds': list(_ds_train.static_stds),
+    }
+
+    def _release_dataloaders():
+        import gc
+        for name in ('train_loader', 'val_loader', 'test_loader'):
+            obj = globals().pop(name, None)
+            if obj is not None and hasattr(obj, '_iterator'):
+                obj._iterator = None
+            del obj
+        gc.collect()
+
+    # Hindcast input windows: every 3-year window whose +5yr target is still observed.
+    HINDCAST_WINDOWS = [
+        (1990, 1995, 2000),
+        (1995, 2000, 2005),
+        (2000, 2005, 2010),
+        (2005, 2010, 2015),
+    ]
+
+    def _predict_region_and_write(best_ckpt_path: str, input_years_override=None,
+                                  output_prefix=None, infer_model=None):
         import time
         start_time = time.time()
-        
+
         print("\n" + "="*70)
         print("LARGE-AREA PREDICTION")
         print("="*70)
@@ -1264,8 +2198,18 @@ if __name__ == "__main__":
         if not geoms:
             print("Empty geometry in region GeoJSON; skipping.")
             return
-        # Configure prediction years from CLI
-        if args.predict_final_year == 2040:
+        # Configure prediction years: explicit window (new) > --predict_input_years > legacy branch
+        window = input_years_override
+        if window is None and args.predict_input_years:
+            window = [int(y.strip()) for y in args.predict_input_years.split(',')]
+        if window is not None:
+            input_years = list(window)
+            if len(input_years) != 3:
+                raise ValueError(f"Prediction window needs exactly 3 input years, got {input_years}")
+            base_year = input_years[-1]
+            target_years = tuple(base_year + h for h in (5, 10, 15, 20))
+            print(f"Input window: {input_years} -> targets {list(target_years)}")
+        elif args.predict_final_year == 2040:
             # Use 2020 as base, predict 2025, 2030, 2035, 2040
             input_years = [2010, 2015, 2020]
             target_years = (2025, 2030, 2035, 2040)
@@ -1316,29 +2260,36 @@ if __name__ == "__main__":
             horizon_years = list(target_years)
             quantile_names = ['lower', 'central', 'upper']  # Updated to match independent heads terminology
             
-            # Create accumulators for each horizon-quantile combination
-            accum_horizons = {}
-            for h in horizon_names:
-                for q in quantile_names:
-                    key = f"{h}_{q}"
-                    accum_horizons[key] = np.zeros((Hwin, Wwin), dtype=np.float64)
-            
-            wsum = np.zeros((Hwin, Wwin), dtype=np.float64)
-            nodata_mask_total = np.zeros((Hwin, Wwin), dtype=bool)
+            # Create accumulators for each horizon-quantile combination.
+            # float32 (not float64) and only for horizons that will actually be written:
+            # at the global extent each accumulator is 2.7 GB, and a hindcast window whose
+            # later horizons fall past the last observed year needs none of them.
+            active_horizons = [
+                h for h, y in zip(horizon_names, horizon_years)
+                if args.predict_max_target_year is None or y <= args.predict_max_target_year
+            ]
+            if not active_horizons:
+                print("⚠ No horizons within --predict_max_target_year; skipping this window.")
+                return infer_model
+            # Accumulators are allocated after the model is loaded, because how many there
+            # are depends on the head family: the spline head adds one per quantile level.
+            # They are also allocated per row band when --predict_row_chunk is set, so both
+            # accum_horizons and wsum live inside the band loop below.
 
-            # Stats and config from training dataset
-            ds_train = train_loader.dataset
-            hm_mean, hm_std = ds_train.hm_mean, ds_train.hm_std
-            elev_mean, elev_std = ds_train.elev_mean, ds_train.elev_std
-            include_components = bool(getattr(ds_train, 'include_components', True))
+            # Stats and config captured from the training dataset before it is released
+            # (see PREDICT_STATS below) — prediction must not keep the dataloaders and
+            # their worker processes alive, since the global accumulators need the RAM.
+            hm_mean, hm_std = PREDICT_STATS['hm_mean'], PREDICT_STATS['hm_std']
+            elev_mean, elev_std = PREDICT_STATS['elev_mean'], PREDICT_STATS['elev_std']
+            include_components = bool(PREDICT_STATS['include_components'])
             static_list_paths = list(static_files if args.static_channels is None else static_files[:int(args.static_channels)])
             t_idxs = [year_to_idx[y] for y in input_years]
-            
-            # CRITICAL: Get per-variable normalization stats (NOT pooled hm_mean/hm_std)
-            comp_means = ds_train.comp_means  # Dict: {var_name: mean}
-            comp_stds = ds_train.comp_stds    # Dict: {var_name: std}
-            static_means = ds_train.static_means  # List: [mean_0, mean_1, ...]
-            static_stds = ds_train.static_stds    # List: [std_0, std_1, ...]
+
+            # CRITICAL: per-variable normalization stats (NOT pooled hm_mean/hm_std)
+            comp_means = PREDICT_STATS['comp_means']  # Dict: {var_name: mean}
+            comp_stds = PREDICT_STATS['comp_stds']    # Dict: {var_name: std}
+            static_means = PREDICT_STATS['static_means']  # List: [mean_0, mean_1, ...]
+            static_stds = PREDICT_STATS['static_stds']    # List: [std_0, std_1, ...]
             # HM_VARS from module (not instance attribute)
             HM_VARS = ["AG", "BU", "EX", "FR", "HI", "NS", "PO", "TI", "gdp", "population"]
 
@@ -1346,6 +2297,29 @@ if __name__ == "__main__":
             hm_srcs = [rasterio.open(p) for p in hm_files]
             comp_srcs = {y: [rasterio.open(p) for p in component_files[y]] for y in years} if include_components else {y: [] for y in years}
             stat_srcs = [rasterio.open(p) for p in static_list_paths]
+            hm_ctx_src, hm_ctx_bands = None, None
+            if (args.hm_context_pattern
+                    and _csv_strs(args.hm_context_stats)):
+                from prepare_hm_context import band_indices
+                hm_path = args.hm_context_pattern.format(year=base_year)
+                if not os.path.exists(hm_path):
+                    raise FileNotFoundError(
+                        f"--hm_context_stats was requested but {hm_path} is missing; "
+                        f"run scripts/prepare_hm_context.py first")
+                hm_ctx_src = rasterio.open(hm_path)
+                hm_ctx_bands = band_indices(hm_ctx_src.tags(),
+                                            _csv_strs(args.hm_context_stats),
+                                            _csv_ints(args.hm_context_radii) or (3, 30, 100))
+                print(f"HM context: {hm_path} bands {hm_ctx_bands}")
+
+            ctx_src = None
+            if args.context_pattern:
+                ctx_path = args.context_pattern.format(year=base_year)
+                if os.path.exists(ctx_path):
+                    ctx_src = rasterio.open(ctx_path)
+                    print(f"Quantile-head context: {ctx_path}")
+                else:
+                    print(f"⚠ context raster missing ({ctx_path}); heads will see zeros")
 
             tile = 128
             stride = int(args.predict_stride)
@@ -1354,12 +2328,76 @@ if __name__ == "__main__":
             bbox_transform = ref_transform * Affine.translation(c0, r0)
             bbox_mask = rio_features.geometry_mask([mapping(region_geom)], out_shape=(Hwin, Wwin), transform=bbox_transform, invert=True)
 
-            # Load model for inference
-            print(f"\nLoading model from checkpoint: {best_ckpt_path}")
+            # Load model for inference (reused across windows when caller supplies it)
             device = next(model.parameters()).device
-            infer_model = SpatioTemporalLightningModule.load_from_checkpoint(best_ckpt_path, map_location=device)
-            infer_model.eval()
-            print(f"✓ Model loaded on device: {device}")
+            if device.type == 'cpu' and torch.cuda.is_available():
+                # Lightning may have returned the module to CPU after fit; prediction over a
+                # large region on CPU is orders of magnitude slower.
+                device = torch.device('cuda')
+            if infer_model is None:
+                print(f"\nLoading model from checkpoint: {best_ckpt_path}")
+                infer_model = SpatioTemporalLightningModule.load_from_checkpoint(best_ckpt_path, map_location=device)
+                # The quantile-head context is derived from the normalized HM channel and
+                # rescaled by hm_std; these are plain attributes absent from the .ckpt, so
+                # without setting them here inference would build the context at a
+                # different scale than training did.
+                infer_model.hm_mean = PREDICT_STATS['hm_mean']
+                infer_model.hm_std = PREDICT_STATS['hm_std']
+                infer_model.eval()
+                print(f"✓ Model loaded on device: {device}")
+            infer_model = infer_model.to(device)
+
+            # The quantile-function raster: one band per u-level, written only by the spline
+            # head. The triple is *derived* from this, and 0.025 / 0.975 are levels of this
+            # grid, so the two agree exactly rather than approximately.
+            qf_u = None
+            qf_names = []
+            if getattr(args, 'predict_qf_levels', 0) and \
+                    getattr(infer_model.model, 'head_family', 'triple') in ('spline', 'pwl', 'isqf'):
+                from src.models.quantile_spline import output_u_grid
+                qf_u = output_u_grid(int(args.predict_qf_levels),
+                                     spacing=getattr(args, 'u_grid_spacing', 'normal'))
+                qf_names = [f"qf{i:03d}" for i in range(len(qf_u))]
+                print(f"  Quantile function: {len(qf_u)} levels, "
+                      f"u in [{qf_u[0]:.5f}, {qf_u[-1]:.5f}], "
+                      f"{len(qf_u) * len(active_horizons)} accumulators")
+            accum_keys = [f"{h}_{q}" for h in active_horizons
+                          for q in list(quantile_names) + qf_names]
+
+            # Optional restriction mask: skip tiles that do not overlap the requested values.
+            # Used for fold hindcasts, where only the held-out fold's pixels are consumed.
+            # Every tile overlapping a kept pixel is still processed, so kept pixels get
+            # exactly the same blended value as an unrestricted run.
+            restrict_win = None
+            restrict_values = None
+            if args.predict_restrict_mask:
+                if not args.predict_restrict_values:
+                    raise ValueError("--predict_restrict_mask requires --predict_restrict_values")
+                restrict_values = [int(v) for v in str(args.predict_restrict_values).split(',')]
+                with rasterio.open(args.predict_restrict_mask) as rsrc:
+                    restrict_win = rsrc.read(1, window=Window(c0, r0, Wwin, Hwin))
+                restrict_win = np.isin(restrict_win, restrict_values)
+                print(f"Restriction mask: {args.predict_restrict_mask} values={restrict_values} "
+                      f"({restrict_win.sum():,} of {restrict_win.size:,} px kept)")
+
+            if int(getattr(args, "predict_subsample_blocks", 0)) > 0:
+                _B = 128
+                _nby, _nbx = (Hwin + _B - 1) // _B, (Wwin + _B - 1) // _B
+                _base = restrict_win if restrict_win is not None else bbox_mask
+                # Only blocks that carry predictable pixels are candidates; otherwise the
+                # sample is mostly ocean and its effective size is a fiction.
+                _cand = [(by, bx) for by in range(_nby) for bx in range(_nbx)
+                         if _base[by * _B:(by + 1) * _B, bx * _B:(bx + 1) * _B].any()]
+                _rng = np.random.default_rng(int(args.predict_subsample_seed))
+                _pick = _rng.permutation(len(_cand))[:int(args.predict_subsample_blocks)]
+                _keep = np.zeros((Hwin, Wwin), dtype=bool)
+                for _i in _pick:
+                    _by, _bx = _cand[_i]
+                    _keep[_by * _B:(_by + 1) * _B, _bx * _B:(_bx + 1) * _B] = True
+                restrict_win = _keep if restrict_win is None else (restrict_win & _keep)
+                print(f"SCREEN MODE: {len(_pick)} of {len(_cand)} candidate {_B}px blocks "
+                      f"(seed {args.predict_subsample_seed}); "
+                      f"{int(restrict_win.sum()):,} px kept for prediction")
             
             def lonlat_grid_for_window(i0: int, j0: int, hi: int, wj: int):
                 rows = np.arange(i0, i0 + hi)
@@ -1393,214 +2431,40 @@ if __name__ == "__main__":
             print(f"  Input years: {input_years}")
             print()
             
-            # Collect all tile coordinates first
-            tile_coords = []
-            for i in range(r0, r1, stride):
-                for j in range(c0, c1, stride):
-                    tile_coords.append((i, j))
-            
+            # ---------------------------------------------------------------------------
+            # Row banding. accum_horizons is len(active_horizons) * (3 + n_qf_levels) arrays
+            # -- 268 for a four-horizon window at 64 quantile levels -- and each spans the
+            # whole region: 2.55 GiB on the 17111 x 40000 global grid. np.zeros is lazily
+            # paged, so what matters is the pages the tiles touch, measured at 185 GiB for
+            # one global fold (kept pixels dilated by the tile halo, 4 KiB pages, 2.3x
+            # amplification over useful data). The box has 125 GB and runs two folds at once.
+            # Africa's grid is 63.1 Mpx, where the same 268 accumulators are ~22 GB, and the
+            # only configuration ever run globally was the 12-accumulator triple head -- so
+            # this is a working set regional scale never exercised.
+            #
+            # A band keeping rows [a, b) accumulates every tile that covers one of them, i.e.
+            # every tile start in (a - tile, b), so the blend weights over [a, b) are complete
+            # and the written values are identical to an unbanded run. The tiles in the halo
+            # are computed twice, which costs tile/row_chunk extra GPU work.
+            _row_chunk = int(getattr(args, "predict_row_chunk", 0) or 0)
+            _bands = plan_row_bands(r0, r1, stride, tile, _row_chunk)
+            if _row_chunk:
+                _acc_gib = max(b[3] - b[2] for b in _bands) * Wwin * 4 / 2**30
+                print(f"  Row banding: {len(_bands)} bands of {_row_chunk} rows; "
+                      f"{len(accum_keys)} accumulators x {_acc_gib:.3f} GiB "
+                      f"= {len(accum_keys) * _acc_gib:.1f} GiB worst case")
+
             batch_size = args.predict_batch_size
             print(f"  Batch size: {batch_size} tiles")
-            
+            total_tiles = sum(len(b[4]) for b in _bands) * len(range(c0, c1, stride))
             tiles_processed = 0
             tiles_skipped = 0
             tiles_with_valid = 0
             last_percent = -1
             tile_start_time = time.time()
-            
-            import torch
-            
-            # Process tiles in batches
-            for batch_start in range(0, len(tile_coords), batch_size):
-                batch_end = min(batch_start + batch_size, len(tile_coords))
-                batch_tiles = tile_coords[batch_start:batch_end]
-                
-                # Prepare batch data
-                batch_inputs_dyn = []
-                batch_inputs_stat = []
-                batch_lonlats = []
-                batch_metadata = []  # Store (i, j, hi, wj, li0, lj0, li1, lj1, valid_mask, input_invalid_mask)
-                
-                for i, j in batch_tiles:
-                    hi = min(tile, r1 - i)
-                    wj = min(tile, c1 - j)
-                    if hi <= 0 or wj <= 0:
-                        continue
-                    # Local indices in accum arrays
-                    li0, lj0 = i - r0, j - c0
-                    li1, lj1 = li0 + hi, lj0 + wj
-                    submask = bbox_mask[li0:li1, lj0:lj1]
-                    if not np.any(submask):
-                        tiles_processed += 1
-                        tiles_skipped += 1
-                        continue
-                    win = Window(j, i, wj, hi)
-                    # Build inputs
-                    dyn_ts = []
-                    for t_idx, y in zip(t_idxs, input_years):
-                        channels = []
-                        arr_hm = hm_srcs[t_idx].read(1, window=win, masked=True).filled(np.nan)
-                        # Data is already in [0, 1] range
-                        channels.append((arr_hm - hm_mean) / hm_std)
-                        if include_components and comp_srcs.get(y, []):
-                            for var_idx, (var_name, src) in enumerate(zip(HM_VARS, comp_srcs[y])):
-                                carr = src.read(1, window=win, masked=True).filled(np.nan)
-                                # Replace NaN with 0 BEFORE normalization (missing = no pressure/activity)
-                                carr = np.nan_to_num(carr, nan=0.0)
-                                # Use per-variable normalization (CRITICAL for GDP/population)
-                                channels.append((carr - comp_means[var_name]) / comp_stds[var_name])
-                        dyn_ts.append(np.stack(channels, axis=0))  # [C_dyn, hi, wj]
-                    input_dynamic_np = np.stack(dyn_ts, axis=0)  # [T, C_dyn, hi, wj]
-                    static_chs = []
-                    # Static file order: [ele, tas, tasmin, pr, dpi_dsi, iucn_nostrict, iucn_strict]
-                    nan_to_zero_static = {0, 4, 5, 6}  # ele, dpi_dsi, iucn_nostrict, iucn_strict
-                    for static_idx, src in enumerate(stat_srcs):
-                        sarr = src.read(1, window=win, masked=True).filled(np.nan)
-                        # Replace NaN with 0 for specific variables (before normalization)
-                        if static_idx in nan_to_zero_static:
-                            sarr = np.nan_to_num(sarr, nan=0.0)
-                        # Use per-variable normalization (CRITICAL for different scales)
-                        static_chs.append((sarr - static_means[static_idx]) / static_stds[static_idx])
-                    input_static_np = np.stack(static_chs, axis=0) if static_chs else np.zeros((0, hi, wj), dtype=np.float32)
 
-                    # Valid mask for prediction (less strict than training)
-                    # Only require HM channel (index 0) to be valid across all timesteps
-                    # Component channels can be NaN (will be replaced with 0.0)
-                    hm_valid_all_times = np.isfinite(input_dynamic_np[:, 0, :, :]).all(axis=0)  # [H, W]
-                    # Only require first static channel (elevation) to be valid
-                    stat_valid = np.isfinite(input_static_np[0]) if static_chs else np.ones((hi, wj), dtype=bool)
-                    valid_mask = submask & hm_valid_all_times & stat_valid
-                    if not np.any(valid_mask):
-                        tiles_processed += 1
-                        tiles_skipped += 1
-                        continue
-                    
-                    tiles_with_valid += 1
-                    tiles_processed += 1
-                    
-                    # Track which pixels had valid inputs (BEFORE replacing NaN)
-                    # This matches the validation code approach (lines 465-467)
-                    dynamic_has_nan = ~np.isfinite(input_dynamic_np).all(axis=(0, 1))  # [hi, wj]
-                    static_has_nan = ~np.isfinite(input_static_np).all(axis=0) if static_chs else np.zeros((hi, wj), dtype=bool)
-                    input_invalid_mask = dynamic_has_nan | static_has_nan  # Pixels to mask in predictions
-                    
-                    # Add to batch
-                    # Replace NaN with 0.0 in normalized space = mean in original space
-                    in_dyn = np.nan_to_num(input_dynamic_np, nan=0.0).astype(np.float32)
-                    in_stat = np.nan_to_num(input_static_np, nan=0.0).astype(np.float32)
-                    lonlat_hw2 = lonlat_grid_for_window(i, j, hi, wj)
-                    
-                    # Pad to tile size if needed (for edge tiles)
-                    if hi < tile or wj < tile:
-                        # Pad dynamic: [T, C, hi, wj] -> [T, C, tile, tile]
-                        T, C = in_dyn.shape[:2]
-                        in_dyn_padded = np.zeros((T, C, tile, tile), dtype=np.float32)
-                        in_dyn_padded[:, :, :hi, :wj] = in_dyn
-                        in_dyn = in_dyn_padded
-                        
-                        # Pad static: [C, hi, wj] -> [C, tile, tile]
-                        C_stat = in_stat.shape[0]
-                        in_stat_padded = np.zeros((C_stat, tile, tile), dtype=np.float32)
-                        in_stat_padded[:, :hi, :wj] = in_stat
-                        in_stat = in_stat_padded
-                        
-                        # Pad lonlat: [hi, wj, 2] -> [tile, tile, 2]
-                        lonlat_padded = np.zeros((tile, tile, 2), dtype=np.float32)
-                        lonlat_padded[:hi, :wj, :] = lonlat_hw2
-                        lonlat_hw2 = lonlat_padded
-                    
-                    batch_inputs_dyn.append(in_dyn)
-                    batch_inputs_stat.append(in_stat)
-                    batch_lonlats.append(lonlat_hw2)
-                    batch_metadata.append((i, j, hi, wj, li0, lj0, li1, lj1, valid_mask, input_invalid_mask))
-                
-                # Process batch on GPU if we have any valid tiles
-                if len(batch_inputs_dyn) > 0:
-                    # Stack into batch tensors
-                    batch_dyn_tensor = torch.from_numpy(np.stack(batch_inputs_dyn, axis=0)).to(device)  # [B, T, C, H, W]
-                    batch_stat_tensor = torch.from_numpy(np.stack(batch_inputs_stat, axis=0)).to(device)  # [B, C, H, W]
-                    batch_lonlat_tensor = torch.from_numpy(np.stack(batch_lonlats, axis=0)).to(device)  # [B, H, W, 2]
-                    
-                    with torch.no_grad():
-                        batch_preds = infer_model(batch_dyn_tensor, batch_stat_tensor, lonlat=batch_lonlat_tensor)  # [B, 12, H, W]
-                    
-                    # Process each tile in the batch
-                    for tile_idx, (i, j, hi, wj, li0, lj0, li1, lj1, valid_mask, input_invalid_mask) in enumerate(batch_metadata):
-                        # Extract quantile predictions for this tile (crop to actual size if padded)
-                        # batch_preds: [B, 12, H, W] where 12 = 4 horizons × 3 quantiles
-                        # Channel ordering: [lower_5yr, central_5yr, upper_5yr, lower_10yr, ...]
-                        preds_horizons = {}
-                        for h_idx, h_name in enumerate(horizon_names):
-                            # Extract 3 quantiles for this horizon
-                            pred_lower = batch_preds[tile_idx, 3*h_idx, :hi, :wj].detach().cpu().numpy()
-                            pred_central = batch_preds[tile_idx, 3*h_idx+1, :hi, :wj].detach().cpu().numpy()
-                            pred_upper = batch_preds[tile_idx, 3*h_idx+2, :hi, :wj].detach().cpu().numpy()
-                            
-                            # Denormalize to [0, 1] scale
-                            pred_lower = pred_lower * hm_std + hm_mean
-                            pred_central = pred_central * hm_std + hm_mean
-                            pred_upper = pred_upper * hm_std + hm_mean
-                            
-                            # CRITICAL: Mask predictions where inputs had NaN (same as validation code)
-                            pred_lower[input_invalid_mask] = np.nan
-                            pred_central[input_invalid_mask] = np.nan
-                            pred_upper[input_invalid_mask] = np.nan
-                            
-                            # Store with keys matching accumulator dict
-                            preds_horizons[f"{h_name}_lower"] = pred_lower
-                            preds_horizons[f"{h_name}_central"] = pred_central
-                            preds_horizons[f"{h_name}_upper"] = pred_upper
-                        
-                        # Distance-to-edge weights within tile
-                        interior = valid_mask.astype(np.uint8)
-                        interior[[0, -1], :] = 0
-                        interior[:, [0, -1]] = 0
-                        weights = distance_transform_edt(interior)
-                        weights = np.where(valid_mask, weights, 0.0)
-                        
-                        if weights.max() > 0:
-                            # Accumulate each horizon-quantile combination
-                            for key, pred in preds_horizons.items():
-                                accum_horizons[key][li0:li1, lj0:lj1] += pred * weights
-                            wsum[li0:li1, lj0:lj1] += weights
-                        nodata_mask_total[li0:li1, lj0:lj1] |= ~valid_mask
-                
-                # Progress indicator (after each batch)
-                percent = int(100 * tiles_processed / total_tiles)
-                if percent != last_percent and percent % 5 == 0:
-                    elapsed = time.time() - tile_start_time
-                    tiles_per_sec = tiles_processed / elapsed if elapsed > 0 else 0
-                    eta_sec = (total_tiles - tiles_processed) / tiles_per_sec if tiles_per_sec > 0 else 0
-                    print(f"  Progress: {percent:3d}% ({tiles_processed:,}/{total_tiles:,} tiles) | "
-                          f"Speed: {tiles_per_sec:.1f} tiles/s | "
-                          f"ETA: {int(eta_sec//60):02d}:{int(eta_sec%60):02d}")
-                    last_percent = percent
-
-            # Final blend for all horizon-quantile combinations
-            print("\n" + "-"*70)
-            print("Blending overlapping tiles for all horizons and quantiles...")
-            m = wsum > 0
-            out_horizons = {}
-            for h_name in horizon_names:
-                for q_name in quantile_names:
-                    key = f"{h_name}_{q_name}"
-                    out_h = np.full((Hwin, Wwin), np.nan, dtype=np.float32)
-                    out_h[m] = (accum_horizons[key][m] / wsum[m]).astype(np.float32)
-                    # Clamp predictions to valid range [0, 1]
-                    out_h[m] = np.clip(out_h[m], 0.0, 1.0)
-                    out_horizons[key] = out_h
-            
-            # Calculate statistics
-            num_valid_pixels = m.sum()
-            num_total_pixels = Hwin * Wwin
-            valid_percent = 100 * num_valid_pixels / num_total_pixels
-            
-            print(f"✓ Blending complete")
-            print(f"  Valid pixels: {num_valid_pixels:,} / {num_total_pixels:,} ({valid_percent:.1f}%)")
-            print(f"  Generated 12 predictions (3 quantiles × 4 horizons)")
-
-            # Write GeoTIFF for each horizon-quantile combination
-            print("\nWriting output GeoTIFFs...")
+            # Outputs are opened once and written band by band. With one band this is a
+            # single full-array write, which is exactly what the unbanded path did.
             out_profile = ref.profile.copy()
             out_profile.update({
                 'height': Hwin,
@@ -1608,20 +2472,424 @@ if __name__ == "__main__":
                 'transform': ref_transform * Affine.translation(c0, r0),
                 'count': 1,
                 'dtype': 'float32',
-                'compress': 'deflate'
+                # NaN, not the HM reference's 3.4e38 sentinel that ref.profile carries in.
+                # The triple is filled with NaN where no tile covered a pixel, so a raster
+                # declaring 3.4e38 declares a value it never writes: a consumer masking on
+                # the tag masks nothing and reads NaN as data, and gdal_translate carries
+                # the wrong tag straight into the delivered COGs. Only the FORWARD product
+                # was exposed -- stitch_fold_predictions sets nodata=NaN explicitly, so every
+                # hindcast deliverable was already correct, and that is why no regional run
+                # ever showed it. Found 2026-09-17 by check_prediction_complete.py, which
+                # counted 370.8% of the land because NaN != 3.4e38 is true.
+                'nodata': np.nan,
+                'compress': 'deflate',
+                # GDAL's BIGTIFF default is IF_NEEDED, which cannot switch to BigTIFF for a
+                # COMPRESSED raster because it cannot predict the compressed size -- so every
+                # output here was a classic TIFF capped at 4 GiB. The 64-band quantile
+                # function over all 184.6M land pixels wants ~15 GB and died at
+                # `TIFFAppendToStrip: Maximum TIFF file size exceeded` partway through band 9
+                # of 34, leaving files that read back as all-finite ZEROS past the failure --
+                # plausible data, not an error. The fold hindcast escaped by 27 MB: its
+                # largest quantile raster is 4,267,991,319 bytes against a 4,294,967,296
+                # ceiling, 99.37%. stitch_fold_predictions has always set this; the
+                # prediction writer never did.
+                'BIGTIFF': 'YES',
             })
-            out_dir = Path(os.getcwd()) / 'data' / 'predictions'
+            if _row_chunk:
+                # A banded write must land on block boundaries; the single-band rasters
+                # inherit the reference raster's layout otherwise.
+                out_profile.update(tiled=True, blockxsize=256, blockysize=256)
+            out_dir = Path(args.predict_output_dir) if args.predict_output_dir else (
+                Path(os.getcwd()) / 'data' / 'predictions'
+            )
             out_dir.mkdir(parents=True, exist_ok=True)
-            
+            prefix = output_prefix if output_prefix is not None else (args.predict_output_prefix or "")
+            max_year = args.predict_max_target_year
+
             out_paths = {}
+            _writers = {}
             for h_name, h_year in zip(horizon_names, horizon_years):
+                if h_name not in active_horizons:
+                    print(f"  · {h_year}: skipped (> --predict_max_target_year {max_year})")
+                    continue
                 for q_name in quantile_names:
                     key = f"{h_name}_{q_name}"
-                    out_path = out_dir / f"prediction_{h_year}_{q_name}_blended.tif"
-                    with rasterio.open(out_path, 'w', **out_profile) as dst:
-                        dst.write(out_horizons[key], 1)
-                    out_paths[key] = out_path
-                    print(f"  ✓ {h_year} {q_name}: {out_path}")
+                    p = out_dir / f"{prefix}prediction_{h_year}_{q_name}_blended.tif"
+                    _writers[key] = rasterio.open(p, 'w', **out_profile)
+                    out_paths[key] = p
+                if qf_names:
+                    # One multi-band raster per horizon rather than 64 files. int16 x 1/32767
+                    # is the ensemble's own storage convention: HM is bounded on [0, 1], so
+                    # this is lossless to 3e-5, far below any quantity of interest.
+                    qf_profile = out_profile.copy()
+                    _qf_f32 = getattr(args, 'predict_qf_dtype', 'int16') == 'float32'
+                    qf_profile.update(
+                        count=len(qf_names),
+                        dtype='float32' if _qf_f32 else 'int16',
+                        nodata=np.nan if _qf_f32 else -32768,
+                        tiled=True, blockxsize=256, blockysize=256, BIGTIFF='YES')
+                    p = out_dir / f"{prefix}prediction_{h_year}_qf_blended.tif"
+                    d = rasterio.open(p, 'w', **qf_profile)
+                    for li, lname in enumerate(qf_names):
+                        d.set_band_description(li + 1, f"u={qf_u[li]:.6f}")
+                    # The scale is a PROPERTY OF THE RASTER and the reader reads it here.
+                    # It used to be the literal "3.0518509e-05" beside a reader that had
+                    # 1/32767 hardcoded -- the same quantity in two places, which is how the
+                    # two get to disagree (rule 2).
+                    # head_family was the LITERAL "spline" until 2026-09-17, whatever head
+                    # ran -- so E1v's own delivered rasters say `spline` while the head is
+                    # `pwl`. Rule 28: a tag that prints a constant is not a fingerprint, and
+                    # this one ships with the product. Read it off the CONSTRUCTED MODULE,
+                    # the same place the banner reads its parameter count, never off a
+                    # literal and not off args (args says what was asked for; the module
+                    # says what was built). The param count travels with it because
+                    # 17-with-tails against 15-without is the only thing that distinguishes
+                    # E1v from a tailless pwl arm on the raster alone.
+                    _tag_mod = getattr(infer_model, 'model', None)
+                    _tag_fam = getattr(_tag_mod, 'head_family', None) or getattr(
+                        args, 'head_family', 'triple')
+                    _tag_np = getattr(_tag_mod, 'n_spline_params', None)
+                    _head_tags = {"head_family": str(_tag_fam)}
+                    if _tag_np is not None:
+                        _head_tags["head_params"] = str(int(_tag_np))
+                    d.update_tags(u_levels=",".join(repr(float(v)) for v in qf_u),
+                                  scale_factor="1.0" if _qf_f32 else "3.0518509e-05",
+                                  **_head_tags)
+                    _writers[f"{h_name}_qf"] = d
+                    out_paths[f"{h_name}_qf"] = p
+
+            num_valid_pixels = 0
+            for _bi, (_keep_a, _keep_b, _acc_r0, _acc_r1, _band_starts) in enumerate(_bands):
+                _accH = _acc_r1 - _acc_r0
+                if _row_chunk:
+                    print(f"\n--- band {_bi + 1}/{len(_bands)}: keep rows "
+                          f"[{_keep_a}, {_keep_b}), accumulate [{_acc_r0}, {_acc_r1}) ---")
+                accum_horizons = {k: np.zeros((_accH, Wwin), dtype=np.float32)
+                                  for k in accum_keys}
+                wsum = np.zeros((_accH, Wwin), dtype=np.float32)
+                # Views, not copies: the full-window masks stay allocated once.
+                _bbox_c = bbox_mask[_acc_r0 - r0:_acc_r1 - r0]
+                _restrict_c = None if restrict_win is None else \
+                    restrict_win[_acc_r0 - r0:_acc_r1 - r0]
+                # Tiles this band must accumulate: every tile covering a kept row.
+                tile_coords = []
+                for i in _band_starts:
+                    for j in range(c0, c1, stride):
+                        tile_coords.append((i, j))
+            
+            
+
+                # Process tiles in batches
+                for batch_start in range(0, len(tile_coords), batch_size):
+                    batch_end = min(batch_start + batch_size, len(tile_coords))
+                    batch_tiles = tile_coords[batch_start:batch_end]
+                
+                    # Prepare batch data
+                    batch_inputs_dyn = []
+                    batch_contexts = []
+                    batch_hm_contexts = []
+                    batch_inputs_stat = []
+                    batch_lonlats = []
+                    batch_metadata = []  # Store (i, j, hi, wj, li0, lj0, li1, lj1, valid_mask, input_invalid_mask)
+                
+                    for i, j in batch_tiles:
+                        hi = min(tile, _acc_r1 - i)
+                        wj = min(tile, c1 - j)
+                        if hi <= 0 or wj <= 0:
+                            continue
+                        # Local indices in accum arrays
+                        li0, lj0 = i - _acc_r0, j - c0
+                        li1, lj1 = li0 + hi, lj0 + wj
+                        submask = _bbox_c[li0:li1, lj0:lj1]
+                        if not np.any(submask):
+                            tiles_processed += 1
+                            tiles_skipped += 1
+                            continue
+                        # Cheap pre-read rejection (before any raster IO) for restricted runs
+                        if _restrict_c is not None and not _restrict_c[li0:li1, lj0:lj1].any():
+                            tiles_processed += 1
+                            tiles_skipped += 1
+                            continue
+                        win = Window(j, i, wj, hi)
+                        # Build inputs
+                        dyn_ts = []
+                        for t_idx, y in zip(t_idxs, input_years):
+                            channels = []
+                            arr_hm = hm_srcs[t_idx].read(1, window=win, masked=True).filled(np.nan)
+                            # Data is already in [0, 1] range
+                            channels.append((arr_hm - hm_mean) / hm_std)
+                            if include_components and comp_srcs.get(y, []):
+                                for var_idx, (var_name, src) in enumerate(zip(HM_VARS, comp_srcs[y])):
+                                    carr = src.read(1, window=win, masked=True).filled(np.nan)
+                                    # Replace NaN with 0 BEFORE normalization (missing = no pressure/activity)
+                                    carr = np.nan_to_num(carr, nan=0.0)
+                                    # Use per-variable normalization (CRITICAL for GDP/population)
+                                    channels.append((carr - comp_means[var_name]) / comp_stds[var_name])
+                            dyn_ts.append(np.stack(channels, axis=0))  # [C_dyn, hi, wj]
+                        input_dynamic_np = np.stack(dyn_ts, axis=0)  # [T, C_dyn, hi, wj]
+                        static_chs = []
+                        # Static file order: [ele, tas, tasmin, pr, dpi_dsi, iucn_nostrict, iucn_strict]
+                        nan_to_zero_static = {0, 4, 5, 6}  # ele, dpi_dsi, iucn_nostrict, iucn_strict
+                        for static_idx, src in enumerate(stat_srcs):
+                            sarr = src.read(1, window=win, masked=True).filled(np.nan)
+                            # Replace NaN with 0 for specific variables (before normalization)
+                            if static_idx in nan_to_zero_static:
+                                sarr = np.nan_to_num(sarr, nan=0.0)
+                            # Use per-variable normalization (CRITICAL for different scales)
+                            static_chs.append((sarr - static_means[static_idx]) / static_stds[static_idx])
+                        input_static_np = np.stack(static_chs, axis=0) if static_chs else np.zeros((0, hi, wj), dtype=np.float32)
+
+                        # Valid mask for prediction (less strict than training)
+                        # Only require HM channel (index 0) to be valid across all timesteps
+                        # Component channels can be NaN (will be replaced with 0.0)
+                        hm_valid_all_times = np.isfinite(input_dynamic_np[:, 0, :, :]).all(axis=0)  # [H, W]
+                        # Only require first static channel (elevation) to be valid
+                        stat_valid = np.isfinite(input_static_np[0]) if static_chs else np.ones((hi, wj), dtype=bool)
+                        valid_mask = submask & hm_valid_all_times & stat_valid
+                        if not np.any(valid_mask):
+                            tiles_processed += 1
+                            tiles_skipped += 1
+                            continue
+                    
+                        tiles_with_valid += 1
+                        tiles_processed += 1
+                    
+                        # Track which pixels had valid inputs (BEFORE replacing NaN)
+                        # This matches the validation code approach (lines 465-467)
+                        dynamic_has_nan = ~np.isfinite(input_dynamic_np).all(axis=(0, 1))  # [hi, wj]
+                        static_has_nan = ~np.isfinite(input_static_np).all(axis=0) if static_chs else np.zeros((hi, wj), dtype=bool)
+                        input_invalid_mask = dynamic_has_nan | static_has_nan  # Pixels to mask in predictions
+                    
+                        # Add to batch
+                        # Replace NaN with 0.0 in normalized space = mean in original space
+                        in_dyn = np.nan_to_num(input_dynamic_np, nan=0.0).astype(np.float32)
+                        in_stat = np.nan_to_num(input_static_np, nan=0.0).astype(np.float32)
+                        lonlat_hw2 = lonlat_grid_for_window(i, j, hi, wj)
+                    
+                        # Pad to tile size if needed (for edge tiles)
+                        if hi < tile or wj < tile:
+                            # Pad dynamic: [T, C, hi, wj] -> [T, C, tile, tile]
+                            T, C = in_dyn.shape[:2]
+                            in_dyn_padded = np.zeros((T, C, tile, tile), dtype=np.float32)
+                            in_dyn_padded[:, :, :hi, :wj] = in_dyn
+                            in_dyn = in_dyn_padded
+                        
+                            # Pad static: [C, hi, wj] -> [C, tile, tile]
+                            C_stat = in_stat.shape[0]
+                            in_stat_padded = np.zeros((C_stat, tile, tile), dtype=np.float32)
+                            in_stat_padded[:, :hi, :wj] = in_stat
+                            in_stat = in_stat_padded
+                        
+                            # Pad lonlat: [hi, wj, 2] -> [tile, tile, 2]
+                            lonlat_padded = np.zeros((tile, tile, 2), dtype=np.float32)
+                            lonlat_padded[:hi, :wj, :] = lonlat_hw2
+                            lonlat_hw2 = lonlat_padded
+                    
+                        if ctx_src is not None:
+                            cx = np.stack([
+                                np.nan_to_num(ctx_src.read(1, window=win, masked=True).filled(np.nan), nan=0.0),
+                                np.nan_to_num(ctx_src.read(2, window=win, masked=True).filled(np.nan), nan=1e4),
+                            ], axis=0).astype(np.float32)
+                            if hi < tile or wj < tile:
+                                padded = np.zeros((2, tile, tile), dtype=np.float32)
+                                padded[1] = 1e4
+                                padded[:, :hi, :wj] = cx
+                                cx = padded
+                            batch_contexts.append(cx)
+                        if hm_ctx_src is not None:
+                            raw = hm_ctx_src.read(hm_ctx_bands, window=win).astype(np.float32)
+                            hm_cx = np.where(raw == -32768, 0.0,
+                                             raw * np.float32(1.0 / 32767.0)).astype(np.float32)
+                            if hi < tile or wj < tile:
+                                # Every other source above pads its edge tiles to the full tile;
+                                # this one did not, so a region whose extent is not a whole number
+                                # of strides handed np.stack a (bands, hi, wj) among (bands, tile,
+                                # tile) and it refused. Training never saw this because chips are
+                                # always full size -- only the prediction path tiles to an edge.
+                                # Zero is what this block already substitutes for the raster's own
+                                # -32768 nodata sentinel.
+                                padded = np.zeros((len(hm_ctx_bands), tile, tile), dtype=np.float32)
+                                padded[:, :hi, :wj] = hm_cx
+                                hm_cx = padded
+                            batch_hm_contexts.append(hm_cx)
+                        batch_inputs_dyn.append(in_dyn)
+                        batch_inputs_stat.append(in_stat)
+                        batch_lonlats.append(lonlat_hw2)
+                        batch_metadata.append((i, j, hi, wj, li0, lj0, li1, lj1, valid_mask, input_invalid_mask))
+                
+                    # Process batch on GPU if we have any valid tiles
+                    if len(batch_inputs_dyn) > 0:
+                        # Stack into batch tensors
+                        batch_dyn_tensor = torch.from_numpy(np.stack(batch_inputs_dyn, axis=0)).to(device)  # [B, T, C, H, W]
+                        batch_stat_tensor = torch.from_numpy(np.stack(batch_inputs_stat, axis=0)).to(device)  # [B, C, H, W]
+                        batch_lonlat_tensor = torch.from_numpy(np.stack(batch_lonlats, axis=0)).to(device)  # [B, H, W, 2]
+                    
+                        batch_ctx_tensor = (
+                            torch.from_numpy(np.stack(batch_contexts, axis=0)).to(device)
+                            if batch_contexts else None
+                        )
+                        batch_hm_tensor = (
+                            torch.from_numpy(np.stack(batch_hm_contexts, axis=0)).to(device)
+                            if batch_hm_contexts else None
+                        )
+                        batch_qf = None
+                        with torch.no_grad():
+                            batch_preds = infer_model(batch_dyn_tensor, batch_stat_tensor,
+                                                      lonlat=batch_lonlat_tensor,
+                                                      change_context=batch_ctx_tensor,
+                                                      hm_context=batch_hm_tensor)  # [B, 12, H, W]
+                            if qf_u is not None:
+                                # Evaluated once per batch, decoded by the *same* function the
+                                # loss uses, so the raster and the objective cannot drift apart.
+                                m_ = infer_model.model
+                                u_t = torch.as_tensor(qf_u, dtype=batch_preds.dtype,
+                                                      device=batch_preds.device)
+                                # model._decode, not splines_from_output: the latter is the
+                                # rational-quadratic decoder and expects 29 channels per
+                                # horizon, so pwl and isqf (16) raised ValueError here --
+                                # every E1/E2/E4 arm would have trained for 50 minutes and
+                                # then failed to write a raster. _decode is the one place
+                                # that knows which family it is (rule 2: a predicate written
+                                # twice will disagree with itself), and it is the same call
+                                # the loss makes.
+                                batch_qf = [
+                                    sp.ppf(u_t).movedim(-1, 1).cpu().numpy()   # [B, n_u, H, W]
+                                    for sp in m_._decode(
+                                        batch_preds, m_.spline_clamp(),
+                                        n_triple=batch_preds.shape[1]
+                                        - m_.num_horizons * m_.n_spline_params)
+                                ]
+                    
+                        # Process each tile in the batch
+                        for tile_idx, (i, j, hi, wj, li0, lj0, li1, lj1, valid_mask, input_invalid_mask) in enumerate(batch_metadata):
+                            # Extract quantile predictions for this tile (crop to actual size if padded)
+                            # batch_preds: [B, 12, H, W] where 12 = 4 horizons × 3 quantiles
+                            # Channel ordering: [lower_5yr, central_5yr, upper_5yr, lower_10yr, ...]
+                            preds_horizons = {}
+                            for h_idx, h_name in enumerate(horizon_names):
+                                if h_name not in active_horizons:
+                                    continue
+                                # Extract 3 quantiles for this horizon
+                                pred_lower = batch_preds[tile_idx, 3*h_idx, :hi, :wj].detach().cpu().numpy()
+                                pred_central = batch_preds[tile_idx, 3*h_idx+1, :hi, :wj].detach().cpu().numpy()
+                                pred_upper = batch_preds[tile_idx, 3*h_idx+2, :hi, :wj].detach().cpu().numpy()
+                            
+                                # Denormalize to [0, 1] scale
+                                pred_lower = pred_lower * hm_std + hm_mean
+                                pred_central = pred_central * hm_std + hm_mean
+                                pred_upper = pred_upper * hm_std + hm_mean
+                            
+                                # CRITICAL: Mask predictions where inputs had NaN (same as validation code)
+                                pred_lower[input_invalid_mask] = np.nan
+                                pred_central[input_invalid_mask] = np.nan
+                                pred_upper[input_invalid_mask] = np.nan
+                            
+                                # Store with keys matching accumulator dict
+                                preds_horizons[f"{h_name}_lower"] = pred_lower
+                                preds_horizons[f"{h_name}_central"] = pred_central
+                                preds_horizons[f"{h_name}_upper"] = pred_upper
+
+                                if qf_u is not None:
+                                    qf = batch_qf[h_idx][tile_idx, :, :hi, :wj]
+                                    qf = qf * hm_std + hm_mean
+                                    qf[:, input_invalid_mask] = np.nan
+                                    for li, lname in enumerate(qf_names):
+                                        preds_horizons[f"{h_name}_{lname}"] = qf[li]
+                        
+                            # Distance-to-edge weights within tile
+                            interior = valid_mask.astype(np.uint8)
+                            interior[[0, -1], :] = 0
+                            interior[:, [0, -1]] = 0
+                            weights = distance_transform_edt(interior)
+                            weights = np.where(valid_mask, weights, 0.0)
+                        
+                            if weights.max() > 0:
+                                # Accumulate each horizon-quantile combination
+                                for key, pred in preds_horizons.items():
+                                    accum_horizons[key][li0:li1, lj0:lj1] += pred * weights
+                                wsum[li0:li1, lj0:lj1] += weights
+                
+                    # Progress indicator (after each batch)
+                    percent = int(100 * tiles_processed / total_tiles)
+                    if percent != last_percent and percent % 5 == 0:
+                        elapsed = time.time() - tile_start_time
+                        tiles_per_sec = tiles_processed / elapsed if elapsed > 0 else 0
+                        eta_sec = (total_tiles - tiles_processed) / tiles_per_sec if tiles_per_sec > 0 else 0
+                        print(f"  Progress: {percent:3d}% ({tiles_processed:,}/{total_tiles:,} tiles) | "
+                              f"Speed: {tiles_per_sec:.1f} tiles/s | "
+                              f"ETA: {int(eta_sec//60):02d}:{int(eta_sec%60):02d}")
+                        last_percent = percent
+                # ---- blend and write this band -------------------------------------
+                m = wsum > 0
+
+                # Blend one raster at a time, at the moment it is written, instead of
+                # building a dict of every horizon x quantile level first.
+                #
+                # On southern Africa (1.86 Mpx) a full second copy is 2 GB and invisible. On
+                # Africa (63.1 Mpx) each array is 0.252 GB, so the copy is 67.6 GB, and
+                # because np.full touches every page it is ALL resident, while
+                # accum_horizons (np.zeros) stays sparse over ocean. Measured peak was ~98 GB
+                # for one fold; two folds in parallel were OOM-killed by the kernel with no
+                # traceback. Blending on demand removes that copy entirely.
+                #
+                # The arithmetic is unchanged -- same expression, evaluated later -- so the
+                # written values are identical. The quantile levels blend on exactly the same
+                # weights as the triple. A weighted average of monotone sequences is
+                # monotone, so the blended quantile function is still a quantile function,
+                # and because 0.025 and 0.975 are levels of the grid the blended bands
+                # reproduce the blended lower/upper rasters rather than merely approximating
+                # them.
+                # In screen mode the kept blocks are exact, but every PROCESSED TILE writes
+                # its whole 128 px extent, so a halo around each block also comes out finite
+                # -- with incomplete blending, because the tiles that would have contributed
+                # to it were skipped. Measured: kept pixels agree with a full run to 3.6e-7
+                # (float32 summation order), the halo to only 3.1e-3, which is the size of
+                # the signal. In the ordinary fold hindcast the halo is harmless because it
+                # falls outside the fold and the stitcher drops it; here it falls INSIDE the
+                # fold, so the scorer would take it.
+                _screen_mask = _restrict_c if int(
+                    getattr(args, "predict_subsample_blocks", 0)) > 0 else None
+                _k0, _k1 = _keep_a - _acc_r0, _keep_b - _acc_r0
+                _win = Window(0, _keep_a - r0, Wwin, _keep_b - _keep_a)
+
+                def _blend(key):
+                    out_h = np.full((_accH, Wwin), np.nan, dtype=np.float32)
+                    out_h[m] = (accum_horizons[key][m] / wsum[m]).astype(np.float32)
+                    # Clamp predictions to valid range [0, 1]
+                    out_h[m] = np.clip(out_h[m], 0.0, 1.0)
+                    if _screen_mask is not None:
+                        out_h[~_screen_mask] = np.nan
+                    return out_h[_k0:_k1]
+
+                num_valid_pixels += int(m[_k0:_k1].sum())
+                for h_name in active_horizons:
+                    for q_name in quantile_names:
+                        key = f"{h_name}_{q_name}"
+                        _writers[key].write(_blend(key), 1, window=_win)
+                    if qf_names:
+                        d = _writers[f"{h_name}_qf"]
+                        for li, lname in enumerate(qf_names):
+                            band = _blend(f"{h_name}_{lname}")
+                            if _qf_f32:
+                                d.write(band.astype(np.float32), li + 1, window=_win)
+                            else:
+                                q = np.where(np.isfinite(band),
+                                             np.round(band * 32767.0), -32768)
+                                d.write(np.clip(q, -32768, 32767).astype(np.int16),
+                                        li + 1, window=_win)
+
+                del accum_horizons, wsum, m
+                accum_horizons = None
+
+            for d in _writers.values():
+                d.close()
+            for key, p in out_paths.items():
+                print(f"  ✓ {key}: {p}")
+            num_total_pixels = Hwin * Wwin
+            valid_percent = 100 * num_valid_pixels / num_total_pixels
+            print(f"✓ Blending complete")
+            print(f"  Valid pixels: {num_valid_pixels:,} / {num_total_pixels:,} "
+                  f"({valid_percent:.1f}%)")
             
             # Final summary
             elapsed_total = time.time() - start_time
@@ -1633,12 +2901,15 @@ if __name__ == "__main__":
             print(f"  Tiles skipped (no data/outside region): {tiles_skipped:,}")
             print(f"Output dimensions: {Hwin} × {Wwin} pixels")
             print(f"Valid output pixels: {num_valid_pixels:,} ({valid_percent:.1f}%)")
-            print(f"\nOutput files (12 total: 3 quantiles × 4 horizons):")
+            print(f"\nOutput files ({len(out_paths)} written):")
             for h_name, h_year in zip(horizon_names, horizon_years):
+                if not any(f"{h_name}_{q}" in out_paths for q in quantile_names):
+                    continue
                 print(f"  {h_year}:")
                 for q_name in quantile_names:
                     key = f"{h_name}_{q_name}"
-                    print(f"    {q_name}: {out_paths[key]}")
+                    if key in out_paths:
+                        print(f"    {q_name}: {out_paths[key]}")
             print(f"\nTotal time: {int(elapsed_total//60):02d}:{int(elapsed_total%60):02d}")
             print("="*70 + "\n")
 
@@ -1650,12 +2921,33 @@ if __name__ == "__main__":
                     src.close()
             for src in stat_srcs:
                 src.close()
+            if ctx_src is not None:
+                ctx_src.close()
+            if hm_ctx_src is not None:
+                hm_ctx_src.close()
+
+            return infer_model
 
     # Run prediction if requested
     if run_large_area_prediction:
+        _release_dataloaders()
         # Use provided checkpoint, or best from training
         pred_checkpoint = checkpoint_path if checkpoint_path else checkpoint_cb.best_model_path
-        if pred_checkpoint:
+        if pred_checkpoint and args.predict_all_windows:
+            # One checkpoint load, all 4 hindcast windows; prefix keeps outputs from colliding
+            # (the same target year is produced by several windows).
+            base_prefix = args.predict_output_prefix or ""
+            cached_model = None
+            for win in HINDCAST_WINDOWS:
+                win_prefix = f"{base_prefix}w{win[-1]}_"
+                print(f"\n{'#'*70}\n# WINDOW {win} -> prefix '{win_prefix}'\n{'#'*70}")
+                cached_model = _predict_region_and_write(
+                    pred_checkpoint,
+                    input_years_override=list(win),
+                    output_prefix=win_prefix,
+                    infer_model=cached_model,
+                )
+        elif pred_checkpoint:
             _predict_region_and_write(pred_checkpoint)
         else:
             print("\n⚠️  No checkpoint available for prediction!")

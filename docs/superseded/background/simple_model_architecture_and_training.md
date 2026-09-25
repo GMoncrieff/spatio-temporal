@@ -101,8 +101,8 @@ Time-invariant geographic characteristics:
 - Static: `hm_static_{VARIABLE}_1000.tiff` (e.g., `hm_static_ele_1000.tiff`)
 
 **Input Sequences:**
-- Model uses 4 consecutive timesteps to predict future horizons
-- Example: [1990, 1995, 2000, 2005] → predict [2010, 2015, 2020, 2025]
+- Model uses 3 consecutive timesteps to predict 4 future horizons (+5/+10/+15/+20yr)
+- Example: [1990, 1995, 2000] → predict [2005, 2010, 2015, 2020]
 
 ---
 
