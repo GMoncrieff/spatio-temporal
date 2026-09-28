@@ -4,7 +4,7 @@
 
 This project implements a **distributional ConvLSTM** that forecasts the Human Modification (HM) index as a **full probability distribution per pixel**. At each of **four forecast horizons** (5, 10, 15, 20 years) the model emits a monotone quantile function `Q_h(u | x)` — the whole predictive distribution of HM at that pixel, from which any quantile, interval, mean or exceedance probability can be read. 
 
-Twenty-three head configurations were screened on Africa, and the two finalists were run globally as a controlled A/B. The final model is trained with the **CRPS** (continuous ranked probability score), computed in closed form on a piecewise-linear quantile function with **15 parameters per horizon**.
+The production model, **E2c**, is trained with the **CRPS** (continuous ranked probability score), computed in closed form on a piecewise-linear quantile function with **15 parameters per horizon**. Its ConvLSTM trunk has a 12 px receptive field, its inputs are standardised with statistics computed over land only, and its static covariates include slope and aspect.
 
 ### Key Features
 
@@ -12,14 +12,14 @@ Twenty-three head configurations were screened on Africa, and the two finalists 
 - **Multi-horizon forecasting**: 5yr, 10yr, 15yr, 20yr ahead predictions
 - **Closed-form CRPS training**: a piecewise-linear quantile head
 - **Residual parameterisation**: the model predicts change on top of the current HM level, starting from persistence
-- **Rich covariates**: HM history plus 10 dynamic covariates (HM stressors, GDP, population), 7 static variables (elevation, climate, protected areas) and 12 channels of precomputed neighbourhood context
+- **Rich covariates**: HM history plus 10 dynamic covariates (HM stressors, GDP, population), 10 static variables (elevation, slope, aspect, climate, protected areas) and 12 channels of precomputed neighbourhood context
 - **Location encoding**: spherical-harmonic positional embeddings for spatial awareness
 - **Out-of-sample validation**: k=5 spatial-block cross-validation, scored against persistence on every land pixel of the globe
 - **Delivered products**: Cloud-Optimised GeoTIFFs and icechunk quantile-function stores for a hindcast (2005–2020) and a forecast (2025–2040)
 
 ## Documentation
-- **[Global production run](docs/global/global_production_e2a.md)** - The production model structure and scorecard
-- **[The conv-spline phase](docs/experiments/conv_spline_phase.md)** - The experiment design that selected the quantile head
+- **[Technical methodology](docs/methodology.pdf)** - The model in full: inputs, architecture, loss, training, prediction and evaluation
+- **[Global production run](docs/global/global_production_e2c.md)** - Configuration, verification, scorecard, products and costs
 
 **Topics covered:**
 - **Input Data**: Dynamic variables, static covariates, neighbourhood context, location encoding
@@ -29,7 +29,6 @@ Twenty-three head configurations were screened on Africa, and the two finalists 
 - **Accuracy Assessment**: CRPS and RMSE skill against persistence, interval coverage, PIT calibration, distance-stratified scores
 - **Prediction**: Tile-based processing, the quantile-function raster, COG and icechunk products
 
-Documents in `docs/superseded/` describe earlier systems that no longer exist on this branch kept for reference 
 
 ## Project Structure
 
@@ -48,29 +47,30 @@ spatio_temporal/
 │   │   └── hm_global/              # Global training data
 │   │       ├── HM_YEAR_VARIABLE_1000.tiff    # Dynamic variables (1990-2020)
 │   │       ├── hm_static_VARIABLE_1000.tiff  # Static covariates
+│   │       ├── hm_static_terrain_{slope,aspsin,aspcos}_1000.tiff  # Slope and aspect of the elevation raster
 │   │       ├── change_context_wYEAR_1000.tif # Precomputed distance-to-past-change
 │   │       ├── hm_context_wYEAR_1000.tif     # Precomputed neighbourhood HM
-│   │       └── fold_mask_b4_1000.tif         # k=5 spatial folds (512 px blocks)
+│   │       └── fold_mask_b4_land_1000.tif    # k=5 spatial folds over land (512 px blocks)
 │   └── conv_spline/
-│       ├── norm_stats.json         # Per-variable normalisation statistics
+│       ├── norm_stats_E2c.json     # Normalisation statistics, exact over land
 │       └── logs/                   # Run logs (every verifier reads these)
 │
 ├── models/
 │   ├── checkpoints/                # Lightning's default checkpoint directory (shared)
 │   └── production/
-│       ├── E2a_global/             # PRODUCTION: the six global E2a checkpoints (5 folds + forward model)
-│       ├── E1v_global/             # The six global E1v checkpoints (the A/B alternative)
+│       └── E2c_global/             # The six production checkpoints (5 folds + forward model) + norm stats
 │
 ├── src/
 │   ├── models/                     # Model architecture
 │   │   ├── spatiotemporal_predictor.py  # ConvLSTM trunk + quantile head decoder
 │   │   ├── quantile_pwl.py         # Piecewise-linear quantile function + closed-form CRPS
-│   │   ├── quantile_spline.py      # Rational-quadratic spline head (screened, not promoted)
+│   │   ├── quantile_spline.py      # Knot grid and shape-head initialisation
 │   │   ├── crps_loss.py            # CRPS loss
 │   │   ├── change_weights.py       # Neighbourhood context channels
 │   │   ├── lightning_module.py     # PyTorch Lightning wrapper
 │   │   └── convlstm.py             # ConvLSTM implementation
 │   ├── locationencoder/            # Spatial position encoding
+│   ├── land.py                     # What counts as land (HM valid and not its 3.4e38 nodata)
 │   ├── strata.py                   # Distance bands and other scoring strata
 │   ├── stitch.py                   # Fold mosaic for the out-of-sample hindcast
 │   ├── qf_diagnostics.py           # Quantile-function diagnostics
@@ -89,21 +89,18 @@ spatio_temporal/
 │   ├── verify_products.py          # Verifies delivered products against their sources
 │   ├── prepare_change_context.py   # Builds change_context_w*.tif
 │   ├── prepare_hm_context.py       # Builds hm_context_w*.tif
-│   └── create_validity_mask.py     # NaN/no-data handling and fold masks
+│   ├── prepare_terrain.py          # Builds slope and aspect from the elevation raster
+│   ├── compute_norm_stats.py       # Exact land-only normalisation statistics
+│   └── create_validity_mask.py     # Land mask and fold masks
 │
 ├── tests/                          # Unit tests (pytest)
 │
 └── docs/                           # Documentation
-    ├── experiments/                # Africa slate: design, per-arm scorecards, comparison
-    │   ├── conv_spline_phase.md    # The experiment design
-    │   ├── scores/                 # Scorecards for every screened arm
-    │   └── promotion/              # The comparison the slate was decided on
-    ├── global/                     # Global production runs
-    │   ├── global_production_e2a.md  # 📘 The production run, scorecard and A/B
-    │   ├── global_production_e1v.md  # The runner, its verifiers, and E1v's scorecard
-    │   ├── scores/                 # Global scorecards, E2a and E1v
-    │   └── tails_ab.html           # The E1v vs E2a comparison page
-    └── superseded/                 # Earlier systems, kept for reference
+    ├── methodology.pdf             # 📘 Technical methodology (source in methodology_src/)
+    └── global/
+        ├── global_production_e2c.md  # The production run: configuration, scorecard, products, costs
+        ├── checkpoints/            # Provenance of the production checkpoints
+        └── scores/                 # Global scorecards
 ```
 
 ## Setup
@@ -172,6 +169,21 @@ hm_static_iucn_strict_1000.tiff     # Protected areas (strict)
 hm_static_iucn_nostrict_1000.tiff   # Protected areas (other)
 ```
 
+The elevation raster declares no nodata and fills every row south of 56 S with `-32768`. That value is declared as a fill in the normalisation sidecar (`static_nodata`) and is read as sea level, not as an elevation.
+
+**Derived inputs for the production model** (build once, in this order):
+```bash
+python scripts/prepare_terrain.py        # -> hm_static_terrain_{slope,aspsin,aspcos}_1000.tiff
+                                         #    slope (deg) and sin/cos of aspect, Horn 3x3 on
+                                         #    WGS84 metric spacing, 2 min for the globe
+python scripts/compute_norm_stats.py --out data/conv_spline/norm_stats_E2c.json --terrain_covariates
+                                         # exact moments over land for all 10 static channels,
+                                         # HM and the covariates; ~4 min
+python scripts/create_validity_mask.py --folds_only --k 5 --fold_block_chips 4 \
+    --fold_min_valid_px 1 --fold_mask_out data/raw/hm_global/fold_mask_b4_land_1000.tif
+                                         # a fold id for every 128 px chip holding any land
+```
+
 **Precomputed neighbourhood context** (one per base year; must be built on the full raster, never inside a training chip, or radii of 30–100 px saturate against the chip edge):
 ```bash
 python scripts/prepare_change_context.py   # -> change_context_w{2000..2020}_1000.tif
@@ -191,28 +203,40 @@ wandb login
 
 ### Training from Scratch
 
-The argparse defaults of `train_lightning.py` are the production model, E2a: head, loss, context, training schedule and export format. A run with no model flags trains E2a.
+**The production model, E2c, is the argparse defaults of `train_lightning.py` plus two flags and its own normalisation sidecar**, and a hindcast also needs its fold mask:
+
+```bash
+--kernel_size 5 --terrain_covariates True --norm_stats_json data/conv_spline/norm_stats_E2c.json
+--fold_mask data/raw/hm_global/fold_mask_b4_land_1000.tif      # k-fold hindcast only
+```
+
+Leaving any of them out does not fail: it silently trains a different model (a 3×3 trunk, seven static channels, or statistics sampled over the whole grid). The global runner (`MODEL=E2c`, below) sets all four and checks each one in the run's log.
 
 #### Basic Training Run
 
 ```bash
-python scripts/train_lightning.py --max_epochs 50
+python scripts/train_lightning.py --max_epochs 50 \
+  --kernel_size 5 --terrain_covariates True --norm_stats_json data/conv_spline/norm_stats_E2c.json
 ```
 
 #### Full Training with All Options
 
-Every option already defaults to its production value (see [Key Training Arguments](#key-training-arguments)), so the production run needs only a region. Add `--train_all_splits True` for the forward model, which holds no geography out:
+Every other option already defaults to its production value (see [Key Training Arguments](#key-training-arguments)). Add `--train_all_splits True` for the forward model, which holds no geography out:
 
 ```bash
 python scripts/train_lightning.py \
+  --kernel_size 5 --terrain_covariates True --norm_stats_json data/conv_spline/norm_stats_E2c.json \
   --run_large_area_prediction True \
   --predict_region config/region_africa.geojson
 ```
 
-The run log prints the head it actually built, and that line is the check that the configuration took effect:
+The run log prints what it actually built, read off the constructed model. These lines are the check that the configuration took effect:
 
 ```
+Trunk:             ConvLSTM 4 layers x 64, kernel 5, dilation 1,1,1,1, receptive radius 12 px over 3 timesteps
+Static channels:   10 (hm_static_ele_1000.tiff, ..., hm_static_terrain_aspcos_1000.tiff); module 10
 Spline head:       family pwl, knots default14 (n=15, bins=14), slopes learned, free scale, 15 params/horizon
+Loaded normalization stats from data/conv_spline/norm_stats_E2c.json
 ```
 
 #### Quick Development Run (Smoke Test)
@@ -228,8 +252,8 @@ python scripts/train_lightning.py \
 
 ### Key Training Arguments
 
-| Argument | Default (E2a) | Description |
-|----------|---------------|-------------|
+| Argument | Default | Description |
+|----------|---------|-------------|
 | `--max_epochs` | 150 | Number of training epochs |
 | `--train_chips` | 100 | Chips sampled per training epoch |
 | `--val_chips` | 40 | Chips sampled per validation epoch |
@@ -237,28 +261,31 @@ python scripts/train_lightning.py \
 | `--batch_size` | 8 | Batch size for training/validation |
 | `--hidden_dim` | 64 | ConvLSTM hidden dimension |
 | `--num_layers` | 4 | Number of ConvLSTM layers |
+| `--kernel_size` | 3 | ConvLSTM kernel. **E2c: 5**, a 12 px receptive radius (3 gives 6 px) |
+| `--terrain_covariates` | False | Add slope, sin(aspect) and cos(aspect) as static channels. **E2c: True** |
 | `--num_workers` | 3 | Data loader workers (0=single-threaded) |
 | `--head_family` | `pwl` | Output head: `pwl` is the piecewise-linear quantile function |
 | `--spline_knots` | `default14` | Quantile-level knot grid (15 knots, 14 bins) |
 | `--free_scale` | True | Learn the quantile increments directly, with no anchor/scale factorisation |
-| `--isqf_tails` / `--isqf_space` | False / `logit` | Learned exponential tails on `-log(1 - HM)` support (E1v uses `True` / `neglog`) |
+| `--isqf_tails` / `--isqf_space` | False / `logit` | Learned exponential tails on `-log(1 - HM)` support (off) |
 | `--central_residual` | True | Predict change on top of HM at the base year, starting from persistence |
 | `--mu_mse_weight` | 0.0 | MSE on the mean; 0 means the model trains on CRPS alone |
-| `--ssim_weight` / `--laplacian_weight` / `--histogram_weight` | 0.0 / 0.0 / 0.0 | Legacy central-field losses, all off |
+| `--ssim_weight` / `--laplacian_weight` / `--histogram_weight` | 0.0 / 0.0 / 0.0 | Additional central-field losses, all off |
 | `--checkpoint_monitor` | `val_crps` | Quantity used to select epochs |
 | `--weight_avg_last` | 20 | Predict with the mean of the last N epochs' weights |
 | `--context_radii` | `3,30,100` | Radii (px) for past-change occupancy context |
 | `--hm_context_radii` / `--hm_context_stats` | `3,30,100` / `mean,max` | Neighbourhood-HM context channels |
 | `--use_location_encoder` | true | Use spherical-harmonic position encoding (8 channels, 10 Legendre polynomials) |
-| `--norm_stats_json` | `data/conv_spline/norm_stats.json` | Normalisation statistics; loaded if present, otherwise computed and written |
+| `--norm_stats_json` | `data/conv_spline/norm_stats.json` | Normalisation statistics. **E2c: `data/conv_spline/norm_stats_E2c.json`**. Loaded if present; if the file is missing, statistics are *sampled over the whole grid* and written there, which is not what E2c trained on |
+| `--fold_mask` | None | k-fold mask for the hindcast. **E2c: `data/raw/hm_global/fold_mask_b4_land_1000.tif`** |
 | `--train_all_splits` | False | Train on all data, holding no geography out (True for the forecast model) |
 | `--seed` | 42 | Random seed |
 
 ### Making Predictions with Existing Checkpoint
 
-**The defaults build E2a, so an E2a checkpoint loads with no model flags.** `--checkpoint` restores the checkpoint's hyperparameters and then overrides the head and context settings from the command line, so a checkpoint of any *other* model needs that model's flags. For E1v that means `--isqf_tails True --isqf_space neglog`. The load is non-strict, so a mismatch shows only as a `randomly initialised: N tensors` line in the log. A correct load prints `Checkpoint loaded with 0 warm-started convs` and no randomly initialised tensors.
+**An E2c checkpoint needs E2c's flags.** `--checkpoint` restores the checkpoint's hyperparameters and then overrides the head and context settings from the command line, and the static channel list comes from the flags, so pass `--kernel_size 5 --terrain_covariates True --norm_stats_json data/conv_spline/norm_stats_E2c.json`. The load is non-strict, so a mismatch can show only as a `randomly initialised: N tensors` line in the log. A correct load prints `Checkpoint loaded with 0 warm-started convs` and no randomly initialised tensors.
 
-**Normalisation statistics are not stored in the checkpoint.** The production checkpoints were trained with `data/conv_spline/norm_stats.json`, which is the default for `--norm_stats_json`. Like the checkpoints, that file is not in git, so copy both when moving to another machine.
+**Normalisation statistics are not stored in the checkpoint.** They are `data/conv_spline/norm_stats_E2c.json`, with a copy in `models/production/E2c_global/`. The sidecar also declares elevation's `-32768` fill, which the reader drops, so it is part of the model, not a cache. Neither the checkpoints nor the sidecars are in git, so copy them together when moving to another machine.
 
 #### Option 1: Load from W&B Artifact
 
@@ -278,17 +305,20 @@ python scripts/train_lightning.py \
 
 #### Option 2: Load from Local Checkpoint File
 
-The production forward model (trained on all data, base year 2020) is `models/production/E2a_global/final_foldNone_3951459.ckpt`:
+The production forward model (trained on all data, base year 2020) is `models/production/E2c_global/final_foldNone_3573819.ckpt`:
 
 ```bash
 python scripts/train_lightning.py \
-  --checkpoint models/production/E2a_global/final_foldNone_3951459.ckpt \
+  --checkpoint models/production/E2c_global/final_foldNone_3573819.ckpt \
+  --kernel_size 5 --terrain_covariates True --norm_stats_json data/conv_spline/norm_stats_E2c.json \
   --max_epochs 0 \
   --run_large_area_prediction True \
   --run_full_set_evaluation False \
   --predict_region config/region_to_predict_small.geojson \
   --predict_final_year 2040
 ```
+
+This recipe was checked on 2026-09-27: it loads with 0 warm-started convs and reproduces the delivered forecast over that region to a median difference of 5e-07 HM (99th percentile 8e-04). It is not bit-identical, because prediction tiles start at the region's own corner, 4 and 9 px off the global run's 64 px tile grid, so the overlap blending differs; the 12 px receptive field makes tile edges matter.
 
 #### Prediction Arguments
 
@@ -348,22 +378,24 @@ python scripts/train_lightning.py --disable_wandb
 
 ## Global Prediction
 
-The global products are built by one runner, which selects the model from a table naming its flags, head family and parameter count together:
+The global products are built by one runner, which selects the model from a table naming its flags, head family, parameter count, fold mask and normalisation sidecar together. **Always pass `MODEL=E2c`**: the runner holds other configurations and does not default to E2c.
 
 ```bash
-MODEL=E2a ALLOW_GLOBAL=1 ./scripts/run_global_model.sh <stage>
+MODEL=E2c ALLOW_GLOBAL=1 ./scripts/run_global_model.sh <stage>
 # stages: args | smoke | hindcast | stitch | score | forecast
 #         | export_hindcast | export_forecast | all
 ```
 
 | Stage | What it does | Measured cost |
 |-------|--------------|---------------|
-| `smoke` | One epoch, one fold, a few hundred blocks through **every** stage on the real global grid; writes the receipt | ~1 h |
-| `hindcast` | k=5 folds, base 2000 → 2005/2010/2015/2020, both GPUs | ~105 min/fold, 5 h 14 total |
-| `stitch` | Holdout mosaic: each pixel from the fold that never saw it | ~3 h 18 |
-| `score` | The scorecard over every land pixel. **Run it alone**: it peaks at ~99 GiB | ~5 h |
-| `forecast` | The `--train_all_splits` forward model, base 2020 → 2025/2030/2035/2040 | ~3 h 50 |
-| `export_*` | Five COGs per year + one icechunk store, then verification | ~2 h each |
+| `smoke` | One epoch, one fold, a few hundred blocks through **every** stage on the real global grid; writes the receipt that pins the code, the flags and the input files | ~1 h |
+| `hindcast` | k=5 folds, base 2000 → 2005/2010/2015/2020, both GPUs | ~97 min/fold, 4 h 52 total |
+| `stitch` | Holdout mosaic: each pixel from the fold that never saw it | ~2 h 40 |
+| `score` | The scorecard over every land pixel. **Run it alone**: it peaks at ~102 GiB | ~5 h |
+| `forecast` | The `--train_all_splits` forward model, base 2020 → 2025/2030/2035/2040 | ~4 h |
+| `export_*` | Five COGs per year + one icechunk store, then verification | ~2 h 50 (both in parallel) |
+
+Measured on the 2026-09-26 E2c run. The forward model can run on one GPU while fold 5 and the stitch run, and the two exports run together; the scorer needs the machine to itself.
 
 ### Products
 
@@ -382,25 +414,25 @@ observed/observed_hm.icechunk             # observed HM 1990-2020, (year, latitu
 - **Observed**: overall HM for 1990–2020 on the same grid, encoding and chunk footprint as the prediction stores, so observed and predicted tiles line up.
 - The prediction stores do not yet declare `dimension_names`, so `xarray.open_zarr` cannot open them; read them with `zarr` directly. The observed store does declare them.
 
-### Global scorecard (E2a, out of sample, 184,573,321 land pixels)
+### Global scorecard (E2c, out of sample, 184,573,321 land pixels)
 
 | Horizon | CRPS skill | RMSE skill | 50% coverage | 95% coverage |
 |---------|------------|------------|--------------|--------------|
-| +5 yr | 0.154 | 0.039 | 0.416 | 0.953 |
-| +10 yr | 0.266 | 0.191 | 0.409 | 0.961 |
-| +15 yr | 0.302 | 0.233 | 0.449 | 0.948 |
-| +20 yr | 0.302 | 0.243 | 0.466 | 0.896 |
+| +5 yr | 0.155 | 0.041 | 0.421 | 0.950 |
+| +10 yr | 0.261 | 0.188 | 0.427 | 0.917 |
+| +15 yr | 0.299 | 0.229 | 0.449 | 0.953 |
+| +20 yr | 0.299 | 0.241 | 0.482 | 0.955 |
 
-Skill is measured against **persistence** (HM unchanged from the base year)
-
+Skill is measured against **persistence** (HM unchanged from the base year).
 
 **Known limitations**
-- **The far-field intervals are too narrow.** Beyond 100 px from past change at +20 yr, the 95% interval covers 70.9% of observations and 12.7% of pixels fall above the 99.9th percentile, against 0.1% nominal. Pooled over all land this shows as the +20 yr coverage of 0.896. The distribution is bounded by its outermost knots (see [Model Architecture](#model-architecture)), so it cannot reach far into the tail.
-- **The distribution is centred slightly low.** The PIT mean is 0.51–0.56 against 0.50, with recurring spikes near 0.22, 0.52, 0.77 and 0.95.
-- **The central intervals are too narrow**: 50% coverage is 0.41–0.47 and 80% coverage 0.74–0.77.
-- **The lower far tail is over-populated**: P(u < 0.001) is 0.0095–0.013 against 0.001.
+- **The far-field intervals are too narrow at +10 yr.** Beyond 100 px from past change at +10 yr, the 95% interval covers 86.1% of observations, and the forecast loses to persistence there on CRPS (skill −1.45). Pooled over all land this shows as the +10 yr coverage of 0.917. Far-field coverage does not change monotonically with lead time (0.981, 0.861, 0.941 and 0.935 at +5 to +20 yr), because nothing constrains how the interval width grows from one horizon to the next. The distribution is bounded by its outermost knots (see [Model Architecture](#model-architecture)), so it cannot reach far into the tail.
+- **The far-field point forecast does not beat persistence**: RMSE skill beyond 100 px is −0.014 at +5 yr and +0.008 at +20 yr.
+- **The distribution is centred slightly low.** The PIT mean is 0.52–0.54 against 0.50, with recurring spikes near 0.22, 0.52, 0.77 and 0.95.
+- **The central intervals are too narrow**: 50% coverage is 0.42–0.48 and 80% coverage 0.76–0.77.
+- **The lower far tail is over-populated**: P(u < 0.001) is 0.0116–0.0125 against 0.001.
 
-The full scorecard, stratified by distance to past change, is `docs/global/scores/scorecard_detailed_g_E2a_hind.html`; see `docs/global/global_production_e2a.md`.
+The full scorecard, stratified by distance to past change, is `docs/global/scores/scorecard_detailed_g_E2c_hind.html`; see `docs/global/global_production_e2c.md`.
 
 ## Data: Human Modification (HM)
 
@@ -413,7 +445,7 @@ We forecast the Human Modification (HM) index, a spatially explicit measure of a
 
 **Key characteristics:**
 - **Temporal cadence**: 5-year intervals (1990, 1995, ..., 2020)
-- **Model inputs**: 3 most recent HM timesteps + 10 dynamic covariates + 7 static variables + 12 neighbourhood-context channels + location encoding
+- **Model inputs**: 3 most recent HM timesteps + 10 dynamic covariates + 10 static variables (7 layers + slope and aspect) + 12 neighbourhood-context channels + location encoding
 - **Target variable**: AA (total Human Modification)
 - **Data range**: [0, 1]
 - **Coverage**: Near-global extent, 17111 × 40000 grid at 0.009° (~1 km), 184.6 M land pixels
@@ -424,10 +456,10 @@ The model reads a three-step window `(t-10, t-5, t)`, so with HM available for 1
 
 ### Quantile-Function Head
 
-A ConvLSTM trunk encodes the input window, and the neighbourhood context enters the trunk directly. A decoder then emits the parameters of one quantile function per horizon:
+A ConvLSTM trunk (4 layers, 64 hidden, 5×5 kernels) encodes the input window, and the neighbourhood context enters the trunk directly. The trunk's receptive radius is 12 px: every convolution on the path from an input pixel to the last layer's last state adds 2 px, over 4 layers and 2 recurrent steps. A decoder then emits the parameters of one quantile function per horizon:
 
 ```
-ConvLSTM trunk (+ 12 context channels + location encoding)
+ConvLSTM trunk (41 input channels per step: 11 dynamic, 10 static, 12 context, 8 location)
            ↓
    Shared representation
            ↓
@@ -445,7 +477,7 @@ ConvLSTM trunk (+ 12 context channels + location encoding)
   Q_h(u | x), monotone by construction, clamped to [0, 1]
 ```
 
-The increments are positive, so the quantile function can never cross itself. With `--central_residual` the ladder sits on top of the base-year HM, so an untrained model starts from persistence. That is **15 parameters per horizon**, against 29 for the rational-quadratic spline head it replaced. The knots span u = 0 to u = 1 and there are no tail parameters, so the predicted distribution is bounded by its outermost knots, Q(0) and Q(1). E1v adds two learned exponential tail rates on `-log(1 - HM)` support (17 parameters), which let the far tails extend beyond them.
+The increments are positive, so the quantile function can never cross itself. With `--central_residual` the ladder sits on top of the base-year HM, so an untrained model starts from persistence. That is **15 parameters per horizon**. The knots span u = 0 to u = 1 and there are no tail parameters, so the predicted distribution is bounded by its outermost knots, Q(0) and Q(1).
 
 ### Loss Function
 
@@ -457,7 +489,7 @@ Selected on:  val_crps
 Predicted with:  the mean of the last 20 epochs' weights
 ```
 
-The CRPS integrates the pinball loss over every quantile level at once, so a single proper scoring rule trains the location, spread and tails of the distribution together. For a piecewise-linear `Q(u)` that integral is exact, so no quadrature is involved. The legacy terms (MSE on the mean, SSIM, Laplacian pyramid, histogram) are all weighted 0 in production.
+The CRPS integrates the pinball loss over every quantile level at once, so a single proper scoring rule trains the location, spread and tails of the distribution together. For a piecewise-linear `Q(u)` that integral is exact, so no quadrature is involved. The code's other loss terms (MSE on the mean, SSIM, Laplacian pyramid, histogram) are all weighted 0.
 
 ## Contributing
 

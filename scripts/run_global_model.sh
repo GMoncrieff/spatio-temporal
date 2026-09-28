@@ -55,26 +55,16 @@
 set -uo pipefail
 cd /home/glenn/spatio-temporal
 
-STAGE="${1:?usage: [MODEL=E1v|E2a] ALLOW_GLOBAL=1 $0 <smoke|hindcast|stitch|score|forecast|export_hindcast|export_forecast|all>}"
-
-# Set before sourcing: conv_spline_base.sh takes each of these as ${VAR:-<africa default>}.
-export REGION="${REGION:-config/region_to_predict_large.geojson}"
-export FOLD_MASK="${FOLD_MASK:-data/raw/hm_global/fold_mask_b4_1000.tif}"
-export FOLDS="${FOLDS:-1,2,3,4,5}"
-export GPUS="${GPUS:-0,1}"
-export EXP_ROOT="${EXP_ROOT:-/mnt/hdd1/spatio-temporal/data/conv_spline/global}"
-export LOG_DIR="${LOG_DIR:-data/conv_spline/logs/global}"
-export SCORE_DIR="${SCORE_DIR:-data/conv_spline/scores/global}"
-export VAL_STRIDE="${VAL_STRIDE:-1024}"
-export MAX_EPOCHS="${MAX_EPOCHS:-150}"
-
-source scripts/conv_spline_base.sh
-guard_region || exit 1
+STAGE="${1:?usage: [MODEL=E1v|E2a|E2c] ALLOW_GLOBAL=1 $0 <smoke|hindcast|stitch|score|forecast|export_hindcast|export_forecast|all>}"
 
 # ---------------------------------------------------------------- the configuration
 # ONE model table, because the head's family, its parameter count and its flags must not be
 # able to drift apart. verify_head_fingerprint is handed all three from here, so a model
 # added below cannot be run without its fingerprint also being declared.
+#
+# Each model also names the two INPUTS it trained on -- its fold mask and its normalisation
+# sidecar -- because a checkpoint is only meaningful beside them, and the table is chosen
+# before conv_spline_base.sh is sourced so that FOLD_MASK is this model's, not the default.
 #
 # The parameter count is NOT decoration: 17 with the learned tails and 15 without is the only
 # thing that distinguishes E1v from E2a on the same family at free scale, and --isqf_tails
@@ -86,7 +76,9 @@ case "${MODEL:=E1v}" in
     # Promoted 2026-09-17 at the close of the conv-spline screening phase.
     # models/production/E1v/README.md and models/production/E1v_global/README.md.
     MODEL_FLAGS="--head_family pwl --isqf_tails True --isqf_space neglog --free_scale True --mu_mse_weight 0.0"
-    MODEL_FAMILY="pwl"; MODEL_PARAMS="17" ;;
+    MODEL_FAMILY="pwl"; MODEL_PARAMS="17"
+    MODEL_FOLD_MASK="data/raw/hm_global/fold_mask_b4_1000.tif"
+    MODEL_NORM_STATS="data/conv_spline/norm_stats.json"; MODEL_NORM_DOMAIN="sampled" ;;
   E2a)
     # The runner-up. Same family and same free scale as E1v, WITHOUT the learned tails, so
     # E1v vs E2a on current code is a clean A/B on the tails alone.
@@ -97,13 +89,49 @@ case "${MODEL:=E1v}" in
     # needed to isolate the tails -- and its numbers are NOT directly comparable to the
     # Africa E2a scorecard.
     MODEL_FLAGS="--head_family pwl --free_scale True --mu_mse_weight 0.0"
-    MODEL_FAMILY="pwl"; MODEL_PARAMS="15" ;;
+    MODEL_FAMILY="pwl"; MODEL_PARAMS="15"
+    MODEL_FOLD_MASK="data/raw/hm_global/fold_mask_b4_1000.tif"
+    MODEL_NORM_STATS="data/conv_spline/norm_stats.json"; MODEL_NORM_DOMAIN="sampled" ;;
+  E2c)
+    # E2a retrained on the round the user defined on 2026-09-25: three changes, no others.
+    #   trunk   --kernel_size 5, 4 layers: receptive radius 12 px against E2a's 6.
+    #   inputs  norm_stats_E2c.json: every channel's moments over HM land only, exactly
+    #           (scripts/compute_norm_stats.py), and elevation's undeclared -32768 fill
+    #           dropped from the stats and read as sea level (static_nodata in the sidecar).
+    #           E2a's elevation mean was -4200 m; over land it is 675 m.
+    #   folds   fold_mask_b4_land_1000.tif: fold ids on the chips holding any land (35.0% of
+    #           the grid). The old mask read HM's finite 3.4e38 nodata as valid, 99.33%.
+    #   terrain --terrain_covariates True: slope, sin(aspect), cos(aspect) of OUR elevation
+    #           raster (scripts/prepare_terrain.py), three static channels read exactly like
+    #           elevation -- ten static channels against E2a's seven. Added 2026-09-26, and the
+    #           first E2c run (without it) was discarded and redone.
+    # The head is E2a's: pwl, free scale, no tails, 15 params/horizon.
+    MODEL_FLAGS="--head_family pwl --free_scale True --mu_mse_weight 0.0 --kernel_size 5 --terrain_covariates True"
+    MODEL_FAMILY="pwl"; MODEL_PARAMS="15"
+    MODEL_FOLD_MASK="data/raw/hm_global/fold_mask_b4_land_1000.tif"
+    MODEL_NORM_STATS="data/conv_spline/norm_stats_E2c.json"; MODEL_NORM_DOMAIN="land"
+    MODEL_EXTRA_INPUTS="data/raw/hm_global/hm_static_terrain_slope_1000.tiff data/raw/hm_global/hm_static_terrain_aspsin_1000.tiff data/raw/hm_global/hm_static_terrain_aspcos_1000.tiff" ;;
   *)
-    echo "FATAL: unknown MODEL='${MODEL}'. Known: E1v, E2a." >&2
+    echo "FATAL: unknown MODEL='${MODEL}'. Known: E1v, E2a, E2c." >&2
     echo "       Add it to the table in $0 together with its family and parameter count;" >&2
     echo "       a model without a declared fingerprint cannot be verified." >&2
     exit 2 ;;
 esac
+# Set before sourcing: conv_spline_base.sh takes each of these as ${VAR:-<africa default>}.
+export REGION="${REGION:-config/region_to_predict_large.geojson}"
+export FOLD_MASK="${FOLD_MASK:-$MODEL_FOLD_MASK}"
+NORM_STATS="${NORM_STATS:-$MODEL_NORM_STATS}"
+export FOLDS="${FOLDS:-1,2,3,4,5}"
+export GPUS="${GPUS:-0,1}"
+export EXP_ROOT="${EXP_ROOT:-/mnt/hdd1/spatio-temporal/data/conv_spline/global}"
+export LOG_DIR="${LOG_DIR:-data/conv_spline/logs/global}"
+export SCORE_DIR="${SCORE_DIR:-data/conv_spline/scores/global}"
+export VAL_STRIDE="${VAL_STRIDE:-1024}"
+export MAX_EPOCHS="${MAX_EPOCHS:-150}"
+
+source scripts/conv_spline_base.sh
+guard_region || exit 1
+
 MODEL_FLAGS="${MODEL_FLAGS_OVERRIDE:-$MODEL_FLAGS}"
 SEED="${SEED:-42}"
 
@@ -145,11 +173,43 @@ CODE_FILES="scripts/train_lightning.py scripts/run_hindcast_folds.py scripts/con
 scripts/run_global_model.sh scripts/export_products.py scripts/score_distributional_model.py \
 scripts/check_qf_raster.py scripts/check_prediction_complete.py scripts/verify_products.py \
 src/stitch.py src/models/spatiotemporal_predictor.py src/models/quantile_pwl.py \
-src/models/lightning_module.py"
+src/models/lightning_module.py src/models/convlstm.py scripts/torchgeo_dataloader.py"
 # Per MODEL: a receipt earned by smoking E1v must never authorise an E2a run.
 STAMP="${LOG_DIR}/smoke_ok_${MODEL}.stamp"
 
 code_hash() { cat $CODE_FILES 2>/dev/null | sha256sum | cut -c1-16; }
+# The fold mask and the normalisation sidecar are data, so the code hash cannot see them
+# change -- and each changes what trains. The receipt pins their bytes as well.
+# MODEL_EXTRA_INPUTS (E2c's terrain rasters, ~2 GB) are pinned by name, size and mtime rather
+# than bytes: this hash is taken on every stage and a full read would cost minutes each time.
+inputs_hash() {
+  { cat "$NORM_STATS" "$FOLD_MASK" 2>/dev/null
+    for f in ${MODEL_EXTRA_INPUTS:-}; do stat -c '%n %s %Y' "$f" 2>/dev/null || echo "missing $f"; done
+  } | sha256sum | cut -c1-16
+}
+
+# A missing sidecar is not an error train_lightning raises: it SAMPLES stats over the whole
+# grid -- ocean and elevation's -32768 fill included -- and writes them to the path it was
+# given. So refuse before anything trains, and check the sidecar is of the kind this model
+# declares (E2c's is exact over land; E1v/E2a's was sampled and says nothing).
+require_norm_stats() {
+  if [ ! -r "$NORM_STATS" ]; then
+    echo "REFUSING ${1}: no normalisation sidecar at ${NORM_STATS}." >&2
+    echo "  train_lightning would sample fresh stats, ocean included, and write them there." >&2
+    [ "$MODEL_NORM_DOMAIN" = "land" ] && \
+      echo "  Build it:  \$PY scripts/compute_norm_stats.py --out ${NORM_STATS}" >&2
+    return 1
+  fi
+  local dom
+  dom=$($PY -c 'import json,sys; print(json.load(open(sys.argv[1])).get("stats_domain","sampled"))' \
+        "$NORM_STATS" 2>/dev/null)
+  if [ "$dom" != "$MODEL_NORM_DOMAIN" ]; then
+    echo "REFUSING ${1}: ${NORM_STATS} holds '${dom:-unreadable}' stats; ${MODEL} trains on" >&2
+    echo "  '${MODEL_NORM_DOMAIN}' stats." >&2
+    return 1
+  fi
+  echo "  ✓ normalisation sidecar ${NORM_STATS} (${dom})"
+}
 
 require_smoke() {
   local want got
@@ -174,6 +234,14 @@ require_smoke() {
     echo "REFUSING ${1}: the smoke receipt is for different code." >&2
     echo "  receipt ${got}   now ${want}" >&2
     echo "  Re-smoke, or the long run is gated on a build that no longer exists." >&2
+    return 1
+  fi
+  local got_in want_in
+  want_in="$(inputs_hash)"
+  got_in=$(awk '/^inputs_hash=/{sub(/^inputs_hash=/,""); print}' "$STAMP")
+  if [ "$got_in" != "$want_in" ]; then
+    echo "REFUSING ${1}: the smoke receipt is for different inputs." >&2
+    echo "  receipt ${got_in:-<none>}   now ${want_in}  (${NORM_STATS} + ${FOLD_MASK})" >&2
     return 1
   fi
   echo "  ✓ smoke receipt ${got} matches the code on disk, for ${MODEL}"
@@ -227,6 +295,9 @@ verify_fold_log() {
   verify_loss_weights     "$log" "$name" "$MODEL_FLAGS"                 || ok=0
   verify_context_wiring   "$log" "$name"                              || ok=0
   verify_head_fingerprint "$log" "$name" "$MODEL_FAMILY" "$MODEL_PARAMS" "$MODEL_FLAGS" || ok=0
+  verify_trunk_fingerprint "$log" "$name" "$MODEL_FLAGS"      || ok=0
+  verify_static_fingerprint "$log" "$name" "$MODEL_FLAGS"     || ok=0
+  verify_norm_stats_log   "$log" "$name" "$NORM_STATS"        || ok=0
   verify_row_banding      "$log" "$name" "$ROW_CHUNK"                 || ok=0
   if [ "$want_wa" != "0" ]; then
     verify_weight_averaging "$log" "$name" "$want_wa"                 || ok=0
@@ -238,6 +309,7 @@ verify_fold_log() {
 
 do_smoke() {
   local root="${SMOKE_ROOT}" logs="${LOG_DIR}/smoke"
+  require_norm_stats smoke || return 1
   rm -rf "$root"
   mkdir -p "$root" "$logs"
   banner "SMOKE ${MODEL} — the real global grid, one epoch, one fold, ${SMOKE_BLOCKS:-400} prediction blocks"
@@ -271,6 +343,7 @@ do_smoke() {
       --region "$REGION" --windows "$WINDOWS" --fold_mask "$FOLD_MASK" \
       --output_root "${root}/hind" --log_dir "$logs" --tag "_smoke_hind" \
       --max_epochs 1 --train_chips 8 --val_stride 8192 --num_workers 2 --disable_wandb \
+      --norm_stats_json "$NORM_STATS" \
       --extra_train_args "$smoke_extra" || { smoke_fail "1/6 train+predict"; return 1; }
   local hlog="${logs}/hindcast_fold1_smoke_hind.log"
   verify_fold_log "$hlog" "smoke-hind" 1 || { smoke_fail "1/6 fingerprints"; return 1; }
@@ -331,6 +404,9 @@ do_smoke() {
     echo "when=$(date -Is)"
     echo "git=$(git rev-parse --short HEAD 2>/dev/null)"
     echo "flags=${MODEL_FLAGS}"
+    echo "inputs_hash=$(inputs_hash)"
+    echo "norm_stats=${NORM_STATS}"
+    echo "fold_mask=${FOLD_MASK}"
     echo "row_chunk=${ROW_CHUNK}"
     echo "score_row_chunk=${SCORE_ROW_CHUNK}"
     echo "region=${REGION}"; } > "$STAMP"
@@ -340,6 +416,7 @@ do_smoke() {
 
 do_hindcast() {
   require_smoke hindcast || return 1
+  require_norm_stats hindcast || return 1
   banner "GLOBAL HINDCAST — ${HIND_NAME} | folds ${FOLDS} | window ${WINDOWS} -> ${HIND_YEARS}"
   echo "  args: ${TRAIN_ARGS}"
   mkdir -p "$HIND_ROOT"
@@ -350,6 +427,7 @@ do_hindcast() {
       --output_root "$HIND_ROOT" --log_dir "$LOG_DIR" --tag "_${HIND_NAME}" \
       --max_epochs "$MAX_EPOCHS" --train_chips "$TRAIN_CHIPS" \
       --val_stride "$VAL_STRIDE" --num_workers "$NUM_WORKERS" \
+      --norm_stats_json "$NORM_STATS" \
       --wandb_group "global-${HIND_NAME}" \
       --extra_train_args "$TRAIN_ARGS"
   local rc=$? ok=1
@@ -419,14 +497,14 @@ run_forecast_train() {
       --max_epochs "$epochs" --train_chips "$TRAIN_CHIPS" \
       --val_stride "$VAL_STRIDE" --num_workers "$NUM_WORKERS" \
       --batch_size 8 --devices 1 \
-      --norm_stats_json data/conv_spline/norm_stats.json \
+      --norm_stats_json "$NORM_STATS" \
       --run_full_set_evaluation False --run_large_area_prediction True \
       --predict_region "$REGION" \
       --predict_final_year 2040 \
       --predict_stride 64 --predict_batch_size 32 \
       --predict_output_dir "$pred_dir" \
       --predict_output_prefix "" \
-      --hidden_dim 64 --num_layers 4 --kernel_size 3 \
+      --hidden_dim 64 --num_layers 4 \
       --locenc_out_channels 8 --locenc_legendre_polys 10 \
       --histogram_lambda_w2 0.1 --histogram_warmup_epochs 0 \
       ${TRAIN_ARGS} ${extra} \
@@ -459,6 +537,7 @@ verify_forecast_log() {
 
 do_forecast() {
   require_smoke forecast || return 1
+  require_norm_stats forecast || return 1
   banner "GLOBAL FORWARD MODEL + FORECAST — ${FC_NAME} | base 2020 -> ${FC_YEARS}"
   echo "  args: ${TRAIN_ARGS}"
   mkdir -p "${FC_ROOT}/preds"
@@ -514,12 +593,15 @@ case "$STAGE" in
     echo "MODEL_FLAGS=${MODEL_FLAGS}"
     echo "MODEL_FAMILY=${MODEL_FAMILY}"
     echo "MODEL_PARAMS=${MODEL_PARAMS}"
+    echo "NORM_STATS=${NORM_STATS}"
+    echo "MODEL_NORM_DOMAIN=${MODEL_NORM_DOMAIN}"
     echo "TRAIN_ARGS=${TRAIN_ARGS}"
     echo "HIND_ROOT=${HIND_ROOT}"
     echo "FC_ROOT=${FC_ROOT}"
     echo "PROD_ROOT=${PROD_ROOT}"
     echo "STAMP=${STAMP}"
     echo "code_hash=$(code_hash)"
+    echo "inputs_hash=$(inputs_hash)"
     ;;
   smoke)            do_smoke ;;
   hindcast)         do_hindcast ;;

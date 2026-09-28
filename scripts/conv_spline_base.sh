@@ -336,6 +336,94 @@ verify_head_fingerprint() {
   echo "  ✓ ${name}: head verified (${got_fam}, ${got_np} params/horizon)"
 }
 
+# The trunk must be the one asked for. E2c differs from E2a ONLY in --kernel_size 5 (receptive
+# radius 12 px against 6), so a run that silently kept the 3x3 trunk would read as "a wider
+# receptive field changed nothing". The kernel is derived from the flags, as the tails are
+# above, so a runner cannot ask for one kernel and check for another; no --kernel_size means
+# argparse's 3. The banner is printed off the constructed ConvLSTM (train_lightning
+# _trunk_banner), and the forecast command used to spell --kernel_size 3 ahead of TRAIN_ARGS
+# -- a second spelling is where the flags and the module part company.
+#
+#   verify_static_fingerprint <log> <name> "<flags>"
+#
+# The static channels the run actually read. --terrain_covariates True (E2c) appends slope,
+# sin(aspect) and cos(aspect) to the seven static layers; a flag accepted and never read would
+# train a seven-channel model and report "terrain changed nothing". The expected count is
+# derived from the flags (7, or 10 with the flag), the banner lists the files the dataset read,
+# and "module N" is the constructed trunk's count -- all three must agree.
+verify_static_fingerprint() {
+  local log="$1" name="$2" flags="${3:-}" line want=7 got mod
+  if [ ! -r "$log" ]; then
+    echo "FATAL: ${name}: no readable log at ${log}; static channels unverified." >&2
+    return 1
+  fi
+  line=$(grep -m1 "^Static channels:" "$log" || true)
+  if [ -z "$line" ]; then
+    echo "FATAL: ${name}: ${log} has no Static channels banner." >&2
+    return 1
+  fi
+  case "$flags" in *--terrain_covariates\ True*) want=10 ;; esac
+  got=$(sed -E 's/^Static channels:[[:space:]]+([0-9]+) .*/\1/' <<<"$line")
+  mod=$(sed -E 's/.*; module ([0-9]+).*/\1/' <<<"$line")
+  if [ "$got" != "$want" ] || [ "$mod" != "$want" ]; then
+    echo "FATAL: ${name}: ${got} static channels read, module built for ${mod}; the flags ask for ${want}." >&2
+    echo "  banner: ${line}" >&2
+    return 1
+  fi
+  if [ "$want" = 10 ] && ! grep -q "hm_static_terrain_slope_1000.tiff, hm_static_terrain_aspsin_1000.tiff, hm_static_terrain_aspcos_1000.tiff" <<<"$line"; then
+    echo "FATAL: ${name}: ten static channels, but not the three terrain rasters in order." >&2
+    echo "  banner: ${line}" >&2
+    return 1
+  fi
+  echo "  ✓ ${name}: static channels verified (${got}, module ${mod})"
+}
+
+#   verify_norm_stats_log <log> <name> <sidecar path>
+#
+# The normalisation sidecar a run read, read back out of its own log. If the path passed as
+# --norm_stats_json does not exist, train_lightning SAMPLES fresh stats over the whole grid --
+# ocean and elevation's -32768 fill included -- and writes them there, so a missing sidecar
+# becomes a contaminated one and the run says only "Computing per-variable normalization
+# statistics". The line that proves the right file was read is the one checked.
+verify_norm_stats_log() {
+  local log="$1" name="$2" want="$3" got
+  if [ ! -r "$log" ]; then
+    echo "FATAL: ${name}: no readable log at ${log}; normalisation sidecar unverified." >&2
+    return 1
+  fi
+  if ! grep -qxF "Loaded normalization stats from ${want}" "$log"; then
+    got=$(grep -m1 "^Loaded normalization stats from" "$log" || true)
+    echo "FATAL: ${name}: the run did not load ${want}." >&2
+    echo "  log: ${got:-<no sidecar loaded: the stats were sampled>}" >&2
+    return 1
+  fi
+  echo "  ✓ ${name}: normalisation sidecar verified (${want})"
+}
+
+#   verify_trunk_fingerprint <log> <name> "<flags>"
+verify_trunk_fingerprint() {
+  local log="$1" name="$2" flags="${3:-}" line got want=3
+  if [ ! -r "$log" ]; then
+    echo "FATAL: ${name}: no readable log at ${log}; trunk unverified." >&2
+    return 1
+  fi
+  line=$(grep -m1 "^Trunk:" "$log" || true)
+  if [ -z "$line" ]; then
+    echo "FATAL: ${name}: ${log} has no Trunk banner; the kernel is unverified." >&2
+    return 1
+  fi
+  case "$flags" in
+    *--kernel_size\ *) want=$(sed -E 's/.*--kernel_size ([0-9]+).*/\1/' <<<"$flags") ;;
+  esac
+  got=$(sed -E 's/.*, kernel ([0-9,]+),.*/\1/' <<<"$line")
+  if [ "$got" != "$want" ]; then
+    echo "FATAL: ${name}: trunk kernel is '${got}', the flags ask for ${want}." >&2
+    echo "  banner: ${line}" >&2
+    return 1
+  fi
+  echo "  ✓ ${name}: trunk verified ($(sed -E 's/^Trunk:[[:space:]]+//' <<<"$line"))"
+}
+
 # Prediction accumulators are len(active_horizons) * (3 + 64) full-window float32 arrays --
 # 268 on a four-horizon window -- and each one spans the band. On the 17111 x 40000 global
 # grid a 2048-row band is 0.305 GiB per accumulator, so BASE_ARGS' Africa-sized

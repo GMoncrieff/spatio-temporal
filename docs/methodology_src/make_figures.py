@@ -3,7 +3,7 @@
 
     python docs/methodology_src/make_figures.py
 
-Reads the fold mask, the stitched E2a hindcast and the E2a scorecard CSVs; writes PNGs to
+Reads the E2c fold mask, the stitched E2c hindcast and the E2c scorecard CSVs; writes PNGs to
 docs/methodology_src/figs/. The remaining figures are copied from docs/global/scores/.
 """
 import sys
@@ -23,8 +23,9 @@ sys.path.insert(0, str(REPO / "scripts"))
 from score_distributional_model import qf_levels  # noqa: E402
 
 FIG = REPO / "docs/methodology_src/figs"
-FOLD_MASK = REPO / "data/raw/hm_global/fold_mask_b4_1000.tif"
-STITCHED = Path("/mnt/hdd1/spatio-temporal/data/conv_spline/global/g_E2a_hind/stitched")
+FOLD_MASK = REPO / "data/raw/hm_global/fold_mask_b4_land_1000.tif"
+STITCHED = Path("/mnt/hdd1/spatio-temporal/data/conv_spline/global/g_E2c_hind/stitched")
+LABEL = "g_E2c_hind"
 SCORES = REPO / "docs/global/scores"
 HM = REPO / "data/raw/hm_global"
 
@@ -41,8 +42,8 @@ def fold_roles():
     with rasterio.open(FOLD_MASK) as s:
         g = s.read(1, out_shape=(s.height // 10, s.width // 10), resampling=rasterio.enums.Resampling.mode)
         z = s.read(1, window=Window(c0, r0, n, n))
-    # The fold mask also assigns ids over the ocean (its validity mask read the HM raster's
-    # finite 3.4e38 sentinel as valid), so roles are drawn on LAND only: that is what is scored.
+    # E2c's mask covers only chips holding land, but a chip's ocean pixels still carry its id,
+    # so roles are drawn on LAND only: that is what is scored.
     with rasterio.open(HM / "HM_2000_AA_1000.tiff") as h:
         lg = h.read(1, out_shape=g.shape, resampling=rasterio.enums.Resampling.nearest)
         lz = h.read(1, window=Window(c0, r0, n, n))
@@ -70,7 +71,7 @@ def fold_roles():
     handles = [plt.Rectangle((0, 0), 1, 1, fc=c) for c in (BLUE, ORANGE, GREY)]
     fig.legend(handles, ["held-out fold (predicted, scored)", "validation fold", "training folds (3 of 5)"],
                loc="lower center", ncol=3, frameon=False, bbox_to_anchor=(0.5, -0.02))
-    fig.tight_layout(rect=(0, 0.06, 1, 1))
+    fig.tight_layout(rect=(0, 0.09, 1, 1))
     fig.savefig(FIG / "fold_roles.png", bbox_inches="tight"); plt.close(fig)
 
 
@@ -108,29 +109,34 @@ def quantile_ladder(row=9976, col=14889):
 
 
 def band_skill():
-    """CRPS and MSE skill, and 95% coverage, by distance to past change at +20 yr."""
-    d = pd.read_csv(SCORES / "dist_g_E2a_hind.csv")
-    c = pd.read_csv(SCORES / "central_g_E2a_hind.csv")
-    d = d[(d.stratum == "distance") & (d.horizon == 20)].set_index("bin")
-    c = c[(c.stratum == "distance") & (c.horizon == 20)].set_index("bin")
+    """(a) CRPS and MSE skill by distance to past change at +20 yr; (b) 95% coverage by band,
+    all four horizons -- the far-field dip sits at +10 yr for E2c, so +20 yr alone hides it."""
+    d = pd.read_csv(SCORES / f"dist_{LABEL}.csv")
+    c = pd.read_csv(SCORES / f"central_{LABEL}.csv")
+    d20 = d[(d.stratum == "distance") & (d.horizon == 20)].set_index("bin")
+    c20 = c[(c.stratum == "distance") & (c.horizon == 20)].set_index("bin")
     bands = ["0-1", "1-3", "3-10", "10-30", "30-100", ">100"]
     x = np.arange(len(bands)); w = 0.38
     fig, ax = plt.subplots(1, 2, figsize=(9.6, 3.2))
-    ax[0].bar(x - w / 2 - 0.01, d.loc[bands, "crps_skill"], w, color=BLUE, label="CRPS skill")
-    ax[0].bar(x + w / 2 + 0.01, c.loc[bands, "skill"], w, color=ORANGE, label="MSE skill")
+    ax[0].bar(x - w / 2 - 0.01, d20.loc[bands, "crps_skill"], w, color=BLUE, label="CRPS skill")
+    ax[0].bar(x + w / 2 + 0.01, c20.loc[bands, "skill"], w, color=ORANGE, label="MSE skill")
     ax[0].axhline(0, color=INK2, lw=0.8)
     ax[0].set_xticks(x); ax[0].set_xticklabels(bands); ax[0].set_xlabel("distance to past change (px)")
     ax[0].set_ylabel("skill vs persistence"); ax[0].legend(frameon=False, fontsize=8)
     ax[0].set_title("(a) skill at +20 yr", loc="left", fontsize=9)
-    ax[1].bar(x, c.loc[bands, "coverage"], 0.6, color=BLUE)
-    ax[1].axhline(0.95, color=INK2, lw=1, ls="--"); ax[1].text(5.45, 0.953, "nominal 0.95", ha="right",
-                                                               va="bottom", fontsize=8, color=INK2)
-    ax[1].set_ylim(0.6, 1.0); ax[1].set_xticks(x); ax[1].set_xticklabels(bands)
+    # Horizons are ordered, so one hue light -> dark rather than four categorical hues.
+    shades = ["#b7d1f0", "#7aaae3", "#2a78d6", "#174a8c"]
+    wb = 0.2
+    for i, h in enumerate((5, 10, 15, 20)):
+        ch = c[(c.stratum == "distance") & (c.horizon == h)].set_index("bin")
+        ax[1].bar(x + (i - 1.5) * (wb + 0.01), ch.loc[bands, "coverage"], wb, color=shades[i],
+                  label=f"+{h} yr")
+    ax[1].axhline(0.95, color=INK2, lw=1, ls="--")
+    ax[1].text(-0.45, 0.953, "nominal 0.95", ha="left", va="bottom", fontsize=8, color=INK2)
+    ax[1].set_ylim(0.7, 1.0); ax[1].set_xticks(x); ax[1].set_xticklabels(bands)
     ax[1].set_xlabel("distance to past change (px)"); ax[1].set_ylabel("95% interval coverage")
-    ax[1].set_title("(b) coverage at +20 yr", loc="left", fontsize=9)
-    for i, b in enumerate(bands):
-        ax[1].text(i, c.loc[b, "coverage"] - 0.012, f"{c.loc[b, 'coverage']:.3f}", ha="center", va="top",
-                   fontsize=7.5, color="white", fontweight="bold")
+    ax[1].set_title("(b) coverage, all four horizons", loc="left", fontsize=9)
+    ax[1].legend(frameon=False, fontsize=7.5, loc="center left", bbox_to_anchor=(1.0, 0.5))
     fig.tight_layout(); fig.savefig(FIG / "band_skill.png"); plt.close(fig)
 
 
@@ -140,5 +146,5 @@ if __name__ == "__main__":
     print("quantile_ladder.png", quantile_ladder())
     band_skill(); print("band_skill.png")
     import shutil
-    for f in ("densities_g_E2a_hind.png", "pit_g_E2a_hind.png", "chips_g_E2a_hind.png"):
+    for f in (f"densities_{LABEL}.png", f"pit_{LABEL}.png", f"chips_{LABEL}.png"):
         shutil.copy2(SCORES / f, FIG / f); print("copied", f)

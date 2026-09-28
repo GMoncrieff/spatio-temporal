@@ -9,6 +9,7 @@ Outputs:
 """
 
 import os
+import sys
 from pathlib import Path
 import numpy as np
 import rasterio
@@ -17,6 +18,9 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.backends.backend_pdf import PdfPages
 import seaborn as sns
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from src.land import hm_land  # noqa: E402
 
 # Configuration
 HM_DIR = "data/raw/hm_global"
@@ -40,69 +44,81 @@ MIN_VALID_RATIO = 0.2  # Minimum 20% valid pixels in a chip
 # Random seed for reproducibility
 RANDOM_SEED = 42
 
+def compute_validity(target_file=TARGET_FILE):
+    """Binary land mask (uint8) from the target HM raster, plus the profile to write it with.
+
+    Land is ``src.land.hm_land``: finite, non-negative and NOT the declared nodata. The HM
+    rasters' nodata is the finite 3.4e38, and the predicate this used to apply,
+    ``~isnan(x) & (x >= 0)``, let it through -- so the ocean counted as valid and the fold
+    mask built from it gave fold ids to 99.33% of the grid.
+    """
+    with rasterio.open(target_file) as src:
+        data = src.read(1)
+        valid_mask = hm_land(data, src.nodata).astype(np.uint8)
+        profile = src.profile.copy()
+        transform, crs = src.transform, src.crs
+    profile.update(
+        dtype=rasterio.uint8,
+        count=1,
+        compress='lzw',
+        tiled=True,
+        blockxsize=512,
+        blockysize=512,
+        nodata=None,  # Remove float nodata value for uint8 mask
+    )
+    return valid_mask, profile, transform, crs
+
+
 def create_validity_mask():
     """Create binary validity mask from target raster."""
     print("=" * 80)
     print("Creating Validity Mask")
     print("=" * 80)
-    
-    with rasterio.open(TARGET_FILE) as src:
-        print(f"Reading target file: {TARGET_FILE}")
-        print(f"  Shape: {src.shape}")
-        print(f"  CRS: {src.crs}")
-        print(f"  Bounds: {src.bounds}")
-        
-        data = src.read(1)
-        profile = src.profile.copy()
-        
-        # Create validity mask (1=valid, 0=invalid)
-        # Valid if: not NaN and >= 0
-        valid_mask = (~np.isnan(data) & (data >= 0)).astype(np.uint8)
-        
-        total_pixels = valid_mask.size
-        valid_pixels = valid_mask.sum()
-        valid_percent = 100 * valid_pixels / total_pixels
-        
-        print(f"\nValidity Statistics:")
-        print(f"  Total pixels: {total_pixels:,}")
-        print(f"  Valid pixels: {valid_pixels:,} ({valid_percent:.2f}%)")
-        print(f"  Invalid pixels: {total_pixels - valid_pixels:,} ({100 - valid_percent:.2f}%)")
-        
-        # Update profile for single-band uint8
-        profile.update(
-            dtype=rasterio.uint8,
-            count=1,
-            compress='lzw',
-            tiled=True,
-            blockxsize=512,
-            blockysize=512,
-            nodata=None,  # Remove float nodata value for uint8 mask
-        )
-        
-        # Write validity mask
-        print(f"\nWriting validity mask: {VALIDITY_MASK_FILE}")
-        with rasterio.open(VALIDITY_MASK_FILE, 'w', **profile) as dst:
-            dst.write(valid_mask, 1)
-            dst.set_band_description(1, "Validity: 1=valid, 0=invalid")
-        
-        print("✓ Validity mask created successfully")
-        
-        return valid_mask, profile, src.transform, src.crs
+    print(f"Reading target file: {TARGET_FILE}")
+    valid_mask, profile, transform, crs = compute_validity(TARGET_FILE)
 
-def enumerate_valid_chips(valid_mask, chip_size=CHIP_SIZE, min_valid_ratio=MIN_VALID_RATIO):
+    total_pixels = valid_mask.size
+    valid_pixels = int(valid_mask.sum())
+    valid_percent = 100 * valid_pixels / total_pixels
+
+    print(f"\nValidity Statistics:")
+    print(f"  Total pixels: {total_pixels:,}")
+    print(f"  Valid pixels: {valid_pixels:,} ({valid_percent:.2f}%)")
+    print(f"  Invalid pixels: {total_pixels - valid_pixels:,} ({100 - valid_percent:.2f}%)")
+
+    # Write validity mask
+    print(f"\nWriting validity mask: {VALIDITY_MASK_FILE}")
+    with rasterio.open(VALIDITY_MASK_FILE, 'w', **profile) as dst:
+        dst.write(valid_mask, 1)
+        dst.set_band_description(1, "Validity: 1=valid, 0=invalid")
+
+    print("✓ Validity mask created successfully")
+
+    return valid_mask, profile, transform, crs
+
+def enumerate_valid_chips(valid_mask, chip_size=CHIP_SIZE, min_valid_ratio=MIN_VALID_RATIO,
+                          min_valid_px=None):
     """Enumerate (i, j) origins of non-overlapping chips with enough valid pixels.
 
     Shared by create_spatial_splits (70/10/10/10) and create_kfold_splits (k rotating
     folds) so both partitions are built from exactly the same chip population.
+
+    ``min_valid_px``, when given, replaces the ratio: a chip is kept when it holds at least
+    that many valid pixels. E2c's fold mask passes 1 -- every chip with any land -- because
+    under a correct land mask the 20% ratio drops 1.78 M coastal and island land px out of
+    every fold, and so out of the hindcast product.
     """
     H, W = valid_mask.shape
     chip_positions = []
     for i in range(0, H - chip_size + 1, chip_size):
         for j in range(0, W - chip_size + 1, chip_size):
             chip = valid_mask[i:i+chip_size, j:j+chip_size]
-            valid_ratio = chip.sum() / (chip_size ** 2)
-
-            if valid_ratio >= min_valid_ratio:
+            n_valid = int(chip.sum())
+            if min_valid_px is not None:
+                keep = n_valid >= int(min_valid_px)
+            else:
+                keep = n_valid / (chip_size ** 2) >= min_valid_ratio
+            if keep:
                 chip_positions.append((i, j))
     return chip_positions
 
@@ -187,7 +203,7 @@ def create_spatial_splits(valid_mask, profile, transform, crs):
     return split_mask
 
 def create_kfold_splits(valid_mask, profile, transform, crs, k=5, block_chips=1,
-                        out_path=None, manifest_path=None):
+                        out_path=None, manifest_path=None, min_valid_px=None):
     """Create k rotating spatial folds for the out-of-sample hindcast harness.
 
     Same chip enumeration and same fixed RANDOM_SEED shuffle as create_spatial_splits,
@@ -230,8 +246,10 @@ def create_kfold_splits(valid_mask, profile, transform, crs, k=5, block_chips=1,
     print("=" * 80)
 
     H, W = valid_mask.shape
-    chip_positions = enumerate_valid_chips(valid_mask)
-    print(f"Found {len(chip_positions)} valid chips (>={MIN_VALID_RATIO*100:.0f}% valid pixels)")
+    chip_positions = enumerate_valid_chips(valid_mask, min_valid_px=min_valid_px)
+    rule = (f">={int(min_valid_px)} valid px" if min_valid_px is not None
+            else f">={MIN_VALID_RATIO*100:.0f}% valid pixels")
+    print(f"Found {len(chip_positions)} valid chips ({rule})")
 
     rng = np.random.default_rng(RANDOM_SEED)
     if block_chips == 1:
@@ -448,6 +466,10 @@ def main(argv=None):
                              "checkerboard. 10 gives contiguous 1280 px fold territories: "
                              "far fewer seams in the stitched hindcast, and a split at ten "
                              "residual correlation lengths instead of one.")
+    parser.add_argument("--fold_min_valid_px", type=int, default=None,
+                        help="Keep a chip in the folds when it holds at least this many "
+                             "valid (land) pixels, instead of the >=20%% ratio. 1 = every "
+                             "chip with any land (E2c's fold_mask_b4_land_1000.tif).")
     parser.add_argument("--fold_mask_out", default=None,
                         help="Where to write the fold mask. Defaults to the production "
                              "fold_mask_1000.tif; point it elsewhere to build an "
@@ -455,15 +477,14 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if args.folds_only:
-        if not os.path.exists(VALIDITY_MASK_FILE):
-            print(f"✗ Validity mask not found: {VALIDITY_MASK_FILE}. Run without --folds_only first.")
-            return 1
-        with rasterio.open(VALIDITY_MASK_FILE) as src:
-            valid_mask = src.read(1)
-            profile = src.profile.copy()
-            transform, crs = src.transform, src.crs
+        # Computed fresh from HM, not read from validity_mask_1000.tif: that file was written
+        # by the predicate that counted the finite 3.4e38 nodata as valid, so it marks the
+        # ocean. It is left on disk untouched, and nothing else reads it.
+        valid_mask, profile, transform, crs = compute_validity(TARGET_FILE)
+        print(f"Land (src.land.hm_land on {TARGET_FILE}): {int(valid_mask.sum()):,} px")
         create_kfold_splits(valid_mask, profile, transform, crs, k=args.k,
                             block_chips=args.fold_block_chips,
+                            min_valid_px=args.fold_min_valid_px,
                             out_path=args.fold_mask_out,
                             manifest_path=(str(Path(args.fold_mask_out).with_suffix("")) + "_manifest.csv"
                                            if args.fold_mask_out else None))
@@ -495,6 +516,7 @@ def main(argv=None):
     if args.make_folds:
         create_kfold_splits(valid_mask, profile, transform, crs, k=args.k,
                             block_chips=args.fold_block_chips,
+                            min_valid_px=args.fold_min_valid_px,
                             out_path=args.fold_mask_out,
                             manifest_path=(str(Path(args.fold_mask_out).with_suffix("")) + "_manifest.csv"
                                            if args.fold_mask_out else None))

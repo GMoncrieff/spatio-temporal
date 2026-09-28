@@ -88,7 +88,7 @@ class SpatioTemporalPredictor(nn.Module):
             self.location_encoder = LocationEncoder(locenc_backbone[0], locenc_backbone[1], locenc_hparams)
         else:
             self.location_encoder = None
-        # Per-layer dilation widens the trunk's ~10 px receptive radius — the binding
+        # Per-layer dilation widens the trunk's receptive radius (6 px at 4 layers x 3x3) — the binding
         # structural limit for both head families — at zero parameter cost. None (the
         # default) means dilation 1 everywhere, i.e. the original trunk.
         if convlstm_dilations is None:

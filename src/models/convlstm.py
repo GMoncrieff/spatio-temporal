@@ -95,6 +95,18 @@ class ConvLSTM(nn.Module):
             last_state_list = last_state_list[-1:]
         return layer_output_list, last_state_list
 
+    def receptive_radius(self, timesteps):
+        """Radius (px) of the input region the last layer's last hidden state depends on.
+
+        Every convolution along the path from an input pixel to (last layer, last timestep)
+        adds (k-1)/2 * d: one per layer entered, plus one per recurrent step, and the
+        longest path takes all T-1 recurrent steps in the layer that reaches furthest. The
+        cell state adds nothing -- c_t = f*c_{t-1} + i*g is pointwise.
+        tests/test_trunk_receptive_field.py checks this against a gradient probe.
+        """
+        reach = [(k[0] // 2) * d for k, d in zip(self.kernel_size, self.dilation)]
+        return int(sum(reach) + (int(timesteps) - 1) * max(reach))
+
     def _init_hidden(self, batch_size, image_size):
         init_states = []
         for i in range(self.num_layers):

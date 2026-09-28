@@ -1,7 +1,11 @@
 # The global production run — E2a, both products
 
-**E2a is the production model (decided 2026-09-25).** See the last section for the decision
-and the limitation it carries.
+**Superseded as production by E2c on 2026-09-27** (`global_production_e2c.md`): E2a's head and
+loss retrained with a 12 px trunk, land-only normalisation, a land-only fold mask and slope and
+aspect covariates. E2a's products, checkpoints and sidecar are kept untouched. What follows is
+the record of E2a as it was when chosen; the last section is that decision.
+
+**E2a was the production model from 2026-09-25 to 2026-09-27.**
 
 Run 2026-09-22/23 on branch `conv-spline`, immediately after the same run for E1v. Read
 `CLAUDE.md` for the configuration and the rules, and `docs/global_production_e1v.md` for the

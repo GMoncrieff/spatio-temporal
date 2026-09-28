@@ -30,8 +30,56 @@ static_files = [
     os.path.join(STATIC_DIR, "hm_static_iucn_strict_1000.tiff"),
 ]
 
+import sys as _sys
+
 import numpy as np
 import rasterio
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in _sys.path:
+    _sys.path.insert(0, _HERE)
+from prepare_terrain import TERRAIN_NAMES  # noqa: E402  (the writer names the files once)
+
+# Slope, sin(aspect), cos(aspect) of hm_static_ele_1000.tiff, precomputed on the full raster by
+# scripts/prepare_terrain.py. Appended after the seven static channels by --terrain_covariates
+# (E2c); off by default, so E1v and E2a keep the seven they trained on.
+TERRAIN_FILES = [os.path.join(STATIC_DIR, TERRAIN_NAMES[k]) for k in ("slope", "aspsin", "aspcos")]
+
+
+def static_file_list(terrain_covariates=False):
+    """THE static channel list, for the dataset, the prediction loop and the stats builder."""
+    return list(static_files) + (list(TERRAIN_FILES) if terrain_covariates else [])
+
+
+# Static channels whose NaN means "absent" rather than "unknown", filled with 0 BEFORE
+# normalisation: elevation (0 m, sea level), dpi_dsi and the two IUCN layers, and the three
+# terrain channels at 7-9 when present (nodata where the DEM is filled: flat, as the sea is).
+# By position in static_file_list(), as both static readers have always indexed them. One
+# spelling: the training dataset and the large-area prediction loop each used to carry their
+# own copy of this set.
+NAN_TO_ZERO_STATIC = frozenset({0, 4, 5, 6, 7, 8, 9})
+
+# Fill values the static rasters use WITHOUT declaring them as nodata, by basename. A masked
+# read passes an undeclared fill through as data: hm_static_ele_1000.tiff fills every row
+# south of 56 S (9.09% of the grid, 558 land px) with -32768, which contaminated E2a's
+# sampled statistics (mean -4200 m against 675 m over land) and reached the trunk as an
+# elevation. scripts/compute_norm_stats.py writes this table into the normalisation sidecar
+# and prepare_static applies whatever the SIDECAR declares -- so the contract travels with
+# the checkpoints, and E2a's sidecar, which declares nothing, reads exactly as it trained.
+STATIC_NODATA = {"hm_static_ele_1000.tiff": -32768.0}
+
+
+def prepare_static(arr, idx, name, mean, std, static_nodata):
+    """One static channel, as the model sees it: declared fill -> NaN -> 0 where the channel
+    takes the NaN fill, then standardised. ``name`` is the raster path or basename."""
+    arr = np.asarray(arr, dtype=np.float32)
+    fill = (static_nodata or {}).get(os.path.basename(str(name)))
+    if fill is not None:
+        arr = np.where(arr == np.float32(fill), np.float32(np.nan), arr)
+    if idx in NAN_TO_ZERO_STATIC:
+        arr = np.nan_to_num(arr, nan=0.0)
+    return (arr - mean) / std
+
 
 class HumanFootprintChipDataset(torch.utils.data.Dataset):
     """
@@ -141,6 +189,8 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
         # the .ckpt), so every inference entrypoint has to reproduce them; passing them in
         # from a JSON sidecar avoids repeatedly paying the raster-sampling cost.
         self.norm_stats_source = "computed"
+        # No undeclared fills unless a sidecar names them (prepare_static).
+        self.static_nodata = {}
         if norm_stats is not None:
             self._load_norm_stats(norm_stats)
         else:
@@ -177,6 +227,7 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
             "comp_stds": {k: float(v) for k, v in self.comp_stds.items()},
             "static_files": [os.path.basename(f) for f in self._static_files],
             "include_components": bool(self.include_components),
+            "static_nodata": dict(self.static_nodata),
         }
 
     def _load_norm_stats(self, norm_stats):
@@ -193,6 +244,8 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
         self.static_stds = [float(v) for v in norm_stats["static_stds"]]
         self.comp_means = {k: float(v) for k, v in norm_stats.get("comp_means", {}).items()}
         self.comp_stds = {k: float(v) for k, v in norm_stats.get("comp_stds", {}).items()}
+        self.static_nodata = {str(k): float(v)
+                              for k, v in (norm_stats.get("static_nodata") or {}).items()}
         if self.include_components and not self.comp_means:
             raise ValueError("norm_stats missing comp_means/comp_stds but include_components=True")
         self.elev_mean = self.static_means[0] if self.static_means else 0.0
@@ -540,16 +593,12 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
             # Static layers
             static_list = []
             # Static file order: [ele, tas, tasmin, pr, dpi_dsi, iucn_nostrict, iucn_strict]
-            # Replace NaN with 0 BEFORE normalization for specific variables
-            nan_to_zero_static = {0, 4, 5, 6}  # ele, dpi_dsi, iucn_nostrict, iucn_strict
             for static_idx, src in enumerate(self._static_srcs):
                 sarr = src.read(1, window=rasterio.windows.Window(j, i, self.chip_size, self.chip_size), masked=True).filled(np.nan)
-                # Replace NaN with 0 for specific variables (before normalization)
-                if static_idx in nan_to_zero_static:
-                    sarr = np.nan_to_num(sarr, nan=0.0)
-                # Use per-variable normalization
-                sarr = (sarr - self.static_means[static_idx]) / self.static_stds[static_idx]
-                static_list.append(sarr)
+                static_list.append(prepare_static(
+                    sarr, static_idx, self._static_files[static_idx],
+                    self.static_means[static_idx], self.static_stds[static_idx],
+                    self.static_nodata))
             input_static = np.stack(static_list, axis=0) if static_list else np.zeros((0, self.chip_size, self.chip_size), dtype=np.float32)
             # Build lon/lat grid [H, W, 2] from target raster transform, reproject to EPSG:4326 if needed
             ref = self._hm_srcs[self.target_t_indices[-1]]  # Use last target year (2020) as reference
@@ -682,6 +731,7 @@ def get_dataloader(
     hm_context_pattern=None,
     hm_context_stats=(),
     hm_context_radii=(3, 30, 100),
+    terrain_covariates=False,
 ):
     """
     Create a DataLoader for the Human Footprint dataset.
@@ -695,7 +745,7 @@ def get_dataloader(
     ds = HumanFootprintChipDataset(
         hm_files,
         component_files,
-        static_files,
+        static_file_list(terrain_covariates),
         chip_size=chip_size,
         timesteps=timesteps,
         stride=stride,

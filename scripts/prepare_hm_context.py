@@ -3,7 +3,7 @@
 
 The model has long-range information about *where change happened* — the past-change distance
 band — and none at all about *where development is*. Its only HM-level input is the pixel's own
-value, plus whatever the trunk's ~10 px receptive radius supplies. But development spreads from
+value, plus whatever the trunk's receptive radius supplies (6 px at 3x3, 12 px at E2c's 5x5). But development spreads from
 development, not only from recently-changed ground, so "how much built-up land is within 30 km
 of here" is a covariate the model has never had.
 

@@ -2,25 +2,71 @@
 
 Spatiotemporal Human Modification (HM) forecasting. **One system lives here now.**
 
-Active branch: **`conv-spline`**. Started 2026-09-07.
+Branch: **`main`** (`conv-spline` was merged by PR #1 on 2026-09-25). The conv-spline phase
+started 2026-09-07.
 
-**The screening phase is CLOSED (2026-09-17). The E1v GLOBAL RUN IS COMPLETE (2026-09-18) and
-its 586 GB of rasters and products were CLEARED on 2026-09-22 to make room for the same run on
-E2a. What survives of E1v: `data/conv_spline/scores/global/` (every scorecard),
-`models/production/E1v/` (Africa, the 2026-09-17 promotion) and `models/production/E1v_global/` (the six
-checkpoints the global run produced). Read `docs/global_production_e2a.md` first, then
-`docs/global_production_e1v.md` for the runner and its verifiers; `docs/conv_spline_phase.md`
-is history, read for method.**
+## E2c IS THE PRODUCTION MODEL — decided by the user 2026-09-27
 
-**E2a IS THE PRODUCTION MODEL — decided by the user 2026-09-25**, after the global A/B below.
-Its products are the delivered ones (`/mnt/hdd1/.../products/E2a/`), its checkpoints are
-`models/production/E2a_global/`, and the README describes it. E1v is the measured alternative.
-**`run_global_model.sh` still defaults `MODEL` to E1v** (`${MODEL:=E1v}`); always pass
-`MODEL=E2a`. Changing the default edits a hashed file and voids both smoke receipts.
+**Read `docs/global/global_production_e2c.md` first.** E2c is E2a (below) retrained on a round
+of fixes the user defined on 2026-09-25/26, with four changes and nothing else:
 
-**The E2a GLOBAL RUN IS ALSO COMPLETE (2026-09-23)** — `--head_family pwl --free_scale True
+    --head_family pwl --free_scale True --mu_mse_weight 0.0 --kernel_size 5 --terrain_covariates True
+    + data/conv_spline/norm_stats_E2c.json  + data/raw/hm_global/fold_mask_b4_land_1000.tif
+
+- **Trunk kernel 5** (4 layers): receptive radius **12 px** against E2a's 6
+  (`r = (k-1)/2 * (sum d + (T-1) max d)`, T = 3; the old "~10 px" comments were wrong).
+- **Land-only normalisation**, exact (`scripts/compute_norm_stats.py`). E2a's stats were
+  sampled over the whole grid, and elevation's undeclared −32768 fill (every row south of 56 S)
+  put its mean at −4200 m (675 m over land). The sidecar declares that fill (`static_nodata`)
+  and `torchgeo_dataloader.prepare_static` — the ONE static reader, for training and prediction —
+  reads it as sea level.
+- **Fold mask over land only** (`fold_mask_b4_land_1000.tif`: any chip with land, 35.0% of the
+  grid). The old builder read HM's finite 3.4e38 nodata as valid, so 99.33% of the grid had a
+  fold id — which also meant **79 of E2a's 131 validation chips were all ocean and scored 0**,
+  diluting its logged `val_crps` ~2.5x (weights unaffected: they are the last-20-epoch mean).
+- **Slope and aspect** as static channels 8–10 (`--terrain_covariates True`;
+  `scripts/prepare_terrain.py`: Horn 3x3 on WGS84 per-row metric spacing, sin and cos of aspect).
+  The `hm_static_ele_slope/asp_*` rasters in the data directory are NOT from our DEM; unused.
+
+**The code's argparse defaults still build E2a.** E2c needs its flags, its sidecar and (for a
+hindcast) its fold mask, and leaving any out fails *silently* — so run it through the runner,
+`MODEL=E2c ALLOW_GLOBAL=1 ./scripts/run_global_model.sh <stage>`, which sets all of them and
+verifies each out of the run's log (`verify_trunk_fingerprint`, `verify_static_fingerprint`,
+`verify_norm_stats_log`, `require_norm_stats`). **`run_global_model.sh` still defaults `MODEL`
+to E1v** (`${MODEL:=E1v}`); always pass `MODEL=E2c`. Changing the default edits a hashed file
+and voids the smoke receipts.
+
+Products (delivered): `/mnt/hdd1/spatio-temporal/data/conv_spline/products/E2c/`, 158 GB, both
+verified (code mismatches 0, collisions 0). Checkpoints: `models/production/E2c_global/` (5
+folds + forward model `final_foldNone_3573819.ckpt`, with a copy of the sidecar). Scores:
+`docs/global/scores/*_g_E2c_hind.*`; scorecard https://claude.ai/artifact/27KxeCDVnCCQ9ULnY9pNv7.
+
+**E2c's global hindcast**, out of sample on all 184,573,321 land pixels: `crps_skill`
+0.155 / 0.261 / 0.299 / 0.299, RMSE skill 0.041 / 0.188 / 0.229 / 0.241, `cov95`
+0.950 / **0.917** / 0.953 / 0.955, cov50 0.42–0.48, PIT mean 0.52–0.54, `far_tail_excess_20`
+8.52 (E2a 22.31). Centrally a tie with E2a (every skill within 0.005). Beyond 100 px, `cov95`
+by horizon is 0.981 / **0.861** / 0.941 / 0.935 and CRPS skill −0.147 / **−1.445** / 0.347 /
+0.263; the +20 yr far-field RMSE skill is +0.0075 (E2a +0.031).
+**E2c's known limitation, which travels with the product: beyond 100 px from past change at
++10 yr its 95% interval covers 86.1% and its CRPS loses to persistence.** Do not describe its
+far-field intervals as calibrated. **Which horizon dips is unstable across retrains** (E2a
++20 yr, an E2c run without terrain +15 yr, E2c +10 yr); the free-scale head has no constraint
+tying width across horizons, and one run per configuration cannot separate the four changes
+from training noise. The terrain channels alone changed nothing measurable centrally
+(E2c without terrain is archived in `data/conv_spline/logs/global/E2c_run1_no_terrain/`).
+
+## E2a — production 2026-09-25 to 2026-09-27, and the tails A/B (history)
+
+E2a's products, checkpoints (`models/production/E2a_global/`) and sidecar
+(`data/conv_spline/norm_stats.json`) are kept untouched; the code's defaults still build it.
+The screening phase closed 2026-09-17; the E1v global run's rasters were cleared 2026-09-22
+(its scorecards and `models/production/E1v*/` survive). Read `docs/global/global_production_e2a.md`
+and `docs/global/global_production_e1v.md` (the runner and its verifiers);
+`docs/experiments/conv_spline_phase.md` is history, read for method.
+
+**The E2a GLOBAL RUN (2026-09-23)** — `--head_family pwl --free_scale True
 --mu_mse_weight 0.0`, **15 params/horizon**, both products built and verified, scored on all
-184,573,321 land px. Read `docs/global_production_e2a.md`. It was scored on Africa at **16**,
+184,573,321 land px. Read `docs/global/global_production_e2a.md`. It was scored on Africa at **16**,
 because `--free_scale` did not actually remove the scale channel until 2026-09-16, so this run
 is NOT the arm on the promotion page and its numbers are not comparable to that scorecard. It
 IS the re-run on current code, so **E1v vs E2a is now a measured A/B on the learned tails
@@ -97,8 +143,9 @@ every arm draws the same nine and the panels stack. `src/qf_plots.py`.
 ## Where the phase is
 
 **Screening is over.** 23 arms were scored on Africa and E1v was promoted on 2026-09-17; the
-measured comparison is in `data/conv_spline/promotion/`. **E2a replaced it as production on
-2026-09-25** after both were run globally on current code. Africa numbers for E1v: CRPS skill 0.2152 /
+measured comparison is in `docs/experiments/promotion/`. **E2a replaced it as production on
+2026-09-25** after both were run globally on current code, and **E2c replaced E2a on
+2026-09-27** (top of this file). Africa numbers for E1v: CRPS skill 0.2152 /
 0.2823 / 0.3033 / 0.3032 at +5/10/15/20 yr, `cov95_20` 0.9722, `far_tail_excess` at h=5
 **1.361** — the best far-tail calibration of any arm run.
 
@@ -107,15 +154,18 @@ measured comparison is in `data/conv_spline/promotion/`. **E2a replaced it as pr
 
 One runner covers both products:
 
-    MODEL=E1v|E2a ALLOW_GLOBAL=1 ./scripts/run_global_model.sh <stage>
+    MODEL=E2c ALLOW_GLOBAL=1 ./scripts/run_global_model.sh <stage>     # E1v | E2a | E2c
     args | smoke | hindcast | stitch | score | forecast
          | export_hindcast | export_forecast | all
 
 `MODEL` selects from a table in the script that names the head's flags, family AND parameter
 count together, so the three cannot drift apart; `verify_head_fingerprint` is handed all
-three from it. Each model gets its own exp roots, product root and **its own smoke receipt** —
-a receipt earned by smoking one model does not authorise another, and the receipt pins the
-flags as well as the code hash. An unknown `MODEL` is refused rather than defaulted.
+three from it. Since E2c the table also names each model's **fold mask and normalisation
+sidecar** (and E2c's terrain rasters as `MODEL_EXTRA_INPUTS`), chosen before
+`conv_spline_base.sh` is sourced. Each model gets its own exp roots, product root and **its own
+smoke receipt** — a receipt earned by smoking one model does not authorise another, and the
+receipt pins the flags, the code hash AND `inputs_hash` (the sidecar and fold mask by bytes,
+the terrain rasters by name/size/mtime). An unknown `MODEL` is refused rather than defaulted.
 
 It sources `conv_spline_base.sh`. **It must never be replaced by `run_global_dist_*.sh`**:
 those source `dist_base_args.sh`, which hardcodes `--head_family spline`, `--seed 46` and
@@ -125,8 +175,10 @@ e1's context flags, so they would silently run e1 and their weaker verifiers cou
 on disk.** `smoke` runs one epoch, one fold, one target year and a few hundred prediction
 blocks through *every* stage — train, predict, read the raster back, stitch, score, export,
 verify the products, and the `--train_all_splits` forward path — on the real global grid, then
-writes `data/conv_spline/logs/global/smoke_ok.stamp`. Edit any of the twelve files the hash
-covers and the receipt is void. Re-smoke; do not weaken the gate.
+writes `data/conv_spline/logs/global/smoke_ok_<MODEL>.stamp`. Edit any of the fifteen files
+the hash covers (`CODE_FILES` in the runner, which since E2c include `torchgeo_dataloader.py`
+and `convlstm.py`) or any pinned input, and the receipt is void. Re-smoke; do not weaken the
+gate.
 
 Measured on the 2026-09-17 global smoke, and these are the numbers to plan against:
 one fold + one horizon + 400 blocks 12.7 min; stitch one target year 10.0 min; five COGs plus
@@ -472,7 +524,8 @@ Kept only where they still apply. Numbering is fresh; the old file's numbers are
   the boolean idiom is
   `type=lambda x: (str(x).lower()=='true'), nargs='?', const=True, default=…`.
 - Tests are flat in `tests/`, pytest, `sys.path.insert(0, parent)` + absolute imports,
-  synthetic tensors. **Measured 2026-09-17 on this machine: 517 passed / 7 failed.** Not the 15
+  synthetic tensors. **Measured 2026-09-26 on this machine: 606 passed / 7 failed** (517 / 7 on
+  2026-09-17, before the E2c round added its tests). Not the 15
   the phase began with — the fixture-needing ones pass now that the data is here. All 7 fail
   identically on `dist-convlstm` (checked in a worktree): stale legacy tests asserting a
   4-channel output from a model that emits 12, forwards that pass no `lonlat` to a trunk built

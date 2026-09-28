@@ -142,6 +142,36 @@ def _spline_head_banner(args, model=None):
             f"{n} params/horizon")
 
 
+def _trunk_banner(model, timesteps=3):
+    """The trunk's shape and receptive radius, read off the constructed ConvLSTM.
+
+    E2c differs from E2a only here (--kernel_size 5), so this is its fingerprint, and
+    conv_spline_base.sh's verify_trunk_fingerprint greps it. Off the module, never off args:
+    the forecast command once spelled --kernel_size 3 ahead of TRAIN_ARGS, and a banner
+    built from the flags cannot see which occurrence argparse kept.
+    """
+    t = model.convlstm
+    kernels = sorted({k[0] for k in t.kernel_size})
+    kernel = ",".join(str(k) for k in kernels)
+    widths = sorted(set(t.hidden_dim))
+    return (f"Trunk:             ConvLSTM {t.num_layers} layers x "
+            f"{','.join(str(w) for w in widths)}, kernel {kernel}, "
+            f"dilation {','.join(str(d) for d in t.dilation)}, "
+            f"receptive radius {t.receptive_radius(timesteps)} px over {timesteps} timesteps")
+
+
+def _static_banner(files, model):
+    """The static channels the dataset reads, and the count the constructed trunk expects.
+
+    Printed off both, never off the flags: --terrain_covariates is E2c's fourth change, and a
+    flag that is accepted and never read would train a seven-channel model and report a null.
+    conv_spline_base.sh's verify_static_fingerprint greps this line.
+    """
+    names = [os.path.basename(f) for f in files]
+    return (f"Static channels:   {len(names)} ({', '.join(names)}); "
+            f"module {int(model.num_static_channels)}")
+
+
 def _experiment_kwargs(args):
     """Model-phase flags, as constructor kwargs. Every default is today's behaviour."""
     return dict(
@@ -191,7 +221,8 @@ def _experiment_kwargs(args):
         hm_context_radii=_csv_ints(args.hm_context_radii),
         isolate_shape_grad=args.isolate_shape_grad,
     )
-from torchgeo_dataloader import get_dataloader, hm_files, component_files, static_files, years
+from torchgeo_dataloader import (get_dataloader, hm_files, component_files, static_files, years,
+                                 prepare_static, static_file_list)
 
 # Geospatial imports for inference
 import rasterio
@@ -235,6 +266,13 @@ if __name__ == "__main__":
         const=True,
         default=True,
         help="Whether to include component covariates (AG, BU, etc.) in dynamic inputs",
+    )
+    parser.add_argument(
+        "--terrain_covariates",
+        type=lambda x: (str(x).lower() == 'true'), nargs='?', const=True, default=False,
+        help="Append slope, sin(aspect) and cos(aspect) of the elevation raster "
+             "(scripts/prepare_terrain.py) to the static channels, read exactly like "
+             "elevation. E2c. Default off: the seven channels E1v/E2a trained on.",
     )
     parser.add_argument(
         "--static_channels",
@@ -482,7 +520,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--convlstm_dilations", type=str, default=None,
         help="Comma-separated per-layer dilation for the ConvLSTM cells, e.g. '1,2,4,8'. "
-             "Widens the trunk's ~10 px receptive radius at zero parameter cost. Default "
+             "Widens the trunk's receptive radius (6 px at 4 layers x 3x3) at zero parameter cost. Default "
              "(None) is dilation 1 everywhere, i.e. today's trunk.",
     )
     # --- Round-2 flags: substantial architecture and objective changes ---
@@ -1013,6 +1051,7 @@ if __name__ == "__main__":
         stride=args.stride,
         include_components=args.include_components,
         static_channels=args.static_channels,
+        terrain_covariates=args.terrain_covariates,
         use_temporal_sampling=True,  # Enable temporal sampling for training
         end_year_options=(2000, 2005, 2010, 2015),
         num_workers=args.num_workers,
@@ -1048,6 +1087,7 @@ if __name__ == "__main__":
         stride=val_stride,
         include_components=args.include_components,
         static_channels=args.static_channels,
+        terrain_covariates=args.terrain_covariates,
         use_temporal_sampling=False,  # Fixed years for validation (Option A)
         num_workers=args.num_workers,
         pin_memory=True if args.num_workers > 0 else False,
@@ -1070,6 +1110,7 @@ if __name__ == "__main__":
         stride=val_stride,
         include_components=args.include_components,
         static_channels=args.static_channels,
+        terrain_covariates=args.terrain_covariates,
         use_temporal_sampling=False,
         num_workers=args.num_workers,
         pin_memory=True if args.num_workers > 0 else False,
@@ -1264,6 +1305,8 @@ if __name__ == "__main__":
     # it; this line is where a log reader tells them apart, and conv_spline_base.sh greps it.
     # A literal here would be rule 25 all over again.
     print(f"Context into trunk: {model.model.context_channels} channels; heads: none")
+    print(_trunk_banner(model.model))
+    print(_static_banner(train_loader.dataset._static_files, model.model))
     _spline_banner = _spline_head_banner(args, getattr(model, 'model', None))
     if _spline_banner:
         print(_spline_banner)
@@ -2141,6 +2184,9 @@ if __name__ == "__main__":
         'comp_stds': dict(_ds_train.comp_stds),
         'static_means': list(_ds_train.static_means),
         'static_stds': list(_ds_train.static_stds),
+        # The sidecar's undeclared-fill table (prepare_static). Prediction must drop exactly
+        # what training dropped, or the pixels south of 56 S see a different elevation.
+        'static_nodata': dict(getattr(_ds_train, 'static_nodata', {})),
     }
 
     def _release_dataloaders():
@@ -2283,7 +2329,8 @@ if __name__ == "__main__":
             hm_mean, hm_std = PREDICT_STATS['hm_mean'], PREDICT_STATS['hm_std']
             elev_mean, elev_std = PREDICT_STATS['elev_mean'], PREDICT_STATS['elev_std']
             include_components = bool(PREDICT_STATS['include_components'])
-            static_list_paths = list(static_files if args.static_channels is None else static_files[:int(args.static_channels)])
+            _statics = static_file_list(args.terrain_covariates)
+            static_list_paths = list(_statics if args.static_channels is None else _statics[:int(args.static_channels)])
             t_idxs = [year_to_idx[y] for y in input_years]
 
             # CRITICAL: per-variable normalization stats (NOT pooled hm_mean/hm_std)
@@ -2630,14 +2677,13 @@ if __name__ == "__main__":
                         input_dynamic_np = np.stack(dyn_ts, axis=0)  # [T, C_dyn, hi, wj]
                         static_chs = []
                         # Static file order: [ele, tas, tasmin, pr, dpi_dsi, iucn_nostrict, iucn_strict]
-                        nan_to_zero_static = {0, 4, 5, 6}  # ele, dpi_dsi, iucn_nostrict, iucn_strict
+                        # The SAME function the training dataset uses (fill, NaN -> 0, scale).
                         for static_idx, src in enumerate(stat_srcs):
                             sarr = src.read(1, window=win, masked=True).filled(np.nan)
-                            # Replace NaN with 0 for specific variables (before normalization)
-                            if static_idx in nan_to_zero_static:
-                                sarr = np.nan_to_num(sarr, nan=0.0)
-                            # Use per-variable normalization (CRITICAL for different scales)
-                            static_chs.append((sarr - static_means[static_idx]) / static_stds[static_idx])
+                            static_chs.append(prepare_static(
+                                sarr, static_idx, static_list_paths[static_idx],
+                                static_means[static_idx], static_stds[static_idx],
+                                PREDICT_STATS['static_nodata']))
                         input_static_np = np.stack(static_chs, axis=0) if static_chs else np.zeros((0, hi, wj), dtype=np.float32)
 
                         # Valid mask for prediction (less strict than training)

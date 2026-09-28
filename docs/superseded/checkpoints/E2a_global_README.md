@@ -29,7 +29,7 @@ banner.
 
 These are the averaged weights (mean of the last 20 epochs), which is what prediction ran on.
 
-**THE PRODUCTION MODEL — chosen 2026-09-25.** `final_foldNone_3951459.ckpt` is the forward
+**Production from 2026-09-25 until 2026-09-27, when E2c replaced it** (`docs/global/checkpoints/E2c_global_README.md`). Chosen 2026-09-25: `final_foldNone_3951459.ckpt` is the forward
 model behind the delivered forecast; the five fold models are behind the delivered hindcast.
 The run began as a clean A/B on the learned tails against `../E1v_global/`
 (`docs/global_production_e2a.md`): the tails cost nothing centrally, and beyond 100 px at

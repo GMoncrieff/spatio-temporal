@@ -161,7 +161,8 @@ def test_a_current_receipt_is_accepted(tmp_path):
     """The control for the two above: the gate must also be passable."""
     d = _args_dump(LOG_DIR=str(tmp_path))
     (tmp_path / "smoke_ok_E1v.stamp").write_text(
-        f"code_hash={d['code_hash']}\nflags={d['MODEL_FLAGS']}\n")
+        f"code_hash={d['code_hash']}\nflags={d['MODEL_FLAGS']}\n"
+        f"inputs_hash={d['inputs_hash']}\n")
     script = (f'cd {ROOT}\n'
               f'export ALLOW_GLOBAL=1 LOG_DIR={tmp_path}\n'
               f'source scripts/run_global_model.sh args >/dev/null\n'
