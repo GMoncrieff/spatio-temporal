@@ -29,6 +29,9 @@ static_files = [
     os.path.join(STATIC_DIR, "hm_static_iucn_nostrict_1000.tiff"),
     os.path.join(STATIC_DIR, "hm_static_iucn_strict_1000.tiff"),
 ]
+# The two WDPA protected-area masks above (IUCN Ia/Ib/II, and every other category). E2d
+# trains without them (--protected_area_covariates False); E1v, E2a and E2c keep them.
+PROTECTED_AREA_FILES = [f for f in static_files if "_iucn_" in os.path.basename(f)]
 
 import sys as _sys
 
@@ -41,23 +44,30 @@ if _HERE not in _sys.path:
 from prepare_terrain import TERRAIN_NAMES  # noqa: E402  (the writer names the files once)
 
 # Slope, sin(aspect), cos(aspect) of hm_static_ele_1000.tiff, precomputed on the full raster by
-# scripts/prepare_terrain.py. Appended after the seven static channels by --terrain_covariates
+# scripts/prepare_terrain.py. Appended after the other static channels by --terrain_covariates
 # (E2c); off by default, so E1v and E2a keep the seven they trained on.
 TERRAIN_FILES = [os.path.join(STATIC_DIR, TERRAIN_NAMES[k]) for k in ("slope", "aspsin", "aspcos")]
 
 
-def static_file_list(terrain_covariates=False):
-    """THE static channel list, for the dataset, the prediction loop and the stats builder."""
-    return list(static_files) + (list(TERRAIN_FILES) if terrain_covariates else [])
+def static_file_list(terrain_covariates=False, protected_area_covariates=True):
+    """THE static channel list, for the dataset, the prediction loop and the stats builder.
+
+    The defaults are the seven channels E1v and E2a trained on; E2c adds terrain (ten), and
+    E2d drops the two protected-area masks from E2c's list (eight)."""
+    base = [f for f in static_files if protected_area_covariates or f not in PROTECTED_AREA_FILES]
+    return base + (list(TERRAIN_FILES) if terrain_covariates else [])
 
 
 # Static channels whose NaN means "absent" rather than "unknown", filled with 0 BEFORE
 # normalisation: elevation (0 m, sea level), dpi_dsi and the two IUCN layers, and the three
-# terrain channels at 7-9 when present (nodata where the DEM is filled: flat, as the sea is).
-# By position in static_file_list(), as both static readers have always indexed them. One
-# spelling: the training dataset and the large-area prediction loop each used to carry their
-# own copy of this set.
-NAN_TO_ZERO_STATIC = frozenset({0, 4, 5, 6, 7, 8, 9})
+# terrain channels (nodata where the DEM is filled: flat, as the sea is). By basename, not by
+# position: --protected_area_covariates False removes channels 5 and 6, and the old
+# positional set ({0, 4, 5, 6, 7, 8, 9}) stayed right for E2d's list only because the terrain
+# channels that slid into 5-7 happen to take the zero fill too. One spelling: the training
+# dataset and the large-area prediction loop each used to carry their own copy of this set.
+NAN_TO_ZERO_STATIC = frozenset(
+    os.path.basename(f) for f in
+    [static_files[0], static_files[4], *PROTECTED_AREA_FILES, *TERRAIN_FILES])
 
 # Fill values the static rasters use WITHOUT declaring them as nodata, by basename. A masked
 # read passes an undeclared fill through as data: hm_static_ele_1000.tiff fills every row
@@ -69,14 +79,15 @@ NAN_TO_ZERO_STATIC = frozenset({0, 4, 5, 6, 7, 8, 9})
 STATIC_NODATA = {"hm_static_ele_1000.tiff": -32768.0}
 
 
-def prepare_static(arr, idx, name, mean, std, static_nodata):
+def prepare_static(arr, name, mean, std, static_nodata):
     """One static channel, as the model sees it: declared fill -> NaN -> 0 where the channel
     takes the NaN fill, then standardised. ``name`` is the raster path or basename."""
     arr = np.asarray(arr, dtype=np.float32)
-    fill = (static_nodata or {}).get(os.path.basename(str(name)))
+    base = os.path.basename(str(name))
+    fill = (static_nodata or {}).get(base)
     if fill is not None:
         arr = np.where(arr == np.float32(fill), np.float32(np.nan), arr)
-    if idx in NAN_TO_ZERO_STATIC:
+    if base in NAN_TO_ZERO_STATIC:
         arr = np.nan_to_num(arr, nan=0.0)
     return (arr - mean) / std
 
@@ -592,11 +603,12 @@ class HumanFootprintChipDataset(torch.utils.data.Dataset):
             input_dynamic = np.stack(dyn_list, axis=0)  # [T, C_dyn, H, W]
             # Static layers
             static_list = []
-            # Static file order: [ele, tas, tasmin, pr, dpi_dsi, iucn_nostrict, iucn_strict]
+            # Static file order: static_file_list() -- [ele, tas, tasmin, pr, dpi_dsi,
+            # (iucn_nostrict, iucn_strict), (slope, aspsin, aspcos)]
             for static_idx, src in enumerate(self._static_srcs):
                 sarr = src.read(1, window=rasterio.windows.Window(j, i, self.chip_size, self.chip_size), masked=True).filled(np.nan)
                 static_list.append(prepare_static(
-                    sarr, static_idx, self._static_files[static_idx],
+                    sarr, self._static_files[static_idx],
                     self.static_means[static_idx], self.static_stds[static_idx],
                     self.static_nodata))
             input_static = np.stack(static_list, axis=0) if static_list else np.zeros((0, self.chip_size, self.chip_size), dtype=np.float32)
@@ -732,6 +744,7 @@ def get_dataloader(
     hm_context_stats=(),
     hm_context_radii=(3, 30, 100),
     terrain_covariates=False,
+    protected_area_covariates=True,
 ):
     """
     Create a DataLoader for the Human Footprint dataset.
@@ -745,7 +758,7 @@ def get_dataloader(
     ds = HumanFootprintChipDataset(
         hm_files,
         component_files,
-        static_file_list(terrain_covariates),
+        static_file_list(terrain_covariates, protected_area_covariates),
         chip_size=chip_size,
         timesteps=timesteps,
         stride=stride,

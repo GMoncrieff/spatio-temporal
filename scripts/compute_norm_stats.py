@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Exact, land-only normalisation statistics: the JSON sidecar that training and prediction read.
 
-    python scripts/compute_norm_stats.py --out data/conv_spline/norm_stats_E2c.json
+    python scripts/compute_norm_stats.py --out data/conv_spline/norm_stats_E2c.json --terrain_covariates
+    python scripts/compute_norm_stats.py --out data/conv_spline/norm_stats_E2d.json --terrain_covariates --drop_protected_areas
 
 E2a's sidecar (``data/conv_spline/norm_stats.json``) came from ``HumanFootprintChipDataset.
 _estimate_norm_stats``, which samples random 128 px windows over the WHOLE grid. That has
@@ -160,6 +161,9 @@ def main(argv=None):
     ap.add_argument("--terrain_covariates", action="store_true",
                     help="Include the slope/aspect channels (E2c), in the order the dataset "
                          "reads them.")
+    ap.add_argument("--drop_protected_areas", action="store_true",
+                    help="Leave out the two WDPA protected-area masks (E2d), as "
+                         "--protected_area_covariates False does in training.")
     ap.add_argument("--block_rows", type=int, default=1024)
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--overwrite", action="store_true",
@@ -172,7 +176,9 @@ def main(argv=None):
         return 1
     t0 = time.time()
     st = build_norm_stats(tdl.hm_files, tdl.component_files, tdl.years, tdl.HM_VARS,
-                          tdl.static_file_list(args.terrain_covariates), args.land_ref,
+                          tdl.static_file_list(args.terrain_covariates,
+                                               not args.drop_protected_areas),
+                          args.land_ref,
                           tdl.STATIC_NODATA,
                           block_rows=args.block_rows, workers=args.workers)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)

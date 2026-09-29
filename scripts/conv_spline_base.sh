@@ -348,11 +348,15 @@ verify_head_fingerprint() {
 #
 # The static channels the run actually read. --terrain_covariates True (E2c) appends slope,
 # sin(aspect) and cos(aspect) to the seven static layers; a flag accepted and never read would
-# train a seven-channel model and report "terrain changed nothing". The expected count is
-# derived from the flags (7, or 10 with the flag), the banner lists the files the dataset read,
-# and "module N" is the constructed trunk's count -- all three must agree.
+# train a seven-channel model and report "terrain changed nothing". --protected_area_covariates
+# False (E2d) removes the two WDPA masks, and there the failure to catch is the opposite: a
+# model that still reads protected areas while being described as one that does not. The
+# expected count is derived from the flags (7, minus 2 without protected areas, plus 3 with
+# terrain), the banner lists the files the dataset read, and "module N" is the constructed
+# trunk's count -- all three must agree, and without protected areas no iucn raster may
+# appear in the banner at all.
 verify_static_fingerprint() {
-  local log="$1" name="$2" flags="${3:-}" line want=7 got mod
+  local log="$1" name="$2" flags="${3:-}" line want=7 got mod terrain=0 pa=1
   if [ ! -r "$log" ]; then
     echo "FATAL: ${name}: no readable log at ${log}; static channels unverified." >&2
     return 1
@@ -362,7 +366,8 @@ verify_static_fingerprint() {
     echo "FATAL: ${name}: ${log} has no Static channels banner." >&2
     return 1
   fi
-  case "$flags" in *--terrain_covariates\ True*) want=10 ;; esac
+  case "$flags" in *--terrain_covariates\ True*) terrain=1; want=$((want + 3)) ;; esac
+  case "$flags" in *--protected_area_covariates\ False*) pa=0; want=$((want - 2)) ;; esac
   got=$(sed -E 's/^Static channels:[[:space:]]+([0-9]+) .*/\1/' <<<"$line")
   mod=$(sed -E 's/.*; module ([0-9]+).*/\1/' <<<"$line")
   if [ "$got" != "$want" ] || [ "$mod" != "$want" ]; then
@@ -370,8 +375,13 @@ verify_static_fingerprint() {
     echo "  banner: ${line}" >&2
     return 1
   fi
-  if [ "$want" = 10 ] && ! grep -q "hm_static_terrain_slope_1000.tiff, hm_static_terrain_aspsin_1000.tiff, hm_static_terrain_aspcos_1000.tiff" <<<"$line"; then
-    echo "FATAL: ${name}: ten static channels, but not the three terrain rasters in order." >&2
+  if [ "$terrain" = 1 ] && ! grep -q "hm_static_terrain_slope_1000.tiff, hm_static_terrain_aspsin_1000.tiff, hm_static_terrain_aspcos_1000.tiff" <<<"$line"; then
+    echo "FATAL: ${name}: terrain asked for, but not the three terrain rasters in order." >&2
+    echo "  banner: ${line}" >&2
+    return 1
+  fi
+  if [ "$pa" = 0 ] && grep -q "iucn" <<<"$line"; then
+    echo "FATAL: ${name}: --protected_area_covariates False, but the run read a protected-area raster." >&2
     echo "  banner: ${line}" >&2
     return 1
   fi

@@ -44,10 +44,10 @@ def test_terrain_appends_the_three_channels_the_script_writes():
     assert [os.path.basename(f) for f in files[7:]] == TERRAIN
 
 
-@pytest.mark.parametrize("idx", [7, 8, 9])
-def test_terrain_nodata_reads_as_zero_like_elevation(idx):
+@pytest.mark.parametrize("name", TERRAIN)
+def test_terrain_nodata_reads_as_zero_like_elevation(name):
     arr = np.array([[np.nan, 2.0]], dtype=np.float32)
-    out = tdl.prepare_static(arr, idx, TERRAIN[idx - 7], 1.0, 2.0, {})
+    out = tdl.prepare_static(arr, name, 1.0, 2.0, {})
     np.testing.assert_allclose(out, [[-0.5, 0.5]])
 
 
@@ -70,10 +70,12 @@ def test_every_static_reader_uses_the_one_list():
     tl = open(os.path.join(ROOT, "scripts", "train_lightning.py")).read()
     assert "--terrain_covariates" in tl
     assert tl.count("terrain_covariates=args.terrain_covariates") >= 3, "all three loaders"
-    assert "static_file_list(args.terrain_covariates)" in tl, "the prediction loop"
+    # The prediction loop reads the list the training dataset read, not a re-derivation.
+    assert "static_list_paths = list(PREDICT_STATS['static_files'])" in tl, "the prediction loop"
+    assert "'static_files': list(_ds_train._static_files)" in tl
     assert not re.search(r"static_list_paths = list\(static_files", tl)
     ns = open(os.path.join(ROOT, "scripts", "compute_norm_stats.py")).read()
-    assert "static_file_list(args.terrain_covariates)" in ns
+    assert "static_file_list(args.terrain_covariates," in ns
 
 
 def test_static_banner_reads_the_module():

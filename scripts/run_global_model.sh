@@ -55,7 +55,7 @@
 set -uo pipefail
 cd /home/glenn/spatio-temporal
 
-STAGE="${1:?usage: [MODEL=E1v|E2a|E2c] ALLOW_GLOBAL=1 $0 <smoke|hindcast|stitch|score|forecast|export_hindcast|export_forecast|all>}"
+STAGE="${1:?usage: [MODEL=E1v|E2a|E2c|E2d] ALLOW_GLOBAL=1 $0 <smoke|hindcast|stitch|score|forecast|export_hindcast|export_forecast|all>}"
 
 # ---------------------------------------------------------------- the configuration
 # ONE model table, because the head's family, its parameter count and its flags must not be
@@ -111,8 +111,22 @@ case "${MODEL:=E1v}" in
     MODEL_FOLD_MASK="data/raw/hm_global/fold_mask_b4_land_1000.tif"
     MODEL_NORM_STATS="data/conv_spline/norm_stats_E2c.json"; MODEL_NORM_DOMAIN="land"
     MODEL_EXTRA_INPUTS="data/raw/hm_global/hm_static_terrain_slope_1000.tiff data/raw/hm_global/hm_static_terrain_aspsin_1000.tiff data/raw/hm_global/hm_static_terrain_aspcos_1000.tiff" ;;
+  E2d)
+    # E2c retrained without protected-area data, the round the user defined on 2026-09-28:
+    # one change, no others.
+    #   inputs  --protected_area_covariates False: the two WDPA masks
+    #           (hm_static_iucn_{nostrict,strict}) are not read, so eight static channels
+    #           against E2c's ten. dpi_dsi stays (the user's decision). norm_stats_E2d.json is
+    #           E2c's land-only builder over the eight (--terrain_covariates
+    #           --drop_protected_areas).
+    # Trunk, head, fold mask and terrain are E2c's.
+    MODEL_FLAGS="--head_family pwl --free_scale True --mu_mse_weight 0.0 --kernel_size 5 --terrain_covariates True --protected_area_covariates False"
+    MODEL_FAMILY="pwl"; MODEL_PARAMS="15"
+    MODEL_FOLD_MASK="data/raw/hm_global/fold_mask_b4_land_1000.tif"
+    MODEL_NORM_STATS="data/conv_spline/norm_stats_E2d.json"; MODEL_NORM_DOMAIN="land"
+    MODEL_EXTRA_INPUTS="data/raw/hm_global/hm_static_terrain_slope_1000.tiff data/raw/hm_global/hm_static_terrain_aspsin_1000.tiff data/raw/hm_global/hm_static_terrain_aspcos_1000.tiff" ;;
   *)
-    echo "FATAL: unknown MODEL='${MODEL}'. Known: E1v, E2a, E2c." >&2
+    echo "FATAL: unknown MODEL='${MODEL}'. Known: E1v, E2a, E2c, E2d." >&2
     echo "       Add it to the table in $0 together with its family and parameter count;" >&2
     echo "       a model without a declared fingerprint cannot be verified." >&2
     exit 2 ;;

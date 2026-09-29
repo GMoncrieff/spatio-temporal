@@ -222,7 +222,7 @@ def _experiment_kwargs(args):
         isolate_shape_grad=args.isolate_shape_grad,
     )
 from torchgeo_dataloader import (get_dataloader, hm_files, component_files, static_files, years,
-                                 prepare_static, static_file_list)
+                                 prepare_static)
 
 # Geospatial imports for inference
 import rasterio
@@ -273,6 +273,13 @@ if __name__ == "__main__":
         help="Append slope, sin(aspect) and cos(aspect) of the elevation raster "
              "(scripts/prepare_terrain.py) to the static channels, read exactly like "
              "elevation. E2c. Default off: the seven channels E1v/E2a trained on.",
+    )
+    parser.add_argument(
+        "--protected_area_covariates",
+        type=lambda x: (str(x).lower() == 'true'), nargs='?', const=True, default=True,
+        help="Read the two WDPA protected-area masks (hm_static_iucn_{nostrict,strict}) as "
+             "static channels. Default on: E1v, E2a and E2c trained with them. E2d sets it "
+             "False and trains without any protected-area data.",
     )
     parser.add_argument(
         "--static_channels",
@@ -1052,6 +1059,7 @@ if __name__ == "__main__":
         include_components=args.include_components,
         static_channels=args.static_channels,
         terrain_covariates=args.terrain_covariates,
+        protected_area_covariates=args.protected_area_covariates,
         use_temporal_sampling=True,  # Enable temporal sampling for training
         end_year_options=(2000, 2005, 2010, 2015),
         num_workers=args.num_workers,
@@ -1088,6 +1096,7 @@ if __name__ == "__main__":
         include_components=args.include_components,
         static_channels=args.static_channels,
         terrain_covariates=args.terrain_covariates,
+        protected_area_covariates=args.protected_area_covariates,
         use_temporal_sampling=False,  # Fixed years for validation (Option A)
         num_workers=args.num_workers,
         pin_memory=True if args.num_workers > 0 else False,
@@ -1111,6 +1120,7 @@ if __name__ == "__main__":
         include_components=args.include_components,
         static_channels=args.static_channels,
         terrain_covariates=args.terrain_covariates,
+        protected_area_covariates=args.protected_area_covariates,
         use_temporal_sampling=False,
         num_workers=args.num_workers,
         pin_memory=True if args.num_workers > 0 else False,
@@ -2187,6 +2197,10 @@ if __name__ == "__main__":
         # The sidecar's undeclared-fill table (prepare_static). Prediction must drop exactly
         # what training dropped, or the pixels south of 56 S see a different elevation.
         'static_nodata': dict(getattr(_ds_train, 'static_nodata', {})),
+        # The static rasters the dataset read, in its order -- the list the model was built
+        # for and the sidecar's moments index. Prediction reads exactly these rather than
+        # re-deriving them from the flags (a second spelling is where the two part company).
+        'static_files': list(_ds_train._static_files),
     }
 
     def _release_dataloaders():
@@ -2329,8 +2343,7 @@ if __name__ == "__main__":
             hm_mean, hm_std = PREDICT_STATS['hm_mean'], PREDICT_STATS['hm_std']
             elev_mean, elev_std = PREDICT_STATS['elev_mean'], PREDICT_STATS['elev_std']
             include_components = bool(PREDICT_STATS['include_components'])
-            _statics = static_file_list(args.terrain_covariates)
-            static_list_paths = list(_statics if args.static_channels is None else _statics[:int(args.static_channels)])
+            static_list_paths = list(PREDICT_STATS['static_files'])
             t_idxs = [year_to_idx[y] for y in input_years]
 
             # CRITICAL: per-variable normalization stats (NOT pooled hm_mean/hm_std)
@@ -2676,12 +2689,13 @@ if __name__ == "__main__":
                             dyn_ts.append(np.stack(channels, axis=0))  # [C_dyn, hi, wj]
                         input_dynamic_np = np.stack(dyn_ts, axis=0)  # [T, C_dyn, hi, wj]
                         static_chs = []
-                        # Static file order: [ele, tas, tasmin, pr, dpi_dsi, iucn_nostrict, iucn_strict]
+                        # Static file order: static_file_list() -- [ele, tas, tasmin, pr,
+                        # dpi_dsi, (iucn_nostrict, iucn_strict), (slope, aspsin, aspcos)].
                         # The SAME function the training dataset uses (fill, NaN -> 0, scale).
                         for static_idx, src in enumerate(stat_srcs):
                             sarr = src.read(1, window=win, masked=True).filled(np.nan)
                             static_chs.append(prepare_static(
-                                sarr, static_idx, static_list_paths[static_idx],
+                                sarr, static_list_paths[static_idx],
                                 static_means[static_idx], static_stds[static_idx],
                                 PREDICT_STATS['static_nodata']))
                         input_static_np = np.stack(static_chs, axis=0) if static_chs else np.zeros((0, hi, wj), dtype=np.float32)

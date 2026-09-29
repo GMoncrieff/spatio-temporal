@@ -36,7 +36,7 @@ def _ele():
 
 
 def test_declared_fill_becomes_sea_level_before_normalising():
-    out = tdl.prepare_static(_ele(), 0, ELE, 675.0, 845.0, DECLARED)
+    out = tdl.prepare_static(_ele(), ELE, 675.0, 845.0, DECLARED)
     want = (np.array([[0.0, 100.0], [0.0, 2000.0]], dtype=np.float32) - 675.0) / 845.0
     np.testing.assert_allclose(out, want, rtol=0, atol=1e-6)
 
@@ -44,7 +44,7 @@ def test_declared_fill_becomes_sea_level_before_normalising():
 def test_without_a_declaration_e2a_reads_byte_identically():
     """E2a's sidecar declares nothing, and its checkpoints saw the fill."""
     mean, std = -4199.65966796875, 11184.3583984375
-    out = tdl.prepare_static(_ele(), 0, ELE, mean, std, {})
+    out = tdl.prepare_static(_ele(), ELE, mean, std, {})
     want = (np.nan_to_num(_ele(), nan=0.0) - mean) / std
     assert np.array_equal(out, want)
 
@@ -52,7 +52,7 @@ def test_without_a_declaration_e2a_reads_byte_identically():
 def test_nan_fill_stays_on_the_same_channels():
     """tas is not in the fill set: NaN there stays NaN, as before."""
     arr = np.array([[np.nan, 20.0]], dtype=np.float32)
-    out = tdl.prepare_static(arr, 1, TAS, 13.0, 13.0, DECLARED)
+    out = tdl.prepare_static(arr, TAS, 13.0, 13.0, DECLARED)
     assert np.isnan(out[0, 0]) and out[0, 1] == np.float32((20.0 - 13.0) / 13.0)
 
 
